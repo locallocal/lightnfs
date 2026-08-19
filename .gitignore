@@ -1,0 +1,6 @@
+build/
+build-*/
+third_party/liburing/
+compile_commands.json
+.cache/
+fuzz/corpus/
