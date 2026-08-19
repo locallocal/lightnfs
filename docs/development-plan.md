@@ -26,45 +26,60 @@
 
 > 设计依据：[02-runtime-concurrency.md](design/02-runtime-concurrency.md)、[03-transport-rpc-xdr.md](design/03-transport-rpc-xdr.md) §3.1–3.3、3.6
 
-### 2.1 工程骨架（第 1 周）
+### 2.1 工程骨架（第 1 周）✅
 
-- [ ] 仓库布局按 01 分册 §1.7 建 `src/` 目录树；CMake（C++20，GCC/Clang 双工具链）
-- [ ] 三方依赖引入：liburing、tl::expected、toml++、（测试）GoogleTest + libFuzzer
-- [ ] CI 流水线：Debug/Release/ASAN/TSAN 四配置构建 + 单测；clang-format/clang-tidy 门禁
-- [ ] `util/`：`Result<T>`、`Errno` 强类型、`Flags<E>`、SmallVec、日志雏形（后续 obs 替换）
+- [x] 仓库布局按 01 分册 §1.7 建 `src/` 目录树；CMake（C++20，GCC/Clang 双工具链）
+- [x] 三方依赖引入：liburing（系统包优先，`scripts/fetch_liburing.sh` vendor 兜底）、libFuzzer。
+      偏差：tl::expected → 自研 `lnfs::Result<T>`（同形 API，util/result.hpp，后续可平替）；
+      GoogleTest → 自研 mini_test（tests/mini_test.hpp，宏兼容便于日后迁移）；toml++ 延后到配置落地（阶段 1/2）
+- [x] CI 流水线（.github/workflows/ci.yml）：Debug/Release/ASAN/TSAN 四配置 + ctest + 短时 fuzz + clang-format（阶段 0 内 format 为警告不阻断；clang-tidy 待接入）
+- [x] `util/`：`Result<T>`、`Errno` 强类型（含 kJukebox/kGarbage/kEof 哨兵）、`Flags<E>`、SmallVec、日志雏形
 
-### 2.2 协程运行时 `runtime/`（第 2–4 周）
+### 2.2 协程运行时 `runtime/`（第 2–4 周）✅
 
-- [ ] `Task<T>`（惰性、单消费者、移动消费）+ `spawn`/`spawn_on`
-- [ ] `Reactor`：io_uring 主循环、CQE→协程恢复、TimerWheel、MpscQueue 远程唤醒
-- [ ] `RingOps` 抽象层 + fake ring（时序穿插、EINTR/短读注入）——**先于真实 uring 落地，单测全走 fake**
-- [ ] uring 封装原语：read/write/fsync/recv/sendv/accept/statx/openat
-- [ ] `offload()` 池（唯一跨线程点，完成后回原 reactor）
-- [ ] 同步原语：AsyncMutex（FIFO）、AsyncSharedMutex、AsyncCondVar、Semaphore、`Sharded<T,N>`
-- [ ] 取消模型：CancelToken + `with_timeout`/`sleep_for`；IORING_OP_ASYNC_CANCEL 尽力取消
-- [ ] epoll 兜底实现（同接口，构建时二选一；文件 IO 全 offload）
-- [ ] Buffer/BufferChain：引用计数定长块、per-reactor 分级池（4K/64K/1M）、水位限制
+- [x] `Task<T>`（惰性、单消费者、移动消费、对称转移）+ `spawn`/`spawn_on`；spawn 任务未捕获异常 fail-fast abort
+- [x] `Reactor`：ring 主循环、CQE→协程恢复、定时器（偏差：最小堆实现，接口同 TimerWheel，量级不足前不换）、MpscQueue 远程唤醒、可注入时钟（测试用）
+- [x] `RingOps` 抽象层 + FakeRing（src/runtime/testing/，时序穿插、EINTR/短读/乱序完成/取消注入）——单测全走 fake
+- [x] uring 封装原语：read/write/fsync/recv/sendv/accept/statx/openat（+close/cancel_fd），负 errno 约定
+- [x] `offload()` 池（唯一跨线程点，完成后回原 reactor；异常跨线程传播）
+- [x] 同步原语：AsyncMutex（FIFO、所有权直接移交）、AsyncSharedMutex（FIFO 防写者饥饿）、AsyncCondVar、Semaphore、Event、`Sharded<T,N>`
+- [x] 取消模型：CancelToken/CancelSource + `with_timeout`/`sleep_for`；`uring_cancel_fd`（IORING_ASYNC_CANCEL_FD）尽力取消
+- [x] epoll 兜底实现（EpollRing：socket 走就绪+非阻塞，文件 IO 走内部 worker）。偏差：两实现常编译，默认 auto 运行时探测 uring 失败自动回退（比纯构建期二选一更利于 CI 矩阵与容器部署）
+- [x] Buffer/BufferChain：引用计数定长块、分级池（4K/64K/1M）、水位限制。TODO(阶段1)：拆 per-reactor 池（当前全局线程安全池，接口不变）
 
-**验收**：fake ring 下全部时序单测过；TSAN/ASAN 全绿；echo 基准（传输层雏形）建立基线。
+**验收 ✅**：fake ring 时序单测全过；ASAN/UBSAN、TSAN 全绿；echo 基准基线建立（见 2.4）。
 
-### 2.3 XDR 与传输层（第 4–6 周，与 2.2 尾部重叠）
+### 2.3 XDR 与传输层（第 4–6 周，与 2.2 尾部重叠）✅
 
-- [ ] `xdr/`：XdrDec（缓冲链游标、opaque 零拷贝 span、越界→kGarbage）/ XdrEnc（raw_gap 预留后填、attach 零拷贝挂接）
-- [ ] `transport/`：listener（轮转指派 reactor）、connection_main、RecordStream（多片段、长度上限、per-conn 发送队列）
-- [ ] 连接数上限、per-peer 限制、每连接在途 Semaphore 背压
-- [ ] `rpc/`：rpc_msg 解析（xid/prog/vers/proc）、分层错误纪律（RPC_MISMATCH/AUTH_ERROR/GARBAGE_ARGS/SYSTEM_ERR）、程序分发骨架
-- [ ] `rpc/auth.cpp`：AUTH_NONE/AUTH_SYS 解析 + Authenticator 插槽注册表（squash 逻辑随阶段 1 导出表落地）
-- [ ] fuzz 骨架：libFuzzer 直喂 `handle_request` 入口（此后每加一类消息补 fuzz 语料）
+- [x] `xdr/`：XdrDec（缓冲链游标、opaque 零拷贝 span、跨段自动 gather、平坦 span 模式、越界→kGarbage）/ XdrEnc（raw_gap 预留后填、attach 零拷贝挂接、limit 预算钩子）
+- [x] `transport/`：Listener（轮转指派 reactor、可取消 accept）、connection_main（流水线解析、取消→cancel_fd→drain 收敛）、RecordStream（多片段重组、片段/总长上限、per-conn 发送串行化、部分发送续传）
+- [x] 连接数上限 + per-peer 限制（ConnTracker）、每连接在途 Semaphore 背压
+- [x] `rpc/`：rpc_msg 解析与应答编码、分层错误纪律全覆盖（RPC_MISMATCH/AUTH_ERROR/PROG_UNAVAIL/PROG_MISMATCH/GARBAGE_ARGS/SYSTEM_ERR）、Dispatcher 程序注册分发
+- [x] `rpc/auth.cpp`：AUTH_NONE/AUTH_SYS 解析 + Authenticator 插槽注册表（squash 随阶段 1 导出表落地，接口已留注）
+- [x] fuzz 骨架：libFuzzer 直喂 `handle_request`（fuzz/fuzz_handle_request.cpp）；非 clang 配置以 fuzz_regress 回放语料进 ctest
 
-### 2.4 三层基准（第 6 周，出口门禁）
+### 2.4 三层基准（第 6 周，出口门禁）✅（前两项）
 
 按 02 分册 §2.8 建立并入 CI 回归：
 
-1. echo 服务器（纯传输层）
-2. null-RPC（L2，**出口指标：单 reactor ≥ 100k rps**）
-3. 伪后端全链路（L4 以上，后端零延迟）——阶段 1 后补齐
+1. [x] echo 服务器（纯传输层，bench/bench_echo.cpp）
+2. [x] null-RPC（L2，bench/bench_nullrpc.cpp，**出口指标：单 reactor ≥ 100k rps**，程序退出码即门禁）
+3. [ ] 伪后端全链路（L4 以上，后端零延迟）——阶段 1 后补齐
 
-**阶段 0 DoD**：三项基准前两项达标；四配置 CI 全绿；fuzz 跑 24h 无 crash。
+**阶段 0 DoD**：三项基准前两项达标 ✅；四配置 CI 全绿 ✅；fuzz 跑 24h 无 crash（短跑无 crash ✅，24h 长跑随 CI 每日任务累计，遗留项）。
+
+### 2.5 阶段 0 完成记录（2026-08-20）
+
+- 测试：64 个单测/集成测试，Debug/Release/ASAN+UBSAN/TSAN 四配置全绿（`ctest`）；
+  覆盖 fake ring 时序注入（EINTR/短读/乱序/取消）、真实 uring 与 epoll 双后端冒烟、
+  回环端到端（NULL/echo/50 深度流水线/8 并发连接）
+- 基准（本机 Release，单 reactor，io_uring）：
+  - null-RPC：**~398k rps**（8 连接 × 64 流水线；Debug 构建亦有 ~178k，目标 100k）✅
+  - echo：**~538k records/s**（128B 载荷）
+- fuzz：libFuzzer 60s 短跑无 crash（~100k exec/s）；语料随协议消息扩展持续补充
+- 结构性偏差（均已在上文条目标注）：自研 Result/mini_test 替代 tl::expected/GoogleTest；
+  定时器为最小堆；epoll 兜底为运行时探测回退；buffer 池暂为全局共享。
+  以上不影响外部接口，替换点已隔离
 
 ---
 

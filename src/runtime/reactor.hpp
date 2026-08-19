@@ -1,0 +1,132 @@
+#pragma once
+// Reactor (design 02 §2.3): submit SQEs -> wait CQEs -> resume waiting coroutines -> run
+// expired timers. One reactor per thread; connections are pinned to a reactor, so business
+// code above the runtime is effectively single-threaded except for explicitly sharded state.
+//
+// Cross-thread entry points are exactly two (02 §2.3): post() (remote wakeup, used by
+// offload completion and sync primitives) and spawn_on() (top-level task placement).
+
+#include <atomic>
+#include <chrono>
+#include <coroutine>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <vector>
+
+#include "runtime/ring_ops.hpp"
+#include "runtime/task.hpp"
+
+namespace lnfs::rt {
+
+class OffloadPool;
+
+using Clock = std::chrono::steady_clock;
+using TimePoint = Clock::time_point;
+
+// MPSC handoff for cross-thread wakeups. Mutex + swap; contention is low (design allows
+// starting simple; the interface is what matters).
+class MpscQueue {
+ public:
+  void push(std::coroutine_handle<> h) {
+    std::lock_guard lk(mu_);
+    q_.push_back(h);
+  }
+  void drain(std::vector<std::coroutine_handle<>>& out) {
+    std::lock_guard lk(mu_);
+    out.swap(q_);
+    q_.clear();
+  }
+  bool empty() {
+    std::lock_guard lk(mu_);
+    return q_.empty();
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<std::coroutine_handle<>> q_;
+};
+
+class Reactor {
+ public:
+  struct Options {
+    // Injectable clock so FakeRing tests can drive timers deterministically.
+    // Null means steady_clock.
+    std::function<TimePoint()> clock;
+  };
+
+  explicit Reactor(RingOps& ring, Options opts = {});
+  ~Reactor();
+
+  Reactor(const Reactor&) = delete;
+
+  // Runs until stop() AND all spawned tasks have finished.
+  void run();
+  void stop();  // thread-safe
+
+  // Thread-safe: schedule h to be resumed on this reactor's thread.
+  void post(std::coroutine_handle<> h);
+
+  RingOps& ring() { return ring_; }
+  OffloadPool* offload_pool() const { return offload_; }
+  void set_offload_pool(OffloadPool* p) { offload_ = p; }
+  TimePoint now() const { return opts_.clock ? opts_.clock() : Clock::now(); }
+
+  // ---- io / timer plumbing (called from this reactor's thread) ----
+  void op_started() { ++pending_ops_; }
+  void op_finished() { --pending_ops_; }
+  void add_timer(TimePoint deadline, std::coroutine_handle<> h);
+
+  // ---- spawn bookkeeping ----
+  void task_started() { live_tasks_.fetch_add(1, std::memory_order_relaxed); }
+  void task_finished() { live_tasks_.fetch_sub(1, std::memory_order_relaxed); }
+  int64_t live_tasks() const { return live_tasks_.load(std::memory_order_relaxed); }
+
+  // Test helper: process what is ready without blocking; returns true if progress was made.
+  bool poll_once();
+
+ private:
+  bool pump(std::optional<std::chrono::nanoseconds> block_for);
+  std::optional<std::chrono::nanoseconds> next_timer_delay();
+  void run_expired_timers();
+
+  RingOps& ring_;
+  Options opts_;
+  OffloadPool* offload_ = nullptr;
+
+  struct TimerEnt {
+    TimePoint deadline;
+    uint64_t seq;  // FIFO tie-break
+    std::coroutine_handle<> h;
+    bool operator>(const TimerEnt& o) const {
+      return deadline != o.deadline ? deadline > o.deadline : seq > o.seq;
+    }
+  };
+  std::priority_queue<TimerEnt, std::vector<TimerEnt>, std::greater<>> timers_;
+  uint64_t timer_seq_ = 0;
+
+  MpscQueue remote_;
+  std::atomic<bool> stop_{false};
+  std::atomic<int64_t> live_tasks_{0};
+  int64_t pending_ops_ = 0;
+};
+
+// TLS accessor (design 02 §2.2). Aborts if called off-reactor.
+Reactor& current_reactor();
+Reactor* current_reactor_or_null();
+// Test/bench helper: mark the calling thread as running `r` (normally done by run()).
+class ReactorGuard {
+ public:
+  explicit ReactorGuard(Reactor* r);
+  ~ReactorGuard();
+
+ private:
+  Reactor* prev_;
+};
+
+// Detached start of a top-level coroutine on reactor r (design 02 §2.2).
+void spawn(Task<void> t, Reactor& r);
+inline void spawn_on(Reactor& r, Task<void> t) { spawn(std::move(t), r); }
+
+}  // namespace lnfs::rt

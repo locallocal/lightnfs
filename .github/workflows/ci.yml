@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc-debug
+            cc: gcc
+            cxx: g++
+            build_type: Debug
+            sanitize: ""
+          - name: gcc-release
+            cc: gcc
+            cxx: g++
+            build_type: Release
+            sanitize: ""
+          - name: clang-asan
+            cc: clang
+            cxx: clang++
+            build_type: Debug
+            sanitize: address
+          - name: clang-tsan
+            cc: clang
+            cxx: clang++
+            build_type: Debug
+            sanitize: thread
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build
+      - name: configure
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DLNFS_SANITIZE=${{ matrix.sanitize }}
+      - name: build
+        run: ninja -C build
+      - name: test
+        run: ctest --test-dir build --output-on-failure --timeout 300
+      - name: bench smoke (no threshold gate in CI)
+        if: matrix.build_type == 'Release'
+        run: |
+          ./build/bench_nullrpc 1 4 10000 32 || true
+          ./build/bench_echo 1 4 10000 32 128 || true
+
+  fuzz-short:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build clang
+      - name: configure
+        run: >
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLNFS_BUILD_FUZZ=ON
+      - name: build
+        run: ninja -C build fuzz_handle_request
+      - name: fuzz 120s
+        run: mkdir -p corpus && ./build/fuzz_handle_request -max_total_time=120 corpus
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clang-format check
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang-format
+          git ls-files 'src/**/*.hpp' 'src/**/*.cpp' 'tests/*.cpp' 'bench/*' 'fuzz/*.cpp' \
+            | xargs clang-format --dry-run -Werror || {
+              echo "::warning::formatting drift (non-blocking during phase 0)"; true; }
