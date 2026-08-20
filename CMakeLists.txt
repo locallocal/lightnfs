@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 project(lightnfs CXX)
 
+find_package(Threads REQUIRED)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -18,6 +20,7 @@ set(LNFS_RING "auto" CACHE STRING "default ring backend: auto, uring or epoll")
 option(LNFS_BUILD_FUZZ "build libFuzzer targets (requires clang)" OFF)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+add_compile_definitions(_GNU_SOURCE)
 if(LNFS_SANITIZE STREQUAL "address")
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)
@@ -38,6 +41,18 @@ message(STATUS "liburing: ${LIBURING_LIBRARY} (${LIBURING_INCLUDE_DIR})")
 
 # ---- core library ----
 add_library(lnfs_core STATIC
+  src/backend/api.cpp
+  src/backend/local.cpp
+  src/backend/memory.cpp
+  src/core/config.cpp
+  src/core/file_handle.cpp
+  src/core/obj_lock.cpp
+  src/core/readdir.cpp
+  src/core/errmap.cpp
+  src/nfsv3/nfs3_types.cpp
+  src/nfsv3/engine.cpp
+  src/mountd/mount3.cpp
+  src/server/rpcbind.cpp
   src/runtime/reactor.cpp
   src/runtime/uring_ring.cpp
   src/runtime/epoll_ring.cpp
@@ -58,7 +73,8 @@ if(LNFS_RING STREQUAL "epoll")
   target_compile_definitions(lnfs_core PUBLIC LNFS_DEFAULT_RING_EPOLL=1)
 endif()
 
-find_package(Threads REQUIRED)
+add_executable(lightnfsd src/main.cpp)
+target_link_libraries(lightnfsd PRIVATE lnfs_core)
 
 # ---- tests ----
 enable_testing()
@@ -76,6 +92,8 @@ add_executable(lnfs_tests
   tests/test_uring_smoke.cpp
   tests/test_offload.cpp
   tests/test_transport_loopback.cpp
+  tests/test_backend.cpp
+  tests/test_nfs3.cpp
 )
 target_link_libraries(lnfs_tests PRIVATE lnfs_core)
 add_test(NAME lnfs_tests COMMAND lnfs_tests)

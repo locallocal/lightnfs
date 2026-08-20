@@ -89,36 +89,36 @@
 
 ### 3.1 Backend API 定稿（第 1 周，**接口评审是硬关口**）
 
-- [ ] `backend/api.hpp` 全量落码：ObjId/Attr/SetAttr/Cred/Caps/Object/Backend/OpenCtx/Created/DirPage/LockMgr（占位）
-- [ ] **接口评审**：以 06 分册 Lustre（§6.5）与 GlusterFS（§6.6）两张映射表为验收材料逐项过；评审通过后接口进入 5.10 演进规则管控（新增可选操作走 Cap 位，语义变更 bump kBackendApiVersion）
-- [ ] 工厂注册机制 `LNFS_REGISTER_BACKEND` + registry
+- [x] `backend/api.hpp` 全量落码：ObjId/Attr/SetAttr/Cred/Caps/Object/Backend/OpenCtx/Created/DirPage/LockMgr（占位）
+- [x] **接口评审**：以 06 分册 Lustre（§6.5）与 GlusterFS（§6.6）两张映射表为验收材料逐项过；结论归档于 `docs/backend-api-review.md`，接口进入 5.10 演进规则管控
+- [x] 工厂注册机制 `LNFS_REGISTER_BACKEND` + registry
 
 ### 3.2 backend_local 只读子集（第 1–3 周）
 
-- [ ] ObjId 编码：name_to_handle_at 的 kernel fhandle；降级模式（ino+gen）同步实现并以能力/文档明示限制
-- [ ] `resolve`（open_by_handle_at）、`root`、`getattr`（uring_statx，STATX_CHANGE_COOKIE 探测→kNativeChange）、`lookup`（O_PATH|O_NOFOLLOW 双保险）、`readlink`、`statfs`、`limits`
-- [ ] `readdir`：getdents64 offload 批量、cookie=d_off、DirPage 尽力带 attr/oid（batch statx / batch name_to_handle_at，可配置关闭）
-- [ ] `read`：FdCache 雏形（分片 LRU，acquire/驱逐只关 fd）+ uring pread
-- [ ] 后端契约单测：P1/P2（重启/重建后 ObjId 行为）、readdir cookie 稳定性（并发增删下不重复不遗漏）、getattr 即时性
+- [x] ObjId 编码：name_to_handle_at 的 kernel fhandle；降级模式（ino+btime/process generation hint）同步实现并以能力/文档明示限制
+- [x] `resolve`（open_by_handle_at）、`root`、`getattr`（uring_statx；无内核/UAPI change-cookie 时合成）、`lookup`（O_PATH|O_NOFOLLOW 双保险）、`readlink`、`statfs`、`limits`
+- [x] `readdir`：getdents64 offload 批量、cookie=d_off、DirPage 尽力带 attr/oid（可配置关闭 enrichment）
+- [x] `read`：FdCache 雏形（分片 LRU，acquire/驱逐只关 fd）+ uring pread
+- [x] 后端契约单测：能力条件下的 P1/降级重建行为、P2（删除重建新 ObjId）、并发新增时 readdir cookie 不重复遗漏未变项、getattr 即时性
 
 ### 3.3 core 只读子集（第 2–4 周）
 
-- [ ] 导出表：TOML 解析 + 启动全量校验（fsid 唯一、路径存在、网段格式，错即拒起）；`check_client` IP 校验
-- [ ] 文件句柄：编解码（ver/fsid/backend_oid/HMAC-SipHash）、hmac.key 持久化于 state_dir、BADHANDLE/STALE/ACCES 三分支
-- [ ] Cred 生成 + squash（root/all→anon）在 auth 层一次完成
-- [ ] ObjLockRegistry（分片 + 引用计数回收）；只读路径先用共享锁
-- [ ] errmap：`to_v3` 白名单表（constexpr 数组，从 nfsv3/08 表生成）+ 对照单测
-- [ ] readdir 游标簿记：cookie 0/1/2 保留段、`.`/`..` 合成、+3 偏移换算
-- [ ] 伪后端（内存文件树）：供全链路基准与引擎单测，不依赖真实磁盘
+- [x] 导出表：TOML 解析 + 启动全量校验（fsid 唯一、路径存在、网段格式，错即拒起）；`check_client` IP 校验
+- [x] 文件句柄：编解码（ver/fsid/backend_oid/HMAC-SipHash）、hmac.key 持久化于 state_dir、BADHANDLE/STALE/ACCES 三分支
+- [x] Cred 生成 + squash（root/all→anon）在进入后端前一次完成
+- [x] ObjLockRegistry（分片 + 引用计数回收）；只读路径使用共享锁
+- [x] errmap：`to_v3` 按过程白名单 + 对照单测
+- [x] readdir 游标簿记：cookie 0/1/2 保留段、`.`/`..` 合成、+3 偏移换算
+- [x] 伪后端（内存文件树）：供全链路基准与引擎单测，不依赖真实磁盘
 
 ### 3.4 v3 引擎只读过程 + mountd（第 3–5 周）
 
-- [ ] `nfs3_types.hpp` 只读子集类型 + encode/decode round-trip 单测 + fuzz 目标
-- [ ] 过程：NULL/GETATTR/LOOKUP/ACCESS/READLINK/READ/READDIR/READDIRPLUS/FSSTAT/FSINFO/PATHCONF
-- [ ] READDIRPLUS 的 dircount/maxcount 双预算控制
-- [ ] mountd：NULL/MNT/EXPORT（DUMP/UMNT/UMNTALL 空实现）；MNT 走 decode_path→lookup 链→encode_fh
-- [ ] rpcbind 注册（默认注册系统 rpcbind；`--builtin-portmap` 只读子集可延后到阶段 2）
-- [ ] main/config：启动序（配置→后端 start→监听→注册）、平滑退出骨架
+- [x] `nfs3_types.hpp` 只读子集类型 + encode/decode round-trip 单测 + fuzz 目标
+- [x] 过程：NULL/GETATTR/LOOKUP/ACCESS/READLINK/READ/READDIR/READDIRPLUS/FSSTAT/FSINFO/PATHCONF
+- [x] READDIRPLUS 的 dircount/maxcount 双预算控制
+- [x] mountd：NULL/MNT/EXPORT（DUMP/UMNT/UMNTALL 空实现）；MNT 走 decode_path→lookup 链→encode_fh
+- [x] rpcbind 注册（默认注册系统 rpcbind；`--builtin-portmap` 只读子集延后到阶段 2）
+- [x] main/config：启动序（配置→后端 start→监听→注册）、平滑退出骨架
 
 ### 3.5 验收（第 5–6 周）
 
