@@ -1,0 +1,29 @@
+[server]
+reactors = 0
+offload_threads = 16
+port = 2049
+mount_port = 20048
+rpcbind = true
+builtin_portmap = false
+state_dir = "/tmp/lightnfs-state"
+max_connections = 4096
+max_request_size = "2MiB"
+
+[protocol]
+v3 = true
+
+[limits]
+inflight_per_conn = 64
+
+[[export]]
+path = "/tmp" # replace with the directory to export
+backend = "local"
+fsid = 1
+clients = ["192.168.0.0/24", "127.0.0.0/8"]
+squash = "root"
+readonly = true
+
+[export.local]
+handles = "auto"
+fd_cache = 4096
+readdir_enrich = true

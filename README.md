@@ -25,5 +25,7 @@ Sanitizer 配置：`-DLNFS_SANITIZE=address|thread`；fuzz（需 clang）：`-DL
 
 ## 当前状态
 
-阶段 0（工程基建 + 协程运行时 + XDR/传输/RPC 层）已完成，
-见[开发计划 §2.5](docs/development-plan.md)的完成记录。协议引擎从阶段 1 开始。
+阶段 1 的 Backend API、LocalFS 只读后端、NFSv3 只读引擎、MOUNTv3、配置与服务端
+入口已实现。部署方式、无特权句柄限制和真实挂载验收见
+[M1 只读说明](docs/m1-readonly.md)；接口评审结论见
+[Backend API v1 评审](docs/backend-api-review.md)。
