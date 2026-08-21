@@ -51,11 +51,12 @@ T run_runtime(rt::Runtime& runtime, rt::Task<T> task) {
   rt::spawn(
       [](rt::Task<T> work, std::mutex* mu, std::condition_variable* cv,
          std::optional<T>* out) -> rt::Task<void> {
-        out->emplace(co_await std::move(work));
+        auto value = co_await std::move(work);
         {
           std::lock_guard lock(*mu);
+          out->emplace(std::move(value));
+          cv->notify_one();  // under the lock: the waiter cannot destroy cv first
         }
-        cv->notify_one();
       }(std::move(task), &mu, &cv, &result),
       runtime.reactor(0));
   std::unique_lock lock(mu);

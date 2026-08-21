@@ -7,10 +7,15 @@ rpcbind = true
 builtin_portmap = false
 state_dir = "/tmp/lightnfs-state"
 max_connections = 4096
+per_peer_limit = 128
 max_request_size = "2MiB"
+# ctl_socket = "/run/lightnfs/ctl.sock"   # default: <state_dir>/ctl.sock
+metrics_port = 0                          # Prometheus text endpoint; 0 = disabled
 
 [protocol]
 v3 = true
+drc_ttl = "120s"    # duplicate request cache entry lifetime
+drc_mem = "64MiB"   # duplicate request cache memory cap
 
 [limits]
 inflight_per_conn = 64
@@ -21,9 +26,10 @@ backend = "local"
 fsid = 1
 clients = ["192.168.0.0/24", "127.0.0.0/8"]
 squash = "root"
-readonly = true
+readonly = true     # phase 2: set false for read-write exports
 
 [export.local]
 handles = "auto"
 fd_cache = 4096
 readdir_enrich = true
+# identity = "check"   # check (default) | strict (faccessat2 confirm) | setfsuid (root only)

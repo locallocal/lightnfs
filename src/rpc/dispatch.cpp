@@ -1,6 +1,7 @@
 #include "rpc/dispatch.hpp"
 
 #include "transport/connection.hpp"
+#include "obs/metrics.hpp"
 #include "util/log.hpp"
 
 namespace lnfs::rpc {
@@ -12,6 +13,7 @@ static Task<void> send_enc(transport::ConnCtx& ctx, xdr::XdrEnc& enc) {
 }
 
 Task<void> Dispatcher::reply_garbage_args(transport::ConnCtx& ctx, uint32_t xid) {
+  obs::Metrics::instance().rpc_garbage.fetch_add(1, std::memory_order_relaxed);
   xdr::XdrEnc enc(ctx.pool);
   encode_reply_accepted_err(enc, xid, kGarbageArgs);
   co_await send_enc(ctx, enc);

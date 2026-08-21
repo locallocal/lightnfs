@@ -1,5 +1,7 @@
 #include "transport/connection.hpp"
 
+#include "obs/metrics.hpp"
+
 #include <arpa/inet.h>
 #include <unistd.h>
 
@@ -44,6 +46,7 @@ bool ConnTracker::try_add(const Peer& p) {
   if (c >= cfg_.per_peer_limit) return false;
   ++c;
   ++total_;
+  obs::Metrics::instance().conns_active.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -52,6 +55,7 @@ void ConnTracker::remove(const Peer& p) {
   auto it = per_peer_.find(p.ip_key());
   if (it != per_peer_.end() && --it->second == 0) per_peer_.erase(it);
   --total_;
+  obs::Metrics::instance().conns_active.fetch_sub(1, std::memory_order_relaxed);
 }
 
 int ConnTracker::count() {
@@ -91,6 +95,8 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp,
     }
     if (rec->empty()) continue;  // empty record: ignore
     if (c->cancel.cancel_requested()) break;
+      if (c->inflight.available() <= 0)
+      obs::Metrics::instance().backpressure_waits.fetch_add(1, std::memory_order_relaxed);
     co_await c->inflight.acquire();  // backpressure (design 01 §1.5)
     ++c->live;
     spawn(handle_one(c, &disp, std::move(*rec)), current_reactor());

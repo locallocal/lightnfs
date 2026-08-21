@@ -80,6 +80,197 @@ Result<ReaddirPlusArgs> ReaddirPlusArgs::decode(xdr::XdrDec& dec) {
   return out;
 }
 
+Result<backend::SetAttr> decode_sattr(xdr::XdrDec& dec) {
+  backend::SetAttr out;
+  if (LNFS_TRY(dec.boolean())) out.mode = LNFS_TRY(dec.u32()) & 07777;
+  if (LNFS_TRY(dec.boolean())) out.uid = LNFS_TRY(dec.u32());
+  if (LNFS_TRY(dec.boolean())) out.gid = LNFS_TRY(dec.u32());
+  if (LNFS_TRY(dec.boolean())) out.size = LNFS_TRY(dec.u64());
+  auto decode_time_how = [&](backend::SetAttr::TimeHow& how,
+                             backend::Timespec& value) -> Result<void> {
+    uint32_t wire = LNFS_TRY(dec.u32());
+    if (wire > 2) return Err(Errno::kGarbage);
+    how = static_cast<backend::SetAttr::TimeHow>(wire);
+    if (how == backend::SetAttr::TimeHow::kClient) {
+      value.sec = LNFS_TRY(dec.u32());
+      value.nsec = LNFS_TRY(dec.u32());
+      if (value.nsec > 999999999u) return Err(Errno::kGarbage);
+    }
+    return {};
+  };
+  LNFS_TRY(decode_time_how(out.atime_how, out.atime));
+  LNFS_TRY(decode_time_how(out.mtime_how, out.mtime));
+  return out;
+}
+
+void encode_sattr(xdr::XdrEnc& enc, const backend::SetAttr& attrs) {
+  auto opt_u32 = [&](const std::optional<uint32_t>& value) {
+    enc.boolean(value.has_value());
+    if (value) enc.u32(*value);
+  };
+  opt_u32(attrs.mode);
+  opt_u32(attrs.uid);
+  opt_u32(attrs.gid);
+  enc.boolean(attrs.size.has_value());
+  if (attrs.size) enc.u64(*attrs.size);
+  auto time_how = [&](backend::SetAttr::TimeHow how, const backend::Timespec& value) {
+    enc.u32(static_cast<uint32_t>(how));
+    if (how == backend::SetAttr::TimeHow::kClient) {
+      enc.u32(static_cast<uint32_t>(value.sec));
+      enc.u32(value.nsec);
+    }
+  };
+  time_how(attrs.atime_how, attrs.atime);
+  time_how(attrs.mtime_how, attrs.mtime);
+}
+
+void SetattrArgs::encode(xdr::XdrEnc& enc) const {
+  object.encode(enc);
+  encode_sattr(enc, attrs);
+  enc.boolean(guard);
+  if (guard) {
+    enc.u32(static_cast<uint32_t>(guard_ctime.sec));
+    enc.u32(guard_ctime.nsec);
+  }
+}
+Result<SetattrArgs> SetattrArgs::decode(xdr::XdrDec& dec) {
+  SetattrArgs out;
+  out.object = LNFS_TRY(FileHandle::decode(dec));
+  out.attrs = LNFS_TRY(decode_sattr(dec));
+  out.guard = LNFS_TRY(dec.boolean());
+  if (out.guard) {
+    out.guard_ctime.sec = LNFS_TRY(dec.u32());
+    out.guard_ctime.nsec = LNFS_TRY(dec.u32());
+  }
+  return out;
+}
+
+Result<WriteArgs> WriteArgs::decode(xdr::XdrDec& dec) {
+  WriteArgs out;
+  out.file = LNFS_TRY(FileHandle::decode(dec));
+  out.offset = LNFS_TRY(dec.u64());
+  out.count = LNFS_TRY(dec.u32());
+  out.stable = LNFS_TRY(dec.u32());
+  if (out.stable > kFileSync) return Err(Errno::kGarbage);
+  out.data = LNFS_TRY(dec.opaque(1u << 24));
+  return out;
+}
+
+void CreateArgs::encode(xdr::XdrEnc& enc) const {
+  where.encode(enc);
+  enc.u32(mode);
+  if (mode == kCreateExclusive) enc.opaque_fixed(verf);
+  else encode_sattr(enc, attrs);
+}
+Result<CreateArgs> CreateArgs::decode(xdr::XdrDec& dec) {
+  CreateArgs out;
+  out.where = LNFS_TRY(Diropargs::decode(dec));
+  out.mode = LNFS_TRY(dec.u32());
+  if (out.mode > kCreateExclusive) return Err(Errno::kGarbage);
+  if (out.mode == kCreateExclusive) {
+    auto verf = LNFS_TRY(dec.opaque_fixed(8));
+    std::copy(verf.begin(), verf.end(), out.verf.begin());
+  } else {
+    out.attrs = LNFS_TRY(decode_sattr(dec));
+  }
+  return out;
+}
+
+void MkdirArgs::encode(xdr::XdrEnc& enc) const {
+  where.encode(enc);
+  encode_sattr(enc, attrs);
+}
+Result<MkdirArgs> MkdirArgs::decode(xdr::XdrDec& dec) {
+  MkdirArgs out;
+  out.where = LNFS_TRY(Diropargs::decode(dec));
+  out.attrs = LNFS_TRY(decode_sattr(dec));
+  return out;
+}
+
+void SymlinkArgs::encode(xdr::XdrEnc& enc) const {
+  where.encode(enc);
+  encode_sattr(enc, attrs);
+  enc.string(target);
+}
+Result<SymlinkArgs> SymlinkArgs::decode(xdr::XdrDec& dec) {
+  SymlinkArgs out;
+  out.where = LNFS_TRY(Diropargs::decode(dec));
+  out.attrs = LNFS_TRY(decode_sattr(dec));
+  out.target = std::string(LNFS_TRY(dec.string(kMaxPath)));
+  return out;
+}
+
+Result<MknodArgs> MknodArgs::decode(xdr::XdrDec& dec) {
+  MknodArgs out;
+  out.where = LNFS_TRY(Diropargs::decode(dec));
+  uint32_t type = LNFS_TRY(dec.u32());
+  if (type < 1 || type > 7) return Err(Errno::kGarbage);
+  out.type = static_cast<backend::FType>(type);
+  if (out.type == backend::FType::kChr || out.type == backend::FType::kBlk) {
+    out.attrs = LNFS_TRY(decode_sattr(dec));
+    out.dev.major = LNFS_TRY(dec.u32());
+    out.dev.minor = LNFS_TRY(dec.u32());
+  } else if (out.type == backend::FType::kSock || out.type == backend::FType::kFifo) {
+    out.attrs = LNFS_TRY(decode_sattr(dec));
+  }
+  // REG/DIR/LNK carry no body; the engine answers BADTYPE.
+  return out;
+}
+
+void RenameArgs::encode(xdr::XdrEnc& enc) const {
+  from.encode(enc);
+  to.encode(enc);
+}
+Result<RenameArgs> RenameArgs::decode(xdr::XdrDec& dec) {
+  RenameArgs out;
+  out.from = LNFS_TRY(Diropargs::decode(dec));
+  out.to = LNFS_TRY(Diropargs::decode(dec));
+  return out;
+}
+
+void LinkArgs::encode(xdr::XdrEnc& enc) const {
+  file.encode(enc);
+  to.encode(enc);
+}
+Result<LinkArgs> LinkArgs::decode(xdr::XdrDec& dec) {
+  LinkArgs out;
+  out.file = LNFS_TRY(FileHandle::decode(dec));
+  out.to = LNFS_TRY(Diropargs::decode(dec));
+  return out;
+}
+
+void CommitArgs::encode(xdr::XdrEnc& enc) const {
+  file.encode(enc);
+  enc.u64(offset);
+  enc.u32(count);
+}
+Result<CommitArgs> CommitArgs::decode(xdr::XdrDec& dec) {
+  CommitArgs out;
+  out.file = LNFS_TRY(FileHandle::decode(dec));
+  out.offset = LNFS_TRY(dec.u64());
+  out.count = LNFS_TRY(dec.u32());
+  return out;
+}
+
+std::optional<WccPre> wcc_pre(const std::optional<backend::Attr>& attr) {
+  if (!attr) return std::nullopt;
+  return WccPre{attr->size, attr->mtime, attr->ctime};
+}
+
+void encode_pre_attr(xdr::XdrEnc& enc, const std::optional<WccPre>& pre) {
+  enc.boolean(pre.has_value());
+  if (!pre) return;
+  enc.u64(pre->size);
+  encode_time(enc, pre->mtime);
+  encode_time(enc, pre->ctime);
+}
+
+void encode_wcc(xdr::XdrEnc& enc, const std::optional<WccPre>& pre,
+                const std::optional<backend::Attr>& post, uint64_t fsid) {
+  encode_pre_attr(enc, pre);
+  encode_post_attr(enc, post, fsid);
+}
+
 void encode_time(xdr::XdrEnc& enc, const backend::Timespec& time) {
   enc.u32(static_cast<uint32_t>(std::clamp<int64_t>(time.sec, 0, UINT32_MAX)));
   enc.u32(std::min(time.nsec, 999999999u));

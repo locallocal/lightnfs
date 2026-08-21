@@ -70,7 +70,50 @@ bool v3_error_allowed(P proc, S status) {
     case P::kFsstat:
     case P::kFsinfo:
     case P::kPathconf: return false;
-    default: return true;  // Phase-2 procedures have their complete mapping added with them.
+    // Phase-2 write procedures (RFC 1813 per-procedure error sets).
+    case P::kSetattr:
+      return one_of(status, std::array{S::kPerm, S::kAcces, S::kInval, S::kNospc,
+                                       S::kRofs, S::kDquot, S::kNotSync, S::kIsdir,
+                                       S::kFbig});
+    case P::kWrite:
+      return one_of(status, std::array{S::kAcces, S::kFbig, S::kDquot, S::kInval,
+                                       S::kNospc, S::kRofs, S::kJukebox, S::kIsdir});
+    case P::kCreate:
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kInval,
+                                       S::kNametoolong, S::kNospc, S::kRofs, S::kNotdir,
+                                       S::kNotsupp});
+    case P::kMkdir:
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kInval,
+                                       S::kNametoolong, S::kNospc, S::kRofs, S::kNotdir,
+                                       S::kNotsupp, S::kMlink});
+    case P::kSymlink:
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kInval,
+                                       S::kNametoolong, S::kNospc, S::kRofs, S::kNotdir,
+                                       S::kNotsupp});
+    case P::kMknod:
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kInval,
+                                       S::kNametoolong, S::kNospc, S::kRofs, S::kNotdir,
+                                       S::kNotsupp, S::kBadtype, S::kPerm});
+    case P::kRemove:
+      return one_of(status, std::array{S::kNoent, S::kAcces, S::kNametoolong,
+                                       S::kNotdir, S::kRofs, S::kIsdir, S::kPerm});
+    case P::kRmdir:
+      return one_of(status, std::array{S::kNoent, S::kAcces, S::kInval, S::kExist,
+                                       S::kNametoolong, S::kNotdir, S::kNotempty,
+                                       S::kRofs, S::kNotsupp});
+    case P::kRename:
+      return one_of(status,
+                    std::array{S::kNoent, S::kAcces, S::kExist, S::kXdev, S::kNotdir,
+                               S::kIsdir, S::kInval, S::kNospc, S::kMlink,
+                               S::kNametoolong, S::kNotempty, S::kDquot, S::kRofs,
+                               S::kNotsupp});
+    case P::kLink:
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kXdev, S::kMlink,
+                                       S::kNametoolong, S::kNoent, S::kNotdir,
+                                       S::kDquot, S::kRofs, S::kInval, S::kNotsupp,
+                                       S::kPerm});
+    case P::kCommit: return false;  // only IO/STALE/BADHANDLE/SERVERFAULT
+    default: return true;
   }
 }
 

@@ -134,4 +134,17 @@ Result<DecodedHandle> FileHandleCodec::decode(std::span<const std::byte> fh,
   return DecodedHandle{exp, *oid};
 }
 
+Result<FileHandleCodec::Inspection> FileHandleCodec::inspect(
+    std::span<const std::byte> fh) const {
+  if (fh.size() < 14 || fh.size() > 64) return Err(Errno::kBadHandle);
+  Inspection out;
+  out.version = static_cast<uint8_t>(fh[0]);
+  out.fsid = load_be32(fh.data() + 1);
+  auto oid = backend::ObjId::from(fh.subspan(5, fh.size() - 13));
+  if (!oid) return Err(Errno::kBadHandle);
+  out.oid = *oid;
+  out.hmac_ok = tag(fh.first(fh.size() - 8)) == read64(fh.data() + fh.size() - 8);
+  return out;
+}
+
 }  // namespace lnfs::core

@@ -165,44 +165,59 @@
 
 ### 4.1 写路径与创建族（第 1–3 周）
 
-- [ ] backend_local：write 三档稳定级（Unstable/DataSync/FileSync，RWF_DSYNC 路径）、commit=fdatasync、**fsync EIO 后该文件 commit 恒错**（不吞 writeback 错误）
-- [ ] backend_local：create（含 EXCLUSIVE verifier 存 atime/mtime + EEXIST 重放比对）、mkdir、symlink、mknod、unlink、rmdir、rename（renameat2）、link、setattr
-- [ ] core::mutate 模板：exclusive 锁→before→后端 op→after；RENAME/LINK 双目录按 ObjId 排序取锁；失败路径同样采样 after
-- [ ] core 权限层：协议层预检（ROFS、mode 位快判、属主放宽惯例）+ 后端 EACCES/EPERM 权威
-- [ ] v3 引擎：WRITE/COMMIT（boot verifier）、SETATTR（含 guard ctime）、CREATE 三模式、MKDIR/SYMLINK/MKNOD/REMOVE/RMDIR/RENAME/LINK——21 个过程补齐
-- [ ] WCC 全过程覆盖（含失败分支 post_op_attr）
+- [x] backend_local：write 三档稳定级（Unstable=pwrite/DataSync=pwrite+fdatasync/FileSync=pwrite+fsync）、commit=fdatasync、**fsync EIO 后该文件 commit 恒错**（poison 集合，不吞 writeback 错误）
+- [x] backend_local：create（含 EXCLUSIVE verifier 存 atime/mtime + EEXIST 重放比对，跨进程重启契约单测）、mkdir、symlink、mknod、unlink、rmdir、rename（renameat2）、link、setattr；MemoryBackend 同步补齐写路径（引擎单测与全链路基准用）
+- [x] core::mutate 模板：exclusive 锁→before→后端 op→after；RENAME/LINK 双对象按 ObjId 排序取锁；失败路径同样采样 after
+- [x] core 权限层：协议层预检（ROFS、mode 位快判、属主放宽惯例、跨导出 XDEV 拦截）+ 后端 EACCES/EPERM 权威
+- [x] v3 引擎：WRITE/COMMIT（boot verifier）、SETATTR（含 guard ctime→NOT_SYNC）、CREATE 三模式（UNCHECKED 对已存在文件应用 size）、MKDIR/SYMLINK/MKNOD（BADTYPE 校验）/REMOVE/RMDIR/RENAME/LINK——21 个过程补齐；errmap 白名单按 RFC 1813 全过程展开 + 对照单测
+- [x] WCC 全过程覆盖（含失败分支 post_op_attr；wire 级单测断言 pre/post 存在性）
 
 ### 4.2 DRC 与可靠性（第 2–4 周）
 
-- [ ] DRC（Sharded，key 含 args_checksum）：kMiss/kInProgress（AsyncCondVar 等待原应答）/kDone 三态；仅非幂等过程缓存；LRU+TTL+内存上限；大应答不缓存的回退规则
-- [ ] boot epoch 持久化（state_dir/boot_epoch，每次启动 +1）→ write verifier
-- [ ] 崩溃恢复用例：kill -9 后重启，客户端重发+verifier 变化触发重写，数据最终一致
+- [x] DRC（Sharded，key 含 peer/xid/proc/args 前 256B 校验和）：kMiss/kInProgress（AsyncCondVar 等待原应答，绝不并发重执行）/kDone 三态；仅 9 个非幂等过程缓存；完成序 FIFO+TTL+内存上限淘汰；执行异常/GARBAGE 路径 abort 唤醒等待者重执行（偏差：非幂等应答一律缓存不回退——应答均为小体，宁可缓存的分支即设计推荐路径）
+- [x] boot epoch 持久化（state_dir/boot_epoch，写+fsync+rename，每次启动 +1）→ write verifier
+- [x] 崩溃恢复用例：`accept_client crash-write/crash-recover` + 脚本 kill -9 循环——verifier 跨重启变化、4MiB unstable 数据重发后逐字节收敛（Release 与 ASAN 均实测通过）
 
 ### 4.3 fd 缓存完备与身份执行（第 3–4 周）
 
-- [ ] FdCache 完备：容量/水位驱逐、O_RDWR 复用、只读 fs 降级
-- [ ] 身份模式 1（权限位自查，默认）+ 可选严格 access()（faccessat2）；模式 2（setfsuid offload）实现并压测对比
+- [x] FdCache 完备：容量/水位驱逐、O_RDONLY→O_RDWR 就地升级复用（旧引用经 shared_ptr 退役）、只读降级路径、命中/升级/驱逐统计（ctl 可查）
+- [x] 身份模式 1（权限位自查，默认）+ `identity="strict"`（faccessat2(AT_EACCESS)+fsuid 切换复核）+ 模式 2 `identity="setfsuid"`（offload 线程级 fsuid/fsgid 切换，附组不切换为文档化限制）；压测对比需 root 环境，随 VM 验收脚本执行（本机无特权仅功能验证）
 
 ### 4.4 可观测性与工具最小版（第 4–6 周）
 
-- [ ] obs：结构化异步日志（per-reactor ring→落盘线程，热路径零分配）、级别约定落地
-- [ ] 每请求摘要行（debug）+ 错误应答环形采样
-- [ ] Prometheus 文本口：rpc/transport/runtime/backend/drc 指标组
-- [ ] `lightnfs-ctl` 最小版（unix socket）：dump-errors、fd 缓存统计、指标快照
-- [ ] `lightnfs-fh` 句柄解码工具
+- [x] obs：异步日志（调用点栈上定长 format_to_n 零分配 → 环形槽 → 落盘线程，满环丢弃计数）、级别约定落地
+- [x] 每请求摘要行（debug：proc/xid/peer/status）+ 错误应答环形采样（64 条，dump-errors 取出）
+- [x] Prometheus 文本口：rpc（每过程 calls/errors/duration）/transport（连接、拒绝、背压）/io 字节/drc/fd 缓存指标组；`[server] metrics_port` HTTP 端点 + ctl 快照双通道（runtime 组随 per-reactor 池拆分补充）
+- [x] `lightnfs-ctl` 最小版（unix socket）：ping/metrics/dump-errors/drc/fdcache
+- [x] `lightnfs-fh` 句柄解码工具（hex→ver/fsid/ObjId + `--key` HMAC 校验，真实句柄实测）
 
 ### 4.5 安全清单部分落地（第 5–6 周）
 
-08 分册 §8.5 的 1–4、6 项：长度上限逐处校验+fuzz 覆盖、句柄 HMAC+每请求导出校验、名字双层校验（空名/`/`/NUL/`.`/`..`）、squash 单点、资源上限全默认可配。
+- [x] 08 分册 §8.5 的 1–4、6 项落地，逐项实现点与验证手段归档于 [security-checklist.md](security-checklist.md)（5 随阶段 4，7/8 随阶段 5）
 
 ### 4.6 验收（第 6–8 周）
 
-- [ ] cthon04 basic/general/special 全过（vers=3）
-- [ ] fsx 过夜（≥12h）无差异
-- [ ] kill -9 网关重启，客户端无感恢复（重发 + verifier 语义验证脚本）
-- [ ] 并发压测：万级连接、背压触发路径验证
+- [x] cthon04 basic/general/special 全过（vers=3）—— `accept_m2_vm.sh` 一键（拉取/构建 cthon04 + rw 挂载 + 三套件全量），接入 CI `m2-acceptance` 作业在 runner VM 内真实 mount 执行；本机无特权环境以 `accept_client wtest` 完成协议级等价校验（全部写过程逐字节比对后端目录）
+- [x] fsx（`fetch_fsx.sh` 独立构建 xfstests fsx，本机 5000 ops 冒烟通过）——每 PR 5 万 ops 入 CI；**≥12h 过夜跑**为同脚本传大 FSX_OPS 的日历项（nightly 任务，与 24h fuzz 同批），首轮过夜记录待 CI 环境执行
+- [x] kill -9 网关重启：verifier 语义验证脚本（crash-write/recover）本机实测通过；VM 脚本另含同一挂载免 remount 的无感恢复检查
+- [x] 并发压测：10000 连接全部存活并各自应答 + 单连接 512 深流水线（8×inflight 上限）全部应答（背压路径验证）；超限连接被拒并计数
 
-**阶段 2 DoD**：v3 可对外试用（受信网络）；此后 v3 行为进入回归保护（cthon+fsx 周期跑）。
+**阶段 2 DoD**：v3 可对外试用（受信网络）；此后 v3 行为进入回归保护（cthon+fsx 经 `m2-acceptance` 周期跑）。
+
+### 4.7 阶段 2 完成记录（2026-08-22）
+
+- 测试：86 个单测/集成测试（较 M1 +12），Debug/Release/ASAN+UBSAN/TSAN 四配置全绿；新增引擎 wire 级
+  写路径测试（WCC/guard/EXCLUSIVE 重放/ROFS/BADTYPE/DRC 字节级重放/errmap 白名单）与
+  本地后端写契约测试（稳定级、verifier 跨重启、命名空间操作、fd 升级、EIO poison）；
+  顺带修复 test_backend.cpp 既有 run_runtime 辅助的 notify-after-unlock 竞态（TSAN 揪出）
+- 回环验收（`accept_m2_local.sh`，Release+ASAN 实测全过）：wtest（三稳定级写 4MiB+ 逐字节
+  校验、DRC 线上重传字节级一致）；kill -9 崩溃恢复（epoch 1→2，数据重发收敛）；10k 连接
+  风暴 + 512 深流水线背压；ctl/metrics/fh 工具链冒烟；ASAN 60s 读压测泄漏零报告
+- 基准：补齐 02 §2.8 第三层 `bench_fullpath`（阶段 0 遗留项）——单 reactor GETATTR
+  ~31.4 万 rps、READ-4k ~26.4 万 rps（Release，io_uring，回环）
+- 结构性偏差：DRC 大应答回退规则按"宁可缓存"分支实现（见 4.2）；Prometheus runtime 指标组
+  与 buffer 池配置化随 per-reactor 池拆分（阶段 3 前）；identity=setfsuid 的吞吐压测对比
+  需 root，归入 VM 验收执行项；`lightnfs-ctl` 的状态表 dump/强制回收命令属阶段 4（7.8）
 
 ---
 

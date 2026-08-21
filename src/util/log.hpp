@@ -2,7 +2,9 @@
 // Logging seed (design 08 §8.2 lands the real async structured logger in phase 2; this
 // keeps call sites stable: level filter + single write, stderr sink).
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <format>
 #include <string_view>
 
@@ -23,8 +25,19 @@ inline bool log_enabled(LogLevel lv) {
 template <class... A>
 void log(LogLevel lv, std::format_string<A...> fmt, A&&... a) {
   if (!log_enabled(lv)) return;
-  detail::log_write(lv, std::format(fmt, std::forward<A>(a)...));
+  // Bounded stack formatting: the hot path never allocates (design 08 §8.2); long
+  // messages truncate at the sink's slot size.
+  char buf[240];
+  auto res = std::format_to_n(buf, static_cast<std::ptrdiff_t>(sizeof(buf)), fmt,
+                              std::forward<A>(a)...);
+  size_t len = std::min(static_cast<size_t>(res.size), sizeof(buf));
+  detail::log_write(lv, std::string_view(buf, len));
 }
+
+// Switch the sink to the async ring + flush thread (production main); tests and tools
+// stay on the synchronous stderr default.
+void init_async_logging();
+void shutdown_async_logging();
 
 #define LNFS_DEBUG(...) ::lnfs::log(::lnfs::LogLevel::kDebug, __VA_ARGS__)
 #define LNFS_INFO(...) ::lnfs::log(::lnfs::LogLevel::kInfo, __VA_ARGS__)

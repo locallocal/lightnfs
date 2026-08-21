@@ -1,5 +1,7 @@
 #include "transport/listener.hpp"
 
+#include "obs/metrics.hpp"
+
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -66,7 +68,9 @@ rt::Task<void> Listener::run() {
       LNFS_WARN("accept failed: {}", errno_name(errno_from_neg(cfd)));
       continue;
     }
+    obs::Metrics::instance().conns_accepted.fetch_add(1, std::memory_order_relaxed);
     if (!tracker_.try_add(peer)) {
+      obs::Metrics::instance().conns_rejected.fetch_add(1, std::memory_order_relaxed);
       LNFS_WARN("conn limit reached, rejecting {}", peer.to_string());
       close(cfd);
       continue;

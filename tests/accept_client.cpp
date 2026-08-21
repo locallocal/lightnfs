@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -55,7 +56,6 @@ constexpr uint32_t kNfsProg = 100003;
 constexpr uint32_t kMountProg = 100005;
 constexpr uint32_t kVers = 3;
 constexpr uint32_t kNfs3Ok = 0;
-constexpr uint32_t kProcUnavail = 3;  // RPC accept_stat
 
 [[noreturn]] void fatal(const char* fmt, ...) {
   va_list ap;
@@ -579,7 +579,7 @@ void walk_dir(Client& c, const Fh& dir_fh, const fs::path& local, uint32_t chunk
   }
 }
 
-void negative_checks(Client& c, const Fh& root) {
+void negative_checks(Client& c, const Fh& root, bool readonly_export) {
   // Tampered handle → NFS3ERR_BADHANDLE (HMAC rejects).
   Fh bad = root;
   bad[bad.size() / 2] ^= std::byte{0x40};
@@ -602,24 +602,38 @@ void negative_checks(Client& c, const Fh& root) {
   auto dec2 = make_dec(reply);
   if (ru32(dec2) != 10003) fatal("bad cookieverf: expected BAD_COOKIE");
 
-  // Every mutation procedure of the M1 surface must answer PROC_UNAVAIL at RPC level.
+  // Mutation procedures with empty argument bodies must be rejected as GARBAGE_ARGS
+  // (arg validation before any side effect).
   for (uint32_t proc : {2u, 7u, 8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u, 21u}) {
     uint32_t stat = 0;
     (void)c.call(kNfsProg, proc, {}, &stat);
-    if (stat != kProcUnavail)
-      fatal("write proc %u: expected PROC_UNAVAIL(3), got accept_stat %u", proc, stat);
+    if (stat != 4)
+      fatal("write proc %u with empty args: expected GARBAGE_ARGS(4), got %u", proc, stat);
   }
 
-  // ACCESS on a read-only export must never grant modify/extend/delete.
   uint32_t granted = access_bits(c, root, 0x3f);
-  if (granted & (0x04 | 0x08 | 0x10))
-    fatal("ACCESS on readonly export granted write bits: 0x%x", granted);
   if (!(granted & 0x01) || !(granted & 0x02))
     fatal("ACCESS did not grant read+lookup on root: 0x%x", granted);
+  if (readonly_export) {
+    // ACCESS on a read-only export must never grant modify/extend/delete, and a
+    // well-formed CREATE must answer ROFS.
+    if (granted & (0x04 | 0x08 | 0x10))
+      fatal("ACCESS on readonly export granted write bits: 0x%x", granted);
+    XdrEnc cr(c.pool);
+    enc_fh(cr, root);
+    cr.string("rofs_probe");
+    cr.u32(0);  // UNCHECKED
+    cr.boolean(false); cr.boolean(false); cr.boolean(false); cr.boolean(false);
+    cr.u32(0); cr.u32(0);
+    auto reply = c.call(kNfsProg, 8, cr.take().to_bytes());
+    auto dec = make_dec(reply);
+    if (ru32(dec) != 30) fatal("CREATE on readonly export: expected ROFS");
+  }
 }
 
 int cmd_walk(const char* host, uint16_t nfs_port, uint16_t mount_port,
-             const std::string& export_path, const fs::path& backing) {
+             const std::string& export_path, const fs::path& backing,
+             bool readonly_export) {
   auto root = mnt(host, mount_port, export_path);
   Client c(host, nfs_port);
   auto info = fsinfo(c, root);
@@ -633,7 +647,7 @@ int cmd_walk(const char* host, uint16_t nfs_port, uint16_t mount_port,
 
   WalkStats st;
   walk_dir(c, root, backing, chunk, st);
-  negative_checks(c, root);
+  negative_checks(c, root, readonly_export);
   std::printf("accept_client walk OK: %zu dirs, %zu files (%zu bytes verified), "
               "%zu symlinks, negative checks passed\n",
               st.dirs, st.files, st.bytes, st.symlinks);
@@ -776,6 +790,446 @@ int cmd_stress(const char* host, uint16_t nfs_port, uint16_t mount_port,
   return 0;
 }
 
+// ---------- phase-2 write-path acceptance ----------
+
+std::pair<bool, bool> skip_wcc(XdrDec& d) {
+  bool pre = rbool(d);
+  if (pre) {
+    ru64(d);
+    for (int i = 0; i < 4; ++i) ru32(d);
+  }
+  bool post = rbool(d);
+  if (post) decode_fattr(d);
+  return {pre, post};
+}
+
+void enc_sattr(XdrEnc& e, std::optional<uint32_t> mode, std::optional<uint64_t> size) {
+  e.boolean(mode.has_value());
+  if (mode) e.u32(*mode);
+  e.boolean(false);  // uid
+  e.boolean(false);  // gid
+  e.boolean(size.has_value());
+  if (size) e.u64(*size);
+  e.u32(0);  // atime DONT_CHANGE
+  e.u32(0);  // mtime DONT_CHANGE
+}
+
+// CREATE; returns NFS status; on OK fills fh_out.
+uint32_t nfs_create(Client& c, const Fh& dir, const std::string& name, uint32_t mode,
+                    std::optional<uint32_t> file_mode, const std::array<std::byte, 8>* verf,
+                    Fh* fh_out) {
+  XdrEnc args(c.pool);
+  enc_fh(args, dir);
+  args.string(name);
+  args.u32(mode);
+  if (mode == 2) args.opaque_fixed(*verf);
+  else enc_sattr(args, file_mode, std::nullopt);
+  auto reply = c.call(kNfsProg, 8, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  if (status == kNfs3Ok) {
+    if (!rbool(dec)) fatal("CREATE %s: missing post-op fh", name.c_str());
+    auto fh = dec.opaque(64);
+    if (!fh) fatal("CREATE: bad fh");
+    if (fh_out) fh_out->assign(fh->begin(), fh->end());
+    if (rbool(dec)) decode_fattr(dec);
+    auto wcc = skip_wcc(dec);
+    if (!wcc.second) fatal("CREATE %s: missing dir wcc post attr", name.c_str());
+  } else {
+    skip_wcc(dec);
+  }
+  return status;
+}
+
+uint32_t nfs_write(Client& c, const Fh& fh, uint64_t off, std::span<const std::byte> data,
+                   uint32_t stable, std::array<std::byte, 8>* verf_out) {
+  XdrEnc args(c.pool);
+  enc_fh(args, fh);
+  args.u64(off);
+  args.u32((uint32_t)data.size());
+  args.u32(stable);
+  args.opaque(data);
+  auto reply = c.call(kNfsProg, 7, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  auto wcc = skip_wcc(dec);
+  if (status != kNfs3Ok) return status;
+  if (!wcc.first || !wcc.second) fatal("WRITE: incomplete wcc");
+  uint32_t count = ru32(dec);
+  if (count != data.size()) fatal("WRITE: short write %u/%zu", count, data.size());
+  uint32_t committed = ru32(dec);
+  if (committed < stable) fatal("WRITE: committed %u below requested %u", committed, stable);
+  auto verf = dec.opaque_fixed(8);
+  if (!verf) fatal("WRITE: missing verifier");
+  if (verf_out) std::copy(verf->begin(), verf->end(), verf_out->begin());
+  return status;
+}
+
+uint32_t nfs_commit(Client& c, const Fh& fh, std::array<std::byte, 8>* verf_out) {
+  XdrEnc args(c.pool);
+  enc_fh(args, fh);
+  args.u64(0);
+  args.u32(0);
+  auto reply = c.call(kNfsProg, 21, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  skip_wcc(dec);
+  if (status != kNfs3Ok) return status;
+  auto verf = dec.opaque_fixed(8);
+  if (!verf) fatal("COMMIT: missing verifier");
+  if (verf_out) std::copy(verf->begin(), verf->end(), verf_out->begin());
+  return status;
+}
+
+uint32_t nfs_dirop(Client& c, uint32_t proc, const Fh& dir, const std::string& name) {
+  XdrEnc args(c.pool);
+  enc_fh(args, dir);
+  args.string(name);
+  auto reply = c.call(kNfsProg, proc, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  if (proc == 9) {  // MKDIR carries create-style results; args lacked sattr though
+    fatal("nfs_dirop misused for MKDIR");
+  }
+  skip_wcc(dec);
+  return status;
+}
+
+uint32_t nfs_mkdir(Client& c, const Fh& dir, const std::string& name, Fh* fh_out) {
+  XdrEnc args(c.pool);
+  enc_fh(args, dir);
+  args.string(name);
+  enc_sattr(args, 0755, std::nullopt);
+  auto reply = c.call(kNfsProg, 9, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  if (status == kNfs3Ok) {
+    if (rbool(dec)) {
+      auto fh = dec.opaque(64);
+      if (fh && fh_out) fh_out->assign(fh->begin(), fh->end());
+    }
+    if (rbool(dec)) decode_fattr(dec);
+    skip_wcc(dec);
+  } else {
+    skip_wcc(dec);
+  }
+  return status;
+}
+
+uint32_t nfs_setattr(Client& c, const Fh& fh, std::optional<uint32_t> mode,
+                     std::optional<uint64_t> size) {
+  XdrEnc args(c.pool);
+  enc_fh(args, fh);
+  enc_sattr(args, mode, size);
+  args.boolean(false);  // no guard
+  auto reply = c.call(kNfsProg, 2, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  skip_wcc(dec);
+  return status;
+}
+
+uint32_t nfs_rename(Client& c, const Fh& from_dir, const std::string& from,
+                    const Fh& to_dir, const std::string& to) {
+  XdrEnc args(c.pool);
+  enc_fh(args, from_dir);
+  args.string(from);
+  enc_fh(args, to_dir);
+  args.string(to);
+  auto reply = c.call(kNfsProg, 14, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  skip_wcc(dec);
+  skip_wcc(dec);
+  return status;
+}
+
+uint32_t nfs_link(Client& c, const Fh& file, const Fh& dir, const std::string& name) {
+  XdrEnc args(c.pool);
+  enc_fh(args, file);
+  enc_fh(args, dir);
+  args.string(name);
+  auto reply = c.call(kNfsProg, 15, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  if (rbool(dec)) decode_fattr(dec);
+  skip_wcc(dec);
+  return status;
+}
+
+uint32_t nfs_symlink(Client& c, const Fh& dir, const std::string& name,
+                     const std::string& target, Fh* fh_out) {
+  XdrEnc args(c.pool);
+  enc_fh(args, dir);
+  args.string(name);
+  enc_sattr(args, std::nullopt, std::nullopt);
+  args.string(target);
+  auto reply = c.call(kNfsProg, 10, args.take().to_bytes());
+  auto dec = make_dec(reply);
+  uint32_t status = ru32(dec);
+  if (status == kNfs3Ok) {
+    if (rbool(dec)) {
+      auto fh = dec.opaque(64);
+      if (fh && fh_out) fh_out->assign(fh->begin(), fh->end());
+    }
+    if (rbool(dec)) decode_fattr(dec);
+  }
+  skip_wcc(dec);
+  return status;
+}
+
+std::vector<std::byte> pattern_bytes(size_t n, uint64_t seed) {
+  std::vector<std::byte> out(n);
+  std::mt19937_64 rng(seed);
+  for (size_t i = 0; i < n; i += 8) {
+    uint64_t v = rng();
+    std::memcpy(out.data() + i, &v, std::min<size_t>(8, n - i));
+  }
+  return out;
+}
+
+// Full read-write acceptance against a writable export.
+int cmd_wtest(const char* host, uint16_t nfs_port, uint16_t mount_port,
+              const std::string& export_path, const fs::path& backing) {
+  auto root = mnt(host, mount_port, export_path);
+  Client c(host, nfs_port);
+
+  // Workspace
+  Fh work;
+  if (nfs_mkdir(c, root, "wtest", &work) != kNfs3Ok) fatal("mkdir wtest failed");
+  if (!fs::is_directory(backing / "wtest")) fatal("mkdir not visible in backing dir");
+
+  // CREATE + WRITE at each stability + byte-verify against the backing file.
+  Fh file;
+  if (nfs_create(c, work, "data.bin", 0, 0644u, nullptr, &file) != kNfs3Ok)
+    fatal("create data.bin failed");
+  auto blob = pattern_bytes(256 * 1024 + 13, 42);
+  std::array<std::byte, 8> verf{}, verf2{};
+  size_t third = blob.size() / 3;
+  if (nfs_write(c, file, 0, std::span(blob).subspan(0, third), 0, &verf) != kNfs3Ok)
+    fatal("unstable write failed");
+  if (nfs_write(c, file, third, std::span(blob).subspan(third, third), 1, &verf2) != kNfs3Ok)
+    fatal("datasync write failed");
+  if (verf != verf2) fatal("write verifier changed within one boot");
+  if (nfs_write(c, file, 2 * third, std::span(blob).subspan(2 * third), 2, &verf2) !=
+      kNfs3Ok)
+    fatal("filesync write failed");
+  if (nfs_commit(c, file, &verf2) != kNfs3Ok) fatal("commit failed");
+  if (verf != verf2) fatal("commit verifier mismatch");
+  if (read_local(backing / "wtest/data.bin") != blob)
+    fatal("backing file bytes differ after write");
+  auto remote = read_all(c, file, blob.size(), 65536);
+  if (remote != blob) fatal("READ-back differs");
+
+  // SETATTR: truncate + chmod, visible in attributes and backing store.
+  if (nfs_setattr(c, file, 0600u, 100u) != kNfs3Ok) fatal("setattr failed");
+  auto attr = getattr(c, file);
+  if (attr.size != 100 || (attr.mode & 07777) != 0600)
+    fatal("setattr not applied: size=%llu mode=%o", (unsigned long long)attr.size,
+          attr.mode);
+  if (fs::file_size(backing / "wtest/data.bin") != 100) fatal("truncate not on disk");
+
+  // CREATE guarded on existing -> EEXIST; unchecked on existing truncates.
+  if (nfs_create(c, work, "data.bin", 1, 0644u, nullptr, nullptr) != 17)
+    fatal("guarded create should EEXIST");
+  Fh again;
+  if (nfs_create(c, work, "data.bin", 0, std::nullopt, nullptr, &again) != kNfs3Ok)
+    fatal("unchecked create on existing failed");
+
+  // EXCLUSIVE create: replay succeeds, different verifier conflicts.
+  std::array<std::byte, 8> everf{};
+  everf[0] = std::byte{0x5A};
+  Fh excl;
+  if (nfs_create(c, work, "excl", 2, std::nullopt, &everf, &excl) != kNfs3Ok)
+    fatal("exclusive create failed");
+  if (nfs_create(c, work, "excl", 2, std::nullopt, &everf, nullptr) != kNfs3Ok)
+    fatal("exclusive replay with same verifier should succeed");
+  everf[0] = std::byte{0x5B};
+  if (nfs_create(c, work, "excl", 2, std::nullopt, &everf, nullptr) != 17)
+    fatal("exclusive with new verifier should EEXIST");
+
+  // SYMLINK / READLINK / LINK / RENAME / REMOVE / RMDIR
+  Fh sym;
+  if (nfs_symlink(c, work, "link", "data.bin", &sym) != kNfs3Ok) fatal("symlink failed");
+  if (read_link(c, sym) != "data.bin") fatal("readlink mismatch");
+  if (nfs_link(c, file, work, "hard") != kNfs3Ok) fatal("link failed");
+  if (getattr(c, file).size != fs::file_size(backing / "wtest/hard"))
+    fatal("hard link contents differ");
+  if (nfs_rename(c, work, "hard", work, "hard2") != kNfs3Ok) fatal("rename failed");
+  if (!fs::exists(backing / "wtest/hard2")) fatal("rename not visible");
+  for (const char* name : {"hard2", "link", "excl", "data.bin"})
+    if (nfs_dirop(c, 12, work, name) != kNfs3Ok) fatal("remove %s failed", name);
+  if (nfs_dirop(c, 13, root, "wtest") != kNfs3Ok) fatal("rmdir failed");
+  if (fs::exists(backing / "wtest")) fatal("rmdir not visible");
+
+  // DRC over the wire: byte-identical retransmission must yield a byte-identical
+  // reply (MKDIR twice with the same xid would otherwise EEXIST).
+  {
+    uint32_t xid = c.next_xid++;
+    XdrEnc args(c.pool);
+    enc_fh(args, root);
+    args.string("drc_check");
+    enc_sattr(args, 0755u, std::nullopt);
+    auto body = args.take().to_bytes();
+    auto record = build_call(c.pool, xid, kNfsProg, 9, body);
+    send_record(c.fd, record);
+    auto first = read_record(c.fd);
+    send_record(c.fd, record);
+    auto second = read_record(c.fd);
+    if (first != second) fatal("DRC: retransmitted MKDIR reply differs");
+    auto dec = make_dec(first);
+    parse_reply_header(dec, xid);
+    if (ru32(dec) != kNfs3Ok) fatal("DRC: first MKDIR failed");
+    if (nfs_dirop(c, 13, root, "drc_check") != kNfs3Ok) fatal("drc_check cleanup");
+  }
+
+  std::printf("accept_client wtest OK: create/write(3 levels)/commit/setattr/"
+              "exclusive-replay/namespace ops/DRC all verified\n");
+  return 0;
+}
+
+// Crash-recovery phase 1: unstable writes, record the verifier.
+int cmd_crash_write(const char* host, uint16_t nfs_port, uint16_t mount_port,
+                    const std::string& export_path, const std::string& state_file) {
+  auto root = mnt(host, mount_port, export_path);
+  Client c(host, nfs_port);
+  Fh file;
+  if (nfs_create(c, root, "crash.bin", 0, 0644u, nullptr, &file) != kNfs3Ok)
+    fatal("create crash.bin failed");
+  auto blob = pattern_bytes(4 << 20, 0xC7A54);
+  std::array<std::byte, 8> verf{};
+  for (size_t off = 0; off < blob.size(); off += 65536) {
+    size_t n = std::min<size_t>(65536, blob.size() - off);
+    if (nfs_write(c, file, off, std::span(blob).subspan(off, n), 0, &verf) != kNfs3Ok)
+      fatal("unstable write at %zu failed", off);
+  }
+  FILE* f = fopen(state_file.c_str(), "w");
+  if (!f) fatal("cannot write state file");
+  for (auto b : verf) fprintf(f, "%02x", (unsigned)b);
+  fprintf(f, "\n");
+  fclose(f);
+  std::printf("accept_client crash-write OK: 4MiB unstable, verifier recorded\n");
+  return 0;
+}
+
+// Crash-recovery phase 2 (after kill -9 + restart): the verifier must have changed,
+// re-sending the data must converge to correct on-disk content.
+int cmd_crash_recover(const char* host, uint16_t nfs_port, uint16_t mount_port,
+                      const std::string& export_path, const fs::path& backing,
+                      const std::string& state_file) {
+  std::ifstream in(state_file);
+  std::string old_hex;
+  if (!(in >> old_hex)) fatal("cannot read state file");
+
+  auto root = mnt(host, mount_port, export_path);
+  Client c(host, nfs_port);
+  auto [file, attr0] = lookup(c, root, "crash.bin");
+  (void)attr0;
+  std::array<std::byte, 8> verf{};
+  if (nfs_commit(c, file, &verf) != kNfs3Ok) fatal("commit after restart failed");
+  char now_hex[17];
+  for (int i = 0; i < 8; ++i)
+    std::snprintf(now_hex + 2 * i, 3, "%02x", (unsigned)verf[i]);
+  if (old_hex == now_hex)
+    fatal("write verifier did not change across restart (%s)", now_hex);
+
+  // Client-side recovery: resend everything FILE_SYNC, then verify byte-for-byte.
+  auto blob = pattern_bytes(4 << 20, 0xC7A54);
+  for (size_t off = 0; off < blob.size(); off += 65536) {
+    size_t n = std::min<size_t>(65536, blob.size() - off);
+    if (nfs_write(c, file, off, std::span(blob).subspan(off, n), 2, nullptr) != kNfs3Ok)
+      fatal("recovery rewrite at %zu failed", off);
+  }
+  if (read_local(backing / "crash.bin") != blob)
+    fatal("post-recovery on-disk content differs");
+  auto remote = read_all(c, file, blob.size(), 65536);
+  if (remote != blob) fatal("post-recovery READ-back differs");
+  if (nfs_dirop(c, 12, root, "crash.bin") != kNfs3Ok) fatal("cleanup remove failed");
+  std::printf("accept_client crash-recover OK: verifier changed %s -> %s, data "
+              "converged after resend\n", old_hex.c_str(), now_hex);
+  return 0;
+}
+
+// Connection storm + per-connection backpressure sanity.  Every accepted connection
+// must answer a NULL call while the whole storm is held open; connections the server
+// sheds at its configured limits count as refused, not failed.
+int cmd_connstorm(const char* host, uint16_t nfs_port, int count, int pipeline_depth) {
+  BufferPool pool;
+  auto null_call = [&](uint32_t xid) { return build_call(pool, xid, kNfsProg, 0, {}); };
+  auto try_null = [&](int fd, uint32_t xid) -> bool {
+    uint32_t hdr = lnfs::xdr::to_be32(0x80000000u | 0);
+    (void)hdr;
+    auto record = null_call(xid);
+    uint32_t marked = lnfs::xdr::to_be32(0x80000000u | (uint32_t)record.size());
+    std::byte h[4];
+    std::memcpy(h, &marked, 4);
+    iovec iov[2] = {{h, 4}, {record.data(), record.size()}};
+    if (writev(fd, iov, 2) != (ssize_t)(4 + record.size())) return false;
+    std::byte rh[4];
+    if (!read_exact(fd, rh, 4)) return false;
+    uint32_t v;
+    std::memcpy(&v, rh, 4);
+    v = lnfs::xdr::from_be32(v);
+    std::vector<std::byte> body(v & 0x7fffffffu);
+    return read_exact(fd, body.data(), body.size());
+  };
+
+  std::vector<int> fds;
+  fds.reserve(count);
+  int refused = 0, alive = 0;
+  for (int i = 0; i < count; ++i) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(nfs_port);
+    inet_pton(AF_INET, host, &a.sin_addr);
+    if (fd < 0 || connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+      if (fd >= 0) close(fd);
+      ++refused;
+      continue;
+    }
+    fds.push_back(fd);
+  }
+  int first_alive = -1;
+  for (int fd : fds) {
+    if (try_null(fd, 0x1000 + (uint32_t)fd)) {
+      ++alive;
+      if (first_alive < 0) first_alive = fd;
+    } else {
+      ++refused;
+    }
+  }
+  if (alive == 0) fatal("connstorm: no connection survived");
+  // One surviving connection pipelines far beyond the inflight cap; every call must be
+  // answered (backpressure delays parsing, never drops).
+  {
+    for (int i = 0; i < pipeline_depth; ++i) {
+      auto record = null_call(0x9000 + i);
+      uint32_t marked = lnfs::xdr::to_be32(0x80000000u | (uint32_t)record.size());
+      std::byte h[4];
+      std::memcpy(h, &marked, 4);
+      iovec iov[2] = {{h, 4}, {record.data(), record.size()}};
+      if (writev(first_alive, iov, 2) != (ssize_t)(4 + record.size()))
+        fatal("connstorm: pipeline write failed at %d", i);
+    }
+    for (int i = 0; i < pipeline_depth; ++i) {
+      std::byte rh[4];
+      if (!read_exact(first_alive, rh, 4)) fatal("connstorm: pipeline reply %d lost", i);
+      uint32_t v;
+      std::memcpy(&v, rh, 4);
+      v = lnfs::xdr::from_be32(v);
+      std::vector<std::byte> body(v & 0x7fffffffu);
+      if (!read_exact(first_alive, body.data(), body.size()))
+        fatal("connstorm: pipeline reply body %d lost", i);
+    }
+  }
+  for (int fd : fds) close(fd);
+  std::printf("accept_client connstorm OK: %d alive of %d attempted (%d shed by "
+              "limits), %d-deep pipeline on one conn fully answered\n",
+              alive, count, refused, pipeline_depth);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -784,7 +1238,12 @@ int main(int argc, char** argv) {
                  "usage: accept_client walk   HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
                  "       accept_client bigdir HOST NFS_PORT MOUNT_PORT EXPORT BACKING SUBDIR COUNT\n"
                  "       accept_client stress HOST NFS_PORT MOUNT_PORT EXPORT BACKING FILE "
-                 "CONNS PIPELINE SECONDS\n");
+                 "CONNS PIPELINE SECONDS\n"
+                 "       accept_client wtest  HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+                 "       accept_client crash-write   HOST NFS_PORT MOUNT_PORT EXPORT STATE\n"
+                 "       accept_client crash-recover HOST NFS_PORT MOUNT_PORT EXPORT "
+                 "BACKING STATE\n"
+                 "       accept_client connstorm HOST NFS_PORT MOUNT_PORT COUNT PIPELINE\n");
     return 2;
   };
   if (argc < 6) return usage();
@@ -793,13 +1252,22 @@ int main(int argc, char** argv) {
   uint16_t nfs_port = (uint16_t)atoi(argv[3]);
   uint16_t mount_port = (uint16_t)atoi(argv[4]);
   std::string export_path = argv[5];
-  if (cmd == "walk" && argc == 7)
-    return cmd_walk(host, nfs_port, mount_port, export_path, argv[6]);
+  if (cmd == "walk" && (argc == 7 || argc == 8))
+    return cmd_walk(host, nfs_port, mount_port, export_path, argv[6],
+                    argc == 8 && std::string(argv[7]) == "ro");
   if (cmd == "bigdir" && argc == 9)
     return cmd_bigdir(host, nfs_port, mount_port, export_path, argv[6], argv[7],
                       strtoull(argv[8], nullptr, 10));
   if (cmd == "stress" && argc == 11)
     return cmd_stress(host, nfs_port, mount_port, export_path, argv[6], argv[7],
                       atoi(argv[8]), atoi(argv[9]), atoi(argv[10]));
+  if (cmd == "wtest" && argc == 7)
+    return cmd_wtest(host, nfs_port, mount_port, export_path, argv[6]);
+  if (cmd == "crash-write" && argc == 7)
+    return cmd_crash_write(host, nfs_port, mount_port, export_path, argv[6]);
+  if (cmd == "crash-recover" && argc == 8)
+    return cmd_crash_recover(host, nfs_port, mount_port, export_path, argv[6], argv[7]);
+  if (cmd == "connstorm" && argc == 7)
+    return cmd_connstorm(host, nfs_port, atoi(argv[5]), atoi(argv[6]));
   return usage();
 }

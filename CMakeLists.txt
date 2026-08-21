@@ -44,6 +44,7 @@ add_library(lnfs_core STATIC
   src/backend/api.cpp
   src/backend/local.cpp
   src/backend/memory.cpp
+  src/core/boot_epoch.cpp
   src/core/config.cpp
   src/core/file_handle.cpp
   src/core/obj_lock.cpp
@@ -53,6 +54,7 @@ add_library(lnfs_core STATIC
   src/nfsv3/engine.cpp
   src/mountd/mount3.cpp
   src/server/rpcbind.cpp
+  src/server/ctl.cpp
   src/runtime/reactor.cpp
   src/runtime/uring_ring.cpp
   src/runtime/epoll_ring.cpp
@@ -60,11 +62,14 @@ add_library(lnfs_core STATIC
   src/runtime/runtime.cpp
   src/runtime/buffer.cpp
   src/util/log.cpp
+  src/obs/metrics.cpp
+  src/obs/errlog.cpp
   src/transport/record_stream.cpp
   src/transport/listener.cpp
   src/transport/connection.cpp
   src/rpc/rpc_msg.cpp
   src/rpc/auth.cpp
+  src/rpc/drc.cpp
   src/rpc/dispatch.cpp
 )
 target_include_directories(lnfs_core PUBLIC src ${LIBURING_INCLUDE_DIR})
@@ -75,6 +80,11 @@ endif()
 
 add_executable(lightnfsd src/main.cpp)
 target_link_libraries(lightnfsd PRIVATE lnfs_core)
+
+# ---- admin tools (design 08 §8.6) ----
+add_executable(lightnfs-ctl tools/lightnfs_ctl.cpp)
+add_executable(lightnfs-fh tools/lightnfs_fh.cpp)
+target_link_libraries(lightnfs-fh PRIVATE lnfs_core)
 
 # ---- tests ----
 enable_testing()
@@ -93,7 +103,9 @@ add_executable(lnfs_tests
   tests/test_offload.cpp
   tests/test_transport_loopback.cpp
   tests/test_backend.cpp
+  tests/test_backend_write.cpp
   tests/test_nfs3.cpp
+  tests/test_write_path.cpp
 )
 target_link_libraries(lnfs_tests PRIVATE lnfs_core)
 add_test(NAME lnfs_tests COMMAND lnfs_tests)
@@ -110,6 +122,9 @@ target_include_directories(bench_echo PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(bench_nullrpc bench/bench_nullrpc.cpp)
 target_link_libraries(bench_nullrpc PRIVATE lnfs_core)
 target_include_directories(bench_nullrpc PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(bench_fullpath bench/bench_fullpath.cpp)
+target_link_libraries(bench_fullpath PRIVATE lnfs_core)
+target_include_directories(bench_fullpath PRIVATE ${CMAKE_SOURCE_DIR})
 
 # ---- fuzz ----
 if(LNFS_BUILD_FUZZ)

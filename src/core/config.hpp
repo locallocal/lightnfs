@@ -39,6 +39,11 @@ struct ServerConfig {
   int max_connections = 4096;
   uint32_t max_request_size = (1u << 20) + (64u << 10);
   int inflight_per_conn = 64;
+  int per_peer_limit = 128;
+  uint64_t drc_ttl_ms = 120000;
+  uint64_t drc_mem = 64u << 20;
+  std::string ctl_socket;   // default: <state_dir>/ctl.sock; "" resolves at startup
+  uint16_t metrics_port = 0;  // 0 = disabled
 };
 
 struct ExportConfig {
