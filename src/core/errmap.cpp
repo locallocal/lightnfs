@@ -123,3 +123,93 @@ S to_v3(Errno error, P proc) {
 }
 
 }  // namespace lnfs::core
+
+namespace lnfs::core {
+namespace {
+
+using S4 = nfsv4::Status;
+using O4 = nfsv4::Op;
+
+S4 raw_mapping_v4(Errno error) {
+  if (error == Errno::kBadHandle) return S4::kBadhandle;
+  if (error == Errno::kJukebox) return S4::kDelay;
+  switch (raw(error)) {
+    case EPERM: return S4::kPerm;
+    case ENOENT: return S4::kNoent;
+    case EIO: return S4::kIo;
+    case ENXIO: return S4::kNxio;
+    case EACCES: return S4::kAccess;
+    case EEXIST: return S4::kExist;
+    case EXDEV: return S4::kXdev;
+    case ENOTDIR: return S4::kNotdir;
+    case EISDIR: return S4::kIsdir;
+    case EINVAL: return S4::kInval;
+    case EFBIG: return S4::kFbig;
+    case ENOSPC: return S4::kNospc;
+    case EROFS: return S4::kRofs;
+    case EMLINK: return S4::kMlink;
+    case ENAMETOOLONG: return S4::kNametoolong;
+    case ENOTEMPTY: return S4::kNotempty;
+#ifdef EDQUOT
+    case EDQUOT: return S4::kDquot;
+#endif
+    case ESTALE: return S4::kStale;
+    case EOPNOTSUPP: return S4::kNotsupp;
+    default: return S4::kIo;
+  }
+}
+
+template <size_t N>
+bool one_of4(S4 value, const std::array<S4, N>& values) {
+  for (S4 candidate : values)
+    if (candidate == value) return true;
+  return false;
+}
+
+}  // namespace
+
+bool v4_error_allowed(O4 op, S4 status) {
+  // Universally legal results (RFC 8881 §15.2 common rows).
+  if (status == S4::kOk || status == S4::kIo || status == S4::kServerfault ||
+      status == S4::kStale || status == S4::kBadhandle || status == S4::kAccess ||
+      status == S4::kDelay)
+    return true;
+  switch (op) {
+    case O4::kLookup:
+      return one_of4(status, std::array{S4::kNoent, S4::kNotdir, S4::kNametoolong,
+                                        S4::kBadname, S4::kSymlink, S4::kWrongsec});
+    case O4::kLookupp:
+      return one_of4(status, std::array{S4::kNoent, S4::kNotdir, S4::kSymlink});
+    case O4::kGetattr: return false;
+    case O4::kAccess: return false;
+    case O4::kReadlink:
+      return one_of4(status, std::array{S4::kInval, S4::kWrongType, S4::kNotsupp});
+    case O4::kRead:
+      return one_of4(status,
+                     std::array{S4::kInval, S4::kIsdir, S4::kWrongType, S4::kOpenmode,
+                                S4::kBadStateid, S4::kStaleStateid, S4::kOldStateid,
+                                S4::kGrace, S4::kExpired});
+    case O4::kReaddir:
+      return one_of4(status, std::array{S4::kNotdir, S4::kBadCookie, S4::kToosmall,
+                                        S4::kInval});
+    case O4::kOpen:
+      return one_of4(status,
+                     std::array{S4::kNoent, S4::kNotdir, S4::kIsdir, S4::kSymlink,
+                                S4::kWrongType, S4::kRofs, S4::kExist, S4::kNospc,
+                                S4::kDquot, S4::kNametoolong, S4::kBadname,
+                                S4::kShareDenied, S4::kGrace, S4::kNoGrace,
+                                S4::kReclaimBad, S4::kStaleClientid, S4::kInval,
+                                S4::kPerm});
+    case O4::kClose:
+      return one_of4(status, std::array{S4::kBadStateid, S4::kStaleStateid,
+                                        S4::kOldStateid, S4::kExpired});
+    default: return true;  // remaining implemented ops answer session/state errors
+  }
+}
+
+S4 to_v4(Errno error, O4 op) {
+  S4 mapped = raw_mapping_v4(error);
+  return v4_error_allowed(op, mapped) ? mapped : S4::kIo;
+}
+
+}  // namespace lnfs::core

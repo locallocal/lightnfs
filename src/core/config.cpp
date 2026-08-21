@@ -236,7 +236,8 @@ Result<Config> parse_config(std::string_view text) {
       }
       // rtmax/wtmax/dtpref are backend limits in phase 1; unknown limit keys are accepted.
     } else if (section == Section::kProtocol) {
-      if (key == "v3" || key == "v4") LNFS_TRY(bool_value(value));
+      if (key == "v3") LNFS_TRY(bool_value(value));
+      else if (key == "v4") config.server.enable_v4 = LNFS_TRY(bool_value(value));
       else if (key == "lease" || key == "grace")
         LNFS_TRY(string_value(value));
       else if (key == "drc_ttl") {

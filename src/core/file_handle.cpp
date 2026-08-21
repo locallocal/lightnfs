@@ -134,6 +134,41 @@ Result<DecodedHandle> FileHandleCodec::decode(std::span<const std::byte> fh,
   return DecodedHandle{exp, *oid};
 }
 
+std::vector<std::byte> FileHandleCodec::encode_raw(uint32_t fsid,
+                                                   const backend::ObjId& oid) const {
+  std::vector<std::byte> out;
+  out.reserve(13 + oid.len);
+  out.push_back(static_cast<std::byte>(kVersion));
+  out.push_back(static_cast<std::byte>(fsid >> 24));
+  out.push_back(static_cast<std::byte>(fsid >> 16));
+  out.push_back(static_cast<std::byte>(fsid >> 8));
+  out.push_back(static_cast<std::byte>(fsid));
+  out.insert(out.end(), oid.view().begin(), oid.view().end());
+  uint64_t auth = tag(out);
+  const auto* bytes = reinterpret_cast<const std::byte*>(&auth);
+  out.insert(out.end(), bytes, bytes + sizeof(auth));
+  return out;
+}
+
+Result<FileHandleCodec::DecodedV4> FileHandleCodec::decode_v4(
+    std::span<const std::byte> fh, const sockaddr_storage& peer) const {
+  if (fh.size() < 14 || fh.size() > 64 || static_cast<uint8_t>(fh[0]) != kVersion)
+    return Err(Errno::kBadHandle);
+  if (tag(fh.first(fh.size() - 8)) != read64(fh.data() + fh.size() - 8))
+    return Err(Errno::kBadHandle);
+  DecodedV4 out;
+  out.fsid = load_be32(fh.data() + 1);
+  auto oid = backend::ObjId::from(fh.subspan(5, fh.size() - 13));
+  if (!oid) return Err(Errno::kBadHandle);
+  out.oid = *oid;
+  if (out.fsid == 0) return out;  // pseudo-fs: no export gate here
+  if (!exports_) return Err(errno_from(ESTALE));
+  out.exp = exports_->by_fsid(out.fsid);
+  if (!out.exp) return Err(errno_from(ESTALE));
+  if (!exports_->check_client(peer, *out.exp)) return Err(errno_from(EACCES));
+  return out;
+}
+
 Result<FileHandleCodec::Inspection> FileHandleCodec::inspect(
     std::span<const std::byte> fh) const {
   if (fh.size() < 14 || fh.size() > 64) return Err(Errno::kBadHandle);

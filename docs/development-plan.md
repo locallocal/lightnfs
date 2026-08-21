@@ -229,28 +229,43 @@
 
 ### 5.1 v4 引擎骨架（第 1–3 周）
 
-- [ ] `nfs4_types.hpp` 骨架清单所需类型 + round-trip 单测 + fuzz
-- [ ] COMPOUND 解释器：ops_table、遇错即停、CFH/SFH 上下文、minorversion=0 恒拒（MINOR_VERS_MISMATCH）、应答大小预算（XdrEnc limit、READDIR 截断、REP_TOO_BIG）
-- [ ] bitmap 属性层：`attr_id → {getter, setter?, encoder}` 注册表，getter 从 core Attr 取值
-- [ ] 只读 op 集：SEQUENCE/PUTFH/PUTROOTFH/GETFH/LOOKUP/LOOKUPP/GETATTR/ACCESS/READLINK/READ（特殊 stateid）/READDIR/SECINFO_NO_NAME（最小）；其余 NOTSUPP
-- [ ] errmap `to_v4` 白名单表（RFC 8881 §15.2）+ 单测
+- [x] `nfs4_types.hpp` 骨架清单所需类型（op/status/stateid/bitmap/chan_attrs）+ round-trip 单测；fuzz 经 `handle_request` 全入口自动覆盖（prog=100003 vers=4 语料随 CI 短跑累积）
+- [x] COMPOUND 解释器：遇错即停、CFH/SFH 上下文、minorversion=0 恒拒（MINOR_VERS_MISMATCH）、应答大小预算（READ/READDIR 预裁剪 + 其余 op 暂存缓冲，超限替换为 REP_TOO_BIG/REP_TOO_BIG_TO_CACHE）、solo-op 纪律（sessionless 多 op → NOT_ONLY_OP；会话内 BIND_CONN 禁、DESTROY_SESSION 须为末位）、未知 op → OP_ILLEGAL
+- [x] bitmap 属性层：单表驱动 GETATTR/READDIR，13 个强制属性 + Linux 客户端实际消费集（mode/owner 数字串/numlinks/times/limits/space/mounted_on_fileid）；statfs 类属性按位预取
+- [x] 只读 op 集全部实现；**偏差（超计划）**：真实 Linux 客户端 `cat` 必经 OPEN→READ→CLOSE，故提前实现最小 open-state（CLAIM_NULL/FH 只读 OPEN + CLOSE + stateid 表 + READ 校验 stateid↔对象一致），FREE/TEST_STATEID 一并可用；其余 op NOTSUPP
+- [x] errmap `to_v4` 白名单表（RFC 8881 §15.2 按已实现 op 展开）+ 对照单测
 
 ### 5.2 伪根与导出集成（第 2–3 周）
 
-- [ ] core 内置伪文件系统（fsid=0，只读合成目录，不经后端）；伪根任意来源可浏览、进导出时校验 IP
+- [x] core 内置伪文件系统（fsid=0 保留、按导出路径合成只读前缀树、不经后端）；伪根任意来源可浏览、LOOKUP 跨入导出时校验 CIDR；READDIR 越界子项按导出根属性呈现（fsid 切换 + mounted_on_fileid）；LOOKUPP 从导出根回到伪树；嵌套导出在 v4 命名空间以外层为准（文档化限制）
 
 ### 5.3 StateMgr：client/session 部分（第 3–5 周）
 
-- [ ] ClientTable/SessionTable（Sharded）；EXCHANGE_ID/CREATE_SESSION/DESTROY_SESSION/DESTROY_CLIENTID/BIND_CONN_TO_SESSION
-- [ ] SEQUENCE 快路径：sessionid 查表→槽边界→seq 三分支（new/replay/misordered）+ in-flight 重复等待；槽缓存（32 槽×8KiB，REP_TOO_BIG_TO_CACHE）
-- [ ] 租约续期无锁化（atomic coarse 时间戳）；锁序规约 ①②③④ 落地 + 死锁矩阵单测
-- [ ] 持久化：clients/ 名单（EXCHANGE_ID 确认后写入）；启动 grace 流程骨架（只读阶段先放行读）
+- [x] ClientTable/SessionTable（Sharded）；EXCHANGE_ID 完整 RFC §18.35 记录语义（confirmed/unconfirmed 双记录、principal 冲突 CLID_INUSE、无状态 case-3 替换、客户端重启检测、UPD_CONFIRMED_REC_A 更新路径、CONFIRMED_R 回旗）；CREATE_SESSION（clientid+seq 重放保护、通道参数钳制、TOOSMALL 下限、GSS 回传凭证解析）；DESTROY_SESSION（连接绑定校验 CONN_NOT_BOUND）/DESTROY_CLIENTID（BUSY 判定）/BIND_CONN_TO_SESSION
+- [x] SEQUENCE 快路径：sessionid 查表→槽边界（BADSLOT/BAD_HIGH_SLOT）→seq 三分支 + in-flight 重复 AsyncCondVar 等待；槽缓存（默认 32 槽 ×8KiB 钳制，cachethis 全程按缓存预算裁剪故恒可缓存；缓存下限不足 → REP_TOO_BIG_TO_CACHE 且不消耗槽序）
+- [x] 租约续期无锁化（ClientRec.lease_expiry atomic coarse 秒，SEQUENCE 仅 store）；锁序规约以"单分片持锁 + 不跨锁"实现（结构性满足 ①②③④）+ 并发死锁矩阵单测（12 客户端 ×2 reactor 全生命周期风暴）
+- [x] 持久化：clients/<hash> 名单（CREATE_SESSION 确认后写入，fsync）；启动 grace 骨架（读放行、CLAIM_PREVIOUS 门禁 NO_GRACE/RECLAIM_BAD、RECLAIM_COMPLETE 全到齐提前出 grace、one_fs=TRUE 不置全局旗）——跨"重启"单测覆盖
 
 ### 5.4 验收（第 5–6 周）
 
-- [ ] `mount -o vers=4.1,ro` 挂载/浏览/读全正常
-- [ ] pynfs 4.1 会话组通过（CI 集成 pynfs，此后持续跑）
-- [ ] v3/v4 双挂载并发读，后端观察序列与结果一致（4.8 一致性清单锚点脚本）
+- [x] `mount -o vers=4.1,ro` 挂载/浏览/读全正常 —— `accept_m3_vm.sh` 一键（真实 mount + ls -lR/cat/md5sum -c + 只读强制），接入 CI `m3-acceptance` 在 runner VM 执行；本机无特权以 `accept_client v4walk`（用户态 4.1 客户端：会话建立、伪根穿越、OPEN/READ/CLOSE 逐字节校验、槽重放字节级一致、minorversion=0 拒绝）实测通过
+- [x] pynfs 4.1 会话组通过（CI 集成随 `m3-acceptance` 持续跑）—— 本机实测：exchange_id/create_session/destroy_session/destroy_clientid/reclaim_complete 五组 **67 通过 / 8 失败，8 个失败全部为需要写支持的 OPEN(CREATE) 用例（阶段 4 范围）**；排除项：EID9（租约到期扫描，6.2 交付）、EID50（SP4_SSV，设计不支持）
+- [x] v3/v4 双挂载并发读一致 —— 本机：同一后端树经 v3 `walk` 与 v4.1 `v4walk` 双客户端逐字节校验一致；VM 脚本另做真实双挂载并发 cat + `diff -r` + 双 md5 校验（4.8 锚点）
+
+### 5.5 阶段 3 完成记录（2026-08-22）
+
+- 测试：97 个单测/集成测试四配置全绿（Debug/Release/ASAN+UBSAN/TSAN）；新增 v4 wire 级
+  测试（COMPOUND 纪律/会话建立/槽重放字节一致/伪根 fsid 穿越/特殊与坏 stateid/READDIR
+  预算分页/errmap）与 StateMgr 并发矩阵、grace 跨重启单测
+- pynfs（用户态直连，无需 mount）：会话五组 67/75 通过（8 个失败全为写依赖）；扩展组
+  sequence/lookup/lookupp/putfh/compound/secinfo_no_name 37/44 通过（余 4 为无特权环境
+  无法 mknod 的块/字符设备树对象、3 为写依赖）；会话语义按 pynfs 逐项校准（solo-op 纪律、
+  principal 碰撞、case-3 替换、CONN_NOT_BOUND、TOOSMALL 下限、REQ/REP_TOO_BIG(_TO_CACHE)
+  预算、**槽重放以新 xid 重组 RPC 头**（RFC §2.10.6.2 的 NFS 级契约）、LOOKUP 空名 INVAL、
+  LOOKUPP 符号链接 SYMLINK、tag UTF-8 校验、非法 opcode 优先于会话纪律、one_fs 语义）
+- 结构性偏差：最小 open-state 提前到本阶段（Linux 客户端读路径硬依赖）；REP_TOO_BIG 预算
+  经"小 op 暂存缓冲"实现（READ/READDIR 仍零拷贝直编）；SECINFO(带名)延后（NO_NAME 已实现，
+  4.1 客户端以 NO_NAME 为主）；`sequence` 组含租约长睡眠用例随 nightly 跑不阻塞每 PR
 
 ---
 

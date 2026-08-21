@@ -14,7 +14,10 @@
 #include "core/file_handle.hpp"
 #include "core/obj_lock.hpp"
 #include "mountd/mount3.hpp"
+#include "core/pseudofs.hpp"
 #include "nfsv3/engine.hpp"
+#include "nfsv4/engine.hpp"
+#include "state/state_mgr.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
 #include "runtime/runtime.hpp"
@@ -139,6 +142,29 @@ int main(int argc, char** argv) {
   lnfs::mountd::Mount3 mount(*exports, *key);
   nfs.register_with(dispatcher);
   mount.register_with(dispatcher);
+
+  // v4.1 stack (phase 3): pseudo-fs namespace + session state + COMPOUND engine.
+  lnfs::core::PseudoFs pseudofs(*exports);
+  lnfs::state::StateMgr state_mgr({.boot_epoch = *epoch,
+                                   .state_dir = server_cfg.state_dir,
+                                   .lease_seconds = lnfs::nfsv4::kLeaseSeconds,
+                                   .max_io = server_cfg.max_request_size});
+  std::optional<lnfs::nfsv4::Engine> nfs4;
+  if (server_cfg.enable_v4) {
+    state_mgr.load_grace_list();
+    nfs4.emplace(*exports, *key, locks, pseudofs, state_mgr);
+    nfs4->register_with(dispatcher);
+  }
+  lnfs::obs::register_text_provider([&state_mgr](std::string& out) {
+    auto s = state_mgr.stats();
+    out += std::format(
+        "lightnfs_v4_clients {}\nlightnfs_v4_sessions {}\nlightnfs_v4_opens {}\n"
+        "lightnfs_v4_seq_new_total {}\nlightnfs_v4_seq_replay_total {}\n"
+        "lightnfs_v4_seq_misordered_total {}\nlightnfs_v4_seq_waits_total {}\n"
+        "lightnfs_v4_in_grace {}\n",
+        s.clients, s.sessions, s.opens, s.seq_new, s.seq_replay, s.seq_misordered,
+        s.seq_waits, s.grace ? 1 : 0);
+  });
 
   lnfs::transport::TransportConfig transport_cfg;
   transport_cfg.max_request_size = server_cfg.max_request_size;

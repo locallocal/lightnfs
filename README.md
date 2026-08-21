@@ -25,9 +25,11 @@ Sanitizer 配置：`-DLNFS_SANITIZE=address|thread`；fuzz（需 clang）：`-DL
 
 ## 当前状态
 
-阶段 2（M2+M3）完成：NFSv3 全部 21 个过程读写可用——写路径三档稳定级与 COMMIT、
-CREATE 三模式（EXCLUSIVE verifier 跨重启）、DRC 重复请求缓存、boot-epoch 写校验子、
-fd 缓存读写升级、异步日志/Prometheus 指标/`lightnfs-ctl`/`lightnfs-fh` 工具。
-详见 [M2 读写说明](docs/m2-readwrite.md) 与 [M1 只读说明](docs/m1-readonly.md)；
-安全清单落地见 [security-checklist.md](docs/security-checklist.md)；接口评审结论见
+阶段 3（M5）完成：NFSv4.1 只读挂载可用——COMPOUND 解释器、会话层（EXCHANGE_ID 全记录
+语义、SEQUENCE 槽表精确一次）、bitmap 属性层、伪文件系统命名空间、最小 open-state 读
+路径；pynfs 4.1 会话组通过（写依赖用例除外）。v3 读写（阶段 2：21 过程、DRC、
+boot-epoch 校验子、fd 缓存、可观测性工具）保持回归保护。
+详见 [M3 v4.1 只读说明](docs/m3-v41-readonly.md)、[M2 读写说明](docs/m2-readwrite.md)、
+[M1 只读说明](docs/m1-readonly.md)；安全清单见
+[security-checklist.md](docs/security-checklist.md)；接口评审结论见
 [Backend API v1 评审](docs/backend-api-review.md)。
