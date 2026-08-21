@@ -53,6 +53,22 @@ jobs:
           ./build/bench_nullrpc 1 4 10000 32 || true
           ./build/bench_echo 1 4 10000 32 128 || true
 
+  # M1 read-only acceptance (development plan §3.5). The runner is a root VM with a
+  # kernel NFS client, so both halves run: userspace-client loopback (incl. ASAN
+  # soak) and a real `mount -o vers=3` with ls -lR / cat / md5sum -c / bigdir /
+  # cthon04 basic read-only subset.
+  m1-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build nfs-common
+      - name: loopback acceptance (Release + ASAN userspace client, 100k bigdir)
+        run: scripts/accept_m1_local.sh 60 100000
+      - name: real-mount acceptance (kernel client + cthon read-only subset)
+        run: scripts/accept_m1_vm.sh 100000
+
   fuzz-short:
     runs-on: ubuntu-latest
     steps:

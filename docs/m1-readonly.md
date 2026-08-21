@@ -32,3 +32,29 @@ cp config/lightnfs.toml.example /tmp/lightnfs.toml
 
 默认向本机 rpcbind 注册 NFSv3 和 MOUNTv3；rpcbind 不可用时仍可通过 mount 的
 `port=`/`mountport=` 显式指定端口。
+
+## 验收（开发计划 §3.5）
+
+验收分两半，数据集统一由 `scripts/gen_dataset.sh DEST [BIGDIR_COUNT]` 生成
+（`tree/` 内容树 + `manifest.md5` + `bigdir/` 10 万项 + `cthon/` 预置树）。
+
+**回环半（无 root）**：`scripts/accept_m1_local.sh [ASAN_STRESS_SECS] [BIGDIR_COUNT]`
+一键构建 Release+ASAN、起真实 `lightnfsd`、用 `lnfs_accept_client`（用户态 NFSv3 客户端）执行：
+
+- `walk`：READDIRPLUS 递归遍历，目录项集合与后端目录逐目录比对，普通文件 READ 逐字节比对、
+  符号链接 READLINK 比对；FSSTAT/FSINFO/PATHCONF/ACCESS 冒烟；负路径（伪造句柄→BADHANDLE、
+  坏 cookieverf→BAD_COOKIE、全部写过程→PROC_UNAVAIL、只读导出 ACCESS 不给写位）
+- `bigdir`：纯 READDIR 对 10 万项目录全分页，无重复、无遗漏
+- `stress`：多连接×流水线随机偏移 READ，每个应答与本地文件逐字节比对；ASAN 构建下长跑
+  即泄漏检查（服务器平滑退出后 LeakSanitizer 判定）
+
+**真实 mount 半（需特权）**：
+
+- root VM / CI runner：`scripts/accept_m1_vm.sh [BIGDIR_COUNT]`（CI 的 `m1-acceptance` 作业）
+- docker 主机：`scripts/accept_m1_container.sh [BIGDIR_COUNT]`（特权容器 + host 网络）
+- 已挂载环境：`scripts/accept_m1.sh SERVER EXPORT [NFS_PORT] [MOUNT_PORT] [COUNT]`
+  （`ls -lR`、`cat`、`md5sum -c`、bigdir 计数、只读强制）
+
+cthon04 由 `scripts/fetch_cthon.sh` 拉取构建（对 test5b 打最小 `CTHON_RO` 补丁：跳过尾部
+unlink 清理）；`scripts/cthon_ro.sh CTHON_DIR TESTDIR` 运行只读可行子集
+test3（lookup）/test5b（read）/test9（statfs）。其余 basic 测试均含写操作，属阶段 2 验收。
