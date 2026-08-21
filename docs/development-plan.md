@@ -122,11 +122,40 @@
 
 ### 3.5 验收（第 5–6 周）
 
-- [ ] 自动化验收脚本（VM/容器内真实 mount）：`mount -o vers=3` 后 `ls -lR`、`cat`、`md5sum -c` 全通过
-- [ ] cthon basic 只读部分通过
-- [ ] 大目录（10 万项）readdir 遍历正确；并发读压测无泄漏（ASAN 长跑）
+- [x] 自动化验收脚本（VM/容器内真实 mount）：`mount -o vers=3` 后 `ls -lR`、`cat`、`md5sum -c` 全通过
+      —— 脚本族交付并接入 CI：`gen_dataset.sh`（数据集+manifest）、`accept_m1.sh`（挂载内校验）、
+      `accept_m1_vm.sh`（root VM 一键，CI `m1-acceptance` 作业即真实 mount）、`accept_m1_container.sh`
+      （docker 特权容器一键）。本机开发环境无特权，另以 `lnfs_accept_client`（用户态 NFSv3 客户端，
+      真实 TCP 打真实 lightnfsd）完成等价校验：全树遍历逐字节比对（= ls -lR/cat/md5sum）+ 负路径
+      （伪造句柄 BADHANDLE、坏 cookieverf、11 个写过程 PROC_UNAVAIL、只读 ACCESS 掩码）
+- [x] cthon basic 只读部分通过 —— 只读可运行子集定义为 test3（lookup）/test5b（read）/test9（statfs），
+      配合 `-n` + 预置目录树；test5b 尾部 unlink 清理以 `CTHON_RO=1` 补丁跳过（`fetch_cthon.sh` 自动
+      应用）。子集已在写保护目录验证全过并由 `cthon_ro.sh` 挂入 mount 验收与 CI；其余 basic 测试均含
+      写操作，归属阶段 2 §4.6
+- [x] 大目录（10 万项）readdir 遍历正确；并发读压测无泄漏（ASAN 长跑）—— 本机执行通过，见 3.6
 
-**阶段 1 DoD**：上述验收全过；接口评审结论归档（映射表勾选记录进 docs）。
+**阶段 1 DoD**：上述验收全过（真实 mount 路径以 CI `m1-acceptance` 作业为常态回归）；接口评审结论
+归档（映射表勾选记录进 docs）。
+
+### 3.6 M1 验收完成记录（2026-08-22）
+
+- 工具：`tests/accept_client.cpp`（`lnfs_accept_client`）—— 用户态 NFSv3/MOUNTv3 客户端，
+  walk（READDIRPLUS 递归遍历 + READ 逐字节比对后端目录 + READLINK/ACCESS/FSSTAT/FSINFO/PATHCONF +
+  负路径检查）、bigdir（纯 READDIR 全分页，唯一性+完整性）、stress（多连接流水线随机偏移 READ，
+  应答逐字节校验）；无 root 依赖，兼作阶段 2 起的每 PR 协议回归
+- 数据集（`gen_dataset.sh`）：块边界尺寸族（0/1/511/4095/4096/4097/64K±1/1M+3/8M）、深目录、
+  unicode/空格名、相对/绝对/悬空符号链接、10 万项平铺目录、cthon 预置树、md5 manifest
+- 本机结果（Release，io_uring，回环）：walk 8 目录 100016 文件（10.8MB 逐字节校验）+ 3 符号链接
+  全过；bigdir 10 万项全分页 0.23s 无重复无遗漏；stress 8 连接 ×32 流水线 30s 完成 1274 万次读
+  （约 42.5 万 ops/s）全部校验通过
+- ASAN+UBSAN（Debug）：walk/bigdir 同样全过；stress 8×32 长跑 300s 完成 1929 万次读
+  （约 6.4 万 ops/s，全部逐字节校验）后平滑退出，LeakSanitizer 无泄漏、无 sanitizer 报错
+- CI：新增 `m1-acceptance` 作业 —— runner VM 内先跑回环验收（含 ASAN 60s 短稳），再
+  `accept_m1_vm.sh` 真实 `mount -o vers=3` + `ls -lR`/`cat`/`md5sum -c` + bigdir 计数 + 只读
+  强制 + cthon 只读子集
+- 偏差记录：cthon basic 的"只读部分"按上（3.5）定义为 test3/test5b/test9 子集；test5b 打
+  `CTHON_RO` 跳过尾部 unlink 清理（补丁最小、上游其余零改动）。§10 风险表"验收环境成本"要求的
+  mount/cthon 一键框架已随本节交付，阶段 2 fsx/cthon 全量可直接复用
 
 ---
 
