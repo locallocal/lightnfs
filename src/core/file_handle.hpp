@@ -27,6 +27,18 @@ class FileHandleCodec {
                                const sockaddr_storage& peer) const;
   void bind(ExportTable& exports) { exports_ = &exports; }
 
+  // Offline decode for lightnfs-fh (design 08 §8.6): no export table, no IP checks.
+  struct Inspection {
+    uint8_t version = 0;
+    uint32_t fsid = 0;
+    backend::ObjId oid;
+    bool hmac_ok = false;
+  };
+  static FileHandleCodec from_key_only(std::array<std::byte, 16> key) {
+    return FileHandleCodec(key);
+  }
+  Result<Inspection> inspect(std::span<const std::byte> fh) const;
+
  private:
   FileHandleCodec(std::array<std::byte, 16> key, ExportTable& exports)
       : key_(key), exports_(&exports) {}

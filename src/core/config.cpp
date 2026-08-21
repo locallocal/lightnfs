@@ -213,6 +213,16 @@ Result<Config> parse_config(std::string_view text) {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n > INT_MAX) return Err(errno_from(EINVAL));
         config.server.max_connections = static_cast<int>(n);
+      } else if (key == "per_peer_limit") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n == 0 || n > 1u << 20) return Err(errno_from(EINVAL));
+        config.server.per_peer_limit = static_cast<int>(n);
+      } else if (key == "ctl_socket") {
+        config.server.ctl_socket = LNFS_TRY(string_value(value));
+      } else if (key == "metrics_port") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n > 65535) return Err(errno_from(EINVAL));
+        config.server.metrics_port = static_cast<uint16_t>(n);
       } else if (key == "max_request_size") {
         uint64_t n = LNFS_TRY(size_value(value));
         if (n > UINT32_MAX) return Err(errno_from(EINVAL));
@@ -227,10 +237,22 @@ Result<Config> parse_config(std::string_view text) {
       // rtmax/wtmax/dtpref are backend limits in phase 1; unknown limit keys are accepted.
     } else if (section == Section::kProtocol) {
       if (key == "v3" || key == "v4") LNFS_TRY(bool_value(value));
-      else if (key == "lease" || key == "grace" || key == "drc_ttl")
+      else if (key == "lease" || key == "grace")
         LNFS_TRY(string_value(value));
-      else if (key == "drc_mem")
-        LNFS_TRY(size_value(value));
+      else if (key == "drc_ttl") {
+        // Duration string, seconds ("120s") or milliseconds ("500ms").
+        std::string s = LNFS_TRY(string_value(value));
+        uint64_t n = 0;
+        size_t digits = 0;
+        while (digits < s.size() && std::isdigit(static_cast<unsigned char>(s[digits])))
+          n = n * 10 + static_cast<uint64_t>(s[digits++] - '0');
+        std::string_view suffix = std::string_view(s).substr(digits);
+        if (digits == 0) return Err(errno_from(EINVAL));
+        if (suffix == "s" || suffix.empty()) config.server.drc_ttl_ms = n * 1000;
+        else if (suffix == "ms") config.server.drc_ttl_ms = n;
+        else return Err(errno_from(EINVAL));
+      } else if (key == "drc_mem")
+        config.server.drc_mem = LNFS_TRY(size_value(value));
       else
         return Err(errno_from(EINVAL));
     } else if (section == Section::kExport && exp) {

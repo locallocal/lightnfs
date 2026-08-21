@@ -133,6 +133,103 @@ struct ReaddirPlusArgs {
   static Result<ReaddirPlusArgs> decode(xdr::XdrDec& dec);
 };
 
+// ---- write-side arguments (RFC 1813) --------------------------------------
+
+// sattr3 <-> backend::SetAttr (time_how: 0 DONT_CHANGE, 1 SERVER, 2 CLIENT).
+Result<backend::SetAttr> decode_sattr(xdr::XdrDec& dec);
+void encode_sattr(xdr::XdrEnc& enc, const backend::SetAttr& attrs);
+
+struct SetattrArgs {
+  FileHandle object;
+  backend::SetAttr attrs;
+  bool guard = false;
+  backend::Timespec guard_ctime{};
+  void encode(xdr::XdrEnc& enc) const;
+  static Result<SetattrArgs> decode(xdr::XdrDec& dec);
+};
+
+inline constexpr uint32_t kUnstable = 0;
+inline constexpr uint32_t kDataSync = 1;
+inline constexpr uint32_t kFileSync = 2;
+
+struct WriteArgs {
+  FileHandle file;
+  uint64_t offset = 0;
+  uint32_t count = 0;
+  uint32_t stable = kFileSync;
+  std::span<const std::byte> data{};  // references the decoded record
+  static Result<WriteArgs> decode(xdr::XdrDec& dec);
+};
+
+inline constexpr uint32_t kCreateUnchecked = 0;
+inline constexpr uint32_t kCreateGuarded = 1;
+inline constexpr uint32_t kCreateExclusive = 2;
+
+struct CreateArgs {
+  Diropargs where;
+  uint32_t mode = kCreateUnchecked;
+  backend::SetAttr attrs;      // UNCHECKED/GUARDED
+  backend::ExclVerf verf{};    // EXCLUSIVE
+  void encode(xdr::XdrEnc& enc) const;
+  static Result<CreateArgs> decode(xdr::XdrDec& dec);
+};
+
+struct MkdirArgs {
+  Diropargs where;
+  backend::SetAttr attrs;
+  void encode(xdr::XdrEnc& enc) const;
+  static Result<MkdirArgs> decode(xdr::XdrDec& dec);
+};
+
+struct SymlinkArgs {
+  Diropargs where;
+  backend::SetAttr attrs;
+  std::string target;
+  void encode(xdr::XdrEnc& enc) const;
+  static Result<SymlinkArgs> decode(xdr::XdrDec& dec);
+};
+
+struct MknodArgs {
+  Diropargs where;
+  backend::FType type = backend::FType::kReg;
+  backend::DevT dev{};
+  backend::SetAttr attrs;
+  static Result<MknodArgs> decode(xdr::XdrDec& dec);
+};
+
+struct RenameArgs {
+  Diropargs from;
+  Diropargs to;
+  void encode(xdr::XdrEnc& enc) const;
+  static Result<RenameArgs> decode(xdr::XdrDec& dec);
+};
+
+struct LinkArgs {
+  FileHandle file;
+  Diropargs to;
+  void encode(xdr::XdrEnc& enc) const;
+  static Result<LinkArgs> decode(xdr::XdrDec& dec);
+};
+
+struct CommitArgs {
+  FileHandle file;
+  uint64_t offset = 0;
+  uint32_t count = 0;
+  void encode(xdr::XdrEnc& enc) const;
+  static Result<CommitArgs> decode(xdr::XdrDec& dec);
+};
+
+// ---- weak cache consistency -----------------------------------------------
+
+struct WccPre {  // wcc_attr: the pre-op sample of the three CTO-relevant fields
+  uint64_t size = 0;
+  backend::Timespec mtime{}, ctime{};
+};
+std::optional<WccPre> wcc_pre(const std::optional<backend::Attr>& attr);
+void encode_pre_attr(xdr::XdrEnc& enc, const std::optional<WccPre>& pre);
+void encode_wcc(xdr::XdrEnc& enc, const std::optional<WccPre>& pre,
+                const std::optional<backend::Attr>& post, uint64_t fsid);
+
 void encode_time(xdr::XdrEnc& enc, const backend::Timespec& time);
 void encode_fattr(xdr::XdrEnc& enc, const backend::Attr& attr, uint64_t fsid);
 void encode_post_attr(xdr::XdrEnc& enc, const std::optional<backend::Attr>& attr,

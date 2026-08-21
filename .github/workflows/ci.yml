@@ -69,6 +69,22 @@ jobs:
       - name: real-mount acceptance (kernel client + cthon read-only subset)
         run: scripts/accept_m1_vm.sh 100000
 
+  # Phase-2 read-write acceptance (development plan §4.6): loopback rw workload with
+  # kill -9 crash recovery, 10k-connection storm and ASAN soak; then a real rw mount
+  # running cthon04 basic/general/special and a short fsx. Overnight fsx (>=12h) runs
+  # from the same script with FSX_OPS raised (nightly, not per-PR).
+  m2-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build nfs-common libtirpc-dev
+      - name: loopback rw acceptance (Release + ASAN, crash recovery, connstorm)
+        run: scripts/accept_m2_local.sh 60
+      - name: real-mount rw acceptance (cthon b/g/s + fsx 50k ops + kill -9 recovery)
+        run: scripts/accept_m2_vm.sh 50000
+
   fuzz-short:
     runs-on: ubuntu-latest
     steps:

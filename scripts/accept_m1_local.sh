@@ -90,7 +90,7 @@ run_phase() {  # $1 = build dir label, $2 = stress seconds
 
   local client="$build/lnfs_accept_client"
   echo "== [$label] walk (full traversal + content verification)"
-  "$client" walk 127.0.0.1 "$nfs_port" "$mount_port" "$dataset" "$dataset"
+  "$client" walk 127.0.0.1 "$nfs_port" "$mount_port" "$dataset" "$dataset" ro
   echo "== [$label] bigdir ($bigdir_count entries)"
   "$client" bigdir 127.0.0.1 "$nfs_port" "$mount_port" "$dataset" "$dataset" \
     bigdir "$bigdir_count"

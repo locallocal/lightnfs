@@ -25,7 +25,9 @@ Sanitizer 配置：`-DLNFS_SANITIZE=address|thread`；fuzz（需 clang）：`-DL
 
 ## 当前状态
 
-阶段 1 的 Backend API、LocalFS 只读后端、NFSv3 只读引擎、MOUNTv3、配置与服务端
-入口已实现。部署方式、无特权句柄限制和真实挂载验收见
-[M1 只读说明](docs/m1-readonly.md)；接口评审结论见
+阶段 2（M2+M3）完成：NFSv3 全部 21 个过程读写可用——写路径三档稳定级与 COMMIT、
+CREATE 三模式（EXCLUSIVE verifier 跨重启）、DRC 重复请求缓存、boot-epoch 写校验子、
+fd 缓存读写升级、异步日志/Prometheus 指标/`lightnfs-ctl`/`lightnfs-fh` 工具。
+详见 [M2 读写说明](docs/m2-readwrite.md) 与 [M1 只读说明](docs/m1-readonly.md)；
+安全清单落地见 [security-checklist.md](docs/security-checklist.md)；接口评审结论见
 [Backend API v1 评审](docs/backend-api-review.md)。

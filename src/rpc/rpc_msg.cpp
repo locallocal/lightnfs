@@ -1,5 +1,7 @@
 #include "rpc/rpc_msg.hpp"
 
+#include <algorithm>
+
 namespace lnfs::rpc {
 
 Result<RpcCall> parse_call(const rt::BufferChain& rec) {
@@ -17,6 +19,34 @@ Result<RpcCall> parse_call(const rt::BufferChain& rec) {
   c.cred.body = LNFS_TRY(dec.opaque(kMaxAuthBody));
   c.verf.flavor = LNFS_TRY(dec.u32());
   c.verf.body = LNFS_TRY(dec.opaque(kMaxAuthBody));
+
+  // FNV-1a over the first 256 bytes of the argument body, for the DRC key
+  // (design 03 §3.7): a reused xid from the same peer must not replay a different call.
+  {
+    size_t args_off = rec.size() - dec.remaining();
+    size_t want = std::min<size_t>(dec.remaining(), 256);
+    uint64_t h = 1469598103934665603ull;
+    size_t skipped = 0;
+    for (size_t i = 0; i < rec.seg_count() && want > 0; ++i) {
+      const auto& seg = rec.seg(i);
+      size_t begin = 0;
+      if (skipped < args_off) {
+        size_t skip = std::min<size_t>(seg.len, args_off - skipped);
+        skipped += skip;
+        begin = skip;
+        if (begin >= seg.len) continue;
+      }
+      size_t take = std::min<size_t>(seg.len - begin, want);
+      const std::byte* p = seg.buf.data() + seg.off + begin;
+      for (size_t j = 0; j < take; ++j) {
+        h ^= static_cast<uint8_t>(p[j]);
+        h *= 1099511628211ull;
+      }
+      want -= take;
+    }
+    c.args_hash = h;
+  }
+
   c.args = std::move(dec);
   return c;
 }

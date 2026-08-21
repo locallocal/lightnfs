@@ -8,8 +8,10 @@
 
 namespace lnfs::backend {
 
-// Read-only in-memory backend used by engine tests and full-path benchmarks.  Directory
-// cookies are allocation sequence numbers, so insertion/deletion never renumbers survivors.
+// In-memory backend used by engine tests and full-path benchmarks (read-write since
+// phase 2).  Directory cookies are allocation sequence numbers, so insertion/deletion
+// never renumbers survivors.  Timestamps come from a process-local logical clock so
+// attribute-change (WCC) tests are deterministic.
 class MemoryBackend final : public Backend {
  public:
   explicit MemoryBackend(uint64_t fsid = 1);
@@ -43,10 +45,16 @@ class MemoryBackend final : public Backend {
                           std::span<const std::byte> data, std::string_view link);
   ObjPtr wrap(const std::shared_ptr<Node>& node);
 
+  Timespec now();  // logical clock; callers hold mu_
+  std::shared_ptr<Node> new_child(const std::shared_ptr<Node>& parent, std::string name,
+                                  FType type, uint32_t mode, const Cred& cred);
+  void erase_child(const std::shared_ptr<Node>& parent, std::string_view name);
+
   uint64_t fsid_;
   mutable std::mutex mu_;
   uint64_t next_id_ = 2;
   uint64_t next_cookie_ = 1;
+  int64_t tick_ = 1;
   std::shared_ptr<Node> root_;
   std::unordered_map<ObjId, std::weak_ptr<Node>, ObjIdHash> objects_;
 };

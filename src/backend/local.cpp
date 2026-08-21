@@ -10,7 +10,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -76,11 +78,12 @@ struct LinuxDirent64 {
 class LocalBackend::FdCache {
  public:
   struct Entry {
-    explicit Entry(int value) : fd(value) {}
+    Entry(int value, int mode) : fd(value), accmode(mode) {}
     ~Entry() {
       if (fd >= 0) ::close(fd);
     }
     int fd;
+    int accmode;  // O_RDONLY or O_RDWR
     uint64_t used = 0;
   };
   using Ref = std::shared_ptr<Entry>;
@@ -90,23 +93,34 @@ class LocalBackend::FdCache {
                                                                     kShards,
                                                                 1)) {}
 
-  rt::Task<Result<Ref>> acquire(const ObjId& oid, int flags) {
+  // One cached fd per object.  A read acquire reuses any entry; a write acquire needs
+  // O_RDWR and upgrades an O_RDONLY entry in place (old refs drain via shared_ptr).
+  // A write acquire on a read-only filesystem propagates EROFS; a read acquire never
+  // asks for more than O_RDONLY, which is the documented degraded mode (06 §6.3).
+  rt::Task<Result<Ref>> acquire(const ObjId& oid, bool write) {
     Shard& shard = shards_[ObjIdHash{}(oid) % kShards];
     {
       std::lock_guard lock(shard.mu);
       auto it = shard.entries.find(oid);
-      if (it != shard.entries.end()) {
+      if (it != shard.entries.end() && (!write || it->second->accmode == O_RDWR)) {
         it->second->used = ++shard.clock;
+        hits_.fetch_add(1, std::memory_order_relaxed);
         co_return it->second;
       }
+      (write && it != shard.entries.end() ? upgrades_ : misses_)
+          .fetch_add(1, std::memory_order_relaxed);
     }
+    int flags = write ? O_RDWR : O_RDONLY;
     auto opened = co_await rt::offload([this, oid, flags] { return backend_.open_oid(oid, flags); });
     if (!opened) co_return Err(opened.error());
-    auto value = std::make_shared<Entry>(*opened);
+    auto value = std::make_shared<Entry>(*opened, flags);
     {
       std::lock_guard lock(shard.mu);
       auto [it, inserted] = shard.entries.emplace(oid, value);
-      if (!inserted) value = it->second;
+      if (!inserted) {
+        if (write && it->second->accmode != O_RDWR) it->second = value;  // upgrade
+        else value = it->second;
+      }
       value->used = ++shard.clock;
       while (shard.entries.size() > per_shard_capacity_) {
         auto victim = shard.entries.end();
@@ -117,9 +131,23 @@ class LocalBackend::FdCache {
         }
         if (victim == shard.entries.end()) break;
         shard.entries.erase(victim);  // Entry closes only its fd; ObjId remains valid.
+        evictions_.fetch_add(1, std::memory_order_relaxed);
       }
     }
     co_return value;
+  }
+
+  FdCacheStats stats() const {
+    FdCacheStats out;
+    out.hits = hits_.load(std::memory_order_relaxed);
+    out.misses = misses_.load(std::memory_order_relaxed);
+    out.upgrades = upgrades_.load(std::memory_order_relaxed);
+    out.evictions = evictions_.load(std::memory_order_relaxed);
+    for (const auto& shard : shards_) {
+      std::lock_guard lock(const_cast<std::mutex&>(shard.mu));
+      out.entries += shard.entries.size();
+    }
+    return out;
   }
 
  private:
@@ -132,11 +160,24 @@ class LocalBackend::FdCache {
   LocalBackend& backend_;
   size_t per_shard_capacity_;
   std::array<Shard, kShards> shards_;
+  std::atomic<uint64_t> hits_{0}, misses_{0}, upgrades_{0}, evictions_{0};
 };
+
+LocalBackend::FdCacheStats LocalBackend::fd_cache_stats() const { return fd_cache_->stats(); }
+
+void LocalBackend::poison(const ObjId& oid) {
+  std::lock_guard lock(poison_mu_);
+  poisoned_.insert(oid);
+}
+
+bool LocalBackend::is_poisoned(const ObjId& oid) const {
+  std::lock_guard lock(poison_mu_);
+  return poisoned_.contains(oid);
+}
 
 LocalBackend::LocalBackend(Config cfg, int root_fd, int mount_fd)
     : cfg_(std::move(cfg)), root_fd_(root_fd), mount_fd_(mount_fd) {
-  caps_.set(Cap::kSymlink).set(Cap::kHardlink);
+  caps_.set(Cap::kSymlink).set(Cap::kHardlink).set(Cap::kMknod);
   fd_cache_ = std::make_unique<FdCache>(*this, cfg_.fd_cache);
   long name = fpathconf(root_fd_, _PC_NAME_MAX);
   long link = fpathconf(root_fd_, _PC_LINK_MAX);
@@ -505,13 +546,459 @@ rt::Task<Result<uint32_t>> LocalObject::read(OpenCtx ctx, uint64_t off,
     if (!attr) co_return Err(attr.error());
     if (ctx.cred.uid != attr->uid) co_return Err(errno_from(EACCES));
   }
-  auto ref = co_await backend_.fd_cache_->acquire(id(), O_RDONLY);
+  auto ref = co_await backend_.fd_cache_->acquire(id(), false);
   if (!ref) co_return Err(ref.error());
   int n = co_await rt::uring_read((*ref)->fd, out, off);
   if (n < 0) co_return Err(errno_from_neg(n));
   auto attr = co_await getattr();
   eof = attr ? off + static_cast<uint64_t>(n) >= attr->size : n == 0;
   co_return static_cast<uint32_t>(n);
+}
+
+namespace {
+
+// Identity mode 2 (design 06 §6.4): switch the offload thread's filesystem ids to the
+// client credential so the kernel performs authoritative permission checks.  fsuid/fsgid
+// are per-thread; supplementary groups are not switched (documented limitation).
+// Requires root; without privilege setfsuid is a no-op and mode 1 checks still apply.
+class ScopedFsIds {
+ public:
+  ScopedFsIds(const Cred& cred, bool enable) {
+    if (!enable || cred.uid == 0) return;
+    old_gid_ = static_cast<uint32_t>(syscall(SYS_setfsgid, cred.gid));
+    old_uid_ = static_cast<uint32_t>(syscall(SYS_setfsuid, cred.uid));
+    active_ = true;
+  }
+  ~ScopedFsIds() {
+    if (!active_) return;
+    syscall(SYS_setfsuid, old_uid_);
+    syscall(SYS_setfsgid, old_gid_);
+  }
+  ScopedFsIds(const ScopedFsIds&) = delete;
+
+ private:
+  bool active_ = false;
+  uint32_t old_uid_ = 0, old_gid_ = 0;
+};
+
+std::string proc_fd_path(int fd) {
+  char buf[40];
+  std::snprintf(buf, sizeof buf, "/proc/self/fd/%d", fd);
+  return buf;
+}
+
+// EXCLUSIVE create verifier persisted across restarts in atime/mtime (design 06 §6.1,
+// nfsv3/04 §8): low half in atime.tv_sec, high half in mtime.tv_sec.
+void verf_split(const ExclVerf& verf, int64_t& lo, int64_t& hi) {
+  uint32_t l = 0, h = 0;
+  std::memcpy(&l, verf.data(), 4);
+  std::memcpy(&h, verf.data() + 4, 4);
+  lo = l;
+  hi = h;
+}
+
+timespec to_timespec(const Timespec& t) {
+  return timespec{static_cast<time_t>(t.sec), static_cast<long>(t.nsec)};
+}
+
+}  // namespace
+
+void LocalBackend::apply_created_owner(int fd, const Cred& cred) {
+  if (cred.uid == 0) return;
+  // Unprivileged servers cannot chown; created objects stay owned by the process user.
+  if (::fchown(fd, cred.uid, cred.gid) < 0 && errno != EPERM && errno != EINVAL) {
+  }
+}
+
+rt::Task<Result<AccessMask>> LocalObject::access(const Cred& cred, AccessMask want) {
+  auto base = co_await Object::access(cred, want);
+  if (backend_.cfg_.identity != LocalBackend::Identity::kStrict || !base)
+    co_return base;
+  // Strict mode: confirm each granted bit with faccessat2(AT_EACCESS) under the client's
+  // fsuid, catching ACLs and other beyond-mode-bits policy (design 06 §6.4).
+  AccessMask granted = *base;
+  co_return co_await rt::offload([this, cred, granted]() mutable -> Result<AccessMask> {
+    ScopedFsIds ids(cred, true);
+    std::string path = proc_fd_path(path_fd_);
+    auto confirm = [&](Access bit, int mode) {
+      if (!granted.has(bit)) return;
+      if (::faccessat(AT_FDCWD, path.c_str(), mode, AT_EACCESS) != 0) granted.clear(bit);
+    };
+    confirm(Access::kRead, R_OK);
+    confirm(Access::kModify, W_OK);
+    confirm(Access::kExtend, W_OK);
+    confirm(Access::kDelete, W_OK);
+    confirm(Access::kLookup, X_OK);
+    confirm(Access::kExecute, X_OK);
+    return granted;
+  });
+}
+
+rt::Task<Result<void>> LocalObject::require_dir_write(const Cred& cred) {
+  if (type() != FType::kDir) co_return Err(errno_from(ENOTDIR));
+  if (backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid)
+    co_return Result<void>{};  // the kernel enforces under the switched fsuid
+  auto allowed = co_await access(cred, AccessMask{}.set(Access::kModify).set(Access::kLookup));
+  if (!allowed) co_return Err(allowed.error());
+  if (!allowed->has(Access::kModify) || !allowed->has(Access::kLookup))
+    co_return Err(errno_from(EACCES));
+  co_return Result<void>{};
+}
+
+Result<Created> LocalObject::created_child_sync(std::string_view name) {
+  std::string owned(name);
+  int fd = ::openat(path_fd_, owned.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return Err(errno_from(errno));
+  auto attr = backend_.attr_from_fd(fd);
+  if (!attr) {
+    ::close(fd);
+    return Err(attr.error());
+  }
+  auto obj = backend_.object_from_fd(fd, child_path(relative_, owned));  // consumes fd
+  if (!obj) return Err(obj.error());
+  return Created{std::move(*obj), *attr};
+}
+
+rt::Task<Result<Created>> LocalObject::created_child(std::string_view name) {
+  std::string owned(name);
+  co_return co_await rt::offload([this, owned] { return created_child_sync(owned); });
+}
+
+rt::Task<Result<Attr>> LocalObject::setattr(const Cred& cred, const SetAttr& s) {
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  if (!fsuid_mode) {
+    auto attr = co_await getattr();
+    if (!attr) co_return Err(attr.error());
+    bool owner = cred.uid == 0 || cred.uid == attr->uid;
+    if ((s.mode || s.atime_how != SetAttr::TimeHow::kOmit ||
+         s.mtime_how != SetAttr::TimeHow::kOmit) &&
+        !owner)
+      co_return Err(errno_from(EPERM));
+    if (s.uid && *s.uid != attr->uid && cred.uid != 0) co_return Err(errno_from(EPERM));
+    if (s.gid && *s.gid != attr->gid && cred.uid != 0 &&
+        !(owner && cred.in_group(*s.gid)))
+      co_return Err(errno_from(EPERM));
+    if (s.size && !owner) {
+      auto allowed = co_await access(cred, Access::kModify);
+      if (!allowed) co_return Err(allowed.error());
+      if (!allowed->has(Access::kModify)) co_return Err(errno_from(EACCES));
+    }
+  }
+  auto applied = co_await rt::offload([this, cred, s, fsuid_mode]() -> Result<void> {
+    ScopedFsIds ids(cred, fsuid_mode);
+    int fd = -1;
+    bool close_fd = false;
+    if (type() == FType::kReg) {
+      auto opened = backend_.open_oid(id(), s.size ? O_RDWR : O_RDONLY);
+      if (!opened && s.size) return Err(opened.error());
+      if (opened) {
+        fd = *opened;
+        close_fd = true;
+      }
+    } else if (type() == FType::kDir) {
+      auto opened = backend_.open_oid(id(), O_RDONLY | O_DIRECTORY);
+      if (opened) {
+        fd = *opened;
+        close_fd = true;
+      }
+    }
+    auto finish = [&](Result<void> r) {
+      if (close_fd) ::close(fd);
+      return r;
+    };
+    if (s.size) {
+      if (type() == FType::kDir) return finish(Err(errno_from(EISDIR)));
+      if (type() != FType::kReg || fd < 0) return finish(Err(errno_from(EINVAL)));
+      if (::ftruncate(fd, static_cast<off_t>(*s.size)) < 0)
+        return finish(Err(errno_from(errno)));
+    }
+    if (s.mode) {
+      int rc = fd >= 0 ? ::fchmod(fd, *s.mode & 07777)
+                       : ::chmod(proc_fd_path(path_fd_).c_str(), *s.mode & 07777);
+      if (rc < 0 && type() != FType::kLnk) return finish(Err(errno_from(errno)));
+    }
+    if (s.uid || s.gid) {
+      uid_t uid = s.uid ? *s.uid : static_cast<uid_t>(-1);
+      gid_t gid = s.gid ? *s.gid : static_cast<gid_t>(-1);
+      int rc = fd >= 0 ? ::fchown(fd, uid, gid)
+                       : ::fchownat(path_fd_, "", uid, gid, AT_EMPTY_PATH);
+      if (rc < 0) return finish(Err(errno_from(errno)));
+    }
+    if (s.atime_how != SetAttr::TimeHow::kOmit || s.mtime_how != SetAttr::TimeHow::kOmit) {
+      timespec times[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
+      if (s.atime_how == SetAttr::TimeHow::kServer) times[0].tv_nsec = UTIME_NOW;
+      else if (s.atime_how == SetAttr::TimeHow::kClient) times[0] = to_timespec(s.atime);
+      if (s.mtime_how == SetAttr::TimeHow::kServer) times[1].tv_nsec = UTIME_NOW;
+      else if (s.mtime_how == SetAttr::TimeHow::kClient) times[1] = to_timespec(s.mtime);
+      int rc = fd >= 0 ? ::futimens(fd, times)
+                       : ::utimensat(AT_FDCWD, proc_fd_path(path_fd_).c_str(), times, 0);
+      if (rc < 0) return finish(Err(errno_from(errno)));
+    }
+    return finish({});
+  });
+  if (!applied) co_return Err(applied.error());
+  co_return co_await getattr();
+}
+
+rt::Task<Result<Created>> LocalObject::create(const Cred& cred, std::string_view name,
+                                              const SetAttr& attrs, ExclVerf* verf) {
+  if (!LocalBackend::valid_name(name)) co_return Err(errno_from(EINVAL));
+  auto dir_ok = co_await require_dir_write(cred);
+  if (!dir_ok) co_return Err(dir_ok.error());
+  std::string owned(name);
+  ExclVerf verf_copy{};
+  if (verf) verf_copy = *verf;
+  bool exclusive = verf != nullptr;
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  co_return co_await rt::offload(
+      [this, cred, owned, attrs, verf_copy, exclusive, fsuid_mode]() -> Result<Created> {
+        ScopedFsIds ids(cred, fsuid_mode);
+        mode_t mode = exclusive ? 0 : (attrs.mode.value_or(0644) & 07777);
+        int fd = ::openat(path_fd_, owned.c_str(),
+                          O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC, mode);
+        if (fd < 0 && errno == EEXIST && exclusive) {
+          // Retransmitted EXCLUSIVE create: match the verifier stored in atime/mtime.
+          struct stat st {};
+          if (::fstatat(path_fd_, owned.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+              S_ISREG(st.st_mode)) {
+            int64_t lo = 0, hi = 0;
+            verf_split(verf_copy, lo, hi);
+            if (st.st_atim.tv_sec == lo && st.st_mtim.tv_sec == hi)
+              return created_child_sync(owned);
+          }
+          return Err(errno_from(EEXIST));
+        }
+        if (fd < 0) return Err(errno_from(errno));
+        if (exclusive) {
+          int64_t lo = 0, hi = 0;
+          verf_split(verf_copy, lo, hi);
+          timespec times[2] = {{static_cast<time_t>(lo), 0}, {static_cast<time_t>(hi), 0}};
+          if (::futimens(fd, times) < 0) {
+            int e = errno;
+            ::close(fd);
+            (void)::unlinkat(path_fd_, owned.c_str(), 0);
+            return Err(errno_from(e));
+          }
+        } else {
+          (void)::fchmod(fd, mode);  // exact mode regardless of process umask
+          if (attrs.size && ::ftruncate(fd, static_cast<off_t>(*attrs.size)) < 0) {
+            int e = errno;
+            ::close(fd);
+            return Err(errno_from(e));
+          }
+        }
+        LocalBackend::apply_created_owner(fd, cred);
+        auto attr = backend_.attr_from_fd(fd);
+        if (!attr) {
+          ::close(fd);
+          return Err(attr.error());
+        }
+        auto obj = backend_.object_from_fd(fd, child_path(relative_, owned));
+        if (!obj) return Err(obj.error());
+        return Created{std::move(*obj), *attr};
+      });
+}
+
+rt::Task<Result<Created>> LocalObject::mkdir(const Cred& cred, std::string_view name,
+                                             const SetAttr& attrs) {
+  if (!LocalBackend::valid_name(name)) co_return Err(errno_from(EINVAL));
+  auto dir_ok = co_await require_dir_write(cred);
+  if (!dir_ok) co_return Err(dir_ok.error());
+  std::string owned(name);
+  mode_t mode = attrs.mode.value_or(0755) & 07777;
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  co_return co_await rt::offload([this, cred, owned, mode, fsuid_mode]() -> Result<Created> {
+    ScopedFsIds ids(cred, fsuid_mode);
+    if (::mkdirat(path_fd_, owned.c_str(), mode) < 0) return Err(errno_from(errno));
+    auto created = created_child_sync(owned);
+    if (!created) return created;
+    int fd = ::openat(path_fd_, owned.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0) {
+      (void)::fchmod(fd, mode);
+      LocalBackend::apply_created_owner(fd, cred);
+      ::close(fd);
+    }
+    return created;
+  });
+}
+
+rt::Task<Result<Created>> LocalObject::symlink(const Cred& cred, std::string_view name,
+                                               std::string_view target, const SetAttr&) {
+  if (!LocalBackend::valid_name(name)) co_return Err(errno_from(EINVAL));
+  if (target.empty() || target.find('\0') != std::string_view::npos)
+    co_return Err(errno_from(EINVAL));
+  auto dir_ok = co_await require_dir_write(cred);
+  if (!dir_ok) co_return Err(dir_ok.error());
+  std::string owned(name), owned_target(target);
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  co_return co_await rt::offload(
+      [this, cred, owned, owned_target, fsuid_mode]() -> Result<Created> {
+        ScopedFsIds ids(cred, fsuid_mode);
+        if (::symlinkat(owned_target.c_str(), path_fd_, owned.c_str()) < 0)
+          return Err(errno_from(errno));
+        if (cred.uid != 0 &&
+            ::fchownat(path_fd_, owned.c_str(), cred.uid, cred.gid,
+                       AT_SYMLINK_NOFOLLOW) < 0 &&
+            errno != EPERM) {
+        }
+        return created_child_sync(owned);
+      });
+}
+
+rt::Task<Result<Created>> LocalObject::mknod(const Cred& cred, std::string_view name,
+                                             FType ftype, DevT dev, const SetAttr& attrs) {
+  if (!LocalBackend::valid_name(name)) co_return Err(errno_from(EINVAL));
+  mode_t type_bits = 0;
+  switch (ftype) {
+    case FType::kChr: type_bits = S_IFCHR; break;
+    case FType::kBlk: type_bits = S_IFBLK; break;
+    case FType::kSock: type_bits = S_IFSOCK; break;
+    case FType::kFifo: type_bits = S_IFIFO; break;
+    default: co_return Err(errno_from(EINVAL));
+  }
+  auto dir_ok = co_await require_dir_write(cred);
+  if (!dir_ok) co_return Err(dir_ok.error());
+  std::string owned(name);
+  mode_t mode = (attrs.mode.value_or(0644) & 07777) | type_bits;
+  dev_t rdev = makedev(dev.major, dev.minor);
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  co_return co_await rt::offload(
+      [this, cred, owned, mode, rdev, fsuid_mode]() -> Result<Created> {
+        ScopedFsIds ids(cred, fsuid_mode);
+        if (::mknodat(path_fd_, owned.c_str(), mode, rdev) < 0)
+          return Err(errno_from(errno));
+        if (cred.uid != 0 &&
+            ::fchownat(path_fd_, owned.c_str(), cred.uid, cred.gid,
+                       AT_SYMLINK_NOFOLLOW) < 0 &&
+            errno != EPERM) {
+        }
+        return created_child_sync(owned);
+      });
+}
+
+rt::Task<Result<void>> LocalObject::unlink(const Cred& cred, std::string_view name) {
+  if (!LocalBackend::valid_name(name)) co_return Err(errno_from(EINVAL));
+  auto dir_ok = co_await require_dir_write(cred);
+  if (!dir_ok) co_return Err(dir_ok.error());
+  std::string owned(name);
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  co_return co_await rt::offload([this, cred, owned, fsuid_mode]() -> Result<void> {
+    ScopedFsIds ids(cred, fsuid_mode);
+    if (::unlinkat(path_fd_, owned.c_str(), 0) < 0) {
+      // POSIX says EISDIR; v3 maps directory removal via REMOVE differently than files.
+      return Err(errno_from(errno));
+    }
+    return {};
+  });
+}
+
+rt::Task<Result<void>> LocalObject::rmdir(const Cred& cred, std::string_view name) {
+  if (!LocalBackend::valid_name(name)) co_return Err(errno_from(EINVAL));
+  auto dir_ok = co_await require_dir_write(cred);
+  if (!dir_ok) co_return Err(dir_ok.error());
+  std::string owned(name);
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  co_return co_await rt::offload([this, cred, owned, fsuid_mode]() -> Result<void> {
+    ScopedFsIds ids(cred, fsuid_mode);
+    if (::unlinkat(path_fd_, owned.c_str(), AT_REMOVEDIR) < 0)
+      return Err(errno_from(errno));
+    return {};
+  });
+}
+
+rt::Task<Result<void>> LocalObject::rename(const Cred& cred, std::string_view from,
+                                           Object& dst_dir, std::string_view to) {
+  if (!LocalBackend::valid_name(from) || !LocalBackend::valid_name(to))
+    co_return Err(errno_from(EINVAL));
+  auto* dst = dynamic_cast<LocalObject*>(&dst_dir);
+  if (!dst || &dst->backend_ != &backend_) co_return Err(errno_from(EXDEV));
+  auto src_ok = co_await require_dir_write(cred);
+  if (!src_ok) co_return Err(src_ok.error());
+  auto dst_ok = co_await dst->require_dir_write(cred);
+  if (!dst_ok) co_return Err(dst_ok.error());
+  std::string owned_from(from), owned_to(to);
+  int dst_fd = dst->path_fd_;
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  co_return co_await rt::offload(
+      [this, cred, owned_from, owned_to, dst_fd, fsuid_mode]() -> Result<void> {
+        ScopedFsIds ids(cred, fsuid_mode);
+        if (::renameat2(path_fd_, owned_from.c_str(), dst_fd, owned_to.c_str(), 0) < 0)
+          return Err(errno_from(errno));
+        return {};
+      });
+}
+
+rt::Task<Result<void>> LocalObject::link(const Cred& cred, Object& file,
+                                         std::string_view name) {
+  if (!LocalBackend::valid_name(name)) co_return Err(errno_from(EINVAL));
+  auto* target = dynamic_cast<LocalObject*>(&file);
+  if (!target || &target->backend_ != &backend_) co_return Err(errno_from(EXDEV));
+  if (target->type() == FType::kDir) co_return Err(errno_from(EPERM));
+  auto dir_ok = co_await require_dir_write(cred);
+  if (!dir_ok) co_return Err(dir_ok.error());
+  std::string owned(name);
+  int target_fd = target->path_fd_;
+  bool fsuid_mode = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  co_return co_await rt::offload([this, cred, owned, target_fd, fsuid_mode]() -> Result<void> {
+    ScopedFsIds ids(cred, fsuid_mode);
+    if (::linkat(target_fd, "", path_fd_, owned.c_str(), AT_EMPTY_PATH) == 0) return {};
+    if (errno != EPERM && errno != EINVAL && errno != ENOENT)
+      return Err(errno_from(errno));
+    // AT_EMPTY_PATH linkat needs CAP_DAC_READ_SEARCH; the /proc alias works unprivileged.
+    if (::linkat(AT_FDCWD, proc_fd_path(target_fd).c_str(), path_fd_, owned.c_str(),
+                 AT_SYMLINK_FOLLOW) < 0)
+      return Err(errno_from(errno));
+    return {};
+  });
+}
+
+rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
+                                              std::span<const std::byte> in,
+                                              Stability stability) {
+  if (type() == FType::kDir) co_return Err(errno_from(EISDIR));
+  if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
+  if (backend_.cfg_.identity != LocalBackend::Identity::kSetFsuid) {
+    auto allowed = co_await access(ctx.cred, Access::kModify);
+    if (!allowed) co_return Err(allowed.error());
+    if (!allowed->has(Access::kModify)) {
+      // v3 open-less owner relaxation, mirroring read (nfsv3/04 §6).
+      auto attr = co_await getattr();
+      if (!attr) co_return Err(attr.error());
+      if (ctx.cred.uid != attr->uid) co_return Err(errno_from(EACCES));
+    }
+  }
+  auto ref = co_await backend_.fd_cache_->acquire(id(), true);
+  if (!ref) co_return Err(ref.error());
+  int fd = (*ref)->fd;
+  size_t done = 0;
+  while (done < in.size()) {
+    int n = co_await rt::uring_write(fd, in.subspan(done), off + done);
+    if (n < 0) co_return Err(errno_from_neg(n));
+    if (n == 0) co_return Err(errno_from(EIO));
+    done += static_cast<size_t>(n);
+  }
+  if (stability != Stability::kUnstable) {
+    int rc = co_await rt::uring_fsync(fd, stability == Stability::kDataSync);
+    if (rc < 0) {
+      backend_.poison(id());
+      co_return Err(errno_from_neg(rc));
+    }
+  }
+  co_return static_cast<uint32_t>(done);
+}
+
+rt::Task<Result<void>> LocalObject::commit(OpenCtx, uint64_t, uint64_t) {
+  if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
+  // Sticky writeback-error contract (06 §6.2): once fsync failed, keep failing.
+  if (backend_.is_poisoned(id())) co_return Err(errno_from(EIO));
+  auto ref = co_await backend_.fd_cache_->acquire(id(), false);
+  if (!ref) co_return Err(ref.error());
+  int rc = co_await rt::uring_fsync((*ref)->fd, true);
+  if (rc < 0) {
+    backend_.poison(id());
+    co_return Err(errno_from_neg(rc));
+  }
+  co_return Result<void>{};
 }
 
 namespace {
@@ -527,6 +1014,10 @@ std::unique_ptr<Backend> make_local(const BackendConfig& cfg) {
   }
   if (auto it = cfg.values.find("readdir_enrich"); it != cfg.values.end())
     local.enrich_readdir = it->second != "false";
+  if (auto it = cfg.values.find("identity"); it != cfg.values.end()) {
+    if (it->second == "strict") local.identity = LocalBackend::Identity::kStrict;
+    else if (it->second == "setfsuid") local.identity = LocalBackend::Identity::kSetFsuid;
+  }
   auto made = LocalBackend::create(std::move(local));
   return made ? std::move(*made) : nullptr;
 }

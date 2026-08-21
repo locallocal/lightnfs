@@ -1,16 +1,24 @@
+#include <sys/stat.h>
+
+#include <chrono>
 #include <csignal>
 #include <condition_variable>
 #include <cstdio>
+#include <format>
 #include <mutex>
 #include <string>
 #include <thread>
 
+#include "core/boot_epoch.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
 #include "core/obj_lock.hpp"
 #include "mountd/mount3.hpp"
 #include "nfsv3/engine.hpp"
+#include "obs/metrics.hpp"
+#include "rpc/drc.hpp"
 #include "runtime/runtime.hpp"
+#include "server/ctl.hpp"
 #include "server/rpcbind.hpp"
 #include "transport/listener.hpp"
 #include "util/log.hpp"
@@ -34,8 +42,8 @@ lnfs::Result<void> run_backend_hook(lnfs::rt::Reactor& reactor,
         {
           std::lock_guard lock(*mu);
           *done = true;
+          cv->notify_one();  // under the lock: the waiter cannot destroy cv first
         }
-        cv->notify_one();
       }(std::move(task), &mu, &cv, &done, &result),
       reactor);
   std::unique_lock lock(mu);
@@ -46,6 +54,9 @@ lnfs::Result<void> run_backend_hook(lnfs::rt::Reactor& reactor,
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Clients dictate creation modes over the wire; the server's own umask must not
+  // subtract bits (the backend applies requested modes exactly).
+  umask(0);
   std::string config_path = "/etc/lightnfs/lightnfs.toml";
   bool check_only = false;
   for (int i = 1; i < argc; ++i) {
@@ -88,6 +99,14 @@ int main(int argc, char** argv) {
   auto exports = std::move(*exports_result);
   key->bind(*exports);
 
+  auto epoch = lnfs::core::bump_boot_epoch(server_cfg.state_dir);
+  if (!epoch) {
+    LNFS_ERROR("cannot persist boot epoch: {}", lnfs::errno_name(epoch.error()));
+    return 1;
+  }
+
+  lnfs::init_async_logging();
+
   lnfs::rt::Runtime runtime({.reactors = server_cfg.reactors,
                              .offload_threads = server_cfg.offload_threads});
   runtime.start();
@@ -101,9 +120,22 @@ int main(int argc, char** argv) {
     }
   }
 
+  lnfs::rpc::Drc drc({.ttl = std::chrono::milliseconds(server_cfg.drc_ttl_ms),
+                      .max_memory = server_cfg.drc_mem});
+  lnfs::obs::register_text_provider([&drc](std::string& out) {
+    auto s = drc.stats();
+    out += std::format(
+        "lightnfs_drc_inserts_total {}\nlightnfs_drc_replays_total {}\n"
+        "lightnfs_drc_waits_total {}\nlightnfs_drc_evictions_total {}\n"
+        "lightnfs_drc_entries {}\nlightnfs_drc_bytes {}\n",
+        s.inserts, s.replays, s.waits, s.evictions, s.entries, s.bytes);
+  });
+
   lnfs::rpc::Dispatcher dispatcher;
   lnfs::core::ObjLockRegistry locks;
   lnfs::nfsv3::Engine nfs(*exports, *key, locks);
+  nfs.set_write_verifier(lnfs::core::verifier_from_epoch(*epoch));
+  nfs.set_drc(&drc);
   lnfs::mountd::Mount3 mount(*exports, *key);
   nfs.register_with(dispatcher);
   mount.register_with(dispatcher);
@@ -112,6 +144,7 @@ int main(int argc, char** argv) {
   transport_cfg.max_request_size = server_cfg.max_request_size;
   transport_cfg.max_inflight_per_conn = server_cfg.inflight_per_conn;
   transport_cfg.max_connections = server_cfg.max_connections;
+  transport_cfg.per_peer_limit = server_cfg.per_peer_limit;
   auto nfs_listener = lnfs::transport::Listener::create(server_cfg.port, transport_cfg,
                                                          dispatcher, runtime);
   auto mount_listener = lnfs::transport::Listener::create(server_cfg.mount_port, transport_cfg,
@@ -125,6 +158,22 @@ int main(int argc, char** argv) {
   }
   lnfs::rt::spawn((*nfs_listener)->run(), runtime.reactor(0));
   lnfs::rt::spawn((*mount_listener)->run(), runtime.reactor(0));
+
+  std::string ctl_path = server_cfg.ctl_socket.empty()
+                             ? server_cfg.state_dir + "/ctl.sock"
+                             : server_cfg.ctl_socket;
+  auto ctl = lnfs::server::CtlServer::create(
+      ctl_path, {.exports = exports.get(), .drc = &drc});
+  if (ctl) lnfs::rt::spawn((*ctl)->run(), runtime.reactor(0));
+  else LNFS_WARN("ctl socket unavailable at {}: {}", ctl_path, lnfs::errno_name(ctl.error()));
+
+  lnfs::Result<std::unique_ptr<lnfs::server::MetricsHttp>> metrics_http =
+      lnfs::Err(lnfs::errno_from(ENODEV));
+  if (server_cfg.metrics_port != 0) {
+    metrics_http = lnfs::server::MetricsHttp::create(server_cfg.metrics_port);
+    if (metrics_http) lnfs::rt::spawn((*metrics_http)->run(), runtime.reactor(0));
+    else LNFS_WARN("metrics port {} unavailable", server_cfg.metrics_port);
+  }
 
   if (server_cfg.rpcbind) {
     auto nfs_reg = lnfs::server::rpcbind_set(lnfs::nfsv3::kProgram, lnfs::nfsv3::kVersion,
@@ -143,6 +192,8 @@ int main(int argc, char** argv) {
 
   (*nfs_listener)->request_stop();
   (*mount_listener)->request_stop();
+  if (ctl) (*ctl)->request_stop();
+  if (metrics_http) (*metrics_http)->request_stop();
   if (server_cfg.rpcbind) {
     (void)lnfs::server::rpcbind_unset(lnfs::nfsv3::kProgram, lnfs::nfsv3::kVersion);
     (void)lnfs::server::rpcbind_unset(lnfs::mountd::kProgram, lnfs::mountd::kVersion);
@@ -151,5 +202,6 @@ int main(int argc, char** argv) {
     (void)run_backend_hook(runtime.reactor(0), entry->backend->stop());
   runtime.stop_and_join();
   LNFS_INFO("lightnfs stopped");
+  lnfs::shutdown_async_logging();
   return 0;
 }

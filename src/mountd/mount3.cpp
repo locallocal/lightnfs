@@ -1,5 +1,7 @@
 #include "mountd/mount3.hpp"
 
+#include "obs/metrics.hpp"
+
 #include <cerrno>
 
 #include "transport/connection.hpp"
@@ -54,6 +56,7 @@ void Mount3::register_with(rpc::Dispatcher& dispatcher) {
 
 rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call,
                                 const rpc::Cred& rpc_cred) {
+  obs::Metrics::instance().mount_calls.fetch_add(1, std::memory_order_relaxed);
   if (call.proc > 5) {
     xdr::XdrEnc enc(ctx.pool);
     rpc::encode_reply_accepted_err(enc, call.xid, rpc::kProcUnavail);
