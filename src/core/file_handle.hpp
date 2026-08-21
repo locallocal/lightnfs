@@ -27,6 +27,19 @@ class FileHandleCodec {
                                const sockaddr_storage& peer) const;
   void bind(ExportTable& exports) { exports_ = &exports; }
 
+  // v4 namespace decode (design 04 §4.3): fsid 0 is the pseudo-fs — browsable from any
+  // source, no export/IP check (that happens when crossing into an export); fsid != 0
+  // resolves the export and enforces the client CIDR like v3.
+  struct DecodedV4 {
+    uint32_t fsid = 0;
+    backend::ObjId oid;
+    ExportEntry* exp = nullptr;  // null for pseudo handles
+  };
+  Result<DecodedV4> decode_v4(std::span<const std::byte> fh,
+                              const sockaddr_storage& peer) const;
+  // Encode with an explicit fsid (0 = pseudo).
+  std::vector<std::byte> encode_raw(uint32_t fsid, const backend::ObjId& oid) const;
+
   // Offline decode for lightnfs-fh (design 08 §8.6): no export table, no IP checks.
   struct Inspection {
     uint8_t version = 0;

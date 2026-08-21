@@ -20,6 +20,13 @@ struct Cred {
   uint32_t gid = 65534;
   SmallVec<uint32_t, 16> gids;
   AuthFlavor flavor = AuthFlavor::kNone;
+  std::string machine;  // AUTH_SYS machinename (v4 principal comparisons)
+
+  // v4 principal identity (RFC 8881 CLID_IN_USE checks): flavor + machine + uid.
+  std::string principal() const {
+    return std::to_string(static_cast<uint32_t>(flavor)) + "/" + machine + "/" +
+           std::to_string(uid);
+  }
 };
 
 class Authenticator {

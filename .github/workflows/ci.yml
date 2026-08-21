@@ -85,6 +85,23 @@ jobs:
       - name: real-mount rw acceptance (cthon b/g/s + fsx 50k ops + kill -9 recovery)
         run: scripts/accept_m2_vm.sh 50000
 
+  # Phase-3 v4.1 read-only acceptance (development plan §5.4): loopback userspace v4.1
+  # client walk + v3/v4 dual-read consistency + pynfs session groups, then a real
+  # vers=4.1,ro mount with a v3/v4 dual-mount comparison on the runner VM.
+  m3-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev ninja-build nfs-common python3-ply
+      - name: loopback v4.1 acceptance (v4walk + dual-read + pynfs sessions + ASAN)
+        run: scripts/accept_m3_local.sh
+      - name: real-mount acceptance (vers=4.1,ro + v3/v4 dual mount)
+        run: scripts/accept_m3_vm.sh
+
   fuzz-short:
     runs-on: ubuntu-latest
     steps:

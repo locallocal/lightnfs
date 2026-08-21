@@ -133,13 +133,14 @@ std::vector<std::byte> read_record(int fd) {
 // ---------- RPC call/reply ----------
 
 std::vector<std::byte> build_call(BufferPool& pool, uint32_t xid, uint32_t prog,
-                                  uint32_t proc, const std::vector<std::byte>& body) {
+                                  uint32_t proc, const std::vector<std::byte>& body,
+                                  uint32_t vers = kVers) {
   XdrEnc enc(pool);
   enc.u32(xid);
   enc.u32(0);  // CALL
   enc.u32(2);  // RPC v2
   enc.u32(prog);
-  enc.u32(kVers);
+  enc.u32(vers);
   enc.u32(proc);
   enc.u32(1);  // AUTH_SYS
   XdrEnc cred(pool);
@@ -159,7 +160,8 @@ std::vector<std::byte> build_call(BufferPool& pool, uint32_t xid, uint32_t prog,
 // Parses the reply header; returns accept_stat (0 = success), fatals on structural error.
 uint32_t parse_reply_header(XdrDec& dec, uint32_t expect_xid) {
   auto xid = dec.u32();
-  if (!xid || *xid != expect_xid) fatal("reply xid mismatch");
+  if (!xid || *xid != expect_xid)
+    fatal("reply xid mismatch: got %#x want %#x", xid ? *xid : 0u, expect_xid);
   if (!dec.u32() || !dec.u32()) fatal("truncated reply header");  // mtype, reply_stat
   auto flavor = dec.u32();
   auto vlen = dec.u32();
@@ -571,6 +573,18 @@ void walk_dir(Client& c, const Fh& dir_fh, const fs::path& local, uint32_t chunk
         if (target != fs::read_symlink(child).string())
           fatal("%s: symlink target mismatch '%s'", child.c_str(), target.c_str());
         ++st.symlinks;
+        break;
+      }
+      case 3:   // BLK
+      case 4:   // CHR
+      case 6:   // SOCK
+      case 7: {  // FIFO
+        auto ftype = fs::symlink_status(child).type();
+        bool ok = (attr.type == 3 && ftype == fs::file_type::block) ||
+                  (attr.type == 4 && ftype == fs::file_type::character) ||
+                  (attr.type == 6 && ftype == fs::file_type::socket) ||
+                  (attr.type == 7 && ftype == fs::file_type::fifo);
+        if (!ok) fatal("%s: special-file type mismatch", child.c_str());
         break;
       }
       default:
@@ -1230,6 +1244,415 @@ int cmd_connstorm(const char* host, uint16_t nfs_port, int count, int pipeline_d
   return 0;
 }
 
+// ---------- NFSv4.1 acceptance (phase 3) ----------
+
+namespace v4 {
+
+constexpr uint32_t kOpAccess = 3, kOpClose = 4, kOpGetattr = 9, kOpGetfh = 10,
+                   kOpLookup = 15, kOpOpen = 18, kOpPutfh = 22, kOpPutrootfh = 24,
+                   kOpRead = 25, kOpReaddir = 26, kOpReadlink = 27,
+                   kOpExchangeId = 42, kOpCreateSession = 43, kOpDestroySession = 44,
+                   kOpSequence = 53, kOpDestroyClientid = 57, kOpReclaimComplete = 58;
+constexpr uint32_t kAttrType = 1, kAttrSize = 4, kAttrFilehandle = 19, kAttrFileid = 20;
+
+struct V4Client {
+  Client rpc;
+  uint64_t clientid = 0;
+  std::array<std::byte, 16> sessionid{};
+  uint32_t slot_seq = 1;
+
+  explicit V4Client(const char* host, uint16_t port) : rpc(host, port) {}
+
+  // Raw COMPOUND exchange; returns the reply payload past the RPC header.
+  std::vector<std::byte> compound(const std::vector<std::byte>& body) {
+    uint32_t xid = rpc.next_xid++;
+    send_record(rpc.fd, build_call(rpc.pool, xid, kNfsProg, 1, body, 4));
+    auto wire = read_record(rpc.fd);
+    XdrDec dec(std::span<const std::byte>(wire.data(), wire.size()));
+    if (parse_reply_header(dec, xid) != 0) fatal("v4: rpc-level error");
+    return {wire.end() - dec.remaining(), wire.end()};
+  }
+
+  // Runs a compound, checks overall status, returns a decoder past {status,tag,count}.
+  struct Res {
+    std::vector<std::byte> bytes;
+    uint32_t status = 0;
+    XdrDec dec{std::span<const std::byte>{}};
+  };
+  Res run(const std::vector<std::byte>& body, uint32_t expect = 0,
+          bool check = true) {
+    Res out;
+    out.bytes = compound(body);
+    out.dec = XdrDec(std::span<const std::byte>(out.bytes.data(), out.bytes.size()));
+    out.status = ru32(out.dec);
+    (void)out.dec.opaque(1024);  // tag
+    (void)ru32(out.dec);         // resarray count
+    if (check && out.status != expect)
+      fatal("v4 compound: status %u (expected %u)", out.status, expect);
+    return out;
+  }
+
+  static void expect_op(XdrDec& d, uint32_t op, uint32_t status = 0) {
+    uint32_t code = ru32(d);
+    if (code != op) fatal("v4: resop %u where %u expected", code, op);
+    uint32_t got = ru32(d);
+    if (got != status) fatal("v4: op %u status %u (expected %u)", op, got, status);
+  }
+  static void skip_sequence_res(XdrDec& d) {
+    expect_op(d, kOpSequence);
+    d.skip(16 + 5 * 4);
+  }
+
+  void establish() {
+    BufferPool& pool = rpc.pool;
+    XdrEnc ex(pool);
+    ex.u32(0);
+    ex.u32(1);
+    ex.u32(1);
+    ex.u32(kOpExchangeId);
+    std::array<std::byte, 8> verf{std::byte{0x42}};
+    ex.opaque_fixed(verf);
+    ex.string("lightnfs-accept-v4");
+    ex.u32(0);
+    ex.u32(0);  // SP4_NONE
+    ex.u32(0);  // no impl id
+    auto r = run(ex.take().to_bytes());
+    expect_op(r.dec, kOpExchangeId);
+    clientid = ru64(r.dec);
+    uint32_t seq = ru32(r.dec);
+
+    XdrEnc cs(pool);
+    cs.u32(0);
+    cs.u32(1);
+    cs.u32(1);
+    cs.u32(kOpCreateSession);
+    cs.u64(clientid);
+    cs.u32(seq);
+    cs.u32(0);
+    for (int chan = 0; chan < 2; ++chan) {
+      cs.u32(0);          // headerpad
+      cs.u32(1u << 20);   // maxreq
+      cs.u32(1u << 20);   // maxresp
+      cs.u32(8u << 10);   // maxresp cached
+      cs.u32(16);         // maxops
+      cs.u32(16);         // slots
+      cs.u32(0);          // rdma_ird
+    }
+    cs.u32(0x40000000);
+    cs.u32(1);
+    cs.u32(0);  // AUTH_NONE cb cred
+    auto c = run(cs.take().to_bytes());
+    expect_op(c.dec, kOpCreateSession);
+    auto sid = c.dec.opaque_fixed(16);
+    if (!sid) fatal("v4: bad sessionid");
+    std::copy(sid->begin(), sid->end(), sessionid.begin());
+
+    // RECLAIM_COMPLETE like a real client finishing recovery.
+    XdrEnc rc(pool);
+    seq_header(rc, 1);
+    rc.u32(kOpReclaimComplete);
+    rc.boolean(false);
+    auto rr = run(rc.take().to_bytes(), 0, false);
+    (void)rr;
+  }
+
+  void seq_header(XdrEnc& enc, uint32_t extra_ops, bool cachethis = false,
+                  std::optional<uint32_t> force_seq = std::nullopt) {
+    enc.u32(0);  // tag
+    enc.u32(1);  // minorversion
+    enc.u32(1 + extra_ops);
+    enc.u32(kOpSequence);
+    enc.opaque_fixed(sessionid);
+    enc.u32(force_seq.value_or(slot_seq));
+    if (!force_seq) slot_seq++;
+    enc.u32(0);  // slot 0
+    enc.u32(0);  // highest
+    enc.boolean(cachethis);
+  }
+
+  void destroy() {
+    XdrEnc ds(rpc.pool);
+    ds.u32(0);
+    ds.u32(1);
+    ds.u32(1);
+    ds.u32(kOpDestroySession);
+    ds.opaque_fixed(sessionid);
+    (void)run(ds.take().to_bytes());
+    XdrEnc dc(rpc.pool);
+    dc.u32(0);
+    dc.u32(1);
+    dc.u32(1);
+    dc.u32(kOpDestroyClientid);
+    dc.u64(clientid);
+    (void)run(dc.take().to_bytes());
+  }
+};
+
+struct V4Entry {
+  std::string name;
+  uint32_t type = 0;
+  uint64_t size = 0;
+  std::vector<std::byte> fh;
+};
+
+// Parses a fattr4 that requested {type,size,filehandle,fileid}.
+void parse_entry_attrs(XdrDec& d, V4Entry& out) {
+  uint32_t words = ru32(d);
+  uint32_t w0 = words > 0 ? ru32(d) : 0;
+  for (uint32_t i = 1; i < words; ++i) (void)ru32(d);
+  uint32_t vals_len = ru32(d);
+  size_t before = d.remaining();
+  if (w0 & (1u << kAttrType)) out.type = ru32(d);
+  if (w0 & (1u << kAttrSize)) out.size = ru64(d);
+  if (w0 & (1u << kAttrFilehandle)) {
+    auto fh = d.opaque(128);
+    if (!fh) fatal("v4: bad entry fh");
+    out.fh.assign(fh->begin(), fh->end());
+  }
+  if (w0 & (1u << kAttrFileid)) (void)ru64(d);
+  size_t consumed = before - d.remaining();
+  if (consumed < vals_len) d.skip(vals_len - consumed);
+}
+
+std::vector<std::byte> lookup_path(V4Client& c,
+                                   const std::vector<std::string>& components) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2 + (uint32_t)components.size());
+  ops.u32(kOpPutrootfh);
+  for (const auto& comp : components) {
+    ops.u32(kOpLookup);
+    ops.string(comp);
+  }
+  ops.u32(kOpGetfh);
+  auto r = c.run(ops.take().to_bytes());
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutrootfh);
+  for (size_t i = 0; i < components.size(); ++i) V4Client::expect_op(r.dec, kOpLookup);
+  V4Client::expect_op(r.dec, kOpGetfh);
+  auto fh = r.dec.opaque(128);
+  if (!fh) fatal("v4: bad path fh");
+  return {fh->begin(), fh->end()};
+}
+
+std::vector<std::byte> v4_read_all(V4Client& c, const std::vector<std::byte>& dir_fh,
+                                   const std::string& name, uint64_t size) {
+  // OPEN(CLAIM_NULL) -> READ loop -> CLOSE, like a kernel client.
+  XdrEnc open_ops(c.rpc.pool);
+  c.seq_header(open_ops, 3);
+  open_ops.u32(kOpPutfh);
+  open_ops.opaque(dir_fh);
+  open_ops.u32(kOpOpen);
+  open_ops.u32(0);
+  open_ops.u32(1);  // READ
+  open_ops.u32(0);
+  open_ops.u64(c.clientid);
+  open_ops.string("accept-owner");
+  open_ops.u32(0);  // NOCREATE
+  open_ops.u32(0);  // CLAIM_NULL
+  open_ops.string(name);
+  open_ops.u32(kOpGetfh);
+  auto r = c.run(open_ops.take().to_bytes());
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  V4Client::expect_op(r.dec, kOpOpen);
+  uint32_t sid_seq = ru32(r.dec);
+  auto sid_other = r.dec.opaque_fixed(12);
+  if (!sid_other) fatal("v4: bad open stateid");
+  std::array<std::byte, 12> other{};
+  std::copy(sid_other->begin(), sid_other->end(), other.begin());
+  rbool(r.dec);
+  ru64(r.dec);
+  ru64(r.dec);
+  ru32(r.dec);  // rflags
+  uint32_t maskw = ru32(r.dec);
+  for (uint32_t i = 0; i < maskw; ++i) (void)ru32(r.dec);
+  ru32(r.dec);  // delegation none
+  V4Client::expect_op(r.dec, kOpGetfh);
+  auto file_fh_span = r.dec.opaque(128);
+  std::vector<std::byte> file_fh(file_fh_span->begin(), file_fh_span->end());
+
+  std::vector<std::byte> data;
+  bool eof = size == 0;
+  while (!eof) {
+    XdrEnc rd(c.rpc.pool);
+    c.seq_header(rd, 2);
+    rd.u32(kOpPutfh);
+    rd.opaque(file_fh);
+    rd.u32(kOpRead);
+    rd.u32(sid_seq);
+    rd.opaque_fixed(other);
+    rd.u64(data.size());
+    rd.u32(65536);
+    auto rr = c.run(rd.take().to_bytes());
+    V4Client::skip_sequence_res(rr.dec);
+    V4Client::expect_op(rr.dec, kOpPutfh);
+    V4Client::expect_op(rr.dec, kOpRead);
+    eof = rbool(rr.dec);
+    auto chunk = rr.dec.opaque(1u << 20);
+    if (!chunk) fatal("v4: bad read data");
+    data.insert(data.end(), chunk->begin(), chunk->end());
+    if (chunk->empty() && !eof) fatal("v4: empty read without eof");
+    if (data.size() > size) fatal("v4: read beyond expected size");
+  }
+
+  XdrEnc cl(c.rpc.pool);
+  c.seq_header(cl, 2);
+  cl.u32(kOpPutfh);
+  cl.opaque(file_fh);
+  cl.u32(kOpClose);
+  cl.u32(0);
+  cl.u32(sid_seq);
+  cl.opaque_fixed(other);
+  auto cr = c.run(cl.take().to_bytes());
+  (void)cr;
+  return data;
+}
+
+void v4_walk_dir(V4Client& c, const std::vector<std::byte>& dir_fh,
+                 const fs::path& local, size_t& dirs, size_t& files, size_t& bytes) {
+  ++dirs;
+  std::unordered_set<std::string> local_names;
+  for (const auto& e : fs::directory_iterator(local))
+    local_names.insert(e.path().filename().string());
+
+  std::vector<V4Entry> entries;
+  uint64_t cookie = 0;
+  bool eof = false;
+  while (!eof) {
+    XdrEnc ops(c.rpc.pool);
+    c.seq_header(ops, 2);
+    ops.u32(kOpPutfh);
+    ops.opaque(dir_fh);
+    ops.u32(kOpReaddir);
+    ops.u64(cookie);
+    std::array<std::byte, 8> verf{};
+    ops.opaque_fixed(verf);
+    ops.u32(1u << 16);
+    ops.u32(1u << 17);
+    ops.u32(1);  // bitmap: one word
+    ops.u32((1u << kAttrType) | (1u << kAttrSize) | (1u << kAttrFilehandle) |
+            (1u << kAttrFileid));
+    auto r = c.run(ops.take().to_bytes());
+    V4Client::skip_sequence_res(r.dec);
+    V4Client::expect_op(r.dec, kOpPutfh);
+    V4Client::expect_op(r.dec, kOpReaddir);
+    (void)r.dec.opaque_fixed(8);
+    size_t page = 0;
+    while (rbool(r.dec)) {
+      V4Entry ent;
+      cookie = ru64(r.dec);
+      auto name = r.dec.string(255);
+      if (!name) fatal("v4: bad readdir name");
+      ent.name = std::string(*name);
+      parse_entry_attrs(r.dec, ent);
+      entries.push_back(std::move(ent));
+      ++page;
+    }
+    eof = rbool(r.dec);
+    if (!eof && page == 0) fatal("v4: empty readdir page without eof");
+  }
+
+  if (entries.size() != local_names.size())
+    fatal("%s: v4 lists %zu entries, backing has %zu", local.c_str(), entries.size(),
+          local_names.size());
+  for (auto& ent : entries) {
+    if (!local_names.count(ent.name))
+      fatal("%s: v4 entry '%s' missing locally", local.c_str(), ent.name.c_str());
+    fs::path child = local / ent.name;
+    if (ent.type == 2) {  // DIR
+      if (ent.fh.empty()) fatal("v4: dir entry without fh");
+      v4_walk_dir(c, ent.fh, child, dirs, files, bytes);
+    } else if (ent.type == 1) {  // REG
+      if (fs::file_size(child) != ent.size)
+        fatal("%s: v4 size mismatch", child.c_str());
+      if (ent.size > 0 && ent.size <= (4u << 20)) {
+        auto remote = v4_read_all(c, dir_fh, ent.name, ent.size);
+        if (remote != read_local(child)) fatal("%s: v4 content mismatch", child.c_str());
+        bytes += remote.size();
+      }
+      ++files;
+    } else if (ent.type == 5) {  // LNK
+      XdrEnc rl(c.rpc.pool);
+      c.seq_header(rl, 2);
+      rl.u32(kOpPutfh);
+      rl.opaque(ent.fh);
+      rl.u32(kOpReadlink);
+      auto rr = c.run(rl.take().to_bytes());
+      V4Client::skip_sequence_res(rr.dec);
+      V4Client::expect_op(rr.dec, kOpPutfh);
+      V4Client::expect_op(rr.dec, kOpReadlink);
+      auto target = rr.dec.string(1024);
+      if (!target || *target != fs::read_symlink(child).string())
+        fatal("%s: v4 symlink mismatch", child.c_str());
+    }
+  }
+}
+
+}  // namespace v4
+
+// Full v4.1 read-only acceptance: session, pseudo-root navigation, recursive walk with
+// byte verification, exactly-once slot replay, negative checks.
+int cmd_v4walk(const char* host, uint16_t nfs_port, const std::string& export_path,
+               const fs::path& backing) {
+  v4::V4Client c(host, nfs_port);
+
+  // minorversion 0 must be rejected before anything else.
+  {
+    XdrEnc bad(c.rpc.pool);
+    bad.u32(0);
+    bad.u32(0);  // minorversion 0
+    bad.u32(1);
+    bad.u32(v4::kOpPutrootfh);
+    auto r = c.run(bad.take().to_bytes(), 10021);  // MINOR_VERS_MISMATCH
+    (void)r;
+  }
+
+  c.establish();
+
+  // Navigate the pseudo root down the export path components.
+  std::vector<std::string> components;
+  {
+    std::string rest = export_path;
+    size_t pos = 0;
+    while (pos < rest.size()) {
+      while (pos < rest.size() && rest[pos] == '/') ++pos;
+      size_t end = rest.find('/', pos);
+      if (pos < rest.size())
+        components.push_back(rest.substr(pos, end == std::string::npos ? std::string::npos
+                                                                       : end - pos));
+      if (end == std::string::npos) break;
+      pos = end + 1;
+    }
+  }
+  auto export_root = v4::lookup_path(c, components);
+
+  size_t dirs = 0, files = 0, bytes = 0;
+  v4::v4_walk_dir(c, export_root, backing, dirs, files, bytes);
+
+  // Exactly-once: a verbatim retransmission (same xid, same slot/seq) must be
+  // answered with the original reply bytes.
+  {
+    XdrEnc ops(c.rpc.pool);
+    c.seq_header(ops, 2, true);
+    ops.u32(v4::kOpPutrootfh);
+    ops.u32(v4::kOpGetfh);
+    auto body = ops.take().to_bytes();
+    uint32_t xid = c.rpc.next_xid++;
+    auto record = build_call(c.rpc.pool, xid, kNfsProg, 1, body, 4);
+    send_record(c.rpc.fd, record);
+    auto first = read_record(c.rpc.fd);
+    send_record(c.rpc.fd, record);  // byte-identical retransmission
+    auto second = read_record(c.rpc.fd);
+    if (first != second) fatal("v4: slot replay bytes differ");
+  }
+
+  c.destroy();
+  std::printf("accept_client v4walk OK: %zu dirs, %zu files (%zu bytes verified) via "
+              "vers=4.1 sessions; pseudo-root crossing, slot replay and negative "
+              "checks passed\n", dirs, files, bytes);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1269,5 +1692,7 @@ int main(int argc, char** argv) {
     return cmd_crash_recover(host, nfs_port, mount_port, export_path, argv[6], argv[7]);
   if (cmd == "connstorm" && argc == 7)
     return cmd_connstorm(host, nfs_port, atoi(argv[5]), atoi(argv[6]));
+  if (cmd == "v4walk" && argc == 7)
+    return cmd_v4walk(host, nfs_port, export_path, argv[6]);
   return usage();
 }

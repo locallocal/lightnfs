@@ -22,6 +22,7 @@ class AuthSys final : public Authenticator {
     if (!dec.u32()) return Err(errno_from(EACCES));  // stamp
     auto name = dec.string(255);
     if (!name) return Err(errno_from(EACCES));
+    out.machine = std::string(*name);
     auto uid = dec.u32();
     auto gid = dec.u32();
     auto ngids = dec.u32();

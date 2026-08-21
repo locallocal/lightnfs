@@ -42,6 +42,7 @@ struct ServerConfig {
   int per_peer_limit = 128;
   uint64_t drc_ttl_ms = 120000;
   uint64_t drc_mem = 64u << 20;
+  bool enable_v4 = true;
   std::string ctl_socket;   // default: <state_dir>/ctl.sock; "" resolves at startup
   uint16_t metrics_port = 0;  // 0 = disabled
 };

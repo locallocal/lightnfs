@@ -16,7 +16,10 @@
 #include "core/file_handle.hpp"
 #include "core/obj_lock.hpp"
 #include "mountd/mount3.hpp"
+#include "core/pseudofs.hpp"
 #include "nfsv3/engine.hpp"
+#include "nfsv4/engine.hpp"
+#include "state/state_mgr.hpp"
 #include "rpc/dispatch.hpp"
 #include "runtime/reactor.hpp"
 #include "runtime/testing/fake_ring.hpp"
@@ -81,6 +84,11 @@ extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
   mountd::Mount3 mount(exports, handles);
   nfs.register_with(disp);
   mount.register_with(disp);
+  // v4.1 stack: COMPOUND decode surface + session/state machinery (phase 3).
+  core::PseudoFs pseudo(exports);
+  state::StateMgr state({.boot_epoch = 1, .state_dir = "/tmp/lnfs-fuzz-state"});
+  nfsv4::Engine nfs4(exports, handles, locks, pseudo, state);
+  nfs4.register_with(disp);
 
   BufferChain rec;
   if (size > 0) {
