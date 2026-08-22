@@ -116,6 +116,19 @@ const char* op_name(uint32_t op) {
     case Op::kSequence: return "SEQUENCE";
     case Op::kTestStateid: return "TEST_STATEID";
     case Op::kDestroyClientid: return "DESTROY_CLIENTID";
+    case Op::kAllocate: return "ALLOCATE";
+    case Op::kCopy: return "COPY";
+    case Op::kCopyNotify: return "COPY_NOTIFY";
+    case Op::kDeallocate: return "DEALLOCATE";
+    case Op::kIoAdvise: return "IO_ADVISE";
+    case Op::kLayouterror: return "LAYOUTERROR";
+    case Op::kLayoutstats: return "LAYOUTSTATS";
+    case Op::kOffloadCancel: return "OFFLOAD_CANCEL";
+    case Op::kOffloadStatus: return "OFFLOAD_STATUS";
+    case Op::kReadPlus: return "READ_PLUS";
+    case Op::kSeek: return "SEEK";
+    case Op::kWriteSame: return "WRITE_SAME";
+    case Op::kClone: return "CLONE";
     case Op::kReclaimComplete: return "RECLAIM_COMPLETE";
     default: return "?";
   }

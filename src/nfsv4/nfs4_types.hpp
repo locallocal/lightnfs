@@ -64,10 +64,32 @@ enum class Op : uint32_t {
   kTestStateid = 55,
   kDestroyClientid = 57,
   kReclaimComplete = 58,
+  // NFSv4.2 (RFC 7862 §13) — only reachable with minorversion=2.
+  kAllocate = 59,
+  kCopy = 60,
+  kCopyNotify = 61,
+  kDeallocate = 62,
+  kIoAdvise = 63,
+  kLayouterror = 64,
+  kLayoutstats = 65,
+  kOffloadCancel = 66,
+  kOffloadStatus = 67,
+  kReadPlus = 68,
+  kSeek = 69,
+  kWriteSame = 70,
+  kClone = 71,
   kIllegal = 10044,
 };
 inline constexpr uint32_t kFirstOp = 3;
+inline constexpr uint32_t kLastOp41 = 58;     // 4.1 ceiling; beyond -> ILLEGAL at minor 1
 inline constexpr uint32_t kLastKnownOp = 71;  // 4.2 ceiling; beyond -> ILLEGAL
+// Minor versions served: 1 and 2 (decision D5 keeps 0 rejected).  4.2 adds ops only;
+// sessions, state and stateids are shared verbatim (RFC 7862 §1.4).
+inline bool minor_supported(uint32_t minor) { return minor == 1 || minor == 2; }
+inline uint32_t last_op_for(uint32_t minor) { return minor >= 2 ? kLastKnownOp : kLastOp41; }
+
+// SEEK data_content4 (RFC 7862 §13.12).
+inline constexpr uint32_t kContentData = 0, kContentHole = 1;
 
 // ---- status codes (nfsv4 research 10) ----
 enum class Status : uint32_t {
@@ -146,6 +168,10 @@ enum class Status : uint32_t {
   kClientidBusy = 10074,
   kBadHighSlot = 10077,
   kWrongType = 10083,
+  // NFSv4.2 (RFC 7862 §11.1)
+  kUnionNotsupp = 10090,
+  kOffloadDenied = 10091,
+  kOffloadNoReqs = 10094,
 };
 
 // ---- core wire structures ----

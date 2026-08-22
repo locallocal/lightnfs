@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Regenerates the syscall allowlist for the systemd unit's seccomp filter by running a
-# real server through strace during a full v3 + v4.1 (read/write/lock) workload
+# real server through strace during a full v3 + v4.1 (read/write/lock) + v4.2 (sparse/
+# copy/clone) workload
 # (security checklist §8.5 item 7).  Prints the sorted syscall set; compare it against
 # packaging/systemd/lightnfs.service after any runtime change.
 #
@@ -38,6 +39,7 @@ strace -f -qq -e trace=all -o "$work/strace.log" \
 srv=$!
 for _ in $(seq 1 100); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
 "$build/lnfs_accept_client" v4rw   127.0.0.1 "$port" "$mount_port" "$work/data" "$work/data" >/dev/null
+"$build/lnfs_accept_client" v42    127.0.0.1 "$port" "$mount_port" "$work/data" "$work/data" >/dev/null
 "$build/lnfs_accept_client" v4walk 127.0.0.1 "$port" "$mount_port" "$work/data" "$work/data" >/dev/null
 "$build/lnfs_accept_client" walk   127.0.0.1 "$port" "$mount_port" "$work/data" "$work/data" >/dev/null
 kill -INT "$srv" 2>/dev/null || true

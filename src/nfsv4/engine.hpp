@@ -1,12 +1,14 @@
 #pragma once
-// NFSv4.1 engine (design 04 §4.5, phase-4 read-write scope): COMPOUND interpreter with
+// NFSv4.1/4.2 engine (design 04 §4.5): COMPOUND interpreter with
 // CFH/SFH registers, stop-on-first-error semantics, response-size budgeting, session
 // integration (SEQUENCE slots via state::StateMgr), the full open-state operation set
 // (OPEN claim NULL/FH/PREVIOUS with create modes, CLOSE, OPEN_DOWNGRADE), stateid-
 // checked IO (READ/WRITE/COMMIT/SETATTR) and the namespace ops (CREATE/REMOVE/RENAME/
-// LINK).  Write verifier = boot epoch (shared with v3: one restart signal).
+// LINK), byte-range locks (LOCK/LOCKT/LOCKU) and, at minorversion 2, the v4.2 sweets
+// (SEEK/ALLOCATE/DEALLOCATE, synchronous intra-server COPY, CLONE — phase 6, RFC 7862).
+// Write verifier = boot epoch (shared with v3: one restart signal).
 // minorversion 0 is permanently rejected (decision D5); unimplemented ops answer
-// NOTSUPP, unknown opcodes answer OP_ILLEGAL.
+// NOTSUPP, opcodes beyond the minor version's table answer OP_ILLEGAL.
 
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
@@ -46,6 +48,7 @@ class Engine {
     transport::ConnCtx& conn;
     const rpc::Cred& cred;
     FhBytes cfh, sfh;
+    uint32_t minor = 1;  // 1 or 2; gates the v4.2 opcode range
     bool session = false;
     state::SessionId sessionid{};
     uint32_t slotid = 0, seqid = 0;
@@ -100,6 +103,18 @@ class Engine {
   rt::Task<uint32_t> op_free_stateid(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_test_stateid(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_reclaim_complete(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+
+  // v4.2 (RFC 7862 §15): regular-file target resolved from CFH (and SFH for the two
+  // two-file ops), stateid-checked like READ/WRITE, capability-gated (NOTSUPP when the
+  // backend lacks the bit).
+  rt::Task<uint32_t> op_seek(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+  rt::Task<uint32_t> op_allocate(Ctx&, xdr::XdrDec&, xdr::XdrEnc&, bool deallocate);
+  rt::Task<uint32_t> op_copy(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+  rt::Task<uint32_t> op_clone(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+  // Resolves a filehandle register to a regular file on an export (pseudo/dir ->
+  // ISDIR, other types -> WRONG_TYPE); `*status` carries the v4 code on failure.
+  rt::Task<Result<Resolved>> resolve_regular(Ctx&, const FhBytes& fh, Op op,
+                                             uint32_t* status);
 
   // Sessionless (solo-compound) operations.
   rt::Task<uint32_t> op_exchange_id(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);

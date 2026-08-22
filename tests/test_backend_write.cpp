@@ -10,7 +10,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <condition_variable>
+#include <vector>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -228,6 +230,104 @@ TEST(BackendWrite, NamespaceOpsAndFdCacheUpgrade) {
     EXPECT_EQ(*r, 1u);
     auto stats = be.fd_cache_stats();
     EXPECT_TRUE(stats.misses >= 1);
+  }
+  runtime.stop_and_join();
+}
+
+// Phase 6 (development plan §8 item 1): the v4.2 backend contract on a real filesystem.
+// Capability bits come from the startup probe; the test asserts behavior consistent with
+// them (tmpfs/ext4: sparse + copy yes; clone only on XFS-reflink/Btrfs).
+TEST(BackendWrite, V42SparseCopyClone) {
+  TmpTree tree;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  {
+    auto made = backend::LocalBackend::create({.path = tree.path, .fsid = 5});
+    ASSERT_TRUE(made.has_value());
+    auto& be = **made;
+    auto caps = be.caps();
+    EXPECT_TRUE(caps.has(backend::Cap::kCopyRange));  // pread/pwrite fallback always
+    auto root = run_runtime(runtime, be.root());
+    ASSERT_TRUE(root.has_value());
+    auto cred = self_cred();
+    backend::OpenCtx open{cred, nullptr};
+
+    backend::SetAttr attrs;
+    attrs.mode = 0644;
+    auto src = run_runtime(runtime, (*root)->create(cred, "src", attrs, nullptr));
+    auto dst = run_runtime(runtime, (*root)->create(cred, "dst", attrs, nullptr));
+    ASSERT_TRUE(src.has_value() && dst.has_value());
+    std::vector<std::byte> block(1 << 16);
+    for (size_t i = 0; i < block.size(); ++i) block[i] = static_cast<std::byte>(i * 7);
+    // Two 64 KiB data blocks with a 64 KiB gap written as zeroes by extension.
+    ASSERT_TRUE(run_runtime(runtime, src->obj->write(open, 0, block, backend::Stability::kUnstable)).has_value());
+    ASSERT_TRUE(run_runtime(runtime, src->obj->write(open, 2 << 16, block, backend::Stability::kFileSync)).has_value());
+
+    if (caps.has(backend::Cap::kSparseOps)) {
+      // Punch the middle block: size unchanged, reads zero, SEEK reports the hole.
+      auto punched = run_runtime(runtime, src->obj->deallocate(open, 1 << 16, 1 << 16));
+      ASSERT_TRUE(punched.has_value());
+      auto attr = run_runtime(runtime, src->obj->getattr());
+      ASSERT_TRUE(attr.has_value());
+      EXPECT_EQ(attr->size, 3u << 16);
+      auto hole = run_runtime(runtime, src->obj->seek(open, 0, backend::SeekWhat::kHole));
+      ASSERT_TRUE(hole.has_value());
+      EXPECT_TRUE(*hole >= (1u << 16) && *hole <= (2u << 16));  // fs granularity
+      auto data = run_runtime(runtime, src->obj->seek(open, 1 << 16, backend::SeekWhat::kData));
+      ASSERT_TRUE(data.has_value());
+      EXPECT_TRUE(*data >= (1u << 16) && *data <= (2u << 16));
+      auto past = run_runtime(runtime, src->obj->seek(open, 3 << 16, backend::SeekWhat::kData));
+      ASSERT_TRUE(!past.has_value());
+      EXPECT_EQ(raw(past.error()), ENXIO);
+      // ALLOCATE past EOF extends the file.
+      auto grown = run_runtime(runtime, src->obj->allocate(open, 3 << 16, 4096));
+      ASSERT_TRUE(grown.has_value());
+      attr = run_runtime(runtime, src->obj->getattr());
+      EXPECT_EQ(attr->size, (3u << 16) + 4096);
+      ASSERT_TRUE(run_runtime(runtime, src->obj->setattr(cred, backend::SetAttr{.size = 3u << 16})).has_value());
+    }
+
+    // copy_range: whole range through EOF (len 0) and a ranged copy at an offset.
+    auto copied = run_runtime(runtime, src->obj->copy_range(open, *dst->obj, open, 0, 0, 0));
+    ASSERT_TRUE(copied.has_value());
+    EXPECT_EQ(*copied, 3u << 16);
+    auto ranged = run_runtime(runtime, src->obj->copy_range(open, *dst->obj, open, 2 << 16, 3 << 16, 100));
+    ASSERT_TRUE(ranged.has_value());
+    EXPECT_EQ(*ranged, 100u);
+    {
+      std::vector<std::byte> a((3u << 16) + 100), b((3u << 16) + 100);
+      bool eof = false;
+      auto ra = run_runtime(runtime, src->obj->read(open, 0, a, eof));
+      auto rb = run_runtime(runtime, dst->obj->read(open, 0, b, eof));
+      ASSERT_TRUE(ra.has_value() && rb.has_value());
+      EXPECT_EQ(*ra, 3u << 16);
+      EXPECT_EQ(*rb, (3u << 16) + 100);
+      EXPECT_TRUE(std::equal(a.begin(), a.begin() + (3u << 16), b.begin()));
+      EXPECT_TRUE(std::equal(b.begin() + (3u << 16), b.end(), a.begin() + (2u << 16)));
+    }
+    // clone: honored iff the probe said so; otherwise the kernel refuses and the errno
+    // is one the CLONE whitelist carries (NOTSUPP / INVAL / XDEV).
+    auto cl = run_runtime(runtime, (*root)->create(cred, "clone", attrs, nullptr));
+    ASSERT_TRUE(cl.has_value());
+    auto cloned = run_runtime(runtime, src->obj->clone(open, *cl->obj, open, 0, 0, 0));
+    if (caps.has(backend::Cap::kCloneRange)) {
+      ASSERT_TRUE(cloned.has_value());
+      auto attr = run_runtime(runtime, cl->obj->getattr());
+      EXPECT_EQ(attr->size, 3u << 16);
+    } else {
+      ASSERT_TRUE(!cloned.has_value());
+      int e = raw(cloned.error());
+      EXPECT_TRUE(e == EOPNOTSUPP || e == EINVAL || e == EXDEV);
+    }
+    // Cross-backend copy/clone is EXDEV at the boundary.
+    auto other = backend::LocalBackend::create({.path = tree.path, .fsid = 6});
+    ASSERT_TRUE(other.has_value());
+    auto oroot = run_runtime(runtime, (*other)->root());
+    auto far = run_runtime(runtime, (*oroot)->create(cred, "far", attrs, nullptr));
+    ASSERT_TRUE(far.has_value());
+    auto xdev = run_runtime(runtime, src->obj->copy_range(open, *far->obj, open, 0, 0, 1));
+    ASSERT_TRUE(!xdev.has_value());
+    EXPECT_EQ(raw(xdev.error()), EXDEV);
   }
   runtime.stop_and_join();
 }

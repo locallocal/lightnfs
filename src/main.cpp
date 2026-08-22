@@ -122,6 +122,10 @@ int main(int argc, char** argv) {
       runtime.stop_and_join();
       return 1;
     }
+    auto caps = entry->backend->caps();
+    LNFS_INFO("export {} v4.2 capabilities: seek/allocate={} copy={} clone={}", entry->path,
+              caps.has(lnfs::backend::Cap::kSparseOps), caps.has(lnfs::backend::Cap::kCopyRange),
+              caps.has(lnfs::backend::Cap::kCloneRange));
   }
 
   lnfs::rpc::Drc drc({.ttl = std::chrono::milliseconds(server_cfg.drc_ttl_ms),

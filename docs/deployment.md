@@ -1,6 +1,6 @@
 # 部署与运维（v1 发布）
 
-lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1，读写），面向"受信网络内导出本地目录树"
+lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面向"受信网络内导出本地目录树"
 的场景。本文是发布运维的落地指南：信任边界、最小特权部署、配置要点、可观测性与已知限制。
 
 ## 1. 安全信任边界（务必先读）
@@ -28,8 +28,9 @@ lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1，读写），面向"�
   `NoNewPrivileges`；
 - 文件系统沙箱：`ProtectSystem=strict` + 仅 `state_dir` 与显式列出的导出树可写；
 - seccomp 白名单：`@system-service` 去掉高危集，再显式加入 io_uring 与句柄系统调用
-  （允许集由 `scripts/gen_seccomp_allowlist.sh` 从真实 v3+v4.1 读写+锁负载的 strace 生成，
-  运行时若变更需复核）。
+  （允许集由 `scripts/gen_seccomp_allowlist.sh` 从真实 v3+v4.1 读写+锁+v4.2 稀疏/拷贝负载
+  的 strace 生成，运行时若变更需复核；v4.2 用到的 `lseek`/`fallocate`/`copy_file_range`/
+  `ioctl(FICLONERANGE)` 与探测用 `openat(O_TMPFILE)` 均在 `@system-service` 内，无需额外放行）。
 
 ```bash
 sudo useradd --system --home /var/lib/lightnfs --shell /usr/sbin/nologin lightnfs
@@ -84,6 +85,11 @@ sudo systemctl enable --now lightnfs
 - **仅 AUTH_SYS**：无 krb5/RPCSEC_GSS（见 §1）。
 - **不实现 NLM/NSM**：v3 无字节锁（设计 D8）。v4.1 有完整字节锁；**v3 与 v4 同挂一后端时，
   v3 写不受 v4 的 share deny / 字节锁约束**（v3 侧本无锁语义，文档明示的边界）。
+- **v4.2 按 op 宣告**：启动时对每个导出探测 `kSparseOps`/`kCopyRange`/`kCloneRange` 并写
+  日志（`export <path> v4.2 capabilities: …`）；无能力位的 op 回 NOTSUPP，Linux 客户端自动
+  降级（`cp --reflink=auto` 退到 COPY 再退到读写）。不做异步/跨服 COPY、READ_PLUS、xattr、
+  sec_label（见 [m6-v42-sweets.md](m6-v42-sweets.md)）。CLONE 仅在 XFS(reflink=1)/Btrfs 导出
+  上可用。
 - **无委托、无 pNFS、无 SECINFO(带名之外) 的多 flavor**：SECINFO/SECINFO_NO_NAME 恒返回
   `[AUTH_SYS]`（AUTH_SYS-only 服务器的合规简化，永不发 WRONGSEC）。
 - **句柄稳定性**：`handles="auto"` 在无 `CAP_DAC_READ_SEARCH` 且文件系统无 STATX_BTIME

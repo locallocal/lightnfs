@@ -307,7 +307,93 @@ class MemoryBackend::MemoryObject final : public Object {
     co_return Result<void>{};  // memory is as stable as it gets
   }
 
+  // ---- v4.2 sweets (design 05 §5.x: kSparseOps / kCopyRange / kCloneRange) ----
+  // A byte vector has no holes: SEEK treats every byte inside [0,size) as data and the
+  // implicit hole at EOF as the only hole, exactly what lseek(2) reports for a dense
+  // file.  DEALLOCATE zeroes (never shrinks); ALLOCATE extends with zeroes.
+
+  rt::Task<Result<uint64_t>> seek(OpenCtx ctx, uint64_t off, SeekWhat what) override {
+    auto gate = co_await io_gate(ctx, /*write=*/false);
+    if (!gate) co_return Err(gate.error());
+    std::lock_guard lock(backend_.mu_);
+    uint64_t size = node_->data.size();
+    if (off >= size) co_return Err(errno_from(ENXIO));
+    co_return what == SeekWhat::kData ? off : size;
+  }
+
+  rt::Task<Result<void>> allocate(OpenCtx ctx, uint64_t off, uint64_t len) override {
+    auto gate = co_await io_gate(ctx, /*write=*/true);
+    if (!gate) co_return Err(gate.error());
+    std::lock_guard lock(backend_.mu_);
+    if (off + len > node_->data.size()) {
+      node_->data.resize(static_cast<size_t>(off + len));
+      touch();
+    }
+    co_return Result<void>{};
+  }
+
+  rt::Task<Result<void>> deallocate(OpenCtx ctx, uint64_t off, uint64_t len) override {
+    auto gate = co_await io_gate(ctx, /*write=*/true);
+    if (!gate) co_return Err(gate.error());
+    std::lock_guard lock(backend_.mu_);
+    uint64_t size = node_->data.size();
+    if (off < size) {
+      uint64_t end = std::min<uint64_t>(size, off + len);
+      std::fill(node_->data.begin() + static_cast<size_t>(off),
+                node_->data.begin() + static_cast<size_t>(end), std::byte{0});
+      touch();
+    }
+    co_return Result<void>{};
+  }
+
+  rt::Task<Result<void>> clone(OpenCtx sctx, Object& dst, OpenCtx dctx, uint64_t soff,
+                               uint64_t doff, uint64_t len) override {
+    auto copied = co_await copy_range(sctx, dst, dctx, soff, doff, len);
+    if (!copied) co_return Err(copied.error());
+    co_return Result<void>{};
+  }
+
+  rt::Task<Result<uint64_t>> copy_range(OpenCtx sctx, Object& dst, OpenCtx dctx,
+                                        uint64_t soff, uint64_t doff, uint64_t len) override {
+    auto* target = dynamic_cast<MemoryObject*>(&dst);
+    if (!target || &target->backend_ != &backend_) co_return Err(errno_from(EXDEV));
+    auto sgate = co_await io_gate(sctx, false);
+    if (!sgate) co_return Err(sgate.error());
+    auto dgate = co_await target->io_gate(dctx, true);
+    if (!dgate) co_return Err(dgate.error());
+    std::lock_guard lock(backend_.mu_);
+    uint64_t ssize = node_->data.size();
+    if (soff >= ssize) co_return 0;  // nothing to copy at/after EOF
+    uint64_t n = std::min<uint64_t>(len, ssize - soff);
+    std::vector<std::byte> chunk(node_->data.begin() + static_cast<size_t>(soff),
+                                 node_->data.begin() + static_cast<size_t>(soff + n));
+    auto& out = target->node_->data;
+    if (doff + n > out.size()) out.resize(static_cast<size_t>(doff + n));
+    std::copy(chunk.begin(), chunk.end(), out.begin() + static_cast<size_t>(doff));
+    target->touch();
+    co_return n;
+  }
+
  private:
+  // Regular-file precondition + permission gate shared by the v4.2 ops (same owner
+  // relaxation as read/write).
+  rt::Task<Result<void>> io_gate(OpenCtx ctx, bool write) {
+    if (type() == FType::kDir) co_return Err(errno_from(EISDIR));
+    if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
+    auto allowed = co_await access(ctx.cred, write ? Access::kModify : Access::kRead);
+    if (!allowed) co_return Err(allowed.error());
+    if (!allowed->has(write ? Access::kModify : Access::kRead) &&
+        ctx.cred.uid != node_->attr.uid)
+      co_return Err(errno_from(EACCES));
+    co_return Result<void>{};
+  }
+  void touch() {  // callers hold backend_.mu_
+    node_->attr.size = node_->data.size();
+    node_->attr.used = node_->data.size();
+    node_->attr.mtime = node_->attr.ctime = backend_.now();
+    node_->attr.change = static_cast<uint64_t>(node_->attr.ctime.sec);
+  }
+
   MemoryBackend& backend_;
   std::shared_ptr<Node> node_;
 };
@@ -324,7 +410,8 @@ MemoryBackend::MemoryBackend(uint64_t fsid) : fsid_(fsid), root_(std::make_share
 Caps MemoryBackend::caps() const {
   Caps out;
   return out.set(Cap::kSymlink).set(Cap::kHardlink).set(Cap::kMknod)
-      .set(Cap::kStableHandles);
+      .set(Cap::kStableHandles).set(Cap::kSparseOps).set(Cap::kCopyRange)
+      .set(Cap::kCloneRange);
 }
 
 Timespec MemoryBackend::now() { return Timespec{tick_++, 0}; }

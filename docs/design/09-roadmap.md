@@ -38,7 +38,7 @@
 
 ## 阶段 6（=M8）：甜点与后端扩展（按需排序）
 
-- v4.2 低成本特性：SEEK/ALLOCATE/DEALLOCATE、同步同服 COPY、CLONE（宣告 minorversion=2）
+- ✅ v4.2 低成本特性：SEEK/ALLOCATE/DEALLOCATE、同步同服 COPY、CLONE（宣告 minorversion=2）——开发计划 §8.1
 - 读委托 + 回传通道发送侧（nfsv4/05 §5.6 阶段 2）
 - 第二后端启动（Lustre 或 GlusterFS，按 06 分册映射表实现）——**接口冻结的真实检验**
 - 可选：NLM/NSM（若出现 v3 锁刚需，按 nfsv3/06 §6.6 选项 2）

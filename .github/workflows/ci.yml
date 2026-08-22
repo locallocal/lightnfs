@@ -139,6 +139,23 @@ jobs:
       - name: real-mount acceptance (vers=4.1: cthon lock group + kernel byte-range locks)
         run: scripts/accept_m5_vm.sh 50000
 
+  # Phase-6 v4.2 sweets (development plan §8 item 1): loopback v42 scenario (SEEK/
+  # ALLOCATE/DEALLOCATE/COPY/CLONE byte-verified, ILLEGAL at minor 1) on top of the M5
+  # regression phases; then a real vers=4.2 mount driven by fallocate/cp/copy_file_range.
+  m6-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev ninja-build nfs-common python3-ply
+      - name: loopback v4.2 acceptance (v42 + M5 phases + ASAN)
+        run: scripts/accept_m6_local.sh
+      - name: real-mount acceptance (vers=4.2: sparse + COPY + CLONE/fallback + cthon)
+        run: scripts/accept_m6_vm.sh
+
   fuzz-short:
     runs-on: ubuntu-latest
     steps:
