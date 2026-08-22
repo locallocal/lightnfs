@@ -1,0 +1,93 @@
+# 部署与运维（v1 发布）
+
+lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1，读写），面向"受信网络内导出本地目录树"
+的场景。本文是发布运维的落地指南：信任边界、最小特权部署、配置要点、可观测性与已知限制。
+
+## 1. 安全信任边界（务必先读）
+
+**lightnfs 只支持 AUTH_SYS（含 AUTH_NONE）鉴权。** AUTH_SYS 的 uid/gid 由客户端自行声明，
+服务器无法验证——**这等同于"网络内任意主机可声称任意用户身份"**。因此：
+
+- **只在受信网络部署**（专用存储 VLAN、容器内网、回环）。**严禁裸露公网。**
+- 公网/跨信任域访问**必须**前置加密与身份层：WireGuard / IPsec 隧道，或 stunnel/TLS
+  终止后再转发到 lightnfs 的 2049 端口。lightnfs 自身不做 RPCSEC_GSS/krb5（设计取舍
+  D8；v1 范围外）。
+- 用 `[[export]] clients = [...]` CIDR 白名单收敛来源，用 `squash` 把不受信客户端的
+  root 映射为匿名（默认 `root`；完全不信任时用 `all`）。
+- 句柄经 SipHash-2-4 HMAC 签名（`state_dir/hmac.key`，首启生成，0600），伪造句柄→
+  BADHANDLE；每请求还校验导出 fsid 与来源 IP。**但这防的是伪造句柄，不是伪造身份**——
+  身份边界仍是上面的网络假设。
+
+## 2. 最小特权部署（systemd）
+
+`packaging/systemd/lightnfs.service` 是按安全清单 §8.5 第 7 项写的最小特权单元：
+
+- 专用系统用户 `lightnfs`（对导出树只读/按需读写，自身不拥有系统文件）；
+- 仅两个 capability：`CAP_DAC_READ_SEARCH`（`open_by_handle_at` 稳定句柄，设计 06）与
+  `CAP_NET_BIND_SERVICE`（绑定 2049/20048），其余 `CapabilityBoundingSet` 清空、
+  `NoNewPrivileges`；
+- 文件系统沙箱：`ProtectSystem=strict` + 仅 `state_dir` 与显式列出的导出树可写；
+- seccomp 白名单：`@system-service` 去掉高危集，再显式加入 io_uring 与句柄系统调用
+  （允许集由 `scripts/gen_seccomp_allowlist.sh` 从真实 v3+v4.1 读写+锁负载的 strace 生成，
+  运行时若变更需复核）。
+
+```bash
+sudo useradd --system --home /var/lib/lightnfs --shell /usr/sbin/nologin lightnfs
+sudo install -m755 build-rel/lightnfsd /usr/local/bin/lightnfsd
+sudo install -m755 build-rel/lightnfs-ctl /usr/local/bin/lightnfs-ctl
+sudo install -Dm644 config/lightnfs.toml.example /etc/lightnfs/lightnfs.toml
+sudoedit /etc/lightnfs/lightnfs.toml     # 填导出路径、clients CIDR、squash
+sudo cp packaging/systemd/lightnfs.service /etc/systemd/system/
+# 把每个导出目录树加进单元的 ReadWritePaths=（只读导出用 ReadOnlyPaths=）
+sudo systemd-analyze security lightnfs.service   # 审计沙箱评分
+sudo systemctl enable --now lightnfs
+```
+
+不用 systemd 时，等价地：以非 root 用户运行，仅授予上述两个 capability
+（`setcap 'cap_dac_read_search,cap_net_bind_service=ep' lightnfsd`，或用高位端口免去
+`CAP_NET_BIND_SERVICE`），并用容器/`bwrap` 限制可见文件系统。
+
+## 3. 关键配置
+
+见 `config/lightnfs.toml.example`（每键有注释）。发布前必查：
+
+| 项 | 键 | 说明 |
+|----|----|------|
+| 端口 | `[server] port` / `mount_port` | 默认 2049 / 20048 |
+| 状态目录 | `[server] state_dir` | 存 boot_epoch、hmac.key、grace 名单——**须持久、独占、0700** |
+| 来源白名单 | `[[export]] clients` | CIDR 列表，收敛到受信网段 |
+| 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none` |
+| 只读 | `[[export]] readonly` | 只读导出置 `true` |
+| 租约/宽限 | `[protocol] lease` | v4.1 租约，也是重启后 grace 时长（默认 90s） |
+| courtesy | `[protocol] courtesy_multiplier` | 过期客户端保留 `N×lease`（默认 24），冲突则立即回收 |
+| 资源上限 | `[server]`/`[limits]` 各键 | 连接/在途/请求大小/DRC/fd 缓存均有默认且可配 |
+
+`lightnfsd --check-config --config <file>` 只校验配置不启动。
+
+## 4. 运维与可观测性
+
+- **ctl 套接字**（`state_dir/ctl.sock`，或 `[server] ctl_socket`）：
+  `lightnfs-ctl <cmd>`——`ping`、`metrics`（Prometheus 文本）、`dump-errors`、`drc`、
+  `fdcache`、`state`（v4 状态表：clients/sessions/opens/locks 计数 + 三表 dump）、
+  `expire-client <clientid>`（强制回收某客户端全部状态，排查挂死/泄漏）。
+- **Prometheus**：`[server] metrics_port` 开一个 HTTP 文本端点；关键指标包括
+  `lightnfs_v4_{clients,sessions,opens,files_with_state,courtesy_clients,in_grace,
+  grace_remaining_seconds,lock_states,lock_segments}`、`lightnfs_v4_reclaims_total{reason}`、
+  `lightnfs_v4_lock_denied_total`、`lightnfs_drc_*`、连接/背压计数。
+- **重启恢复**：进程重启后 boot_epoch +1，读 `state_dir/clients/` 名单进入 grace
+  （时长 = lease），仅名单内客户端可 reclaim；名单内全部 RECLAIM_COMPLETE 则提前结束。
+  普通操作在 grace 内收 GRACE 重试。**不要清空 state_dir**，否则客户端无法 reclaim、
+  可能丢未提交写。
+
+## 5. 已知限制（v1）
+
+- **仅 AUTH_SYS**：无 krb5/RPCSEC_GSS（见 §1）。
+- **不实现 NLM/NSM**：v3 无字节锁（设计 D8）。v4.1 有完整字节锁；**v3 与 v4 同挂一后端时，
+  v3 写不受 v4 的 share deny / 字节锁约束**（v3 侧本无锁语义，文档明示的边界）。
+- **无委托、无 pNFS、无 SECINFO(带名之外) 的多 flavor**：SECINFO/SECINFO_NO_NAME 恒返回
+  `[AUTH_SYS]`（AUTH_SYS-only 服务器的合规简化，永不发 WRONGSEC）。
+- **句柄稳定性**：`handles="auto"` 在无 `CAP_DAC_READ_SEARCH` 且文件系统无 STATX_BTIME
+  （如 tmpfs）时，句柄不跨重启稳定——生产用 `CAP_DAC_READ_SEARCH` + 内核句柄，或
+  `handles="kernel"` 强制（启动即校验，不满足则拒绝启动）。
+- **单机网关**：状态在进程内存 + `state_dir` 名单；不做多网关状态共享（后端原生锁接口
+  `native_locks()` 已定型，留待 Lustre/Gluster 后端切换）。

@@ -69,10 +69,6 @@ size_t OtherHash::operator()(const StateOther& other) const noexcept {
   return static_cast<size_t>(h ^ (uint64_t(l) << 17));
 }
 
-size_t FileKeyHash::operator()(const FileKey& k) const noexcept {
-  return backend::ObjIdHash{}(k.oid) ^ (static_cast<size_t>(k.fsid) * 0x9E3779B97F4A7C15ull);
-}
-
 StateMgr::StateMgr(Config cfg) : cfg_(std::move(cfg)) {}
 
 StateMgr::ClientShard& StateMgr::client_shard(uint64_t clientid) {
@@ -585,23 +581,39 @@ rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from
     if (rec->closed) co_return nullptr;  // raced with CLOSE / another reclaim
     rec->closed = true;
     shard.table.erase(rec->other);
-    open_count_.fetch_sub(1, std::memory_order_relaxed);
+    if (rec->type == StateType::kOpen)
+      open_count_.fetch_sub(1, std::memory_order_relaxed);
     released = std::move(rec->bopen);  // under the state shard: IO-path copies are safe
   }
+  FileKey key{rec->fsid, rec->oid};
+  std::vector<StateRef> dependents;  // lock states derived from a closing open
   {
-    FileKey key{rec->fsid, rec->oid};
     FileShard& shard = file_shard(key);
     auto lock = co_await shard.mu.lock();
     auto it = shard.table.find(key);
     if (it != shard.table.end()) {
-      auto& opens = it->second.opens;
-      opens.erase(std::remove(opens.begin(), opens.end(), rec), opens.end());
-      if (opens.empty()) {
+      auto& file = it->second;
+      if (rec->type == StateType::kOpen) {
+        auto& opens = file.opens;
+        opens.erase(std::remove(opens.begin(), opens.end(), rec), opens.end());
+        for (const auto& l : file.locks)
+          if (l->parent_open == rec) dependents.push_back(l);
+      } else {
+        auto& locks = file.locks;
+        locks.erase(std::remove(locks.begin(), locks.end(), rec), locks.end());
+      }
+      if (file.opens.empty() && file.locks.empty()) {
         shard.table.erase(it);
         file_count_.fetch_sub(1, std::memory_order_relaxed);
       }
     }
   }
+  if (rec->type == StateType::kLock) {
+    locks_.release_owner(key, rec->lowner);  // plain mutex table: no shard lock held
+    lock_count_.fetch_sub(1, std::memory_order_relaxed);
+  }
+  // CLOSE releases the byte-range locks held through this open (RFC 8881 §18.2.4).
+  for (const auto& l : dependents) (void)co_await unlink_state(l, from_client);
   if (from_client) {
     ClientShard& shard = clients_[fnv64(rec->client->owner_id) % kShards];
     auto lock = co_await shard.mu.lock();
@@ -797,18 +809,19 @@ rt::Task<StateMgr::IoCheck> StateMgr::check_io(const Stateid& sid, uint64_t clie
     out.bopen = it->second->bopen;
   }
   const StateRec& rec = *out.rec;
+  const StateRec& open = rec.type == StateType::kLock && rec.parent_open ? *rec.parent_open : rec;
   if (rec.client->expired.load(std::memory_order_relaxed)) {
     out.status = as_u32(Status::kExpired);
-  } else if (rec.client->clientid != clientid || rec.fsid != fsid || !(rec.oid == oid) ||
-             rec.type != StateType::kOpen) {
+  } else if (rec.client->clientid != clientid || rec.fsid != fsid || !(rec.oid == oid)) {
     out.status = as_u32(Status::kBadStateid);
   } else if (sid.seqid != 0 && sid.seqid < rec.seqid) {
     out.status = as_u32(Status::kOldStateid);
   } else if (sid.seqid != 0 && sid.seqid > rec.seqid) {
     out.status = as_u32(Status::kBadStateid);
-  } else if ((rec.access & need) == 0) {
+  } else if ((open.access & need) == 0) {
     out.status = as_u32(Status::kOpenmode);
   }
+  if (rec.type == StateType::kLock && out.status == 0) out.bopen = open.bopen;
   co_return out;
 }
 
@@ -912,10 +925,293 @@ rt::Task<uint32_t> StateMgr::free_stateid(const Stateid& sid) {
   if (sid.is_special()) co_return as_u32(Status::kBadStateid);
   if (epoch_of(sid.other) != static_cast<uint32_t>(cfg_.boot_epoch))
     co_return as_u32(Status::kStaleStateid);
-  StateShard& shard = state_shard(sid.other);
-  auto lock = co_await shard.mu.lock();
-  co_return shard.table.contains(sid.other) ? as_u32(Status::kLocksHeld)
-                                            : as_u32(Status::kBadStateid);
+  StateRef rec;
+  {
+    StateShard& shard = state_shard(sid.other);
+    auto lock = co_await shard.mu.lock();
+    auto it = shard.table.find(sid.other);
+    if (it == shard.table.end()) co_return as_u32(Status::kBadStateid);
+    rec = it->second;
+  }
+  // Open stateids are released by CLOSE; a lock stateid can be freed once its ranges
+  // are gone (RFC 8881 §18.38.3), otherwise LOCKS_HELD.
+  if (rec->type != StateType::kLock) co_return as_u32(Status::kLocksHeld);
+  if (locks_.count_owner(FileKey{rec->fsid, rec->oid}, rec->lowner) > 0)
+    co_return as_u32(Status::kLocksHeld);
+  (void)co_await unlink_state(rec, true);
+  co_return 0;
+}
+
+// ---- byte-range locks ------------------------------------------------------
+
+backend::LockOwnerId StateMgr::make_lowner(uint64_t clientid, std::string_view owner) {
+  backend::LockOwnerId id;
+  id.len = 20;
+  std::memcpy(id.bytes.data(), &clientid, 8);
+  uint64_t h = fnv64(owner);
+  std::memcpy(id.bytes.data() + 8, &h, 8);
+  uint32_t len = static_cast<uint32_t>(owner.size());
+  std::memcpy(id.bytes.data() + 16, &len, 4);
+  return id;
+}
+
+void StateMgr::remember_lock_owner(const backend::LockOwnerId& id,
+                                   std::shared_ptr<ClientRec> client, std::string owner) {
+  std::lock_guard g(lock_owner_mu_);
+  lock_owners_[std::string(reinterpret_cast<const char*>(id.bytes.data()), id.len)] =
+      LockOwnerRec{std::move(client), std::move(owner)};
+}
+
+std::optional<StateMgr::LockOwnerRec> StateMgr::find_lock_owner(
+    const backend::LockOwnerId& id) {
+  std::lock_guard g(lock_owner_mu_);
+  auto it = lock_owners_.find(
+      std::string(reinterpret_cast<const char*>(id.bytes.data()), id.len));
+  if (it == lock_owners_.end()) return std::nullopt;
+  return it->second;
+}
+
+rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
+  LockResult out;
+  auto client = co_await find_client(args.clientid);
+  if (!client || !client->confirmed) {
+    out.status = as_u32(Status::kStaleClientid);
+    co_return out;
+  }
+  if (client->expired.load(std::memory_order_relaxed)) {
+    out.status = as_u32(Status::kExpired);
+    co_return out;
+  }
+  bool reclaim_done;
+  {
+    ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
+    auto lock = co_await shard.mu.lock();
+    reclaim_done = client->reclaim_complete;
+  }
+  if (args.reclaim) {  // same grace gate as OPEN(CLAIM_PREVIOUS)
+    if (!in_grace() || reclaim_done) {
+      out.status = as_u32(Status::kNoGrace);
+      co_return out;
+    }
+    if (!in_stable_list(client->owner_id)) {
+      out.status = as_u32(Status::kReclaimBad);
+      co_return out;
+    }
+  } else if (in_grace() || !reclaim_done) {
+    out.status = as_u32(Status::kGrace);
+    co_return out;
+  }
+
+  // Resolve the lock-owner and its anchoring open state.
+  StateRef open_rec, lock_rec;
+  std::string owner_bytes;
+  if (args.new_owner) {
+    if (args.open_stateid.is_special() ||
+        epoch_of(args.open_stateid.other) != static_cast<uint32_t>(cfg_.boot_epoch)) {
+      out.status = args.open_stateid.is_special() ? as_u32(Status::kBadStateid)
+                                                  : as_u32(Status::kStaleStateid);
+      co_return out;
+    }
+    {
+      StateShard& shard = state_shard(args.open_stateid.other);
+      auto lock = co_await shard.mu.lock();
+      auto it = shard.table.find(args.open_stateid.other);
+      if (it != shard.table.end()) open_rec = it->second;
+    }
+    if (!open_rec || open_rec->type != StateType::kOpen || open_rec->client != client ||
+        open_rec->fsid != args.fsid || !(open_rec->oid == args.oid)) {
+      out.status = as_u32(Status::kBadStateid);
+      co_return out;
+    }
+    uint32_t s = args.open_stateid.seqid;
+    if (s != 0 && s < open_rec->seqid) {
+      out.status = as_u32(Status::kOldStateid);
+      co_return out;
+    }
+    if (s != 0 && s > open_rec->seqid) {
+      out.status = as_u32(Status::kBadStateid);
+      co_return out;
+    }
+    owner_bytes = args.owner;
+  } else {
+    if (args.lock_stateid.is_special() ||
+        epoch_of(args.lock_stateid.other) != static_cast<uint32_t>(cfg_.boot_epoch)) {
+      out.status = args.lock_stateid.is_special() ? as_u32(Status::kBadStateid)
+                                                  : as_u32(Status::kStaleStateid);
+      co_return out;
+    }
+    {
+      StateShard& shard = state_shard(args.lock_stateid.other);
+      auto lock = co_await shard.mu.lock();
+      auto it = shard.table.find(args.lock_stateid.other);
+      if (it != shard.table.end()) lock_rec = it->second;
+    }
+    if (!lock_rec || lock_rec->type != StateType::kLock || lock_rec->client != client ||
+        lock_rec->fsid != args.fsid || !(lock_rec->oid == args.oid)) {
+      out.status = as_u32(Status::kBadStateid);
+      co_return out;
+    }
+    uint32_t s = args.lock_stateid.seqid;
+    if (s != 0 && s < lock_rec->seqid) {
+      out.status = as_u32(Status::kOldStateid);
+      co_return out;
+    }
+    if (s != 0 && s > lock_rec->seqid) {
+      out.status = as_u32(Status::kBadStateid);
+      co_return out;
+    }
+    open_rec = lock_rec->parent_open;
+    owner_bytes = lock_rec->owner;
+  }
+  // The lock type must be covered by the open's access mode (RFC 8881 §18.10.3).
+  uint32_t need = args.exclusive ? kShareWrite : kShareRead;
+  if (!open_rec || open_rec->closed || (open_rec->access & need) == 0) {
+    out.status = as_u32(Status::kOpenmode);
+    co_return out;
+  }
+  backend::LockOwnerId lowner = make_lowner(args.clientid, owner_bytes);
+  FileKey key{args.fsid, args.oid};
+  backend::LockRange range{args.offset, args.length};
+
+  // Arbitrate; a conflict held by a courtesy client reclaims it first (07 §7.4).
+  for (int attempt = 0;; ++attempt) {
+    auto conflict = locks_.lock(key, lowner, range, args.exclusive);
+    if (!conflict) break;
+    auto holder = find_lock_owner(conflict->owner);
+    if (holder && holder->client->courtesy.load(std::memory_order_relaxed) && attempt < 8) {
+      (void)co_await expire_client_impl(holder->client->clientid, kReasonConflict);
+      continue;
+    }
+    if (holder && holder->client->expired.load(std::memory_order_relaxed) && attempt < 8) {
+      co_await rt::sleep_for(std::chrono::milliseconds(1));  // reclaim chain in flight
+      continue;
+    }
+    lock_denied_.fetch_add(1, std::memory_order_relaxed);
+    out.status = as_u32(Status::kDenied);
+    out.denied.offset = conflict->range.offset;
+    out.denied.length = conflict->range.length;
+    out.denied.exclusive = conflict->exclusive;
+    if (holder) {
+      out.denied.clientid = holder->client->clientid;
+      out.denied.owner = holder->owner;
+    }
+    co_return out;
+  }
+  remember_lock_owner(lowner, client, owner_bytes);
+
+  // Granted: reuse the (lock-owner, file) stateid or mint one.
+  bool created = false;
+  {
+    FileShard& shard = file_shard(key);
+    auto lock = co_await shard.mu.lock();
+    auto& file = shard.table[key];
+    if (!lock_rec) {
+      for (const auto& l : file.locks)
+        if (!l->closed && same_owner(l->lowner, lowner)) lock_rec = l;
+    }
+    if (!lock_rec) {
+      lock_rec = std::make_shared<StateRec>();
+      lock_rec->type = StateType::kLock;
+      lock_rec->other = new_other(StateType::kLock);
+      lock_rec->client = client;
+      lock_rec->fsid = args.fsid;
+      lock_rec->oid = args.oid;
+      lock_rec->owner = owner_bytes;
+      lock_rec->lowner = lowner;
+      lock_rec->parent_open = open_rec;
+      lock_rec->seqid = 0;  // bumped below
+      if (file.opens.empty() && file.locks.empty())
+        file_count_.fetch_add(1, std::memory_order_relaxed);
+      file.locks.push_back(lock_rec);
+      created = true;
+    }
+    lock_rec->seqid += 1;
+  }
+  if (created) {
+    {
+      StateShard& shard = state_shard(lock_rec->other);
+      auto lock = co_await shard.mu.lock();
+      shard.table[lock_rec->other] = lock_rec;
+      lock_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool dead;
+    {
+      ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
+      auto lock = co_await shard.mu.lock();
+      dead = client->expired.load(std::memory_order_relaxed);
+      if (!dead) client->states.insert(lock_rec->other);
+    }
+    if (dead) {
+      (void)co_await unlink_state(lock_rec, false);
+      out.status = as_u32(Status::kExpired);
+      co_return out;
+    }
+  }
+  out.stateid.seqid = lock_rec->seqid;
+  out.stateid.other = lock_rec->other;
+  co_return out;
+}
+
+rt::Task<StateMgr::LockResult> StateMgr::lockt(uint64_t clientid, uint32_t fsid,
+                                               const backend::ObjId& oid, std::string owner,
+                                               bool exclusive, uint64_t offset,
+                                               uint64_t length) {
+  LockResult out;
+  auto client = co_await find_client(clientid);
+  if (!client || !client->confirmed) {
+    out.status = as_u32(Status::kStaleClientid);
+    co_return out;
+  }
+  backend::LockOwnerId lowner = make_lowner(clientid, owner);
+  FileKey key{fsid, oid};
+  for (int attempt = 0;; ++attempt) {
+    auto conflict = locks_.test(key, &lowner, {offset, length}, exclusive);
+    if (!conflict) co_return out;
+    auto holder = find_lock_owner(conflict->owner);
+    if (holder && holder->client->courtesy.load(std::memory_order_relaxed) && attempt < 8) {
+      (void)co_await expire_client_impl(holder->client->clientid, kReasonConflict);
+      continue;
+    }
+    out.status = as_u32(Status::kDenied);
+    out.denied.offset = conflict->range.offset;
+    out.denied.length = conflict->range.length;
+    out.denied.exclusive = conflict->exclusive;
+    if (holder) {
+      out.denied.clientid = holder->client->clientid;
+      out.denied.owner = holder->owner;
+    }
+    co_return out;
+  }
+}
+
+rt::Task<uint32_t> StateMgr::locku(const Stateid& sid, uint64_t clientid, uint64_t offset,
+                                   uint64_t length, Stateid* out) {
+  if (sid.is_special()) co_return as_u32(Status::kBadStateid);
+  if (epoch_of(sid.other) != static_cast<uint32_t>(cfg_.boot_epoch))
+    co_return as_u32(Status::kStaleStateid);
+  StateRef rec;
+  {
+    StateShard& shard = state_shard(sid.other);
+    auto lock = co_await shard.mu.lock();
+    auto it = shard.table.find(sid.other);
+    if (it == shard.table.end()) co_return as_u32(Status::kBadStateid);
+    rec = it->second;
+  }
+  if (rec->type != StateType::kLock || rec->client->clientid != clientid)
+    co_return as_u32(Status::kBadStateid);
+  if (sid.seqid != 0 && sid.seqid < rec->seqid) co_return as_u32(Status::kOldStateid);
+  if (sid.seqid != 0 && sid.seqid > rec->seqid) co_return as_u32(Status::kBadStateid);
+  locks_.unlock(FileKey{rec->fsid, rec->oid}, rec->lowner, {offset, length});
+  {
+    FileShard& shard = file_shard(FileKey{rec->fsid, rec->oid});
+    auto lock = co_await shard.mu.lock();  // serializes seqid bumps with LOCK
+    rec->seqid += 1;
+  }
+  if (out) {
+    out->other = sid.other;
+    out->seqid = rec->seqid;
+  }
+  co_return 0;
 }
 
 // ---- leases ----------------------------------------------------------------
@@ -1070,6 +1366,9 @@ StateMgr::Stats StateMgr::stats() const {
   out.reclaim_forced = reclaim_forced_.load(std::memory_order_relaxed);
   out.share_denied = share_denied_.load(std::memory_order_relaxed);
   out.open_merges = open_merges_.load(std::memory_order_relaxed);
+  out.lock_states = nonneg(lock_count_);
+  out.lock_segments = locks_.total_segments();
+  out.lock_denied = lock_denied_.load(std::memory_order_relaxed);
   out.grace = in_grace();
   out.grace_remaining = grace_remaining_seconds();
   return out;
@@ -1117,6 +1416,20 @@ rt::Task<std::string> StateMgr::dump() {
         oid_hex += std::format("{:02x}", static_cast<unsigned>(b));
       std::string owner_hex;
       for (unsigned char ch : rec->owner) owner_hex += std::format("{:02x}", ch);
+      if (rec->type == StateType::kLock) {
+        std::string ranges;
+        for (const auto& seg : locks_.segments(FileKey{rec->fsid, rec->oid}))
+          if (same_owner(seg.owner, rec->lowner))
+            ranges += std::format("[{},{}){} ", seg.start,
+                                  seg.end == UINT64_MAX ? std::string("EOF")
+                                                        : std::to_string(seg.end),
+                                  seg.exclusive ? "W" : "R");
+        out += std::format(
+            "lock {} seqid={} client={:#x} fsid={} oid={} owner={} parent={} ranges={}\n",
+            hex_other(other), rec->seqid.load(), rec->client->clientid, rec->fsid, oid_hex,
+            owner_hex, rec->parent_open ? hex_other(rec->parent_open->other) : "-", ranges);
+        continue;
+      }
       out += std::format(
           "open {} seqid={} client={:#x} fsid={} oid={} owner={} access={} deny={}\n",
           hex_other(other), rec->seqid.load(), rec->client->clientid, rec->fsid, oid_hex,

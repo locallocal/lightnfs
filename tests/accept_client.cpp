@@ -1594,7 +1594,8 @@ void v4_walk_dir(V4Client& c, const std::vector<std::byte>& dir_fh,
 
 // ---------- NFSv4.1 read-write acceptance (phase 4) ----------
 
-constexpr uint32_t kOpCommit = 5, kOpCreate = 6, kOpLink = 11, kOpOpenDowngrade = 21,
+constexpr uint32_t kOpCommit = 5, kOpCreate = 6, kOpLock = 12, kOpLockt = 13,
+                   kOpLocku = 14, kOpLink = 11, kOpOpenDowngrade = 21,
                    kOpRemove = 28, kOpRename = 29, kOpSavefh = 32, kOpSetattr = 34,
                    kOpWrite = 38;
 constexpr uint32_t kShareDenied = 10015, kOpenmode = 10038, kGrace = 10013,
@@ -1976,6 +1977,159 @@ int cmd_v4rw(const char* host, uint16_t nfs_port, const std::string& export_path
   return 0;
 }
 
+namespace v4 { struct LockDenied { uint64_t offset=0, length=0; uint64_t clientid=0; std::string owner; }; }
+
+// v4.1 byte-range lock acceptance (development plan §6.3/§7): two clients contend over
+// a file — LOCK (new + existing owner), LOCKT probe, DENIED with holder info, upgrade,
+// LOCKU release and IO gated by lock/open mode; every effect cross-checked.
+int cmd_v4lock(const char* host, uint16_t nfs_port, const std::string& export_path,
+               const fs::path& backing) {
+  using namespace v4;
+  V4Client a(host, nfs_port);
+  a.establish();
+  auto root = lookup_path(a, split_path(export_path));
+  auto payload = random_bytes(4096, 0x51);
+  auto oa = v4_open(a, root, "v4lock.bin", 3, 0, "lock-owner-a", true);
+  if (oa.status != 0) fatal("v4lock: OPEN(CREATE) status %u", oa.status);
+  if (v4_write(a, oa.fh, oa.stateid, 0, payload, 2) != 0) fatal("v4lock: seed WRITE failed");
+
+  auto do_lock = [&](v4::V4Client& c, const std::vector<std::byte>& fh, uint32_t type,
+                     uint64_t off, uint64_t len, bool new_owner, const v4::Stateid4& sid,
+                     const std::string& owner, v4::Stateid4* out, v4::LockDenied* denied) {
+    XdrEnc ops(c.rpc.pool);
+    c.seq_header(ops, 2);
+    ops.u32(kOpPutfh);
+    ops.opaque(fh);
+    ops.u32(kOpLock);
+    ops.u32(type);
+    ops.boolean(false);
+    ops.u64(off);
+    ops.u64(len);
+    ops.boolean(new_owner);
+    if (new_owner) {
+      ops.u32(0);
+      sid.encode(ops);
+      ops.u32(0);
+      ops.u64(c.clientid);
+      ops.string(owner);
+    } else {
+      sid.encode(ops);
+      ops.u32(0);
+    }
+    auto r = c.run(ops.take().to_bytes(), 0, false);
+    V4Client::skip_sequence_res(r.dec);
+    V4Client::expect_op(r.dec, kOpPutfh);
+    uint32_t opcode = ru32(r.dec);
+    uint32_t code = ru32(r.dec);
+    if (opcode != kOpLock) fatal("v4lock: expected LOCK resop, got op=%u status=%u", opcode, code);
+    if (code == 0 && out) *out = Stateid4::decode(r.dec);
+    else if (code == 10010 && denied) {  // NFS4ERR_DENIED
+      denied->offset = ru64(r.dec);
+      denied->length = ru64(r.dec);
+      ru32(r.dec);
+      denied->clientid = ru64(r.dec);
+      auto o = r.dec.opaque(1024);
+      denied->owner.assign(reinterpret_cast<const char*>(o->data()), o->size());
+    }
+    return code;
+  };
+
+  // a: exclusive [0,100).
+  v4::Stateid4 lsid;
+  if (do_lock(a, oa.fh, 2, 0, 100, true, oa.stateid, "lo-a", &lsid, nullptr) != 0)
+    fatal("v4lock: a WRITE_LT failed");
+  if (lsid.seqid != 1 || (lsid.other[4] != std::byte{2}))
+    fatal("v4lock: lock stateid malformed");
+
+  // b: overlapping read lock -> DENIED naming a; disjoint -> OK.
+  V4Client b(host, nfs_port, "lightnfs-accept-v4-b");
+  b.establish();
+  auto ob = v4_open(b, root, "v4lock.bin", 3, 0, "lock-owner-b", false);
+  if (ob.status != 0) fatal("v4lock: b OPEN status %u", ob.status);
+  v4::LockDenied denied;
+  if (do_lock(b, ob.fh, 1, 50, 10, true, ob.stateid, "lo-b", nullptr, &denied) != 10010)
+    fatal("v4lock: expected DENIED for b's overlapping lock");
+  if (denied.clientid != a.clientid || denied.owner != "lo-a" || denied.offset != 0 ||
+      denied.length != 100)
+    fatal("v4lock: DENIED holder info wrong (client=%llx owner=%s [%llu,%llu))",
+          (unsigned long long)denied.clientid, denied.owner.c_str(),
+          (unsigned long long)denied.offset, (unsigned long long)denied.length);
+  v4::Stateid4 lsb;
+  if (do_lock(b, ob.fh, 2, 100, 100, true, ob.stateid, "lo-b", &lsb, nullptr) != 0)
+    fatal("v4lock: b disjoint lock failed");
+
+  // LOCKT: b probing a's range -> DENIED; a probing its own -> OK.
+  auto do_lockt = [&](v4::V4Client& c, const std::string& owner, uint64_t off, uint64_t len) {
+    XdrEnc ops(c.rpc.pool);
+    c.seq_header(ops, 2);
+    ops.u32(kOpPutfh);
+    ops.opaque(oa.fh);
+    ops.u32(kOpLockt);
+    ops.u32(2);
+    ops.u64(off);
+    ops.u64(len);
+    ops.u64(c.clientid);
+    ops.string(owner);
+    auto r = c.run(ops.take().to_bytes(), 0, false);
+    V4Client::skip_sequence_res(r.dec);
+    V4Client::expect_op(r.dec, kOpPutfh);
+    ru32(r.dec);  // opcode
+    return ru32(r.dec);
+  };
+  if (do_lockt(b, "lo-b", 10, 5) != 10010) fatal("v4lock: LOCKT should be DENIED");
+  if (do_lockt(a, "lo-a", 10, 5) != 0) fatal("v4lock: own-range LOCKT should be OK");
+
+  // a upgrades the existing lock-owner over [200,50) via the lock stateid, then LOCKU
+  // the whole file; b can then lock what a held.
+  v4::Stateid4 lsid2;
+  if (do_lock(a, oa.fh, 2, 200, 50, false, lsid, "", &lsid2, nullptr) != 0)
+    fatal("v4lock: a existing-owner extend failed");
+  if (!(lsid2.other == lsid.other) || lsid2.seqid != 2)
+    fatal("v4lock: existing-owner lock did not bump seqid on same stateid");
+  auto do_locku = [&](v4::V4Client& c, const v4::Stateid4& sid, uint64_t off, uint64_t len) {
+    XdrEnc ops(c.rpc.pool);
+    c.seq_header(ops, 2);
+    ops.u32(kOpPutfh);
+    ops.opaque(oa.fh);
+    ops.u32(kOpLocku);
+    ops.u32(2);
+    ops.u32(0);
+    sid.encode(ops);
+    ops.u64(off);
+    ops.u64(len);
+    auto r = c.run(ops.take().to_bytes(), 0, false);
+    V4Client::skip_sequence_res(r.dec);
+    V4Client::expect_op(r.dec, kOpPutfh);
+    ru32(r.dec);  // opcode
+    uint32_t code = ru32(r.dec);
+    if (code == 0) return (int)v4::Stateid4::decode(r.dec).seqid;
+    return -(int)code;
+  };
+  if (do_locku(a, lsid2, 0, UINT64_MAX) != 3) fatal("v4lock: LOCKU did not bump seqid");
+  if (do_lockt(b, "lo-b", 0, 100) != 0) fatal("v4lock: range still locked after LOCKU");
+
+  // Data survived all the lock churn.
+  if (v4_read(a, oa.fh, oa.stateid, payload.size()) != payload)
+    fatal("v4lock: data changed under locking");
+  if (v4_close(b, ob.fh, ob.stateid) != 0) fatal("v4lock: b CLOSE failed");
+  if (v4_close(a, oa.fh, oa.stateid) != 0) fatal("v4lock: a CLOSE failed");
+  // CLOSE released a's remaining lock state: b may now take the whole file exclusively.
+  V4Client c(host, nfs_port, "lightnfs-accept-v4-c");
+  c.establish();
+  auto oc = v4_open(c, root, "v4lock.bin", 3, 0, "lock-owner-c", false);
+  v4::Stateid4 lc;
+  if (do_lock(c, oc.fh, 2, 0, UINT64_MAX, true, oc.stateid, "lo-c", &lc, nullptr) != 0)
+    fatal("v4lock: whole-file lock after CLOSE should succeed");
+  if (v4_close(c, oc.fh, oc.stateid) != 0) fatal("v4lock: c CLOSE failed");
+  (void)backing;
+  b.destroy();
+  a.destroy();
+  c.destroy();
+  std::printf("accept_client v4lock OK: LOCK new/existing owner, LOCKT probe, DENIED with "
+              "holder, upgrade+LOCKU split, CLOSE releases locks, data intact\n");
+  return 0;
+}
+
 // Server-restart reclaim scenario (development plan §6.3 / design 07 §7.5): open +
 // write, run RESTART_CMD (kills and restarts the server), then re-establish the same
 // client identity and CLAIM_PREVIOUS inside grace; verifies data, the STALE_STATEID /
@@ -2175,7 +2329,8 @@ int main(int argc, char** argv) {
                  "       accept_client v4rw   HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
                  "       accept_client v4reclaim HOST NFS_PORT MOUNT_PORT EXPORT BACKING "
                  "RESTART_CMD\n"
-                 "       accept_client v4courtesy HOST NFS_PORT MOUNT_PORT EXPORT LEASE_SECS\n");
+                 "       accept_client v4courtesy HOST NFS_PORT MOUNT_PORT EXPORT LEASE_SECS\n"
+                 "       accept_client v4lock HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n");
     return 2;
   };
   if (argc < 6) return usage();
@@ -2209,5 +2364,7 @@ int main(int argc, char** argv) {
     return cmd_v4reclaim(host, nfs_port, export_path, argv[6], argv[7]);
   if (cmd == "v4courtesy" && argc == 7)
     return cmd_v4courtesy(host, nfs_port, export_path, (unsigned)atoi(argv[6]));
+  if (cmd == "v4lock" && argc == 7)
+    return cmd_v4lock(host, nfs_port, export_path, argv[6]);
   return usage();
 }

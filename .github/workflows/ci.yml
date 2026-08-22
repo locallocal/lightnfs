@@ -121,6 +121,24 @@ jobs:
       - name: real-mount acceptance (vers=4.1 rw: cthon + fsx + restart reclaim)
         run: scripts/accept_m4_vm.sh 50000
 
+  # Phase-5 v4.1 locks + security acceptance (development plan §7): loopback userspace
+  # v4lock scenario + pynfs lock/secinfo/courteous groups + the M4 rw/reclaim/courtesy
+  # phases; then a real vers=4.1 mount on the runner VM with cthon lock group and kernel
+  # POSIX byte-range locking.
+  m5-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev ninja-build nfs-common python3-ply
+      - name: loopback v4.1 lock acceptance (v4lock + pynfs locks/secinfo + rw/reclaim + ASAN)
+        run: scripts/accept_m5_local.sh
+      - name: real-mount acceptance (vers=4.1: cthon lock group + kernel byte-range locks)
+        run: scripts/accept_m5_vm.sh 50000
+
   fuzz-short:
     runs-on: ubuntu-latest
     steps:

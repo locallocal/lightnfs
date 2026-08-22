@@ -126,6 +126,8 @@ enum class Status : uint32_t {
   kBadchar = 10040,
   kBadname = 10041,
   kBadRange = 10042,
+  kLockNotsupp = 10043,
+  kLockRange = 10028,
   kFileOpen = 10046,
   kOpIllegal = 10044,
   kBadsession = 10052,

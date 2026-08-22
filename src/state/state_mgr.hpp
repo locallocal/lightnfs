@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,6 +25,7 @@
 #include "nfsv4/nfs4_types.hpp"
 #include "runtime/sync.hpp"
 #include "runtime/task.hpp"
+#include "state/lock_mgr.hpp"
 
 namespace lnfs::state {
 
@@ -86,8 +88,11 @@ struct StateRec {  // other = {boot_epoch(4B)|type(1B)|counter(7B)}
   uint32_t fsid = 0;
   backend::ObjId oid{};
   // kOpen:
-  std::string owner;  // open_owner4.owner bytes
+  std::string owner;  // open_owner4.owner / lock_owner4.owner bytes
   std::atomic<uint32_t> access{0}, deny{0};
+  // kLock:
+  backend::LockOwnerId lowner{};  // {clientid(8) | fnv64(owner)(8) | len(4)}
+  std::shared_ptr<StateRec> parent_open;  // the open stateid the lock derives from
   // Backend open handle: written only under the state shard lock (creation before
   // publication, taken out by unlink) and copied under it for the IO path; the
   // handle itself is released outside every lock.
@@ -96,16 +101,9 @@ struct StateRec {  // other = {boot_epoch(4B)|type(1B)|counter(7B)}
 };
 using StateRef = std::shared_ptr<StateRec>;
 
-struct FileKey {
-  uint32_t fsid = 0;
-  backend::ObjId oid{};
-  friend bool operator==(const FileKey&, const FileKey&) = default;
-};
-struct FileKeyHash {
-  size_t operator()(const FileKey& k) const noexcept;
-};
-struct FileStateRec {  // conflict arbitration: share reservations (locks: phase 5)
+struct FileStateRec {  // conflict arbitration entry: share reservations + lock owners
   std::vector<StateRef> opens;
+  std::vector<StateRef> locks;  // one lock stateid per (lock-owner, file)
 };
 
 // Compatibility view for callers that only need the identity of an open state.
@@ -240,7 +238,37 @@ class StateMgr {
                                     uint32_t deny, Stateid* out);
   rt::Task<uint32_t> free_stateid(const Stateid& sid);
 
-  // ---- leases (7.4) ----
+  // ---- byte-range locks (7.6; LOCK/LOCKT/LOCKU, RFC 8881 §18.10–§18.12) ----
+  struct LockDenied {
+    uint64_t offset = 0, length = 0;
+    bool exclusive = false;
+    uint64_t clientid = 0;
+    std::string owner;  // lock_owner4.owner of the conflicting holder
+  };
+  struct LockArgs {
+    uint64_t clientid = 0;
+    uint32_t fsid = 0;
+    backend::ObjId oid{};
+    bool exclusive = false;
+    bool reclaim = false;
+    uint64_t offset = 0, length = 0;  // length UINT64_MAX = to EOF (validated by caller)
+    bool new_owner = false;
+    Stateid open_stateid{};  // new_owner: the open the lock derives from
+    std::string owner;       // new_owner: lock_owner4.owner
+    Stateid lock_stateid{};  // !new_owner: existing lock stateid
+  };
+  struct LockResult {
+    uint32_t status = 0;  // OK / DENIED / BAD_STATEID / OLD_STATEID / OPENMODE / GRACE ...
+    Stateid stateid{};    // OK: the (new or bumped) lock stateid
+    LockDenied denied{};  // status == DENIED
+  };
+  rt::Task<LockResult> lock(LockArgs args);
+  rt::Task<LockResult> lockt(uint64_t clientid, uint32_t fsid, const backend::ObjId& oid,
+                             std::string owner, bool exclusive, uint64_t offset,
+                             uint64_t length);
+  rt::Task<uint32_t> locku(const Stateid& sid, uint64_t clientid, uint64_t offset,
+                           uint64_t length, Stateid* out);
+  GatewayLockMgr& lock_table() { return locks_; }
   // One scanner pass: expired leases → courtesy; courtesy beyond the window → reclaim.
   rt::Task<void> scan_leases();
   // Runs scan_leases once per second until *stop becomes true.
@@ -256,6 +284,8 @@ class StateMgr {
     uint64_t lease_expirations = 0;  // clients that entered courtesy
     uint64_t reclaim_conflict = 0, reclaim_timeout = 0, reclaim_forced = 0;
     uint64_t share_denied = 0, open_merges = 0;
+    size_t lock_states = 0, lock_segments = 0;
+    uint64_t lock_denied = 0;
     bool grace = false;
     int64_t grace_remaining = 0;
   };
@@ -304,10 +334,23 @@ class StateMgr {
   StateOther new_other(StateType type);
   // Internal reclaim chain; `reason` selects the metric.
   rt::Task<uint32_t> expire_client_impl(uint64_t clientid, int reason);
-  // Drops one state from the stateid table, the file index and its client.
+  // Drops one state from the stateid table, the file index and its client.  An open
+  // state takes its lock states (and their ranges) with it.
   rt::Task<backend::OpenPtr> unlink_state(const StateRef& rec, bool from_client);
+  static backend::LockOwnerId make_lowner(uint64_t clientid, std::string_view owner);
+  // Resolves a lock-owner id to its holder (conflict reporting / courtesy reclaim).
+  struct LockOwnerRec {
+    std::shared_ptr<ClientRec> client;
+    std::string owner;
+  };
+  std::optional<LockOwnerRec> find_lock_owner(const backend::LockOwnerId& id);
+  void remember_lock_owner(const backend::LockOwnerId& id, std::shared_ptr<ClientRec> client,
+                           std::string owner);
 
   Config cfg_;
+  GatewayLockMgr locks_;
+  std::mutex lock_owner_mu_;
+  std::unordered_map<std::string, LockOwnerRec> lock_owners_;  // key: 24 id bytes
   std::array<ClientShard, kShards> clients_;
   std::array<SessionShard, kShards> sessions_;
   std::array<StateShard, kShards> states_;
@@ -327,7 +370,9 @@ class StateMgr {
   std::atomic<int64_t> client_count_{0}, session_count_{0}, open_count_{0},
       file_count_{0}, courtesy_count_{0};
   std::atomic<uint64_t> lease_expirations_{0}, reclaim_conflict_{0},
-      reclaim_timeout_{0}, reclaim_forced_{0}, share_denied_{0}, open_merges_{0};
+      reclaim_timeout_{0}, reclaim_forced_{0}, share_denied_{0}, open_merges_{0},
+      lock_denied_{0};
+  std::atomic<int64_t> lock_count_{0};
 };
 
 }  // namespace lnfs::state

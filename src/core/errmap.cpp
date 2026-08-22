@@ -78,29 +78,30 @@ bool v3_error_allowed(P proc, S status) {
     case P::kWrite:
       return one_of(status, std::array{S::kAcces, S::kFbig, S::kDquot, S::kInval,
                                        S::kNospc, S::kRofs, S::kJukebox, S::kIsdir});
+    // Phase-5 audit (nfsv3 research 08 §8.2): CREATE-family sets are exactly the RFC
+    // rows; MKDIR additionally admits MLINK (directory link-count limit) and
+    // REMOVE/RMDIR admit PERM (sticky directories) — documented deviations that keep
+    // the client's errno meaningful instead of a degraded IO.
     case P::kCreate:
-      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kInval,
-                                       S::kNametoolong, S::kNospc, S::kRofs, S::kNotdir,
-                                       S::kNotsupp});
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kNametoolong,
+                                       S::kNospc, S::kRofs, S::kNotdir, S::kNotsupp});
     case P::kMkdir:
-      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kInval,
-                                       S::kNametoolong, S::kNospc, S::kRofs, S::kNotdir,
-                                       S::kNotsupp, S::kMlink});
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kNametoolong,
+                                       S::kNospc, S::kRofs, S::kNotdir, S::kMlink});
     case P::kSymlink:
-      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kInval,
-                                       S::kNametoolong, S::kNospc, S::kRofs, S::kNotdir,
-                                       S::kNotsupp});
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kNametoolong,
+                                       S::kNospc, S::kRofs, S::kNotdir, S::kNotsupp});
     case P::kMknod:
-      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kInval,
-                                       S::kNametoolong, S::kNospc, S::kRofs, S::kNotdir,
-                                       S::kNotsupp, S::kBadtype, S::kPerm});
+      return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kNametoolong,
+                                       S::kNospc, S::kRofs, S::kNotdir, S::kNotsupp,
+                                       S::kBadtype, S::kPerm});
     case P::kRemove:
       return one_of(status, std::array{S::kNoent, S::kAcces, S::kNametoolong,
                                        S::kNotdir, S::kRofs, S::kIsdir, S::kPerm});
     case P::kRmdir:
       return one_of(status, std::array{S::kNoent, S::kAcces, S::kInval, S::kExist,
                                        S::kNametoolong, S::kNotdir, S::kNotempty,
-                                       S::kRofs, S::kNotsupp});
+                                       S::kRofs, S::kNotsupp, S::kPerm});
     case P::kRename:
       return one_of(status,
                     std::array{S::kNoent, S::kAcces, S::kExist, S::kXdev, S::kNotdir,
@@ -182,7 +183,12 @@ bool v4_error_allowed(O4 op, S4 status) {
       return one_of4(status, std::array{S4::kNoent, S4::kNotdir, S4::kSymlink});
     case O4::kGetattr:
     case O4::kVerify:
-    case O4::kNverify: return false;
+    case O4::kNverify:
+    case O4::kGetfh:
+    case O4::kPutfh:
+    case O4::kPutrootfh:
+    case O4::kSavefh:
+    case O4::kRestorefh: return false;
     case O4::kAccess: return false;
     case O4::kReadlink:
       return one_of4(status, std::array{S4::kInval, S4::kWrongType, S4::kNotsupp});
@@ -245,6 +251,27 @@ bool v4_error_allowed(O4 op, S4 status) {
                                 S4::kInval, S4::kPerm, S4::kNospc, S4::kDquot,
                                 S4::kMlink, S4::kNotsupp, S4::kWrongType,
                                 S4::kRestorefh});
+    case O4::kLock:
+    case O4::kLockt:
+    case O4::kLocku:
+      return one_of4(status,
+                     std::array{S4::kInval, S4::kIsdir, S4::kWrongType, S4::kDenied,
+                                S4::kBadStateid, S4::kStaleStateid, S4::kOldStateid,
+                                S4::kOpenmode, S4::kGrace, S4::kNoGrace, S4::kReclaimBad,
+                                S4::kExpired, S4::kStaleClientid, S4::kBadRange,
+                                S4::kLockRange, S4::kLockNotsupp});
+    case O4::kSecinfo:
+      return one_of4(status, std::array{S4::kNoent, S4::kNotdir, S4::kNametoolong,
+                                        S4::kBadname, S4::kInval, S4::kWrongsec});
+    case O4::kSecinfoNoName:
+      return one_of4(status, std::array{S4::kNoent, S4::kNotdir, S4::kInval,
+                                        S4::kWrongsec});
+    case O4::kFreeStateid:
+      return one_of4(status, std::array{S4::kBadStateid, S4::kStaleStateid,
+                                        S4::kLocksHeld});
+    case O4::kTestStateid: return false;
+    case O4::kReclaimComplete:
+      return one_of4(status, std::array{S4::kCompleteAlready, S4::kStaleClientid});
     default: return true;  // remaining implemented ops answer session/state errors
   }
 }

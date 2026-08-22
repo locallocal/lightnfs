@@ -53,21 +53,23 @@ Every milestone ships one-click acceptance scripts:
 `scripts/accept_m*_local.sh` run the loopback half without root (userspace NFS
 clients driving a real server over TCP, byte-verified against the backing tree);
 `scripts/accept_m*_vm.sh` run real kernel mounts on a root VM and are wired into
-CI (`m1-acceptance` … `m4-acceptance` jobs), including cthon04,
+CI (`m1-acceptance` … `m5-acceptance` jobs), including cthon04,
 fsx, and pynfs integration.
 
 ## Status
 
-Phase 4 (M6) complete: NFSv4.1 read-write with the full state machine — open
-state table with share reservations and same-owner merging, CLOSE/OPEN_DOWNGRADE,
-stateid-checked READ/WRITE/COMMIT/SETATTR, namespace ops, VERIFY/NVERIFY, lease
-scanner with courtesy clients and the reclaim chain (conflict / timeout / forced
-via `lightnfs-ctl`), and a complete grace/reclaim gate (stable client list,
-CLAIM_PREVIOUS, early grace exit). Phase 3 (M5, read-only v4.1: COMPOUND
-interpreter, session layer, pseudo-fs) and phase 2 (NFSv3 read-write) remain
-under regression protection.
+Phase 5 (M7) complete — **v1 release candidate**: NFSv4.1 byte-range locks
+(gateway LockMgr with POSIX merge/split, LOCK/LOCKT/LOCKU, lock stateids,
+non-blocking DENIED with holder info), full SECINFO/SECINFO_NO_NAME, an audited
+error whitelist across v3/v4, and the release security hardening — a least-
+privilege systemd unit (two capabilities, seccomp allowlist) and a deployment
+guide covering the AUTH_SYS trust boundary. Phase 4 (M6, v4.1 read-write + full
+state machine), phase 3 (M5, read-only v4.1) and phase 2 (NFSv3 read-write)
+remain under regression protection.
 
-Details: [M4 v4.1 read-write notes](docs/m4-v41-readwrite.md),
+Details: [M5 v4.1 locks + security notes](docs/m5-locks-security.md),
+[deployment guide](docs/deployment.md),
+[M4 v4.1 read-write notes](docs/m4-v41-readwrite.md),
 [M3 v4.1 read-only notes](docs/m3-v41-readonly.md),
 [M2 read-write notes](docs/m2-readwrite.md),
 [M1 read-only notes](docs/m1-readonly.md); security checklist:
