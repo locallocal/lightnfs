@@ -378,6 +378,25 @@
 
 CI 环境要点：真实 mount 测试需嵌套 VM 或特权容器（内核 NFS 客户端）；准备两套内核（≥6.6 带 STATX_CHANGE_COOKIE / 老内核 epoll 兜底路径）做矩阵构建。
 
+### 9.1 基建落地记录（2026-08-23）
+
+上表每一行对应的具体 CI 作业 / 脚本（`.github/workflows/ci.yml` 每 PR；`nightly.yml` 每日
+02:00 UTC、每周日 04:00 UTC；均可 `workflow_dispatch` 手动触发）：
+
+| 层 | 落地 | 作业 / 脚本 |
+|----|------|------------|
+| 运行时 | fake ring 时序单测、`LNFS_SANITIZE=address/thread` 两配置、frame 哨兵（`util/errno` sentinel + FakeRing EINTR/短读注入） | `build-test` 矩阵：gcc-debug / gcc-release / **gcc-release-epoll**（`LNFS_RING=epoll` 兜底路径）/ **gcc-release-old-kernel**（ubuntu-22.04 runner）/ clang-asan / clang-tsan |
+| XDR | round-trip 单测；libFuzzer `fuzz_handle_request`，每 PR 120s 以 `fuzz/corpus` 为种子，崩溃产物上传；**每日 1h 长跑**，语料经 cache 跨夜增长并 `-merge` 回写 | `fuzz-short`（每 PR）、`nightly.yml: fuzz-long` |
+| 后端契约 | P1/P2、10 万项 cookie 稳定性、稳定级落盘 + 粘性 fsync EIO、v4.2 稀疏/拷贝契约 | `lnfs_tests`（`Backend.*`、`BackendWrite.*`） |
+| 错误映射 | **生成式单测**：`scripts/gen_errmap_cases.py` 解析 `docs/nfsv3/08-errors.md` §8.2 表生成 `tests/errmap_v3_cases.inc`，`Nfs3.ErrorWhitelistMatchesResearchTable` 逐行对照；CI `--check` 防陈旧。首次运行即发现 LINK 行漏 NOSPC（RFC 1813 §3.3.15）已修。v4 行（RFC 8881 §15.2 / 7862 §11.2）仍为 `Nfs4.ErrmapV4Whitelist` 手写对照 | `build-test` 的 errmap 步骤 |
+| 性能 | 三层基准 **阈值门禁**：`scripts/bench_gate.sh` 以 `bench/baseline.txt` × `LNFS_BENCH_FLOOR`（本地 0.5，CI 0.2——共享 runner 噪声大，门禁目标是数量级退化）判定 | `build-test`（Release、无 sanitizer）bench gate 步骤 |
+| 协议一致性 | cthon04 / pynfs（4.1，期望失败名单 `pynfs_m5_expected.txt`）/ fsx：每 PR 短跑（m1–m6 作业）；**每日**过夜 fsx（2M ops，v3 与 v4.1）+ cthon 全组 + pynfs `all` 全量报告（与期望名单 diff，仅报告） | `m1-acceptance`…`m6-acceptance`、`nightly.yml: conformance-overnight` |
+| v3/v4 一致 | 同负载双版本挂载对比（`accept_m3_vm.sh` 双 mount + `accept_m4/m5_vm.sh` 混合写） | 每 PR `m3-acceptance`；每日 `conformance-overnight` |
+| 故障注入 | `scripts/fault_inject.sh`：N× kill -9 重启循环（crash-write/recover）、**fsync EIO 注入**（`LNFS_FAULT_FSYNC_EIO=N` 使前 N 次 fsync 失败，`accept_client fsync-eio` 验证 NFS3ERR_IO + 粘性）、客户端消失（courtesy 冲突/超时回收）、v4 带状态重启 reclaim | **每周** `nightly.yml: fault-injection-weekly`（20 次循环） |
+
+环境要点落地：真实 mount 在 GitHub root runner 上直接执行（无嵌套 VM）；内核矩阵以
+ubuntu-22.04 / ubuntu-latest 两代 runner 覆盖；epoll 兜底以 `LNFS_RING=epoll` 构建项覆盖。
+
 ---
 
 ## 10. 风险与应对（登记于 09 分册，此处补执行动作）

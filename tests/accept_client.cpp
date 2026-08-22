@@ -1247,6 +1247,37 @@ int cmd_connstorm(const char* host, uint16_t nfs_port, int count, int pipeline_d
   return 0;
 }
 
+// Fault injection (development plan §9 "故障注入"): the server runs with
+// LNFS_FAULT_FSYNC_EIO=1.  The first fsync fails -> COMMIT answers NFS3ERR_IO, and the
+// sticky-poison contract (design 06 §6.2) keeps every later COMMIT on that file failing
+// even though the injected fault is spent; a different file syncs fine.
+int cmd_fsync_eio(const char* host, uint16_t nfs_port, uint16_t mount_port,
+                  const std::string& export_path) {
+  auto root = mnt(host, mount_port, export_path);
+  Client c(host, nfs_port);
+  Fh work;
+  if (nfs_mkdir(c, root, "fault", &work) != kNfs3Ok) fatal("fsync-eio: mkdir failed");
+  Fh victim, healthy;
+  if (nfs_create(c, work, "victim.bin", 0, 0644u, nullptr, &victim) != kNfs3Ok)
+    fatal("fsync-eio: create victim failed");
+  if (nfs_create(c, work, "healthy.bin", 0, 0644u, nullptr, &healthy) != kNfs3Ok)
+    fatal("fsync-eio: create healthy failed");
+  auto blob = pattern_bytes(64 * 1024, 7);
+  if (nfs_write(c, victim, 0, blob, 0, nullptr) != kNfs3Ok) fatal("fsync-eio: UNSTABLE write");
+  uint32_t st = nfs_commit(c, victim, nullptr);
+  if (st != 5) fatal("fsync-eio: first COMMIT expected NFS3ERR_IO, got %u", st);
+  for (int i = 0; i < 3; ++i) {
+    st = nfs_commit(c, victim, nullptr);
+    if (st != 5) fatal("fsync-eio: COMMIT #%d after poison expected IO, got %u", i + 2, st);
+  }
+  if (nfs_write(c, healthy, 0, blob, 2, nullptr) != kNfs3Ok)
+    fatal("fsync-eio: FILE_SYNC write on a healthy file must succeed after the fault");
+  if (nfs_commit(c, healthy, nullptr) != kNfs3Ok) fatal("fsync-eio: healthy COMMIT failed");
+  std::printf("accept_client fsync-eio OK: injected EIO surfaced as NFS3ERR_IO, stayed "
+              "sticky over 3 retries, unrelated file unaffected\n");
+  return 0;
+}
+
 // ---------- NFSv4.1 acceptance (phase 3) ----------
 
 namespace v4 {
@@ -2556,7 +2587,8 @@ int main(int argc, char** argv) {
                  "RESTART_CMD\n"
                  "       accept_client v4courtesy HOST NFS_PORT MOUNT_PORT EXPORT LEASE_SECS\n"
                  "       accept_client v4lock HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
-                 "       accept_client v42    HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n");
+                 "       accept_client v42    HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+                 "       accept_client fsync-eio HOST NFS_PORT MOUNT_PORT EXPORT\n");
     return 2;
   };
   if (argc < 6) return usage();
@@ -2594,5 +2626,7 @@ int main(int argc, char** argv) {
     return cmd_v4lock(host, nfs_port, export_path, argv[6]);
   if (cmd == "v42" && argc == 7)
     return cmd_v42(host, nfs_port, export_path, argv[6]);
+  if (cmd == "fsync-eio" && argc == 6)
+    return cmd_fsync_eio(host, nfs_port, mount_port, export_path);
   return usage();
 }

@@ -112,7 +112,7 @@ bool v3_error_allowed(P proc, S status) {
       return one_of(status, std::array{S::kAcces, S::kExist, S::kXdev, S::kMlink,
                                        S::kNametoolong, S::kNoent, S::kNotdir,
                                        S::kDquot, S::kRofs, S::kInval, S::kNotsupp,
-                                       S::kPerm});
+                                       S::kPerm, S::kNospc});  // NOSPC: RFC 1813 §3.3.15
     case P::kCommit: return false;  // only IO/STALE/BADHANDLE/SERVERFAULT
     default: return true;
   }

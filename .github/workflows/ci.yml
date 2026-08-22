@@ -6,32 +6,58 @@ on:
   pull_request:
 
 jobs:
+  # Development plan §9: runtime (fake-ring unit tests + ASAN/TSAN), XDR round-trips,
+  # backend contract, errmap (doc-derived) — every PR.  Two kernel generations
+  # (ubuntu-22.04 / 24.04 runners) and the epoll fallback ring form the matrix called for
+  # in §9's "CI 环境要点".
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: gcc-debug
+            os: ubuntu-latest
             cc: gcc
             cxx: g++
             build_type: Debug
             sanitize: ""
+            ring: auto
           - name: gcc-release
+            os: ubuntu-latest
             cc: gcc
             cxx: g++
             build_type: Release
             sanitize: ""
+            ring: auto
+          - name: gcc-release-epoll
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            build_type: Release
+            sanitize: ""
+            ring: epoll
+          - name: gcc-release-old-kernel
+            os: ubuntu-22.04
+            cc: gcc
+            cxx: g++
+            build_type: Release
+            sanitize: ""
+            ring: auto
           - name: clang-asan
+            os: ubuntu-latest
             cc: clang
             cxx: clang++
             build_type: Debug
             sanitize: address
+            ring: auto
           - name: clang-tsan
+            os: ubuntu-latest
             cc: clang
             cxx: clang++
             build_type: Debug
             sanitize: thread
+            ring: auto
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -43,15 +69,18 @@ jobs:
           -DCMAKE_C_COMPILER=${{ matrix.cc }}
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           -DLNFS_SANITIZE=${{ matrix.sanitize }}
+          -DLNFS_RING=${{ matrix.ring }}
       - name: build
         run: ninja -C build
+      - name: errmap cases are derived from the research doc (freshness check)
+        run: python3 scripts/gen_errmap_cases.py --check
       - name: test
         run: ctest --test-dir build --output-on-failure --timeout 300
-      - name: bench smoke (no threshold gate in CI)
-        if: matrix.build_type == 'Release'
-        run: |
-          ./build/bench_nullrpc 1 4 10000 32 || true
-          ./build/bench_echo 1 4 10000 32 128 || true
+      - name: three-layer benchmark gate (bench/baseline.txt x LNFS_BENCH_FLOOR)
+        if: matrix.build_type == 'Release' && matrix.sanitize == ''
+        env:
+          LNFS_BENCH_FLOOR: "0.2"
+        run: scripts/bench_gate.sh build
 
   # M1 read-only acceptance (development plan §3.5). The runner is a root VM with a
   # kernel NFS client, so both halves run: userspace-client loopback (incl. ASAN
@@ -118,7 +147,7 @@ jobs:
           sudo apt-get install -y liburing-dev ninja-build nfs-common python3-ply
       - name: loopback v4.1 rw acceptance (v4rw + reclaim + courtesy + pynfs + ASAN)
         run: scripts/accept_m4_local.sh
-      - name: real-mount acceptance (vers=4.1 rw: cthon + fsx + restart reclaim)
+      - name: "real-mount acceptance (vers=4.1 rw: cthon + fsx + restart reclaim)"
         run: scripts/accept_m4_vm.sh 50000
 
   # Phase-5 v4.1 locks + security acceptance (development plan §7): loopback userspace
@@ -136,7 +165,7 @@ jobs:
           sudo apt-get install -y liburing-dev ninja-build nfs-common python3-ply
       - name: loopback v4.1 lock acceptance (v4lock + pynfs locks/secinfo + rw/reclaim + ASAN)
         run: scripts/accept_m5_local.sh
-      - name: real-mount acceptance (vers=4.1: cthon lock group + kernel byte-range locks)
+      - name: "real-mount acceptance (vers=4.1: cthon lock group + kernel byte-range locks)"
         run: scripts/accept_m5_vm.sh 50000
 
   # Phase-6 v4.2 sweets (development plan §8 item 1): loopback v42 scenario (SEEK/
@@ -153,7 +182,7 @@ jobs:
           sudo apt-get install -y liburing-dev ninja-build nfs-common python3-ply
       - name: loopback v4.2 acceptance (v42 + M5 phases + ASAN)
         run: scripts/accept_m6_local.sh
-      - name: real-mount acceptance (vers=4.2: sparse + COPY + CLONE/fallback + cthon)
+      - name: "real-mount acceptance (vers=4.2: sparse + COPY + CLONE/fallback + cthon)"
         run: scripts/accept_m6_vm.sh
 
   fuzz-short:
@@ -168,8 +197,19 @@ jobs:
           -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLNFS_BUILD_FUZZ=ON
       - name: build
         run: ninja -C build fuzz_handle_request
-      - name: fuzz 120s
-        run: mkdir -p corpus && ./build/fuzz_handle_request -max_total_time=120 corpus
+      - name: fuzz 120s (seeded from the checked-in corpus)
+        run: |
+          mkdir -p corpus
+          ./build/fuzz_handle_request -max_total_time=120 corpus fuzz/corpus
+      - name: upload crashes (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
 
   format:
     runs-on: ubuntu-latest

@@ -1,0 +1,124 @@
+name: nightly
+
+# Development plan §9 cadences beyond per-PR: daily fuzz long run (XDR row), daily
+# protocol-conformance runs with overnight-scale fsx (cthon/pynfs/fsx row), daily v3/v4
+# dual-mount comparison (v3/v4 一致 row), weekly fault injection (故障注入 row).
+on:
+  schedule:
+    - cron: "0 2 * * *"    # daily 02:00 UTC
+    - cron: "0 4 * * 0"    # weekly Sunday 04:00 UTC (fault injection)
+  workflow_dispatch:
+    inputs:
+      fsx_ops:
+        description: fsx operations for the overnight run
+        default: "2000000"
+      fuzz_seconds:
+        description: libFuzzer wall time
+        default: "3600"
+
+jobs:
+  fuzz-long:
+    if: github.event.schedule != '0 4 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build clang
+      - name: configure
+        run: >
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLNFS_BUILD_FUZZ=ON
+      - name: build
+        run: ninja -C build fuzz_handle_request
+      - name: restore grown corpus
+        uses: actions/cache@v4
+        with:
+          path: corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: fuzz (long)
+        run: |
+          mkdir -p corpus
+          ./build/fuzz_handle_request -max_total_time=${{ inputs.fuzz_seconds || 3600 }} \
+            -max_len=4096 corpus fuzz/corpus
+          ./build/fuzz_handle_request -merge=1 fuzz/corpus corpus
+          git diff --stat -- fuzz/corpus || true
+      - name: upload findings + corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-long
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            corpus
+
+  conformance-overnight:
+    if: github.event.schedule != '0 4 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev ninja-build nfs-common libtirpc-dev python3-ply
+      - name: v3 rw overnight fsx + cthon (real mount)
+        run: scripts/accept_m2_vm.sh ${{ inputs.fsx_ops || 2000000 }}
+      - name: v4.1 rw overnight fsx + cthon + reclaim (real mount)
+        run: scripts/accept_m4_vm.sh ${{ inputs.fsx_ops || 2000000 }}
+      - name: v3/v4 dual-mount comparison (real mount)
+        run: scripts/accept_m3_vm.sh
+      - name: v4.1 locks + v4.2 sweets (real mount)
+        run: |
+          scripts/accept_m5_vm.sh 200000
+          scripts/accept_m6_vm.sh
+      - name: pynfs full 4.1 suite (report only — drift is diffed against the expected list)
+        run: |
+          scripts/fetch_pynfs.sh "$RUNNER_TEMP/pynfs"
+          cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
+          cmake --build build-rel --target lightnfsd >/dev/null
+          mkdir -p "$RUNNER_TEMP/pyexport" "$RUNNER_TEMP/pystate"
+          cat > "$RUNNER_TEMP/lightnfs.toml" <<EOC
+          [server]
+          reactors = 0
+          port = 12519
+          mount_port = 12518
+          rpcbind = false
+          state_dir = "$RUNNER_TEMP/pystate"
+          [[export]]
+          path = "$RUNNER_TEMP/pyexport"
+          backend = "local"
+          fsid = 1
+          clients = ["127.0.0.0/8"]
+          squash = "none"
+          readonly = false
+          EOC
+          ./build-rel/lightnfsd --config "$RUNNER_TEMP/lightnfs.toml" > "$RUNNER_TEMP/server.log" 2>&1 &
+          sleep 1
+          (cd "$RUNNER_TEMP/pynfs/nfs4.1" && python3 ./testserver.py \
+            "127.0.0.1:12519$RUNNER_TEMP/pyexport" --minorversion=1 --noinit --force all \
+            > "$RUNNER_TEMP/pynfs-all.log" 2>&1) || true
+          tail -3 "$RUNNER_TEMP/pynfs-all.log"
+          grep FAILURE "$RUNNER_TEMP/pynfs-all.log" | awk '{print $1}' | sort -u > "$RUNNER_TEMP/failed.txt" || true
+          echo "failures not in scripts/pynfs_m5_expected.txt (informational):"
+          comm -23 "$RUNNER_TEMP/failed.txt" <(sort scripts/pynfs_m5_expected.txt) || true
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-overnight
+          path: ${{ runner.temp }}/pynfs-all.log
+
+  fault-injection-weekly:
+    if: github.event.schedule == '0 4 * * 0' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build
+      - name: crash loop x20 + fsync EIO + client kill + v4 restart
+        run: scripts/fault_inject.sh 20
