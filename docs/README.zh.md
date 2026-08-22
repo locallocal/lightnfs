@@ -43,12 +43,13 @@ HTTP 端点暴露。
 
 ## 当前状态
 
-阶段 4（M6）完成：NFSv4.1 读写 + 状态机全量——open 状态表（share reservation 裁决、
-同 owner 合并）、CLOSE/OPEN_DOWNGRADE、带 stateid 校验的 READ/WRITE/COMMIT/SETATTR、
-名字空间 op、VERIFY/NVERIFY、租约扫描与 courtesy 回收链（冲突/超时/`lightnfs-ctl` 强制）、
-完整 grace/reclaim 门禁（稳定名单、CLAIM_PREVIOUS、提前出 grace）。阶段 3（M5，v4.1 只读：
-COMPOUND 解释器、会话层、伪根）与阶段 2（v3 读写）保持回归保护。
-详见 [M4 v4.1 读写说明](m4-v41-readwrite.md)、[M3 v4.1 只读说明](m3-v41-readonly.md)、
+阶段 5（M7）完成——**v1 发布候选**：NFSv4.1 字节区间锁（网关内 LockMgr、POSIX 合并/拆分、
+LOCK/LOCKT/LOCKU、lock stateid、非阻塞 DENIED 带持有者）、完整 SECINFO/SECINFO_NO_NAME、
+v3/v4 错误白名单复查，以及发布前安全加固——最小特权 systemd 单元（两个 capability +
+seccomp 白名单）与部署文档（AUTH_SYS 信任边界）。阶段 4（M6，v4.1 读写+状态机全量）、
+阶段 3（M5，v4.1 只读）与阶段 2（v3 读写）保持回归保护。
+详见 [M5 v4.1 锁与安全说明](m5-locks-security.md)、[部署指南](deployment.md)、
+[M4 v4.1 读写说明](m4-v41-readwrite.md)、[M3 v4.1 只读说明](m3-v41-readonly.md)、
 [M2 读写说明](m2-readwrite.md)、
 [M1 只读说明](m1-readonly.md)；安全清单见 [security-checklist.md](security-checklist.md)；
 接口评审结论见 [Backend API v1 评审](backend-api-review.md)。

@@ -483,6 +483,23 @@ rt::Task<uint32_t> Engine::exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
       enc.u32(opcode);
       co_return co_await op_link(ctx, dec, enc);
     }
+    case Op::kLock: {
+      enc.u32(opcode);
+      co_return co_await op_lock(ctx, dec, enc);
+    }
+    case Op::kLockt: {
+      enc.u32(opcode);
+      co_return co_await op_lockt(ctx, dec, enc);
+    }
+    case Op::kLocku: {
+      enc.u32(opcode);
+      co_return co_await op_locku(ctx, dec, enc);
+    }
+    case Op::kSecinfo: {
+      enc.u32(opcode);
+      ctx.current_valid = false;
+      co_return co_await op_secinfo(ctx, dec, enc);
+    }
     case Op::kVerify:
     case Op::kNverify: {
       enc.u32(opcode);
@@ -2186,6 +2203,240 @@ rt::Task<uint32_t> Engine::op_reclaim_complete(Ctx& ctx, xdr::XdrDec& dec,
   uint32_t code = co_await state_.reclaim_complete(ctx.clientid);
   enc.u32(code);
   co_return code;
+}
+
+// ---- byte-range locks (phase 5: design 07 §7.6) ------------------------------
+
+namespace {
+
+constexpr uint32_t kReadLt = 1, kWriteLt = 2, kReadWLt = 3, kWriteWLt = 4;
+
+// Validates locktype/offset/length per RFC 8881 §18.10.3; returns 0 or a status.
+uint32_t check_lock_range(uint32_t locktype, uint64_t offset, uint64_t length) {
+  if (locktype < kReadLt || locktype > kWriteWLt) return st(Status::kInval);
+  if (length == 0) return st(Status::kInval);
+  if (length != UINT64_MAX && offset > UINT64_MAX - length) return st(Status::kInval);
+  return 0;
+}
+
+void encode_lock_denied(xdr::XdrEnc& enc, const state::StateMgr::LockDenied& d) {
+  enc.u64(d.offset);
+  enc.u64(d.length);
+  enc.u32(d.exclusive ? kWriteLt : kReadLt);
+  enc.u64(d.clientid);
+  enc.opaque(std::span<const std::byte>(reinterpret_cast<const std::byte*>(d.owner.data()),
+                                        d.owner.size()));
+}
+
+}  // namespace
+
+// Resolves the CFH to a regular file on an export for the lock ops.
+rt::Task<Result<Engine::Resolved>> Engine::resolve_lock_target(Ctx& ctx, uint32_t* status) {
+  *status = 0;
+  if (ctx.cfh.empty()) {
+    *status = st(Status::kNofilehandle);
+    co_return Err(errno_from(EINVAL));
+  }
+  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!resolved) {
+    *status = st(core::to_v4(resolved.error(), Op::kLock));
+    co_return Err(resolved.error());
+  }
+  if (resolved->pseudo() || resolved->obj->type() == backend::FType::kDir) {
+    *status = st(Status::kIsdir);
+    co_return Err(errno_from(EISDIR));
+  }
+  if (resolved->obj->type() != backend::FType::kReg) {
+    *status = st(Status::kWrongType);
+    co_return Err(errno_from(EINVAL));
+  }
+  co_return resolved;
+}
+
+rt::Task<uint32_t> Engine::op_lock(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto locktype = dec.u32();
+  auto reclaim = dec.boolean();
+  auto offset = dec.u64();
+  auto length = dec.u64();
+  auto new_owner = dec.boolean();
+  if (!locktype || !reclaim || !offset || !length || !new_owner) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  state::StateMgr::LockArgs args;
+  args.new_owner = *new_owner;
+  if (*new_owner) {  // open_to_lock_owner4
+    auto open_seqid = dec.u32();  // 4.0 owner seqids: ignored in 4.1
+    auto open_sid = Stateid::decode(dec);
+    auto lock_seqid = dec.u32();
+    auto owner_client = dec.u64();
+    auto owner = dec.opaque(kMaxOwnerId);
+    if (!open_seqid || !open_sid || !lock_seqid || !owner_client || !owner) {
+      enc.u32(st(Status::kBadxdr));
+      co_return st(Status::kBadxdr);
+    }
+    args.open_stateid = *open_sid;
+    args.owner.assign(reinterpret_cast<const char*>(owner->data()), owner->size());
+  } else {  // exist_lock_owner4
+    auto lock_sid = Stateid::decode(dec);
+    auto lock_seqid = dec.u32();
+    if (!lock_sid || !lock_seqid) {
+      enc.u32(st(Status::kBadxdr));
+      co_return st(Status::kBadxdr);
+    }
+    args.lock_stateid = *lock_sid;
+  }
+  if (uint32_t code = check_lock_range(*locktype, *offset, *length); code != 0) {
+    enc.u32(code);
+    co_return code;
+  }
+  uint32_t code = 0;
+  auto target = co_await resolve_lock_target(ctx, &code);
+  if (!target) {
+    enc.u32(code);
+    co_return code;
+  }
+  Stateid* anchor = args.new_owner ? &args.open_stateid : &args.lock_stateid;
+  if (uint32_t cur = resolve_current(ctx, *anchor); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  args.clientid = ctx.clientid;
+  args.fsid = target->exp->fsid;
+  args.oid = target->oid;
+  args.exclusive = *locktype == kWriteLt || *locktype == kWriteWLt;
+  args.reclaim = *reclaim;
+  args.offset = *offset;
+  args.length = *length;
+  auto result = co_await state_.lock(std::move(args));
+  enc.u32(result.status);
+  if (result.status == st(Status::kDenied)) {
+    encode_lock_denied(enc, result.denied);
+  } else if (result.status == 0) {
+    ctx.current_sid = result.stateid;
+    ctx.current_valid = true;
+    result.stateid.encode(enc);
+  }
+  co_return result.status;
+}
+
+rt::Task<uint32_t> Engine::op_lockt(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto locktype = dec.u32();
+  auto offset = dec.u64();
+  auto length = dec.u64();
+  auto owner_client = dec.u64();
+  auto owner = dec.opaque(kMaxOwnerId);
+  if (!locktype || !offset || !length || !owner_client || !owner) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (uint32_t code = check_lock_range(*locktype, *offset, *length); code != 0) {
+    enc.u32(code);
+    co_return code;
+  }
+  uint32_t code = 0;
+  auto target = co_await resolve_lock_target(ctx, &code);
+  if (!target) {
+    enc.u32(code);
+    co_return code;
+  }
+  auto result = co_await state_.lockt(
+      ctx.clientid, target->exp->fsid, target->oid,
+      std::string(reinterpret_cast<const char*>(owner->data()), owner->size()),
+      *locktype == kWriteLt || *locktype == kWriteWLt, *offset, *length);
+  enc.u32(result.status);
+  if (result.status == st(Status::kDenied)) encode_lock_denied(enc, result.denied);
+  co_return result.status;
+}
+
+rt::Task<uint32_t> Engine::op_locku(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto locktype = dec.u32();
+  auto seqid = dec.u32();
+  auto sid = Stateid::decode(dec);
+  auto offset = dec.u64();
+  auto length = dec.u64();
+  if (!locktype || !seqid || !sid || !offset || !length) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (uint32_t code = check_lock_range(*locktype, *offset, *length); code != 0) {
+    enc.u32(code);
+    co_return code;
+  }
+  uint32_t code = 0;
+  auto target = co_await resolve_lock_target(ctx, &code);
+  if (!target) {
+    enc.u32(code);
+    co_return code;
+  }
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  Stateid out;
+  code = co_await state_.locku(*sid, ctx.clientid, *offset, *length, &out);
+  enc.u32(code);
+  if (code == 0) {
+    ctx.current_sid = out;
+    ctx.current_valid = true;
+    out.encode(enc);
+  }
+  co_return code;
+}
+
+// SECINFO (RFC 8881 §18.29): AUTH_SYS-only server — the answer is always [AUTH_SYS]
+// once the name resolves; the current filehandle is consumed (§2.6.3.1.1.8).
+rt::Task<uint32_t> Engine::op_secinfo(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto name = dec.string(kMaxName + 1);
+  if (!name) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  if (name->empty() || !utf8_component(*name)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!valid_component4(*name)) {
+    enc.u32(st(Status::kBadname));
+    co_return st(Status::kBadname);
+  }
+  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!resolved) {
+    uint32_t code = st(core::to_v4(resolved.error(), Op::kSecinfo));
+    enc.u32(code);
+    co_return code;
+  }
+  if (resolved->pseudo()) {
+    if (!resolved->node->children.contains(*name)) {
+      enc.u32(st(Status::kNoent));
+      co_return st(Status::kNoent);
+    }
+  } else {
+    if (resolved->obj->type() != backend::FType::kDir) {
+      enc.u32(st(Status::kNotdir));
+      co_return st(Status::kNotdir);
+    }
+    auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
+    auto cred = mapped.view();
+    auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+    auto held = co_await lock->lock_shared();
+    auto found = co_await resolved->obj->lookup(cred, *name);
+    if (!found) {
+      uint32_t code = st(core::to_v4(found.error(), Op::kSecinfo));
+      enc.u32(code);
+      co_return code;
+    }
+  }
+  enc.u32(st(Status::kOk));
+  enc.u32(1);  // one flavor
+  enc.u32(1);  // AUTH_SYS
+  ctx.cfh.clear();
+  ctx.current_valid = false;
+  co_return st(Status::kOk);
 }
 
 // ---- sessionless operations ------------------------------------------------

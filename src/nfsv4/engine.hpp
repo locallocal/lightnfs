@@ -91,6 +91,11 @@ class Engine {
   rt::Task<uint32_t> op_rename(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_link(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_verify(Ctx&, xdr::XdrDec&, xdr::XdrEnc&, bool nverify);
+  rt::Task<uint32_t> op_lock(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+  rt::Task<uint32_t> op_lockt(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+  rt::Task<uint32_t> op_locku(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+  rt::Task<uint32_t> op_secinfo(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+  rt::Task<Result<Resolved>> resolve_lock_target(Ctx&, uint32_t* status);
   rt::Task<uint32_t> op_secinfo_no_name(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_free_stateid(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_test_stateid(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);

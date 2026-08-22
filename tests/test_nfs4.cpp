@@ -539,6 +539,22 @@ TEST(Nfs4, ErrmapV4Whitelist) {
   EXPECT_EQ((uint32_t)to_v4(Errno::kJukebox, Op::kRead), stv(Status::kDelay));
   // Out-of-whitelist degrades to IO.
   EXPECT_EQ((uint32_t)to_v4(errno_from(ENOTEMPTY), Op::kGetattr), stv(Status::kIo));
+  // Phase-5 audit rows (RFC 8881 §15.2).
+  EXPECT_EQ((uint32_t)to_v4(errno_from(ENOTEMPTY), Op::kRemove), stv(Status::kNotempty));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(EXDEV), Op::kLink), stv(Status::kXdev));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(EISDIR), Op::kLock), stv(Status::kIsdir));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(ENOENT), Op::kSecinfo), stv(Status::kNoent));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(ENOENT), Op::kLock), stv(Status::kIo));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(EINVAL), Op::kGetfh), stv(Status::kIo));
+  EXPECT_TRUE(core::v4_error_allowed(Op::kFreeStateid, Status::kLocksHeld));
+  EXPECT_FALSE(core::v4_error_allowed(Op::kTestStateid, Status::kBadStateid));
+  // v3 audit rows (nfsv3 research 08 §8.2).
+  using core::to_v3;
+  using nfsv3::Proc;
+  EXPECT_EQ((uint32_t)to_v3(errno_from(EINVAL), Proc::kCreate), (uint32_t)nfsv3::Status::kIo);
+  EXPECT_EQ((uint32_t)to_v3(errno_from(EMLINK), Proc::kMkdir), (uint32_t)nfsv3::Status::kMlink);
+  EXPECT_EQ((uint32_t)to_v3(errno_from(EPERM), Proc::kRmdir), (uint32_t)nfsv3::Status::kPerm);
+  EXPECT_EQ((uint32_t)to_v3(errno_from(ENOTEMPTY), Proc::kCommit), (uint32_t)nfsv3::Status::kIo);
 }
 
 // ---- phase 4: read-write + full state (development plan §6) -----------------------
@@ -1193,4 +1209,148 @@ TEST(Nfs4, CurrentStateidAndReclaimCompleteGate) {
   EXPECT_EQ(do_close(f, late.fh, zero), 0u);  // seqid 0 accepted by CLOSE
   // Non-UTF-8 name -> INVAL.
   EXPECT_EQ(do_open(f, dir_fh, "\xC0\xC1", 1, 0, "owner-late").status, stv(Status::kInval));
+}
+
+TEST(Nfs4, LockOpsAndSecinfo) {
+  V4Fixture f;
+  f.establish_session();
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "hello", 3, 0, "owner-l");
+  ASSERT_TRUE(o.status == 0);
+  auto lock_op = [&](uint32_t type, uint64_t off, uint64_t len, bool new_owner,
+                     const nfsv4::Stateid& sid, std::string_view owner) {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(o.fh);
+    ops.u32(static_cast<uint32_t>(Op::kLock));
+    ops.u32(type);
+    ops.boolean(false);
+    ops.u64(off);
+    ops.u64(len);
+    ops.boolean(new_owner);
+    if (new_owner) {
+      ops.u32(0);
+      sid.encode(ops);
+      ops.u32(0);
+      ops.u64(f.clientid);
+      ops.string(owner);
+    } else {
+      sid.encode(ops);
+      ops.u32(0);
+    }
+    return f.parse(f.compound_raw(f.session_body(2, ops.take())));
+  };
+  auto r1 = lock_op(2, 0, 100, true, o.stateid, "lo-1");  // WRITE_LT
+  ASSERT_TRUE(r1.status == 0);
+  V4Fixture::expect_op(r1.dec, Op::kSequence, 0);
+  r1.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(r1.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(r1.dec, Op::kLock, 0);
+  auto lsid = *nfsv4::Stateid::decode(r1.dec);
+  EXPECT_EQ(lsid.seqid, 1u);
+  // Second owner on the same client conflicts: DENIED carries the holder.
+  auto r2 = lock_op(1, 50, 10, true, o.stateid, "lo-2");
+  EXPECT_EQ(r2.status, stv(Status::kDenied));
+  V4Fixture::expect_op(r2.dec, Op::kSequence, 0);
+  r2.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(r2.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(r2.dec, Op::kLock, stv(Status::kDenied));
+  EXPECT_EQ(*r2.dec.u64(), 0u);
+  EXPECT_EQ(*r2.dec.u64(), 100u);
+  EXPECT_EQ(*r2.dec.u32(), 2u);  // WRITE_LT
+  EXPECT_EQ(*r2.dec.u64(), f.clientid);
+  auto who = *r2.dec.opaque(1024);
+  EXPECT_STREQ(std::string(reinterpret_cast<const char*>(who.data()), who.size()), "lo-1");
+  // length 0 -> INVAL; overflow -> INVAL; bad locktype -> INVAL.
+  EXPECT_EQ(lock_op(1, 0, 0, true, o.stateid, "lo-2").status, stv(Status::kInval));
+  EXPECT_EQ(lock_op(1, UINT64_MAX - 1, 5, true, o.stateid, "lo-2").status, stv(Status::kInval));
+  EXPECT_EQ(lock_op(9, 0, 5, true, o.stateid, "lo-2").status, stv(Status::kInval));
+  // LOCKT from another owner: DENIED; from the holder: OK.
+  auto lockt = [&](std::string_view owner) {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(o.fh);
+    ops.u32(static_cast<uint32_t>(Op::kLockt));
+    ops.u32(1);
+    ops.u64(10);
+    ops.u64(1);
+    ops.u64(f.clientid);
+    ops.string(owner);
+    return f.parse(f.compound_raw(f.session_body(2, ops.take()))).status;
+  };
+  EXPECT_EQ(lockt("lo-2"), stv(Status::kDenied));
+  EXPECT_EQ(lockt("lo-1"), 0u);
+  // Existing-owner LOCK via the current stateid placeholder in one compound:
+  // {PUTFH, LOCK(new, lo-3 on [200,10)), LOCKU(current, [200,10))}.
+  {
+    nfsv4::Stateid current{};
+    current.seqid = 1;
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(o.fh);
+    ops.u32(static_cast<uint32_t>(Op::kLock));
+    ops.u32(1);
+    ops.boolean(false);
+    ops.u64(200);
+    ops.u64(10);
+    ops.boolean(true);
+    ops.u32(0);
+    o.stateid.encode(ops);
+    ops.u32(0);
+    ops.u64(f.clientid);
+    ops.string("lo-3");
+    ops.u32(static_cast<uint32_t>(Op::kLocku));
+    ops.u32(1);
+    ops.u32(0);
+    current.encode(ops);
+    ops.u64(200);
+    ops.u64(10);
+    auto r = f.parse(f.compound_raw(f.session_body(3, ops.take())));
+    EXPECT_EQ(r.status, 0u);
+  }
+  EXPECT_EQ(f.state->stats().lock_states, 2u);
+  // LOCKU on lo-1 then CLOSE: everything released.
+  {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(o.fh);
+    ops.u32(static_cast<uint32_t>(Op::kLocku));
+    ops.u32(2);
+    ops.u32(0);
+    lsid.encode(ops);
+    ops.u64(0);
+    ops.u64(100);
+    auto r = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    ASSERT_TRUE(r.status == 0);
+    V4Fixture::expect_op(r.dec, Op::kSequence, 0);
+    r.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(r.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(r.dec, Op::kLocku, 0);
+    EXPECT_EQ(nfsv4::Stateid::decode(r.dec)->seqid, 2u);
+  }
+  EXPECT_EQ(lockt("lo-2"), 0u);
+  EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+  EXPECT_EQ(f.state->stats().lock_states, 0u);
+  EXPECT_EQ(f.state->stats().opens, 0u);
+
+  // SECINFO: [AUTH_SYS] for an existing name, NOENT otherwise, CFH consumed.
+  auto secinfo = [&](std::string_view name, bool getfh) {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(dir_fh);
+    ops.u32(static_cast<uint32_t>(Op::kSecinfo));
+    ops.string(name);
+    if (getfh) ops.u32(static_cast<uint32_t>(Op::kGetfh));
+    return f.parse(f.compound_raw(f.session_body(getfh ? 3 : 2, ops.take())));
+  };
+  auto s1 = secinfo("hello", false);
+  ASSERT_TRUE(s1.status == 0);
+  V4Fixture::expect_op(s1.dec, Op::kSequence, 0);
+  s1.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(s1.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(s1.dec, Op::kSecinfo, 0);
+  EXPECT_EQ(*s1.dec.u32(), 1u);
+  EXPECT_EQ(*s1.dec.u32(), 1u);  // AUTH_SYS
+  EXPECT_EQ(secinfo("nosuch", false).status, stv(Status::kNoent));
+  EXPECT_EQ(secinfo("hello", true).status, stv(Status::kNofilehandle));
 }

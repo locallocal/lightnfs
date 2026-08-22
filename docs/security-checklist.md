@@ -55,3 +55,52 @@ fuzz：`fuzz/fuzz_handle_request.cpp` 直喂 `Dispatcher::handle_request`，阶�
 
 验证：`accept_client connstorm`（10k 连接 + 超深流水线背压）；超限连接被拒并计数
 （`lightnfs_connections_rejected_total`）。
+
+## 5. 宽限期 reclaim 名单强制 ✅（阶段 4）
+
+- 稳定存储仅 `state_dir/{boot_epoch, hmac.key, clients/<hash(co_ownerid)>}`（07 §7.5 红线）；
+  CREATE_SESSION 确认后写入名单（fsync），客户端状态全清后延迟删除。
+- 重启：epoch++ → 读名单进入 grace（时长 = lease）。grace 内 OPEN/LOCK 的 CLAIM_PREVIOUS/
+  reclaim **仅接受名单内客户端**（否则 RECLAIM_BAD），普通建状态操作 → GRACE，匿名写 → GRACE，
+  读放行；名单内客户端全部 RECLAIM_COMPLETE → 提前出 grace；RECLAIM_COMPLETE 之后的 reclaim
+  → NO_GRACE。
+- 实现点：`state/state_mgr.cpp`（`load_grace_list`/`in_grace`/`in_stable_list`/OPEN/lock 门禁）。
+- 验证：单测 `StateMgr.GraceReclaimGate`、`Nfs4.RestartReclaimWithinGrace`、`Nfs4.CurrentStateidAndReclaimCompleteGate`；
+  `accept_client v4reclaim`（带打开状态 kill -9 重启 → grace 内 reclaim → 数据无损 → 门禁）；
+  VM 脚本内核客户端持开文件跨重启写入校验。
+
+## 7. 最小特权运行 + seccomp 白名单 ✅（阶段 5）
+
+- `packaging/systemd/lightnfs.service`：专用系统用户 `lightnfs`；`AmbientCapabilities` =
+  `CAP_DAC_READ_SEARCH`（open_by_handle_at 稳定句柄）+ `CAP_NET_BIND_SERVICE`（绑 2049/20048），
+  `CapabilityBoundingSet` 同集、其余全 drop、`NoNewPrivileges`。
+- 文件系统沙箱：`ProtectSystem=strict` + 仅 `state_dir` 与显式导出树可写；`PrivateTmp`/
+  `PrivateDevices`/`ProtectKernel*`/`ProtectProc=invisible`/`MemoryDenyWriteExecute` 等全开。
+- seccomp：`SystemCallFilter=@system-service` 去掉 `@clock @debug @module @mount @obsolete
+  @raw-io @reboot @swap @cpu-emulation`，再显式加入 `io_uring_{setup,enter,register}` 与
+  `name_to_handle_at`/`open_by_handle_at`；越权系统调用返回 EPERM。
+- 白名单来源：`scripts/gen_seccomp_allowlist.sh` 对真实 v3+v4.1 读写+锁负载做 strace 取全量
+  系统调用集（本机实测集：io_uring_{setup,enter} / name_to_handle_at / open_by_handle_at /
+  openat / statx / fsync / linkat / renameat / unlinkat / getdents64 / socket 族 等，
+  全部落在上述白名单内）。运行时集变更需重跑并复核单元文件。
+- 验证：`systemd-analyze security lightnfs.service` 审计沙箱评分（安装后运行）。
+
+## 8. AUTH_SYS 信任边界写入部署文档 ✅（阶段 5）
+
+- `docs/deployment.md` §1 明确：AUTH_SYS 身份不可验证 ⇒ 仅受信网络部署，公网必须前置
+  WireGuard/IPsec 或 TLS；`clients` CIDR 白名单 + `squash` 收敛；句柄 HMAC 防伪造句柄
+  但不防伪造身份。§5 归档全部已知限制（无 GSS、无 NLM、v3/v4 混布锁边界、句柄稳定性、
+  单机网关）。
+
+---
+
+## 复查记录：错误白名单全覆盖（阶段 5，08 §8.5 隐含 + 开发计划 §7）
+
+- v3：`v3_error_allowed` 逐过程对照 nfsv3 研究分册 08 §8.2（RFC 1813）复查——CREATE 族收敛为
+  RFC 行（去掉早期多余的 INVAL/NOTSUPP），MKDIR 增 MLINK（目录链接数上限）、REMOVE/RMDIR 增
+  PERM（sticky 目录）为文档化偏差，保留对客户端有意义的 errno。
+- v4：`v4_error_allowed` 覆盖全部已实现 op，阶段 5 新增 LOCK/LOCKT/LOCKU（DENIED/BAD_RANGE/
+  LOCK_RANGE/LOCK_NOTSUPP/OPENMODE/租约族）、SECINFO/SECINFO_NO_NAME（WRONGSEC/NOENT）、
+  FREE_STATEID（LOCKS_HELD）、RECLAIM_COMPLETE、无参 op（GETFH/PUTFH*/SAVEFH/RESTOREFH/
+  GETATTR/VERIFY/NVERIFY 只放行通用集）逐条对照 RFC 8881 §15.2。
+- 验证：`tests/test_nfs4.cpp::Nfs4.ErrmapV4Whitelist` 扩充 v3/v4 对照断言（越界结果降级为 IO）。

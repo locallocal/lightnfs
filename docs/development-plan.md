@@ -318,14 +318,23 @@
 
 > 设计依据：[07-state-management.md](design/07-state-management.md) §7.6、[08-config-observability.md](design/08-config-observability.md) §8.5
 
-- [ ] 网关内 LockMgr（实现 5.8 接口）：per-ObjId 区间树、POSIX 合并/拆分、非阻塞（DENIED+冲突者）
-- [ ] LOCK/LOCKT/LOCKU op + lock stateid（parent_open 关联、lock owner 表）
-- [ ] SECINFO/SECINFO_NO_NAME 完整
-- [ ] 错误白名单全覆盖复查（4.6 两张表对照调研分册全量过一遍）
-- [ ] 安全清单收尾：最小特权（CAP_DAC_READ_SEARCH+CAP_NET_BIND_SERVICE，systemd+seccomp 白名单单元文件）、部署文档（AUTH_SYS 信任边界、TLS/WireGuard 前置）
-- [ ] **验收**：cthon lock 组（vers=4.1）；pynfs 锁相关组；8.5 全 8 项逐条验收记录归档
+- [x] 网关内 LockMgr（实现 5.8 接口）：per-ObjId 区间段表、POSIX 合并/拆分/升降级、非阻塞（DENIED+冲突者），`backend::LockMgr` 唯一 v1 实现者——`src/state/lock_mgr.{hpp,cpp}`
+- [x] LOCK/LOCKT/LOCKU op + lock stateid（parent_open 关联、lock owner 表、seqid 纪律、OPENMODE/DENIED/OLD_STATEID、CLOSE 连带释放、FREE_STATEID→LOCKS_HELD、courtesy 冲突回收、grace 门禁）——`state_mgr.cpp` 锁状态层 + `engine.cpp` 三 op
+- [x] SECINFO/SECINFO_NO_NAME 完整（AUTH_SYS-only 恒 `[AUTH_SYS]`、消费 CFH、名字校验）
+- [x] 错误白名单全覆盖复查（4.6 两张表对照调研分册全量过一遍）：v3 CREATE 族收敛 + MKDIR MLINK/REMOVE·RMDIR PERM 文档化偏差；v4 新增 LOCK/SECINFO/FREE_STATEID/RECLAIM_COMPLETE/无参 op 行——`Nfs4.ErrmapV4Whitelist` 扩充对照
+- [x] 安全清单收尾：最小特权（`packaging/systemd/lightnfs.service`：CAP_DAC_READ_SEARCH+CAP_NET_BIND_SERVICE、CapBoundingSet 同集、seccomp `@system-service` 去高危集 + io_uring/句柄系统调用白名单，`scripts/gen_seccomp_allowlist.sh` 从真实负载 strace 生成）、部署文档（`docs/deployment.md`：AUTH_SYS 信任边界、TLS/WireGuard 前置、运维、限制）
+- [x] **验收**：cthon lock 组（vers=4.1，`accept_m5_vm.sh` -l + 内核 fcntl 字节锁）；pynfs 锁相关组（本机 currentstateid/courteous/secinfo_no_name/SEC 26 通过/1 失败=CSID7 pynfs 自身 NameError）；8.5 全 8 项逐条验收记录归档（`security-checklist.md`）
 
-估算 4–6 周。此阶段结束 = **v1 发布候选**：打 tag、发布文档（部署/运维/限制说明）、Backend API 冻结公告。
+### 7.1 阶段 5 完成记录（2026-08-22）
+
+- 测试：111 个单测/集成测试三配置全绿（Release/ASAN+UBSAN/TSAN）；新增 `LockMgr`
+  （POSIX 合并/拆分/升级/冲突/区间助手 2 组）、`StateMgr.ByteRangeLocksLifecycle`
+  （LOCK new/existing owner、DENIED 持有者、LOCKT、lock stateid IO 模式、FREE/LOCKU/CLOSE、
+  courtesy 冲突回收）、`Nfs4.LockOpsAndSecinfo`（wire 级 LOCK/LOCKT/LOCKU/SECINFO）
+- 回环验收（`accept_m5_local.sh`）：`v4lock`（双客户端锁全流程）+ v4rw/reclaim/courtesy/ctl
+  回归 + pynfs 锁/secinfo/courtesy 组；两配置（Release/ASAN）通过
+- 此阶段结束 = **v1 发布候选**：Backend API 接口 `native_locks()` 切换点已定型（网关内
+  LockMgr 为唯一 v1 实现者）；部署/运维/限制文档齐备
 
 ---
 

@@ -55,6 +55,7 @@ add_library(lnfs_core STATIC
   src/nfsv4/attrs.cpp
   src/nfsv4/engine.cpp
   src/core/pseudofs.cpp
+  src/state/lock_mgr.cpp
   src/state/state_mgr.cpp
   src/nfsv3/engine.cpp
   src/mountd/mount3.cpp
@@ -113,6 +114,7 @@ add_executable(lnfs_tests
   tests/test_write_path.cpp
   tests/test_nfs4.cpp
   tests/test_state.cpp
+  tests/test_lock_mgr.cpp
 )
 target_link_libraries(lnfs_tests PRIVATE lnfs_core)
 add_test(NAME lnfs_tests COMMAND lnfs_tests)

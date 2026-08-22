@@ -467,3 +467,118 @@ TEST(StateMgr, GraceReclaimGate) {
   });
   runtime.stop_and_join();
 }
+
+TEST(StateMgr, ByteRangeLocksLifecycle) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  state::StateMgr mgr({.boot_epoch = 5, .state_dir = dir.path, .lease_seconds = 1,
+                       .courtesy_multiplier = 1});
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(mgr, "client-a", 1);
+    auto b = co_await connect(mgr, "client-b", 2);
+    auto oa = co_await mgr.open(open_args(a.clientid, 1, "oa", state::kShareBoth, 0), nullptr);
+    auto ob = co_await mgr.open(open_args(b.clientid, 1, "ob", state::kShareRead, 0), nullptr);
+    EXPECT_EQ(oa.status, kOk);
+    EXPECT_EQ(ob.status, kOk);
+
+    state::StateMgr::LockArgs la;
+    la.clientid = a.clientid;
+    la.fsid = 1;
+    la.oid = oid_of(1);
+    la.exclusive = true;
+    la.offset = 0;
+    la.length = 100;
+    la.new_owner = true;
+    la.open_stateid = oa.stateid;
+    la.owner = "proc-a";
+    auto l1 = co_await mgr.lock(la);
+    EXPECT_EQ(l1.status, kOk);
+    EXPECT_EQ(l1.stateid.seqid, 1u);
+    EXPECT_EQ(l1.stateid.other[4], std::byte{2});  // type byte = kLock
+    // b (read-only open) asking for a write lock -> OPENMODE; a read lock over a's
+    // exclusive range -> DENIED naming a's owner; outside the range -> OK.
+    state::StateMgr::LockArgs lb = la;
+    lb.clientid = b.clientid;
+    lb.open_stateid = ob.stateid;
+    lb.owner = "proc-b";
+    EXPECT_EQ((co_await mgr.lock(lb)).status, st4(nfsv4::Status::kOpenmode));
+    lb.exclusive = false;
+    auto denied = co_await mgr.lock(lb);
+    EXPECT_EQ(denied.status, st4(nfsv4::Status::kDenied));
+    EXPECT_EQ(denied.denied.clientid, a.clientid);
+    EXPECT_STREQ(denied.denied.owner, "proc-a");
+    EXPECT_EQ(denied.denied.length, 100u);
+    EXPECT_TRUE(denied.denied.exclusive);
+    EXPECT_EQ(mgr.stats().lock_states, 1u);  // no stateid minted for a denied new owner
+    lb.offset = 100;
+    auto l2 = co_await mgr.lock(lb);
+    EXPECT_EQ(l2.status, kOk);
+    // LOCKT from b over a's range -> DENIED; from a itself -> OK (own locks ignored).
+    auto t1 = co_await mgr.lockt(b.clientid, 1, oid_of(1), "proc-b", false, 0, 10);
+    EXPECT_EQ(t1.status, st4(nfsv4::Status::kDenied));
+    auto t2 = co_await mgr.lockt(a.clientid, 1, oid_of(1), "proc-a", true, 0, 10);
+    EXPECT_EQ(t2.status, kOk);
+    // Existing lock stateid path bumps seqid; stale seqid is OLD_STATEID.
+    la.new_owner = false;
+    la.lock_stateid = l1.stateid;
+    la.offset = 200;
+    auto l3 = co_await mgr.lock(la);
+    EXPECT_EQ(l3.status, kOk);
+    EXPECT_TRUE(l3.stateid.other == l1.stateid.other);
+    EXPECT_EQ(l3.stateid.seqid, 2u);
+    EXPECT_EQ((co_await mgr.lock(la)).status, st4(nfsv4::Status::kOldStateid));
+    // IO through a lock stateid carries the open's mode.
+    auto io = co_await mgr.check_io(l3.stateid, a.clientid, 1, oid_of(1), state::kShareWrite);
+    EXPECT_EQ(io.status, kOk);
+    auto io2 = co_await mgr.check_io(l2.stateid, b.clientid, 1, oid_of(1), state::kShareWrite);
+    EXPECT_EQ(io2.status, st4(nfsv4::Status::kOpenmode));
+    // FREE_STATEID: LOCKS_HELD while ranges remain; LOCKU everything, then frees.
+    EXPECT_EQ(co_await mgr.free_stateid(l3.stateid), st4(nfsv4::Status::kLocksHeld));
+    nfsv4::Stateid after;
+    EXPECT_EQ(co_await mgr.locku(l3.stateid, a.clientid, 0, UINT64_MAX, &after), kOk);
+    EXPECT_EQ(after.seqid, 3u);
+    EXPECT_EQ(co_await mgr.locku(l3.stateid, b.clientid, 0, 1, nullptr),
+              st4(nfsv4::Status::kBadStateid));
+    EXPECT_EQ(co_await mgr.free_stateid(after), kOk);
+    EXPECT_EQ(mgr.stats().lock_states, 1u);
+    // CLOSE releases b's lock state and its ranges.
+    nfsv4::Stateid closed;
+    EXPECT_EQ(co_await mgr.close_state(ob.stateid, b.clientid, &closed), kOk);
+    auto s = mgr.stats();
+    EXPECT_EQ(s.lock_states, 0u);
+    EXPECT_EQ(s.lock_segments, 0u);
+    EXPECT_EQ(s.files, 1u);
+    EXPECT_EQ(s.lock_denied, 1u);
+
+    // Courtesy conflict through a lock: a takes a lock, goes silent, b's lock reclaims.
+    la.new_owner = true;
+    la.open_stateid = oa.stateid;
+    la.offset = 0;
+    la.length = 10;
+    EXPECT_EQ((co_await mgr.lock(la)).status, kOk);
+    auto ob2 = co_await mgr.open(open_args(b.clientid, 1, "ob", state::kShareBoth, 0), nullptr);
+    EXPECT_EQ(ob2.status, kOk);
+    lb.open_stateid = ob2.stateid;
+    lb.new_owner = true;
+    lb.offset = 0;
+    lb.length = 10;
+    lb.exclusive = true;
+    EXPECT_EQ((co_await mgr.lock(lb)).status, st4(nfsv4::Status::kDenied));
+    co_await rt::sleep_for(std::chrono::milliseconds(2100));
+    auto seq = co_await mgr.sequence_begin(b.sessionid, 0, 1, 0, false, 1);
+    EXPECT_EQ(seq.status, kOk);
+    co_await mgr.sequence_complete(b.sessionid, 0, 1, false, {});
+    co_await mgr.scan_leases();
+    EXPECT_EQ(mgr.stats().courtesy, 1u);
+    EXPECT_EQ((co_await mgr.lock(lb)).status, kOk);
+    auto s2 = mgr.stats();
+    EXPECT_EQ(s2.reclaim_conflict, 1u);
+    EXPECT_EQ(s2.opens, 1u);
+    EXPECT_EQ(s2.lock_states, 1u);
+    auto dump = co_await mgr.dump();
+    EXPECT_TRUE(dump.find("lock ") != std::string::npos);
+    EXPECT_TRUE(dump.find("[0,10)W") != std::string::npos);
+  });
+  runtime.stop_and_join();
+}
