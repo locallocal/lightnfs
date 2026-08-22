@@ -275,24 +275,42 @@
 
 ### 6.1 状态表全量（第 1–4 周）
 
-- [ ] StateTable/FileStateIdx；stateid.other 含 boot_epoch（STALE_STATEID 零成本判定）
-- [ ] OPEN（claim NULL/FH/PREVIOUS）：share reservation 冲突裁决、同 owner 合并（并集 access/deny、seqid++）、backend OpenPtr 入状态表
-- [ ] CLOSE/OPEN_DOWNGRADE；OpenPtr 释放移出临界区异步执行
-- [ ] READ/WRITE/COMMIT/SETATTR 带 stateid：校验顺序（特殊 stateid→查表→OPENMODE）→ 落到与 v3 相同的后端调用
-- [ ] CREATE（目录类对象）、REMOVE/RENAME/LINK 等 v4 名字空间 op 补齐
+- [x] StateTable/FileStateIdx；stateid.other 含 boot_epoch（STALE_STATEID 零成本判定）——`states_`（other→StateRec）+ `files_`（{fsid,oid}→opens）双索引 + `ClientRec.states` 反引用，16 分片、单分片持锁、持锁零后端 IO（并发矩阵单测仍为死锁自由证明）
+- [x] OPEN（claim NULL/FH/PREVIOUS）：share reservation 冲突裁决（SHARE_DENIED，匿名 stateid 受 deny 约束 → LOCKED）、同 owner 合并（并集 access/deny、seqid++）、backend OpenPtr 入状态表；create UNCHECKED/GUARDED/EXCLUSIVE4/EXCLUSIVE4_1（attrset 回报）、POSIX 权限预检、委托意愿 → OPEN_DELEGATE_NONE_EXT 带原因；**补齐**：当前 stateid（{1,0}）语义（OPEN/DOWNGRADE/CLOSE 置、SAVEFH/RESTOREFH 随句柄保存、PUTFH/LOOKUP 等清除）、未 RECLAIM_COMPLETE 的客户端建状态 → GRACE（RFC §18.51.3）
+- [x] CLOSE/OPEN_DOWNGRADE；OpenPtr 释放移出临界区（状态管理器内所有释放均在最后一把分片锁之后）；seqid 纪律：0=当前、旧 OLD_STATEID、超前 BAD_STATEID；DOWNGRADE 仅收窄（否则 INVAL）
+- [x] READ/WRITE/COMMIT/SETATTR 带 stateid：校验顺序（特殊 stateid→查表→client/对象→seqid→OPENMODE）→ 落到与 v3 相同的后端调用；verifier = boot epoch 与 v3 共用；SETATTR fattr4 可设置集 + BADOWNER/INVAL/ATTRNOTSUPP 判定、attrsset 恒编码
+- [x] CREATE（DIR/LNK/BLK/CHR/SOCK/FIFO，REG→BADTYPE）、REMOVE/RENAME/LINK 等 v4 名字空间 op 补齐（change_info4 排他锁下 atomic；跨导出 XDEV；伪根 ROFS；非 UTF-8 名 INVAL）；**超计划**：VERIFY/NVERIFY（同掩码编码字节比较）
 
 ### 6.2 租约、courtesy 与 grace/reclaim（第 3–6 周）
 
-- [ ] LeaseQueue 到期扫描协程；courtesy 状态（冲突即回收 / 超时 24×lease 无条件回收）；回收动作链（StateRec→OpenPtr 析构→锁表→files_ 反引用→ClientRec→稳定名单）
-- [ ] grace 完整：CLAIM_PREVIOUS/reclaim 仅限名单（RECLAIM_BAD）、普通建状态→GRACE、RECLAIM_COMPLETE 全到齐提前出 grace
-- [ ] state 指标组全量（7.8 清单）；`lightnfs-ctl` 补状态表 dump、强制回收 client
+- [x] LeaseQueue 到期扫描协程（每秒一轮，reactor 0 常驻）；courtesy 状态（冲突即回收 / 超时 `courtesy_multiplier`×lease 无条件回收，默认 24×；courtesy 期内重新 SEQUENCE 即复活）；回收动作链（StateRec→OpenPtr 析构→files_ 反引用→会话销毁→ClientRec→稳定名单）；客户端重启（新 verifier 经 CREATE_SESSION 确认）走同一条链
+- [x] grace 完整：CLAIM_PREVIOUS/reclaim 仅限名单（RECLAIM_BAD）、RECLAIM_COMPLETE 之后 reclaim → NO_GRACE、普通建状态→GRACE、匿名 WRITE→GRACE、读放行、RECLAIM_COMPLETE 全到齐提前出 grace
+- [x] state 指标组全量（7.8 清单：clients/sessions/opens/files/courtesy/grace 剩余/槽重放/租约到期/三路回收/share_denied/open_merges）；`lightnfs-ctl` 补 `state`（指标 + 三表 dump）与 `expire-client <id>` 强制回收；配置 `[protocol] lease`/`courtesy_multiplier`
 
 ### 6.3 验收（第 6–8 周，长稳与开发并行）
 
-- [ ] cthon basic/general（vers=4.1）；fsx 过夜
-- [ ] 服务器重启 reclaim 用例（7.5 场景脚本：带打开状态重启→grace 内 reclaim→数据无损）
-- [ ] 租约回收用例（kill 客户端 VM→courtesy→冲突回收与超时回收两路径）
-- [ ] v3/v4 混布：同后端 v3 写 + v4 状态并发（文档明示的边界行为验证）
+- [x] cthon basic/general（vers=4.1）；fsx 过夜 —— `accept_m4_vm.sh`（root VM，CI `m4-acceptance`：cthon b/g/s + fsx，`FSX_OPS=2000000` 为过夜参数）；本机无特权以 `accept_client v4rw`（用户态 4.1 读写客户端：OPEN(CREATE)/分块 UNSTABLE WRITE+COMMIT verifier/逐字节读回与后端比对/SETATTR 截断/双客户端 share deny/DOWNGRADE/CREATE-RENAME-LINK-REMOVE 后端镜像校验）实测通过
+- [x] 服务器重启 reclaim 用例（7.5 场景脚本：带打开状态重启→grace 内 reclaim→数据无损）—— `accept_client v4reclaim`（kill -9 + 重启 + 同 owner 重建会话 + CLAIM_PREVIOUS + 旧 stateid STALE/普通 OPEN GRACE/事后 NO_GRACE 门禁）实测通过；VM 脚本以内核客户端持开文件跨重启写入校验；单测 `RestartReclaimWithinGrace`/`GraceReclaimGate` 覆盖
+- [x] 租约回收用例（kill 客户端 VM→courtesy→冲突回收与超时回收两路径）—— `accept_client v4courtesy`（持有者断连不 CLOSE：租约内 SHARE_DENIED、到期后冲突回收放行、第二持有者超时回收）+ `lightnfs-ctl state` 计数校验实测通过（lease=3s）；单测 `CourtesyConflictAndTimeoutReclaim`
+- [x] v3/v4 混布：同后端 v3 写 + v4 状态并发（文档明示的边界行为验证）—— VM 脚本双挂载并发写互见；本机 v3 `walk` 与 v4 `v4walk`/`v4rw` 同后端交叉回归
+
+### 6.4 阶段 4 完成记录（2026-08-22）
+
+- 测试：107 个单测/集成测试三配置全绿（Release/ASAN+UBSAN/TSAN）；新增 StateMgr 三组
+  （share/merge/downgrade/close 纪律、courtesy 冲突+超时+强制+复活、grace 门禁）与 v4 wire
+  七组（create/write/commit/读回、EXCLUSIVE4(_1) 重放与 OPENMODE、share deny/LOCKED/
+  DOWNGRADE/CLAIM_FH 合并、SETATTR 各属性与错误码、名字空间 op、跨"重启" reclaim、
+  当前 stateid + RECLAIM_COMPLETE 门禁）
+- 回环验收（`accept_m4_local.sh`）：v4rw / v4walk / walk / v4reclaim / v4courtesy / ctl 全
+  通过；pynfs 4.1（用户态直连）open/rename/verify/courteous/currentstateid + 阶段 3 全部
+  组：**184 用例 162 通过 / 22 失败，22 个失败全部为预期排除**（LOCK 依赖 4、委托/回传
+  依赖 7、pynfs 自身 NameError 1、需 root 的块/字符设备树对象 10；`scripts/pynfs_m4_expected.txt`）
+- 按 pynfs 校准的语义：seqid=0 在 CLOSE/OPEN_DOWNGRADE 同样表示"当前版本"；当前 stateid
+  特殊值；未 RECLAIM_COMPLETE 即建状态 → GRACE；非 UTF-8 名 INVAL；OPEN_DELEGATE_NONE_EXT
+- 已知边界（详见 [m4-v41-readwrite.md](m4-v41-readwrite.md)）：无特权回退句柄在无
+  STATX_BTIME 的文件系统（tmpfs）上句柄不跨重启稳定（`v4reclaim` 打印提示并按名重解析后
+  继续校验状态语义；生产用内核句柄/btime 文件系统无此限制）；v3 写不受 v4 deny 约束；
+  LOCK/委托/SECINFO(带名)/ACL 属阶段 5/6
 
 ---
 

@@ -37,6 +37,7 @@
 #include <map>
 #include <optional>
 #include <random>
+#include <functional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -1260,8 +1261,10 @@ struct V4Client {
   uint64_t clientid = 0;
   std::array<std::byte, 16> sessionid{};
   uint32_t slot_seq = 1;
+  std::string owner_id;  // co_ownerid: distinct per simulated client
 
-  explicit V4Client(const char* host, uint16_t port) : rpc(host, port) {}
+  explicit V4Client(const char* host, uint16_t port, std::string owner = "lightnfs-accept-v4")
+      : rpc(host, port), owner_id(std::move(owner)) {}
 
   // Raw COMPOUND exchange; returns the reply payload past the RPC header.
   std::vector<std::byte> compound(const std::vector<std::byte>& body) {
@@ -1303,7 +1306,7 @@ struct V4Client {
     d.skip(16 + 5 * 4);
   }
 
-  void establish() {
+  void establish(bool send_reclaim_complete = true) {
     BufferPool& pool = rpc.pool;
     XdrEnc ex(pool);
     ex.u32(0);
@@ -1312,7 +1315,7 @@ struct V4Client {
     ex.u32(kOpExchangeId);
     std::array<std::byte, 8> verf{std::byte{0x42}};
     ex.opaque_fixed(verf);
-    ex.string("lightnfs-accept-v4");
+    ex.string(owner_id);
     ex.u32(0);
     ex.u32(0);  // SP4_NONE
     ex.u32(0);  // no impl id
@@ -1347,6 +1350,7 @@ struct V4Client {
     if (!sid) fatal("v4: bad sessionid");
     std::copy(sid->begin(), sid->end(), sessionid.begin());
 
+    if (!send_reclaim_complete) return;
     // RECLAIM_COMPLETE like a real client finishing recovery.
     XdrEnc rc(pool);
     seq_header(rc, 1);
@@ -1588,7 +1592,507 @@ void v4_walk_dir(V4Client& c, const std::vector<std::byte>& dir_fh,
   }
 }
 
+// ---------- NFSv4.1 read-write acceptance (phase 4) ----------
+
+constexpr uint32_t kOpCommit = 5, kOpCreate = 6, kOpLink = 11, kOpOpenDowngrade = 21,
+                   kOpRemove = 28, kOpRename = 29, kOpSavefh = 32, kOpSetattr = 34,
+                   kOpWrite = 38;
+constexpr uint32_t kShareDenied = 10015, kOpenmode = 10038, kGrace = 10013,
+                   kStaleStateid = 10023, kNoGrace = 10033;
+
+struct Stateid4 {
+  uint32_t seqid = 0;
+  std::array<std::byte, 12> other{};
+  void encode(XdrEnc& e) const {
+    e.u32(seqid);
+    e.opaque_fixed(other);
+  }
+  static Stateid4 decode(XdrDec& d) {
+    Stateid4 s;
+    s.seqid = ru32(d);
+    auto o = d.opaque_fixed(12);
+    if (!o) fatal("v4: bad stateid");
+    std::copy(o->begin(), o->end(), s.other.begin());
+    return s;
+  }
+};
+
+struct OpenOut {
+  uint32_t status = 0;
+  Stateid4 stateid;
+  std::vector<std::byte> fh;
+  bool other_differs(const OpenOut& o) const { return stateid.other != o.stateid.other; }
+};
+
+// {SEQUENCE, PUTFH dir|file, OPEN, GETFH}: claim 0 (name) or 4 (CLAIM_FH) or 1
+// (CLAIM_PREVIOUS); create=true → OPEN4_CREATE UNCHECKED with mode 0644.
+OpenOut v4_open(V4Client& c, const std::vector<std::byte>& fh, const std::string& name,
+                uint32_t access, uint32_t deny, const std::string& owner, bool create,
+                uint32_t claim = 0, std::optional<uint64_t> size = std::nullopt) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 3);
+  ops.u32(kOpPutfh);
+  ops.opaque(fh);
+  ops.u32(kOpOpen);
+  ops.u32(0);
+  ops.u32(access);
+  ops.u32(deny);
+  ops.u64(c.clientid);
+  ops.string(owner);
+  if (create) {
+    ops.u32(1);  // OPEN4_CREATE
+    ops.u32(0);  // UNCHECKED4
+    ops.u32(2);  // bitmap: 2 words
+    ops.u32(size ? (1u << kAttrSize) : 0);
+    ops.u32(1u << (33 - 32));  // mode
+    XdrEnc vals(c.rpc.pool);
+    if (size) vals.u64(*size);
+    vals.u32(0644);
+    auto bytes = vals.take().to_bytes();
+    ops.opaque(bytes);
+  } else {
+    ops.u32(0);
+  }
+  ops.u32(claim);
+  if (claim == 0) ops.string(name);
+  else if (claim == 1) ops.u32(0);
+  ops.u32(kOpGetfh);
+  auto r = c.run(ops.take().to_bytes(), 0, false);
+  OpenOut out;
+  out.status = r.status;
+  if (r.status != 0) return out;
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  V4Client::expect_op(r.dec, kOpOpen);
+  out.stateid = Stateid4::decode(r.dec);
+  rbool(r.dec);
+  ru64(r.dec);
+  ru64(r.dec);
+  ru32(r.dec);
+  uint32_t words = ru32(r.dec);
+  for (uint32_t i = 0; i < words; ++i) (void)ru32(r.dec);
+  ru32(r.dec);
+  V4Client::expect_op(r.dec, kOpGetfh);
+  auto span = r.dec.opaque(128);
+  if (!span) fatal("v4: bad open fh");
+  out.fh.assign(span->begin(), span->end());
+  return out;
+}
+
+uint32_t v4_write(V4Client& c, const std::vector<std::byte>& fh, const Stateid4& sid,
+                  uint64_t offset, std::span<const std::byte> data, uint32_t stable,
+                  std::array<std::byte, 8>* verf = nullptr) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2);
+  ops.u32(kOpPutfh);
+  ops.opaque(fh);
+  ops.u32(kOpWrite);
+  sid.encode(ops);
+  ops.u64(offset);
+  ops.u32(stable);
+  ops.opaque(data);
+  auto r = c.run(ops.take().to_bytes(), 0, false);
+  if (r.status != 0) return r.status;
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  V4Client::expect_op(r.dec, kOpWrite);
+  uint32_t n = ru32(r.dec);
+  if (n != data.size()) fatal("v4: short write %u of %zu", n, data.size());
+  (void)ru32(r.dec);
+  auto v = r.dec.opaque_fixed(8);
+  if (!v) fatal("v4: bad write verifier");
+  if (verf) std::copy(v->begin(), v->end(), verf->begin());
+  return 0;
+}
+
+std::array<std::byte, 8> v4_commit(V4Client& c, const std::vector<std::byte>& fh) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2);
+  ops.u32(kOpPutfh);
+  ops.opaque(fh);
+  ops.u32(kOpCommit);
+  ops.u64(0);
+  ops.u32(0);
+  auto r = c.run(ops.take().to_bytes());
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  V4Client::expect_op(r.dec, kOpCommit);
+  auto v = r.dec.opaque_fixed(8);
+  std::array<std::byte, 8> out{};
+  std::copy(v->begin(), v->end(), out.begin());
+  return out;
+}
+
+std::vector<std::byte> v4_read(V4Client& c, const std::vector<std::byte>& fh,
+                               const Stateid4& sid, uint64_t size, uint32_t* status = nullptr) {
+  std::vector<std::byte> data;
+  bool eof = size == 0;
+  while (!eof) {
+    XdrEnc rd(c.rpc.pool);
+    c.seq_header(rd, 2);
+    rd.u32(kOpPutfh);
+    rd.opaque(fh);
+    rd.u32(kOpRead);
+    sid.encode(rd);
+    rd.u64(data.size());
+    rd.u32(65536);
+    auto rr = c.run(rd.take().to_bytes(), 0, false);
+    if (rr.status != 0) {
+      if (status) *status = rr.status;
+      return data;
+    }
+    V4Client::skip_sequence_res(rr.dec);
+    V4Client::expect_op(rr.dec, kOpPutfh);
+    V4Client::expect_op(rr.dec, kOpRead);
+    eof = rbool(rr.dec);
+    auto chunk = rr.dec.opaque(1u << 20);
+    if (!chunk) fatal("v4: bad read data");
+    data.insert(data.end(), chunk->begin(), chunk->end());
+    if (chunk->empty() && !eof) fatal("v4: empty read without eof");
+    if (data.size() >= size) break;
+  }
+  if (status) *status = 0;
+  return data;
+}
+
+uint32_t v4_close(V4Client& c, const std::vector<std::byte>& fh, const Stateid4& sid) {
+  XdrEnc cl(c.rpc.pool);
+  c.seq_header(cl, 2);
+  cl.u32(kOpPutfh);
+  cl.opaque(fh);
+  cl.u32(kOpClose);
+  cl.u32(0);
+  sid.encode(cl);
+  return c.run(cl.take().to_bytes(), 0, false).status;
+}
+
+uint32_t v4_setattr_size(V4Client& c, const std::vector<std::byte>& fh, const Stateid4& sid,
+                         uint64_t size) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2);
+  ops.u32(kOpPutfh);
+  ops.opaque(fh);
+  ops.u32(kOpSetattr);
+  sid.encode(ops);
+  ops.u32(1);
+  ops.u32(1u << kAttrSize);
+  XdrEnc vals(c.rpc.pool);
+  vals.u64(size);
+  auto bytes = vals.take().to_bytes();
+  ops.opaque(bytes);
+  return c.run(ops.take().to_bytes(), 0, false).status;
+}
+
+uint32_t v4_dir_op(V4Client& c, const std::vector<std::byte>& dir_fh,
+                   const std::function<void(XdrEnc&)>& body, uint32_t extra = 0,
+                   const std::function<void(XdrEnc&)>& prefix = {}) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2 + extra);
+  if (prefix) prefix(ops);
+  ops.u32(kOpPutfh);
+  ops.opaque(dir_fh);
+  body(ops);
+  return c.run(ops.take().to_bytes(), 0, false).status;
+}
+
+uint32_t v4_reclaim_complete(V4Client& c) {
+  XdrEnc rc(c.rpc.pool);
+  c.seq_header(rc, 1);
+  rc.u32(kOpReclaimComplete);
+  rc.boolean(false);
+  return c.run(rc.take().to_bytes(), 0, false).status;
+}
+
+std::vector<std::string> split_path(const std::string& path) {
+  std::vector<std::string> components;
+  size_t pos = 0;
+  while (pos < path.size()) {
+    while (pos < path.size() && path[pos] == '/') ++pos;
+    size_t end = path.find('/', pos);
+    if (pos < path.size())
+      components.push_back(path.substr(pos, end == std::string::npos ? std::string::npos
+                                                                     : end - pos));
+    if (end == std::string::npos) break;
+    pos = end + 1;
+  }
+  return components;
+}
+
+std::vector<std::byte> random_bytes(size_t n, uint32_t seed) {
+  std::vector<std::byte> out(n);
+  uint32_t x = seed ? seed : 1;
+  for (auto& b : out) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    b = static_cast<std::byte>(x);
+  }
+  return out;
+}
+
 }  // namespace v4
+
+// Full v4.1 read-write acceptance (development plan §6.3 loopback half): create,
+// chunked UNSTABLE writes + COMMIT verifier, byte-verified read-back and backing-file
+// comparison, SETATTR truncate, share reservation across two clients, OPEN_DOWNGRADE,
+// namespace ops (CREATE dir / RENAME / LINK / REMOVE) mirrored on the backing tree.
+int cmd_v4rw(const char* host, uint16_t nfs_port, const std::string& export_path,
+             const fs::path& backing) {
+  using namespace v4;
+  V4Client a(host, nfs_port);
+  a.establish();
+  auto root = lookup_path(a, split_path(export_path));
+
+  // Create + write 3 MiB in 64 KiB UNSTABLE chunks, then COMMIT.
+  auto payload = random_bytes(3u << 20, 0x1234);
+  auto o = v4_open(a, root, "v4rw.bin", 3, 0, "rw-owner", true);
+  if (o.status != 0) fatal("v4rw: OPEN(CREATE) status %u", o.status);
+  std::array<std::byte, 8> wverf{}, cverf{};
+  for (size_t off = 0; off < payload.size(); off += 65536) {
+    size_t len = std::min<size_t>(65536, payload.size() - off);
+    uint32_t st = v4_write(a, o.fh, o.stateid, off,
+                           std::span<const std::byte>(payload.data() + off, len), 0, &wverf);
+    if (st != 0) fatal("v4rw: WRITE status %u at %zu", st, off);
+  }
+  cverf = v4_commit(a, o.fh);
+  if (cverf != wverf) fatal("v4rw: COMMIT verifier differs from WRITE verifier");
+  if (read_local(backing / "v4rw.bin") != payload) fatal("v4rw: backing file mismatch");
+  if (v4_read(a, o.fh, o.stateid, payload.size()) != payload)
+    fatal("v4rw: read-back mismatch");
+
+  // Truncate via SETATTR(size) with the open stateid.
+  if (uint32_t st = v4_setattr_size(a, o.fh, o.stateid, 1u << 20); st != 0)
+    fatal("v4rw: SETATTR size status %u", st);
+  if (fs::file_size(backing / "v4rw.bin") != (1u << 20)) fatal("v4rw: truncate not applied");
+
+  // Share reservation across clients: a re-opens with deny WRITE (same owner merges,
+  // seqid++); b's WRITE open is SHARE_DENIED; anonymous WRITE is LOCKED; after
+  // OPEN_DOWNGRADE drops the deny, b succeeds.
+  auto o2 = v4_open(a, root, "v4rw.bin", 3, 2, "rw-owner", false);
+  if (o2.status != 0 || o2.other_differs(o)) fatal("v4rw: merge OPEN status %u", o2.status);
+  if (o2.stateid.seqid != o.stateid.seqid + 1) fatal("v4rw: merged seqid not bumped");
+  V4Client b(host, nfs_port, "lightnfs-accept-v4-b");
+  b.establish();
+  auto ob = v4_open(b, root, "v4rw.bin", 2, 0, "b-owner", false);
+  if (ob.status != kShareDenied) fatal("v4rw: expected SHARE_DENIED, got %u", ob.status);
+  {
+    Stateid4 anon{};
+    std::array<std::byte, 4> x{};
+    uint32_t st = v4_write(b, o.fh, anon, 0, x, 0);
+    if (st != 10012) fatal("v4rw: anonymous write vs deny: expected LOCKED, got %u", st);
+    auto ro = v4_open(b, root, "v4rw.bin", 1, 0, "b-owner", false);
+    if (ro.status != 0) fatal("v4rw: read OPEN under deny WRITE status %u", ro.status);
+    st = v4_write(b, ro.fh, ro.stateid, 0, x, 0);
+    if (st != kOpenmode) fatal("v4rw: write via read-only open: expected OPENMODE, got %u", st);
+    if (v4_close(b, ro.fh, ro.stateid) != 0) fatal("v4rw: CLOSE b/ro failed");
+  }
+  {
+    XdrEnc dg(a.rpc.pool);
+    a.seq_header(dg, 2);
+    dg.u32(kOpPutfh);
+    dg.opaque(o.fh);
+    dg.u32(kOpOpenDowngrade);
+    o2.stateid.encode(dg);
+    dg.u32(0);
+    dg.u32(3);
+    dg.u32(0);
+    auto r = a.run(dg.take().to_bytes());
+    V4Client::skip_sequence_res(r.dec);
+    V4Client::expect_op(r.dec, kOpPutfh);
+    V4Client::expect_op(r.dec, kOpOpenDowngrade);
+    o2.stateid = Stateid4::decode(r.dec);
+  }
+  ob = v4_open(b, root, "v4rw.bin", 2, 0, "b-owner", false);
+  if (ob.status != 0) fatal("v4rw: OPEN after downgrade status %u", ob.status);
+  if (v4_close(b, ob.fh, ob.stateid) != 0) fatal("v4rw: CLOSE b failed");
+  // Stale seqid CLOSE is OLD_STATEID; the current one succeeds.
+  if (v4_close(a, o.fh, o.stateid) != 10024) fatal("v4rw: expected OLD_STATEID on stale CLOSE");
+  if (v4_close(a, o.fh, o2.stateid) != 0) fatal("v4rw: CLOSE a failed");
+
+  // Namespace: CREATE dir, RENAME file into it, LINK, REMOVE — mirrored on backing.
+  uint32_t st = v4_dir_op(a, root, [&](XdrEnc& e) {
+    e.u32(kOpCreate);
+    e.u32(2);  // NF4DIR
+    e.string("v4dir");
+    e.u32(0);  // empty bitmap
+    e.u32(0);  // empty attrlist
+  });
+  if (st != 0) fatal("v4rw: CREATE dir status %u", st);
+  if (!fs::is_directory(backing / "v4dir")) fatal("v4rw: v4dir missing on backing");
+  auto dir_fh = lookup_path(a, [&] {
+    auto c = split_path(export_path);
+    c.push_back("v4dir");
+    return c;
+  }());
+  st = v4_dir_op(a, dir_fh, [&](XdrEnc& e) {
+    e.u32(kOpRename);
+    e.string("v4rw.bin");
+    e.string("moved.bin");
+  }, 2, [&](XdrEnc& e) {
+    e.u32(kOpPutfh);
+    e.opaque(root);
+    e.u32(kOpSavefh);
+  });
+  if (st != 0) fatal("v4rw: RENAME status %u", st);
+  if (!fs::exists(backing / "v4dir" / "moved.bin") || fs::exists(backing / "v4rw.bin"))
+    fatal("v4rw: RENAME not reflected on backing");
+  auto moved_fh = lookup_path(a, [&] {
+    auto c = split_path(export_path);
+    c.push_back("v4dir");
+    c.push_back("moved.bin");
+    return c;
+  }());
+  st = v4_dir_op(a, root, [&](XdrEnc& e) {
+    e.u32(kOpLink);
+    e.string("hardlink.bin");
+  }, 2, [&](XdrEnc& e) {
+    e.u32(kOpPutfh);
+    e.opaque(moved_fh);
+    e.u32(kOpSavefh);
+  });
+  if (st != 0) fatal("v4rw: LINK status %u", st);
+  if (fs::hard_link_count(backing / "hardlink.bin") != 2) fatal("v4rw: LINK not reflected");
+  st = v4_dir_op(a, root, [&](XdrEnc& e) {
+    e.u32(kOpRemove);
+    e.string("v4dir");
+  });
+  if (st != 66) fatal("v4rw: REMOVE non-empty dir: expected NOTEMPTY, got %u", st);
+  for (auto [fh, name] : {std::pair{dir_fh, "moved.bin"}, std::pair{root, "hardlink.bin"},
+                          std::pair{root, "v4dir"}}) {
+    st = v4_dir_op(a, fh, [&](XdrEnc& e) {
+      e.u32(kOpRemove);
+      e.string(name);
+    });
+    if (st != 0) fatal("v4rw: REMOVE %s status %u", name, st);
+  }
+  if (fs::exists(backing / "v4dir") || fs::exists(backing / "hardlink.bin"))
+    fatal("v4rw: REMOVE not reflected on backing");
+
+  b.destroy();
+  a.destroy();
+  std::printf("accept_client v4rw OK: %zu bytes written/committed/read back, truncate, "
+              "share deny across clients, OPENMODE/LOCKED/OLD_STATEID discipline, "
+              "downgrade, dir/rename/link/remove mirrored on backing\n", payload.size());
+  return 0;
+}
+
+// Server-restart reclaim scenario (development plan §6.3 / design 07 §7.5): open +
+// write, run RESTART_CMD (kills and restarts the server), then re-establish the same
+// client identity and CLAIM_PREVIOUS inside grace; verifies data, the STALE_STATEID /
+// GRACE / NO_GRACE gates and RECLAIM_COMPLETE's early grace exit.
+int cmd_v4reclaim(const char* host, uint16_t nfs_port, const std::string& export_path,
+                  const fs::path& backing, const std::string& restart_cmd) {
+  using namespace v4;
+  std::vector<std::byte> fh;
+  Stateid4 old_sid;
+  std::string before = "before-restart";
+  std::span<const std::byte> before_bytes(
+      reinterpret_cast<const std::byte*>(before.data()), before.size());
+  {
+    V4Client c(host, nfs_port);
+    c.establish();
+    auto root = lookup_path(c, split_path(export_path));
+    auto o = v4_open(c, root, "reclaim.bin", 3, 0, "reclaim-owner", true, 0, 0);
+    if (o.status != 0) fatal("v4reclaim: OPEN status %u", o.status);
+    if (v4_write(c, o.fh, o.stateid, 0, before_bytes, 2) != 0) fatal("v4reclaim: WRITE failed");
+    fh = o.fh;
+    old_sid = o.stateid;
+    // Connection dropped without CLOSE: the state is live when the server dies.
+  }
+  std::printf("v4reclaim: state held, restarting server: %s\n", restart_cmd.c_str());
+  if (std::system(restart_cmd.c_str()) != 0) fatal("v4reclaim: restart command failed");
+
+  V4Client c(host, nfs_port);
+  c.establish(false);  // same co_ownerid + verifier: listed; no RECLAIM_COMPLETE yet
+  auto root = lookup_path(c, split_path(export_path));
+  uint32_t st = 0;
+  (void)v4_read(c, fh, old_sid, before.size(), &st);
+  if (st == 70) {  // NFS4ERR_STALE (handle): unprivileged fallback handles on a
+                   // filesystem without STATX_BTIME are process-local (design 06);
+                   // re-resolve by name so the state-level scenario still runs.
+    std::printf("v4reclaim: note: filehandle not stable across restart (fallback handle "
+                "mode without btime); re-resolving by name\n");
+    auto comps = split_path(export_path);
+    comps.push_back("reclaim.bin");
+    fh = lookup_path(c, comps);
+    (void)v4_read(c, fh, old_sid, before.size(), &st);
+  }
+  if (st != kStaleStateid) fatal("v4reclaim: old stateid: expected STALE_STATEID, got %u", st);
+  auto plain = v4_open(c, root, "reclaim.bin", 3, 0, "reclaim-owner", false);
+  if (plain.status != kGrace) fatal("v4reclaim: plain OPEN in grace: expected GRACE, got %u",
+                                    plain.status);
+  auto re = v4_open(c, fh, "", 3, 0, "reclaim-owner", false, 1);
+  if (re.status != 0) fatal("v4reclaim: CLAIM_PREVIOUS status %u", re.status);
+  auto data = v4_read(c, re.fh, re.stateid, before.size());
+  if (std::string(reinterpret_cast<const char*>(data.data()), data.size()) != before)
+    fatal("v4reclaim: data lost across restart");
+  std::string after = " after";
+  if (v4_write(c, re.fh, re.stateid, before.size(),
+               std::span<const std::byte>(reinterpret_cast<const std::byte*>(after.data()),
+                                          after.size()), 2) != 0)
+    fatal("v4reclaim: WRITE with reclaimed stateid failed");
+  if (v4_reclaim_complete(c) != 0) fatal("v4reclaim: RECLAIM_COMPLETE failed");
+  plain = v4_open(c, root, "reclaim.bin", 3, 0, "reclaim-owner", false);
+  if (plain.status != 0) fatal("v4reclaim: OPEN after grace: status %u", plain.status);
+  auto late = v4_open(c, fh, "", 3, 0, "reclaim-owner", false, 1);
+  if (late.status != kNoGrace) fatal("v4reclaim: late reclaim: expected NO_GRACE, got %u",
+                                     late.status);
+  if (v4_close(c, re.fh, plain.stateid) != 0) fatal("v4reclaim: CLOSE failed");
+  auto local = read_local(backing / "reclaim.bin");
+  if (std::string(reinterpret_cast<const char*>(local.data()), local.size()) != before + after)
+    fatal("v4reclaim: backing content wrong after reclaim");
+  c.destroy();
+  std::printf("accept_client v4reclaim OK: CLAIM_PREVIOUS inside grace, data intact, "
+              "STALE_STATEID/GRACE/NO_GRACE gates, early grace exit\n");
+  return 0;
+}
+
+// Lease-expiry scenario (development plan §6.3 / design 07 §7.4): a client holding a
+// deny-WRITE open vanishes (connection dropped, no CLOSE).  Inside the lease a second
+// client is SHARE_DENIED; once the lease lapses the holder is a courtesy client and the
+// conflicting OPEN reclaims it.  A second vanished holder is left for the timeout
+// path, which the caller verifies through lightnfs-ctl (reclaim_timeout counter).
+int cmd_v4courtesy(const char* host, uint16_t nfs_port, const std::string& export_path,
+                   unsigned lease_seconds) {
+  using namespace v4;
+  auto hold = [&](const char* name, const char* owner) {
+    V4Client holder(host, nfs_port, std::string("lightnfs-accept-") + owner);
+    holder.establish();
+    auto root = lookup_path(holder, split_path(export_path));
+    auto o = v4_open(holder, root, name, 1, 2, owner, true, 0, 0);  // READ, deny WRITE
+    if (o.status != 0) fatal("v4courtesy: holder OPEN status %u", o.status);
+    // holder goes out of scope: TCP closed, session/state left behind
+  };
+  hold("courtesy.bin", "holder-a");
+  V4Client b(host, nfs_port, "lightnfs-accept-v4-b");
+  b.establish();
+  auto root = lookup_path(b, split_path(export_path));
+  auto denied = v4_open(b, root, "courtesy.bin", 2, 0, "b-owner", false);
+  if (denied.status != kShareDenied)
+    fatal("v4courtesy: inside lease: expected SHARE_DENIED, got %u", denied.status);
+  std::printf("v4courtesy: denied inside lease; waiting %us for expiry\n", lease_seconds + 2);
+  for (unsigned i = 0; i < lease_seconds + 2; ++i) {
+    sleep(1);
+    XdrEnc hb(b.rpc.pool);  // keep b's own lease alive
+    b.seq_header(hb, 0);
+    (void)b.run(hb.take().to_bytes());
+  }
+  auto ok = v4_open(b, root, "courtesy.bin", 2, 0, "b-owner", false);
+  if (ok.status != 0) fatal("v4courtesy: after lease: expected OK (conflict reclaim), got %u",
+                            ok.status);
+  std::string payload = "written after courtesy reclaim";
+  if (v4_write(b, ok.fh, ok.stateid, 0,
+               std::span<const std::byte>(reinterpret_cast<const std::byte*>(payload.data()),
+                                          payload.size()), 2) != 0)
+    fatal("v4courtesy: WRITE failed");
+  if (v4_close(b, ok.fh, ok.stateid) != 0) fatal("v4courtesy: CLOSE failed");
+  // Leave a second vanished holder for the timeout path.
+  hold("timeout.bin", "holder-c");
+  b.destroy();
+  std::printf("accept_client v4courtesy OK: SHARE_DENIED inside lease, conflict reclaim "
+              "after expiry; timeout holder left behind\n");
+  return 0;
+}
 
 // Full v4.1 read-only acceptance: session, pseudo-root navigation, recursive walk with
 // byte verification, exactly-once slot replay, negative checks.
@@ -1666,7 +2170,12 @@ int main(int argc, char** argv) {
                  "       accept_client crash-write   HOST NFS_PORT MOUNT_PORT EXPORT STATE\n"
                  "       accept_client crash-recover HOST NFS_PORT MOUNT_PORT EXPORT "
                  "BACKING STATE\n"
-                 "       accept_client connstorm HOST NFS_PORT MOUNT_PORT COUNT PIPELINE\n");
+                 "       accept_client connstorm HOST NFS_PORT MOUNT_PORT COUNT PIPELINE\n"
+                 "       accept_client v4walk HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+                 "       accept_client v4rw   HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+                 "       accept_client v4reclaim HOST NFS_PORT MOUNT_PORT EXPORT BACKING "
+                 "RESTART_CMD\n"
+                 "       accept_client v4courtesy HOST NFS_PORT MOUNT_PORT EXPORT LEASE_SECS\n");
     return 2;
   };
   if (argc < 6) return usage();
@@ -1694,5 +2203,11 @@ int main(int argc, char** argv) {
     return cmd_connstorm(host, nfs_port, atoi(argv[5]), atoi(argv[6]));
   if (cmd == "v4walk" && argc == 7)
     return cmd_v4walk(host, nfs_port, export_path, argv[6]);
+  if (cmd == "v4rw" && argc == 7)
+    return cmd_v4rw(host, nfs_port, export_path, argv[6]);
+  if (cmd == "v4reclaim" && argc == 8)
+    return cmd_v4reclaim(host, nfs_port, export_path, argv[6], argv[7]);
+  if (cmd == "v4courtesy" && argc == 7)
+    return cmd_v4courtesy(host, nfs_port, export_path, (unsigned)atoi(argv[6]));
   return usage();
 }

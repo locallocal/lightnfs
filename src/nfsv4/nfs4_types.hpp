@@ -20,6 +20,7 @@ inline constexpr uint32_t kMaxName = 255;
 inline constexpr uint32_t kMaxTag = 1024;
 inline constexpr uint32_t kMaxOwnerId = 1024;    // EXCHANGE_ID co_ownerid
 inline constexpr uint32_t kLeaseSeconds = 90;
+inline constexpr uint32_t kMaxSymlink = 4096;
 
 // ---- operation codes (nfsv4 research 02 §2.4) ----
 enum class Op : uint32_t {
@@ -99,6 +100,7 @@ enum class Status : uint32_t {
   kSame = 10009,
   kDenied = 10010,
   kExpired = 10011,
+  kLocked = 10012,
   kGrace = 10013,
   kFhexpired = 10014,
   kShareDenied = 10015,
@@ -112,13 +114,19 @@ enum class Status : uint32_t {
   kOldStateid = 10024,
   kBadStateid = 10025,
   kNotSame = 10027,
+  kAttrnotsupp = 10032,
   kSymlink = 10029,
   kRestorefh = 10030,
   kNoGrace = 10033,
   kReclaimBad = 10034,
   kBadxdr = 10036,
+  kLocksHeld = 10037,
   kOpenmode = 10038,
+  kBadowner = 10039,
+  kBadchar = 10040,
   kBadname = 10041,
+  kBadRange = 10042,
+  kFileOpen = 10046,
   kOpIllegal = 10044,
   kBadsession = 10052,
   kBadslot = 10053,

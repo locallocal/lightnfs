@@ -1,7 +1,7 @@
 // lightnfs-ctl (design 08 §8.6, minimal): sends one command over the server's unix
 // admin socket and prints the text reply.
 //
-//   lightnfs-ctl [--socket PATH] <ping|metrics|dump-errors|drc|fdcache>
+//   lightnfs-ctl [--socket PATH] <ping|metrics|dump-errors|drc|fdcache|state|expire-client ID>
 //
 // Default socket: $LIGHTNFS_CTL, else /tmp/lightnfs-state/ctl.sock.
 
@@ -24,10 +24,11 @@ int main(int argc, char** argv) {
   }
   if (argi >= argc) {
     std::fprintf(stderr,
-                 "usage: lightnfs-ctl [--socket PATH] <ping|metrics|dump-errors|drc|fdcache>\n");
+                 "usage: lightnfs-ctl [--socket PATH] <ping|metrics|dump-errors|drc|fdcache|state|expire-client ID>\n");
     return 2;
   }
   std::string cmd = argv[argi];
+  for (int i = argi + 1; i < argc; ++i) cmd += std::string(" ") + argv[i];
   cmd += '\n';
 
   int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);

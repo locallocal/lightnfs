@@ -1,7 +1,7 @@
 #pragma once
 // Management endpoints (design 08 §8.3/8.6, minimal phase-2 versions):
 //  - CtlServer: line-oriented unix-socket admin interface for lightnfs-ctl
-//    (ping / metrics / dump-errors / fdcache / drc)
+//    (ping / metrics / dump-errors / fdcache / drc / state / expire-client <id>)
 //  - MetricsHttp: one-shot HTTP responder serving the Prometheus text exposition
 
 #include <memory>
@@ -14,12 +14,16 @@
 namespace lnfs::rpc {
 class Drc;
 }
+namespace lnfs::state {
+class StateMgr;
+}
 
 namespace lnfs::server {
 
 struct CtlDeps {
   core::ExportTable* exports = nullptr;
   rpc::Drc* drc = nullptr;
+  state::StateMgr* state = nullptr;  // v4 state table dump / forced client reclaim
 };
 
 class CtlServer {
@@ -33,6 +37,8 @@ class CtlServer {
 
   // Shared with MetricsHttp: text answer for one admin command.
   static std::string answer(const CtlDeps& deps, std::string_view command);
+  // Commands that must run as coroutines (state table locks): falls back to answer().
+  static rt::Task<std::string> answer_async(const CtlDeps& deps, std::string command);
 
  private:
   CtlServer(int fd, std::string path, CtlDeps deps)

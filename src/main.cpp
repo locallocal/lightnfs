@@ -1,5 +1,6 @@
 #include <sys/stat.h>
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <condition_variable>
@@ -147,13 +148,17 @@ int main(int argc, char** argv) {
   lnfs::core::PseudoFs pseudofs(*exports);
   lnfs::state::StateMgr state_mgr({.boot_epoch = *epoch,
                                    .state_dir = server_cfg.state_dir,
-                                   .lease_seconds = lnfs::nfsv4::kLeaseSeconds,
+                                   .lease_seconds = server_cfg.lease_seconds,
+                                   .courtesy_multiplier = server_cfg.courtesy_multiplier,
                                    .max_io = server_cfg.max_request_size});
   std::optional<lnfs::nfsv4::Engine> nfs4;
+  std::atomic<bool> lease_stop{false};
   if (server_cfg.enable_v4) {
     state_mgr.load_grace_list();
     nfs4.emplace(*exports, *key, locks, pseudofs, state_mgr);
     nfs4->register_with(dispatcher);
+    // Lease scanner (07 §7.4): expiry → courtesy → conflict/timeout reclaim.
+    lnfs::rt::spawn(state_mgr.run_lease_scanner(&lease_stop), runtime.reactor(0));
   }
   lnfs::obs::register_text_provider([&state_mgr](std::string& out) {
     auto s = state_mgr.stats();
@@ -161,9 +166,17 @@ int main(int argc, char** argv) {
         "lightnfs_v4_clients {}\nlightnfs_v4_sessions {}\nlightnfs_v4_opens {}\n"
         "lightnfs_v4_seq_new_total {}\nlightnfs_v4_seq_replay_total {}\n"
         "lightnfs_v4_seq_misordered_total {}\nlightnfs_v4_seq_waits_total {}\n"
-        "lightnfs_v4_in_grace {}\n",
+        "lightnfs_v4_in_grace {}\nlightnfs_v4_grace_remaining_seconds {}\n"
+        "lightnfs_v4_files_with_state {}\nlightnfs_v4_courtesy_clients {}\n"
+        "lightnfs_v4_lease_expirations_total {}\n"
+        "lightnfs_v4_reclaims_total{{reason=\"conflict\"}} {}\n"
+        "lightnfs_v4_reclaims_total{{reason=\"timeout\"}} {}\n"
+        "lightnfs_v4_reclaims_total{{reason=\"forced\"}} {}\n"
+        "lightnfs_v4_share_denied_total {}\nlightnfs_v4_open_merges_total {}\n",
         s.clients, s.sessions, s.opens, s.seq_new, s.seq_replay, s.seq_misordered,
-        s.seq_waits, s.grace ? 1 : 0);
+        s.seq_waits, s.grace ? 1 : 0, s.grace_remaining, s.files, s.courtesy,
+        s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout, s.reclaim_forced,
+        s.share_denied, s.open_merges);
   });
 
   lnfs::transport::TransportConfig transport_cfg;
@@ -189,7 +202,7 @@ int main(int argc, char** argv) {
                              ? server_cfg.state_dir + "/ctl.sock"
                              : server_cfg.ctl_socket;
   auto ctl = lnfs::server::CtlServer::create(
-      ctl_path, {.exports = exports.get(), .drc = &drc});
+      ctl_path, {.exports = exports.get(), .drc = &drc, .state = &state_mgr});
   if (ctl) lnfs::rt::spawn((*ctl)->run(), runtime.reactor(0));
   else LNFS_WARN("ctl socket unavailable at {}: {}", ctl_path, lnfs::errno_name(ctl.error()));
 
@@ -216,6 +229,7 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, on_signal);
   while (!stopping) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
+  lease_stop.store(true);
   (*nfs_listener)->request_stop();
   (*mount_listener)->request_stop();
   if (ctl) (*ctl)->request_stop();

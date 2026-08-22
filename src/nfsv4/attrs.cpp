@@ -17,7 +17,8 @@ const Bitmap& supported_attrs() {
                         kMaxlink, kMaxname, kMaxread, kMaxwrite, kMode, kNoTrunc,
                         kNumlinks, kOwner, kOwnerGroup, kRawdev, kSpaceAvail, kSpaceFree,
                         kSpaceTotal, kSpaceUsed, kTimeAccess, kTimeDelta, kTimeMetadata,
-                        kTimeModify, kMountedOnFileid})
+                        kTimeModify, kMountedOnFileid, kTimeAccessSet,
+                        kTimeModifySet, kSuppattrExclCreat})
       b.set(id);
     return b;
   }();
@@ -66,7 +67,7 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src,
     vals.u64(0);
   }
   if (ok(kUniqueHandles)) vals.boolean(true);
-  if (ok(kLeaseTime)) vals.u32(kLeaseSeconds);
+  if (ok(kLeaseTime)) vals.u32(src.lease_seconds);
   if (ok(kRdattrError)) vals.u32(0);
   if (ok(kCansettime)) vals.boolean(true);
   if (ok(kCaseInsensitive)) vals.boolean(src.case_insensitive);
@@ -102,10 +103,105 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src,
   if (ok(kTimeModify)) encode_nfstime(vals, a.mtime);
   if (ok(kMountedOnFileid))
     vals.u64(src.mounted_on_fileid ? src.mounted_on_fileid : a.fileid);
+  if (ok(kSuppattrExclCreat)) settable_attrs().encode(vals);
 
   actual.encode(enc);
   auto bytes = vals.take().to_bytes();
   enc.opaque(bytes);
+}
+
+const Bitmap& settable_attrs() {
+  static const Bitmap value = [] {
+    Bitmap b;
+    for (uint32_t id : {kSize, kMode, kOwner, kOwnerGroup, kTimeAccessSet, kTimeModifySet})
+      b.set(id);
+    return b;
+  }();
+  return value;
+}
+
+namespace {
+
+// "1000" → 1000.  "name@domain" forms need idmap, which AUTH_SYS deployments do not
+// run: BADOWNER sends the client to its numeric fallback (nfs4_disable_idmapping).
+bool parse_numeric_owner(std::string_view s, uint32_t& out) {
+  if (s.empty() || s.size() > 10) return false;
+  uint64_t n = 0;
+  for (char c : s) {
+    if (c < '0' || c > '9') return false;
+    n = n * 10 + static_cast<uint64_t>(c - '0');
+  }
+  if (n > UINT32_MAX) return false;
+  out = static_cast<uint32_t>(n);
+  return true;
+}
+
+}  // namespace
+
+Status decode_settable_fattr(xdr::XdrDec& dec, backend::SetAttr& out, Bitmap& set) {
+  auto mask = Bitmap::decode(dec);
+  auto vals = mask ? dec.opaque(1u << 20) : Result<std::span<const std::byte>>(Err(Errno::kGarbage));
+  if (!mask || !vals) return Status::kBadxdr;
+  xdr::XdrDec v(*vals);
+  const Bitmap& sup = supported_attrs();
+  const Bitmap& settable = settable_attrs();
+  for (uint32_t bit = 0; bit < 96; ++bit) {
+    if (!mask->test(bit)) continue;
+    if (!settable.test(bit)) return sup.test(bit) ? Status::kInval : Status::kAttrnotsupp;
+    switch (bit) {
+      case kSize: {
+        auto n = v.u64();
+        if (!n) return Status::kBadxdr;
+        out.size = *n;
+        break;
+      }
+      case kMode: {
+        auto n = v.u32();
+        if (!n) return Status::kBadxdr;
+        if (*n & ~07777u) return Status::kInval;
+        out.mode = *n;
+        break;
+      }
+      case kOwner:
+      case kOwnerGroup: {
+        auto s = v.string(1024);
+        if (!s) return Status::kBadxdr;
+        uint32_t id;
+        if (!parse_numeric_owner(*s, id)) return Status::kBadowner;
+        if (bit == kOwner) out.uid = id;
+        else out.gid = id;
+        break;
+      }
+      case kTimeAccessSet:
+      case kTimeModifySet: {
+        auto how = v.u32();
+        if (!how || *how > 1) return Status::kBadxdr;
+        backend::Timespec t{};
+        if (*how == 1) {  // SET_TO_CLIENT_TIME4
+          auto sec = v.u64();
+          auto nsec = v.u32();
+          if (!sec || !nsec) return Status::kBadxdr;
+          if (*nsec >= 1000000000u) return Status::kInval;
+          t.sec = static_cast<int64_t>(*sec);
+          t.nsec = *nsec;
+        }
+        auto mode = *how == 1 ? backend::SetAttr::TimeHow::kClient
+                              : backend::SetAttr::TimeHow::kServer;
+        if (bit == kTimeAccessSet) {
+          out.atime_how = mode;
+          out.atime = t;
+        } else {
+          out.mtime_how = mode;
+          out.mtime = t;
+        }
+        break;
+      }
+      default: return Status::kAttrnotsupp;
+    }
+    set.set(bit);
+  }
+  if (!v.at_end()) return Status::kBadxdr;  // trailing bytes: malformed attrlist
+  return Status::kOk;
 }
 
 }  // namespace lnfs::nfsv4
