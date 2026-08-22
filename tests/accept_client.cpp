@@ -20,6 +20,7 @@
 //       concurrent read path for the ASAN leak soak.
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -27,6 +28,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -1261,6 +1263,7 @@ struct V4Client {
   uint64_t clientid = 0;
   std::array<std::byte, 16> sessionid{};
   uint32_t slot_seq = 1;
+  uint32_t minor = 1;    // COMPOUND minorversion (2 for the v4.2 scenario)
   std::string owner_id;  // co_ownerid: distinct per simulated client
 
   explicit V4Client(const char* host, uint16_t port, std::string owner = "lightnfs-accept-v4")
@@ -1310,7 +1313,7 @@ struct V4Client {
     BufferPool& pool = rpc.pool;
     XdrEnc ex(pool);
     ex.u32(0);
-    ex.u32(1);
+    ex.u32(minor);
     ex.u32(1);
     ex.u32(kOpExchangeId);
     std::array<std::byte, 8> verf{std::byte{0x42}};
@@ -1326,7 +1329,7 @@ struct V4Client {
 
     XdrEnc cs(pool);
     cs.u32(0);
-    cs.u32(1);
+    cs.u32(minor);
     cs.u32(1);
     cs.u32(kOpCreateSession);
     cs.u64(clientid);
@@ -1363,7 +1366,7 @@ struct V4Client {
   void seq_header(XdrEnc& enc, uint32_t extra_ops, bool cachethis = false,
                   std::optional<uint32_t> force_seq = std::nullopt) {
     enc.u32(0);  // tag
-    enc.u32(1);  // minorversion
+    enc.u32(minor);
     enc.u32(1 + extra_ops);
     enc.u32(kOpSequence);
     enc.opaque_fixed(sessionid);
@@ -1377,14 +1380,14 @@ struct V4Client {
   void destroy() {
     XdrEnc ds(rpc.pool);
     ds.u32(0);
-    ds.u32(1);
+    ds.u32(minor);
     ds.u32(1);
     ds.u32(kOpDestroySession);
     ds.opaque_fixed(sessionid);
     (void)run(ds.take().to_bytes());
     XdrEnc dc(rpc.pool);
     dc.u32(0);
-    dc.u32(1);
+    dc.u32(minor);
     dc.u32(1);
     dc.u32(kOpDestroyClientid);
     dc.u64(clientid);
@@ -2311,6 +2314,228 @@ int cmd_v4walk(const char* host, uint16_t nfs_port, const std::string& export_pa
   return 0;
 }
 
+// ---------- NFSv4.2 sweets acceptance (phase 6) ----------
+
+namespace v4 {
+
+constexpr uint32_t kOpAllocate = 59, kOpCopy = 60, kOpDeallocate = 62, kOpSeek = 69,
+                   kOpClone = 71, kOpIllegal = 10044;
+constexpr uint32_t kNxio = 6, kNotsupp = 10004, kOpIllegalStatus = 10044, kInval = 22;
+
+struct SeekOut {
+  uint32_t status = 0;
+  bool eof = false;
+  uint64_t offset = 0;
+};
+SeekOut v4_seek(V4Client& c, const std::vector<std::byte>& fh, const Stateid4& sid,
+                uint64_t offset, uint32_t what) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2);
+  ops.u32(kOpPutfh);
+  ops.opaque(fh);
+  ops.u32(kOpSeek);
+  sid.encode(ops);
+  ops.u64(offset);
+  ops.u32(what);
+  auto r = c.run(ops.take().to_bytes(), 0, false);
+  SeekOut out;
+  out.status = r.status;
+  if (r.status != 0) return out;
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  V4Client::expect_op(r.dec, kOpSeek);
+  out.eof = rbool(r.dec);
+  out.offset = ru64(r.dec);
+  return out;
+}
+
+uint32_t v4_alloc(V4Client& c, const std::vector<std::byte>& fh, const Stateid4& sid,
+                  uint32_t op, uint64_t offset, uint64_t length) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2);
+  ops.u32(kOpPutfh);
+  ops.opaque(fh);
+  ops.u32(op);
+  sid.encode(ops);
+  ops.u64(offset);
+  ops.u64(length);
+  return c.run(ops.take().to_bytes(), 0, false).status;
+}
+
+// {PUTFH src, SAVEFH, PUTFH dst, COPY|CLONE}; COPY returns the byte count via *count.
+uint32_t v4_copy(V4Client& c, const std::vector<std::byte>& src, const Stateid4& ssid,
+                 const std::vector<std::byte>& dst, const Stateid4& dsid, uint64_t soff,
+                 uint64_t doff, uint64_t count, bool clone, uint64_t* copied = nullptr) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 4);
+  ops.u32(kOpPutfh);
+  ops.opaque(src);
+  ops.u32(kOpSavefh);
+  ops.u32(kOpPutfh);
+  ops.opaque(dst);
+  ops.u32(clone ? kOpClone : kOpCopy);
+  ssid.encode(ops);
+  dsid.encode(ops);
+  ops.u64(soff);
+  ops.u64(doff);
+  ops.u64(count);
+  if (!clone) {
+    ops.boolean(true);
+    ops.boolean(true);
+    ops.u32(0);
+  }
+  auto r = c.run(ops.take().to_bytes(), 0, false);
+  if (r.status != 0) return r.status;
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  V4Client::expect_op(r.dec, kOpSavefh);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  V4Client::expect_op(r.dec, clone ? kOpClone : kOpCopy);
+  if (!clone) {
+    if (ru32(r.dec) != 0) fatal("v42: COPY answered with a callback stateid");
+    uint64_t n = ru64(r.dec);
+    (void)ru32(r.dec);            // committed
+    (void)r.dec.opaque_fixed(8);  // verifier
+    if (!rbool(r.dec) || !rbool(r.dec)) fatal("v42: COPY not consecutive+synchronous");
+    if (copied) *copied = n;
+  }
+  return 0;
+}
+
+}  // namespace v4
+
+// Loopback v4.2 scenario against a live server: SEEK/ALLOCATE/DEALLOCATE mirrored on the
+// backing file (size, zeroes, lseek(SEEK_HOLE) agreement), whole-file + ranged COPY
+// byte-verified, CLONE honored or NOTSUPP (fs without reflink), the 4.2 opcodes ILLEGAL
+// at minorversion 1.
+int cmd_v42(const char* host, uint16_t nfs_port, const std::string& export_path,
+            const fs::path& backing) {
+  using namespace v4;
+  V4Client a(host, nfs_port, "lightnfs-accept-v42");
+  a.minor = 2;
+  a.establish();
+  auto root = lookup_path(a, split_path(export_path));
+  const uint64_t blk = 1 << 16;
+  auto block = random_bytes(blk, 0x42);
+
+  auto src = v4_open(a, root, "v42src.bin", 3, 0, "v42-owner", true);
+  if (src.status != 0) fatal("v42: OPEN(CREATE) src status %u", src.status);
+  if (v4_write(a, src.fh, src.stateid, 0, block, 2) != 0) fatal("v42: WRITE 0 failed");
+  if (v4_write(a, src.fh, src.stateid, 2 * blk, block, 2) != 0) fatal("v42: WRITE 2 failed");
+
+  // DEALLOCATE the middle block: size unchanged, zeroes on the backing file.
+  if (uint32_t st = v4_alloc(a, src.fh, src.stateid, kOpDeallocate, blk, blk); st != 0)
+    fatal("v42: DEALLOCATE status %u", st);
+  if (fs::file_size(backing / "v42src.bin") != 3 * blk) fatal("v42: DEALLOCATE changed size");
+  {
+    auto on_disk = read_local(backing / "v42src.bin");
+    std::vector<std::byte> expect(3 * blk);
+    std::copy(block.begin(), block.end(), expect.begin());
+    std::copy(block.begin(), block.end(), expect.begin() + 2 * blk);
+    if (on_disk != expect) fatal("v42: backing content after DEALLOCATE mismatch");
+  }
+  // SEEK agrees with lseek(2) on the backing file.
+  {
+    int fd = ::open((backing / "v42src.bin").c_str(), O_RDONLY);
+    if (fd < 0) fatal("v42: cannot open backing file");
+    off_t local_hole = ::lseek(fd, 0, SEEK_HOLE);
+    off_t local_data = ::lseek(fd, (off_t)blk, SEEK_DATA);
+    ::close(fd);
+    auto hole = v4_seek(a, src.fh, src.stateid, 0, 1);
+    if (hole.status != 0) fatal("v42: SEEK hole status %u", hole.status);
+    if (hole.eof || hole.offset != (uint64_t)local_hole)
+      fatal("v42: SEEK hole %llu eof=%d vs lseek %lld", (unsigned long long)hole.offset,
+            hole.eof, (long long)local_hole);
+    auto data = v4_seek(a, src.fh, src.stateid, blk, 0);
+    if (data.status != 0) fatal("v42: SEEK data status %u", data.status);
+    if (data.offset != (uint64_t)local_data)
+      fatal("v42: SEEK data %llu vs lseek %lld", (unsigned long long)data.offset,
+            (long long)local_data);
+    auto tail = v4_seek(a, src.fh, src.stateid, 2 * blk + 1, 1);
+    if (tail.status != 0 || !tail.eof || tail.offset != 3 * blk)
+      fatal("v42: SEEK hole at tail: status %u eof=%d off=%llu", tail.status, tail.eof,
+            (unsigned long long)tail.offset);
+    if (v4_seek(a, src.fh, src.stateid, 3 * blk, 0).status != kNxio)
+      fatal("v42: SEEK data past EOF expected NXIO");
+  }
+  // ALLOCATE past EOF extends; zero length is INVAL.
+  if (uint32_t st = v4_alloc(a, src.fh, src.stateid, kOpAllocate, 3 * blk, 4096); st != 0)
+    fatal("v42: ALLOCATE status %u", st);
+  if (fs::file_size(backing / "v42src.bin") != 3 * blk + 4096) fatal("v42: ALLOCATE size");
+  if (v4_alloc(a, src.fh, src.stateid, kOpAllocate, 0, 0) != kInval)
+    fatal("v42: ALLOCATE length 0 expected INVAL");
+  if (v4_setattr_size(a, src.fh, src.stateid, 3 * blk) != 0) fatal("v42: truncate back");
+
+  // COPY whole file, then a ranged copy at an offset; byte-verified on the backing tree.
+  auto dst = v4_open(a, root, "v42dst.bin", 3, 0, "v42-owner", true);
+  if (dst.status != 0) fatal("v42: OPEN(CREATE) dst status %u", dst.status);
+  uint64_t copied = 0;
+  if (uint32_t st = v4_copy(a, src.fh, src.stateid, dst.fh, dst.stateid, 0, 0, 0, false, &copied);
+      st != 0)
+    fatal("v42: COPY status %u", st);
+  if (copied != 3 * blk) fatal("v42: COPY count %llu", (unsigned long long)copied);
+  (void)v4_commit(a, dst.fh);
+  if (read_local(backing / "v42dst.bin") != read_local(backing / "v42src.bin"))
+    fatal("v42: COPY content mismatch");
+  if (uint32_t st = v4_copy(a, src.fh, src.stateid, dst.fh, dst.stateid, 2 * blk, 3 * blk, 100,
+                            false, &copied);
+      st != 0 || copied != 100)
+    fatal("v42: ranged COPY status %u count %llu", st, (unsigned long long)copied);
+  {
+    auto d = read_local(backing / "v42dst.bin");
+    if (d.size() != 3 * blk + 100 ||
+        !std::equal(d.begin() + 3 * blk, d.end(), block.begin()))
+      fatal("v42: ranged COPY content mismatch");
+  }
+  // Read-through-server agrees with the backing file (cache coherence after COPY).
+  if (v4_read(a, dst.fh, dst.stateid, 3 * blk + 100) != read_local(backing / "v42dst.bin"))
+    fatal("v42: READ after COPY mismatch");
+
+  // CLONE: reflink when the export fs supports it, NOTSUPP otherwise.
+  auto cl = v4_open(a, root, "v42clone.bin", 3, 0, "v42-owner", true);
+  if (cl.status != 0) fatal("v42: OPEN(CREATE) clone status %u", cl.status);
+  uint32_t cst = v4_copy(a, src.fh, src.stateid, cl.fh, cl.stateid, 0, 0, 0, true);
+  const char* clone_note = "";
+  if (cst == 0) {
+    if (read_local(backing / "v42clone.bin") != read_local(backing / "v42src.bin"))
+      fatal("v42: CLONE content mismatch");
+    clone_note = "CLONE reflinked";
+  } else if (cst == kNotsupp) {
+    clone_note = "CLONE NOTSUPP (export fs without reflink)";
+  } else {
+    fatal("v42: CLONE status %u", cst);
+  }
+
+  // Stateid discipline: read-only open may SEEK, not ALLOCATE.
+  auto ro = v4_open(a, root, "v42src.bin", 1, 0, "v42-ro", false);
+  if (ro.status != 0) fatal("v42: ro OPEN status %u", ro.status);
+  if (v4_seek(a, src.fh, ro.stateid, 0, 0).status != 0) fatal("v42: ro SEEK failed");
+  if (v4_alloc(a, src.fh, ro.stateid, kOpAllocate, 0, 1) != kOpenmode)
+    fatal("v42: ro ALLOCATE expected OPENMODE");
+  if (v4_close(a, src.fh, ro.stateid) != 0) fatal("v42: CLOSE ro");
+  if (v4_close(a, cl.fh, cl.stateid) != 0) fatal("v42: CLOSE clone");
+  if (v4_close(a, dst.fh, dst.stateid) != 0) fatal("v42: CLOSE dst");
+  if (v4_close(a, src.fh, src.stateid) != 0) fatal("v42: CLOSE src");
+  a.destroy();
+
+  // minorversion 1 on the same server: the 4.2 opcodes are OP_ILLEGAL.
+  V4Client b(host, nfs_port, "lightnfs-accept-v41");
+  b.establish();
+  auto root1 = lookup_path(b, split_path(export_path));
+  auto f1 = v4_open(b, root1, "v42src.bin", 1, 0, "v41-owner", false);
+  if (f1.status != 0) fatal("v42: 4.1 OPEN status %u", f1.status);
+  if (v4_seek(b, f1.fh, f1.stateid, 0, 0).status != kOpIllegalStatus)
+    fatal("v42: SEEK at minorversion 1 expected OP_ILLEGAL");
+  if (v4_close(b, f1.fh, f1.stateid) != 0) fatal("v42: 4.1 CLOSE");
+  b.destroy();
+
+  std::printf("accept_client v42 OK: DEALLOCATE/SEEK/ALLOCATE mirrored on backing, COPY "
+              "%llu+100 bytes byte-verified, %s, OPENMODE/INVAL/NXIO discipline, 4.2 ops "
+              "ILLEGAL at minor 1\n",
+              (unsigned long long)(3 * blk), clone_note);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2330,7 +2555,8 @@ int main(int argc, char** argv) {
                  "       accept_client v4reclaim HOST NFS_PORT MOUNT_PORT EXPORT BACKING "
                  "RESTART_CMD\n"
                  "       accept_client v4courtesy HOST NFS_PORT MOUNT_PORT EXPORT LEASE_SECS\n"
-                 "       accept_client v4lock HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n");
+                 "       accept_client v4lock HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+                 "       accept_client v42    HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n");
     return 2;
   };
   if (argc < 6) return usage();
@@ -2366,5 +2592,7 @@ int main(int argc, char** argv) {
     return cmd_v4courtesy(host, nfs_port, export_path, (unsigned)atoi(argv[6]));
   if (cmd == "v4lock" && argc == 7)
     return cmd_v4lock(host, nfs_port, export_path, argv[6]);
+  if (cmd == "v42" && argc == 7)
+    return cmd_v42(host, nfs_port, export_path, argv[6]);
   return usage();
 }

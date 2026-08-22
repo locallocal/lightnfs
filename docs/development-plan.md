@@ -342,10 +342,24 @@
 
 按价值/成本排序，彼此独立可并行：
 
-1. **v4.2 低成本特性**（~2–3 周）：SEEK/ALLOCATE/DEALLOCATE（kSparseOps）、同步同服 COPY（kCopyRange）、CLONE（kCloneRange）；宣告 minorversion=2；backend_local 对应实现 + 运行时探测
-2. **第二后端**（Lustre 或 GlusterFS，~6–8 周）：按 06 分册映射表实现——**接口冻结的真实检验**，出现接口缺口必须走 5.10 演进规则并回写 06 分册
-3. **读委托 + 回传通道发送侧**（依赖真实需求触发）：CB_COMPOUND 发送、CB_RECALL、SessionRec.back 启用
-4. **可选 NLM/NSM**：仅当 v3 锁刚需出现（nfsv3/06 §6.6 选项 2）
+1. [x] **v4.2 低成本特性**（~2–3 周）：SEEK/ALLOCATE/DEALLOCATE（kSparseOps）、同步同服 COPY（kCopyRange）、CLONE（kCloneRange）；宣告 minorversion=2；backend_local 对应实现 + 运行时探测——`engine.cpp` v4.2 段 + `local.cpp` 五方法与 `probe_v42_caps`，见 [m6-v42-sweets.md](m6-v42-sweets.md)
+2. [ ] **第二后端**（Lustre 或 GlusterFS，~6–8 周）：按 06 分册映射表实现——**接口冻结的真实检验**，出现接口缺口必须走 5.10 演进规则并回写 06 分册。*未启动：需要目标存储客户端库与测试环境（liblustreapi / libgfapi），当前不可得；具备环境即为下一优先级*
+3. [ ] **读委托 + 回传通道发送侧**（依赖真实需求触发）：CB_COMPOUND 发送、CB_RECALL、SessionRec.back 启用。*等待触发条件*
+4. [ ] **可选 NLM/NSM**：仅当 v3 锁刚需出现（nfsv3/06 §6.6 选项 2）。*等待触发条件*
+
+### 8.1 阶段 6 第 1 项完成记录（2026-08-23）
+
+- 小版本：COMPOUND 接受 minorversion 1/2（0 与 3+ 拒绝）；会话/状态与 4.1 共用；操作码表按
+  小版本收缩（minor 1 下 59–71 `OP_ILLEGAL`，minor 2 下未实现 4.2 op `NOTSUPP`）
+- 五 op：SEEK/ALLOCATE/DEALLOCATE/COPY（同步同服、`UNSTABLE`+验证器、跨服 NOTSUPP）/CLONE，
+  stateid 纪律与 READ/WRITE 同源，能力位门禁，RFC 7862 §11.2 白名单五行
+- backend_local：lseek/fallocate/FICLONERANGE/copy_file_range（pread/pwrite 兜底）；启动
+  `O_TMPFILE` 探测置能力位并写启动日志；MemoryBackend 全能力位供引擎测试
+- 测试：115 项单测/集成（新增 `Nfs4.MinorversionTwoOpcodeTable`、`Nfs4.V42SeekAllocateDeallocate`、
+  `Nfs4.V42CopyAndClone`、`BackendWrite.V42SparseCopyClone`、errmap 4.2 行）
+- 验收：`accept_m6_local.sh`（`v42` 场景 + M5 全阶段回归，Release/ASAN）；`accept_m6_vm.sh`
+  + CI `m6-acceptance`（`mount -o vers=4.2`：fallocate/lseek 洞图对照、`cp`/`copy_file_range`
+  字节对照、`cp --reflink` 依能力位、cthon b/g）
 
 ---
 

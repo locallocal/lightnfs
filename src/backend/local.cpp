@@ -7,6 +7,7 @@
 #include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -227,7 +228,43 @@ Result<std::unique_ptr<LocalBackend>> LocalBackend::create(Config cfg) {
     out->caps_.set(Cap::kStableHandles);
     out->root_oid_ = *kernel;
   }
+  out->probe_v42_caps();
   return out;
+}
+
+// Probes with two O_TMPFILE files inside the export (no namespace footprint); if the
+// kernel/filesystem lacks O_TMPFILE, falls back to the documented defaults: lseek/
+// fallocate are assumed (every mainstream fs), copy_file_range has a pread/pwrite
+// fallback in copy_range(), and CLONE follows the fs magic (XFS/Btrfs).
+void LocalBackend::probe_v42_caps() {
+  caps_.set(Cap::kSparseOps).set(Cap::kCopyRange);
+  int a = ::openat(mount_fd_, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+  int b = a >= 0 ? ::openat(mount_fd_, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600) : -1;
+  if (a < 0 || b < 0) {
+    if (a >= 0) ::close(a);
+    struct statfs sf {};
+    if (::fstatfs(mount_fd_, &sf) == 0 &&
+        (sf.f_type == 0x58465342 /* XFS */ || sf.f_type == 0x9123683E /* BTRFS */))
+      caps_.set(Cap::kCloneRange);
+    return;
+  }
+  char buf[4096];
+  std::memset(buf, 'x', sizeof buf);
+  bool wrote = ::pwrite(a, buf, sizeof buf, 0) == static_cast<ssize_t>(sizeof buf);
+  if (wrote) {
+    if (::fallocate(a, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 1024) < 0 &&
+        errno == EOPNOTSUPP)
+      caps_.clear(Cap::kSparseOps);
+    if (::lseek(a, 0, SEEK_HOLE) < 0 && errno == EINVAL) caps_.clear(Cap::kSparseOps);
+    struct file_clone_range range {};
+    range.src_fd = a;
+    range.src_offset = 0;
+    range.src_length = 0;
+    range.dest_offset = 0;
+    if (::ioctl(b, FICLONERANGE, &range) == 0) caps_.set(Cap::kCloneRange);
+  }
+  ::close(a);
+  ::close(b);
 }
 
 LocalBackend::~LocalBackend() {
@@ -999,6 +1036,162 @@ rt::Task<Result<void>> LocalObject::commit(OpenCtx, uint64_t, uint64_t) {
     co_return Err(errno_from_neg(rc));
   }
   co_return Result<void>{};
+}
+
+rt::Task<Result<void>> LocalObject::io_gate(const Cred& cred, bool write) {
+  if (type() == FType::kDir) co_return Err(errno_from(EISDIR));
+  if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
+  if (write && backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid)
+    co_return Result<void>{};  // the kernel decides under the client's fsuid
+  auto allowed = co_await access(cred, write ? Access::kModify : Access::kRead);
+  if (!allowed) co_return Err(allowed.error());
+  if (!allowed->has(write ? Access::kModify : Access::kRead)) {
+    auto attr = co_await getattr();  // v3 open-less owner relaxation (nfsv3/04 §6)
+    if (!attr) co_return Err(attr.error());
+    if (cred.uid != attr->uid) co_return Err(errno_from(EACCES));
+  }
+  co_return Result<void>{};
+}
+
+// ---- v4.2 sweets -------------------------------------------------------------
+
+rt::Task<Result<uint64_t>> LocalObject::seek(OpenCtx ctx, uint64_t off, SeekWhat what) {
+  auto gate = co_await io_gate(ctx.cred, false);
+  if (!gate) co_return Err(gate.error());
+  auto ref = co_await backend_.fd_cache_->acquire(id(), false);
+  if (!ref) co_return Err(ref.error());
+  int fd = (*ref)->fd;
+  co_return co_await rt::offload([fd, off, what]() -> Result<uint64_t> {
+    off_t r = ::lseek(fd, static_cast<off_t>(off), what == SeekWhat::kData ? SEEK_DATA : SEEK_HOLE);
+    if (r < 0) return Err(errno_from(errno));  // ENXIO past EOF / no data
+    return static_cast<uint64_t>(r);
+  });
+}
+
+rt::Task<Result<void>> LocalObject::allocate(OpenCtx ctx, uint64_t off, uint64_t len) {
+  auto gate = co_await io_gate(ctx.cred, true);
+  if (!gate) co_return Err(gate.error());
+  auto ref = co_await backend_.fd_cache_->acquire(id(), true);
+  if (!ref) co_return Err(ref.error());
+  int fd = (*ref)->fd;
+  bool fsuid = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  Cred cred = ctx.cred;
+  co_return co_await rt::offload([fd, off, len, fsuid, cred]() -> Result<void> {
+    ScopedFsIds ids(cred, fsuid);
+    if (::fallocate(fd, 0, static_cast<off_t>(off), static_cast<off_t>(len)) < 0)
+      return Err(errno_from(errno));
+    return {};
+  });
+}
+
+rt::Task<Result<void>> LocalObject::deallocate(OpenCtx ctx, uint64_t off, uint64_t len) {
+  auto gate = co_await io_gate(ctx.cred, true);
+  if (!gate) co_return Err(gate.error());
+  auto ref = co_await backend_.fd_cache_->acquire(id(), true);
+  if (!ref) co_return Err(ref.error());
+  int fd = (*ref)->fd;
+  bool fsuid = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  Cred cred = ctx.cred;
+  co_return co_await rt::offload([fd, off, len, fsuid, cred]() -> Result<void> {
+    ScopedFsIds ids(cred, fsuid);
+    if (::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(off),
+                    static_cast<off_t>(len)) < 0)
+      return Err(errno_from(errno));
+    return {};
+  });
+}
+
+rt::Task<Result<void>> LocalObject::clone(OpenCtx sctx, Object& dst, OpenCtx dctx,
+                                          uint64_t src_off, uint64_t dst_off, uint64_t len) {
+  auto* target = dynamic_cast<LocalObject*>(&dst);
+  if (!target || &target->backend_ != &backend_) co_return Err(errno_from(EXDEV));
+  auto sgate = co_await io_gate(sctx.cred, false);
+  if (!sgate) co_return Err(sgate.error());
+  auto dgate = co_await target->io_gate(dctx.cred, true);
+  if (!dgate) co_return Err(dgate.error());
+  auto sref = co_await backend_.fd_cache_->acquire(id(), false);
+  if (!sref) co_return Err(sref.error());
+  auto dref = co_await backend_.fd_cache_->acquire(target->id(), true);
+  if (!dref) co_return Err(dref.error());
+  int sfd = (*sref)->fd, dfd = (*dref)->fd;
+  bool fsuid = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  Cred cred = dctx.cred;
+  co_return co_await rt::offload([sfd, dfd, src_off, dst_off, len, fsuid, cred]() -> Result<void> {
+    ScopedFsIds ids(cred, fsuid);
+    struct file_clone_range range {};
+    range.src_fd = sfd;
+    range.src_offset = src_off;
+    range.src_length = len;  // 0 = to EOF (FICLONERANGE semantics match CLONE's)
+    range.dest_offset = dst_off;
+    if (::ioctl(dfd, FICLONERANGE, &range) < 0) {
+      // Kernel speaks EOPNOTSUPP/EINVAL/EXDEV for "not reflinkable here"; all three
+      // pass through to the engine's CLONE whitelist.
+      return Err(errno_from(errno == ENOTTY ? EOPNOTSUPP : errno));
+    }
+    return {};
+  });
+}
+
+rt::Task<Result<uint64_t>> LocalObject::copy_range(OpenCtx sctx, Object& dst, OpenCtx dctx,
+                                                   uint64_t src_off, uint64_t dst_off,
+                                                   uint64_t len) {
+  auto* target = dynamic_cast<LocalObject*>(&dst);
+  if (!target || &target->backend_ != &backend_) co_return Err(errno_from(EXDEV));
+  auto sgate = co_await io_gate(sctx.cred, false);
+  if (!sgate) co_return Err(sgate.error());
+  auto dgate = co_await target->io_gate(dctx.cred, true);
+  if (!dgate) co_return Err(dgate.error());
+  auto sref = co_await backend_.fd_cache_->acquire(id(), false);
+  if (!sref) co_return Err(sref.error());
+  auto dref = co_await backend_.fd_cache_->acquire(target->id(), true);
+  if (!dref) co_return Err(dref.error());
+  int sfd = (*sref)->fd, dfd = (*dref)->fd;
+  bool fsuid = backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid;
+  Cred cred = dctx.cred;
+  co_return co_await rt::offload([sfd, dfd, src_off, dst_off, len, fsuid, cred]() -> Result<uint64_t> {
+    ScopedFsIds ids(cred, fsuid);
+    uint64_t want = len;
+    if (want == 0) {  // to EOF
+      struct stat st {};
+      if (::fstat(sfd, &st) < 0) return Err(errno_from(errno));
+      if (static_cast<uint64_t>(st.st_size) <= src_off) return 0;
+      want = static_cast<uint64_t>(st.st_size) - src_off;
+    }
+    uint64_t done = 0;
+    bool offload_ok = true;
+    while (done < want) {
+      off64_t in = static_cast<off64_t>(src_off + done);
+      off64_t out = static_cast<off64_t>(dst_off + done);
+      size_t chunk = static_cast<size_t>(std::min<uint64_t>(want - done, 1ull << 30));
+      ssize_t n = -1;
+      if (offload_ok) {
+        n = ::copy_file_range(sfd, &in, dfd, &out, chunk, 0);
+        if (n < 0 && (errno == EXDEV || errno == EOPNOTSUPP || errno == ENOSYS ||
+                      errno == EINVAL)) {
+          offload_ok = false;  // fall back below (same byte semantics, more CPU)
+          n = -1;
+        } else if (n < 0) {
+          return Err(errno_from(errno));
+        }
+      }
+      if (!offload_ok) {
+        std::vector<std::byte> buf(std::min<size_t>(chunk, 1u << 20));
+        ssize_t r = ::pread(sfd, buf.data(), buf.size(), in);
+        if (r < 0) return Err(errno_from(errno));
+        if (r == 0) break;  // source EOF
+        size_t w = 0;
+        while (w < static_cast<size_t>(r)) {
+          ssize_t k = ::pwrite(dfd, buf.data() + w, static_cast<size_t>(r) - w, out + w);
+          if (k < 0) return Err(errno_from(errno));
+          w += static_cast<size_t>(k);
+        }
+        n = r;
+      }
+      if (n == 0) break;  // source EOF
+      done += static_cast<uint64_t>(n);
+    }
+    return done;
+  });
 }
 
 namespace {

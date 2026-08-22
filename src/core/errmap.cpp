@@ -272,6 +272,34 @@ bool v4_error_allowed(O4 op, S4 status) {
     case O4::kTestStateid: return false;
     case O4::kReclaimComplete:
       return one_of4(status, std::array{S4::kCompleteAlready, S4::kStaleClientid});
+    // NFSv4.2 rows (RFC 7862 §11.2).
+    case O4::kSeek:
+      return one_of4(status,
+                     std::array{S4::kInval, S4::kIsdir, S4::kWrongType, S4::kSymlink,
+                                S4::kNxio, S4::kNotsupp, S4::kUnionNotsupp,
+                                S4::kBadStateid, S4::kStaleStateid, S4::kOldStateid,
+                                S4::kOpenmode, S4::kGrace, S4::kExpired});
+    case O4::kAllocate:
+    case O4::kDeallocate:
+      return one_of4(status,
+                     std::array{S4::kInval, S4::kIsdir, S4::kWrongType, S4::kSymlink,
+                                S4::kNotsupp, S4::kBadStateid, S4::kStaleStateid,
+                                S4::kOldStateid, S4::kOpenmode, S4::kGrace, S4::kExpired,
+                                S4::kRofs, S4::kFbig, S4::kNospc, S4::kDquot});
+    case O4::kClone:
+      return one_of4(status,
+                     std::array{S4::kInval, S4::kIsdir, S4::kWrongType, S4::kSymlink,
+                                S4::kNotsupp, S4::kBadStateid, S4::kStaleStateid,
+                                S4::kOldStateid, S4::kOpenmode, S4::kGrace, S4::kExpired,
+                                S4::kRofs, S4::kFbig, S4::kNospc, S4::kDquot, S4::kXdev,
+                                S4::kLocked});
+    case O4::kCopy:
+      return one_of4(status,
+                     std::array{S4::kInval, S4::kIsdir, S4::kWrongType, S4::kSymlink,
+                                S4::kNotsupp, S4::kBadStateid, S4::kStaleStateid,
+                                S4::kOldStateid, S4::kOpenmode, S4::kGrace, S4::kExpired,
+                                S4::kRofs, S4::kFbig, S4::kNospc, S4::kDquot, S4::kXdev,
+                                S4::kLocked, S4::kOffloadDenied});
     default: return true;  // remaining implemented ops answer session/state errors
   }
 }

@@ -149,6 +149,7 @@ struct V4Fixture {
   }
 
   // ---- session bootstrap ----
+  uint32_t minor = 1;  // COMPOUND minorversion used by every helper (2 for v4.2 tests)
   uint64_t clientid = 0;
   state::SessionId sessionid{};
   std::array<uint32_t, 64> slot_seq{};  // next seq per slot
@@ -157,7 +158,7 @@ struct V4Fixture {
                          std::string_view owner = "lnfs-test-client") {
     xdr::XdrEnc body(pool);
     body.u32(0);  // tag len
-    body.u32(1);  // minorversion
+    body.u32(minor);
     body.u32(1);  // numops
     body.u32(static_cast<uint32_t>(Op::kExchangeId));
     std::array<std::byte, 8> verf{std::byte{9}};
@@ -174,7 +175,7 @@ struct V4Fixture {
 
     xdr::XdrEnc cs(pool);
     cs.u32(0);
-    cs.u32(1);
+    cs.u32(minor);
     cs.u32(1);
     cs.u32(static_cast<uint32_t>(Op::kCreateSession));
     cs.u64(clientid);
@@ -208,7 +209,7 @@ struct V4Fixture {
                                std::optional<uint32_t> force_seq = std::nullopt) {
     xdr::XdrEnc body(pool);
     body.u32(0);  // tag
-    body.u32(1);
+    body.u32(minor);
     body.u32(1 + extra_ops);
     body.u32(static_cast<uint32_t>(Op::kSequence));
     body.opaque_fixed(sessionid);
@@ -548,6 +549,14 @@ TEST(Nfs4, ErrmapV4Whitelist) {
   EXPECT_EQ((uint32_t)to_v4(errno_from(EINVAL), Op::kGetfh), stv(Status::kIo));
   EXPECT_TRUE(core::v4_error_allowed(Op::kFreeStateid, Status::kLocksHeld));
   EXPECT_FALSE(core::v4_error_allowed(Op::kTestStateid, Status::kBadStateid));
+  // Phase-6 v4.2 rows (RFC 7862 §11.2).
+  EXPECT_EQ((uint32_t)to_v4(errno_from(ENXIO), Op::kSeek), stv(Status::kNxio));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(EXDEV), Op::kClone), stv(Status::kXdev));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(EOPNOTSUPP), Op::kCopy), stv(Status::kNotsupp));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(ENOSPC), Op::kAllocate), stv(Status::kNospc));
+  EXPECT_EQ((uint32_t)to_v4(errno_from(ENOTEMPTY), Op::kDeallocate), stv(Status::kIo));
+  EXPECT_TRUE(core::v4_error_allowed(Op::kSeek, Status::kUnionNotsupp));
+  EXPECT_FALSE(core::v4_error_allowed(Op::kSeek, Status::kNospc));
   // v3 audit rows (nfsv3 research 08 §8.2).
   using core::to_v3;
   using nfsv3::Proc;
@@ -1353,4 +1362,332 @@ TEST(Nfs4, LockOpsAndSecinfo) {
   EXPECT_EQ(*s1.dec.u32(), 1u);  // AUTH_SYS
   EXPECT_EQ(secinfo("nosuch", false).status, stv(Status::kNoent));
   EXPECT_EQ(secinfo("hello", true).status, stv(Status::kNofilehandle));
+}
+
+// ---- phase 6: v4.2 sweets (development plan §8 item 1) -----------------------------
+
+namespace {
+
+struct SeekRes {
+  uint32_t status = 0;
+  bool eof = false;
+  uint64_t offset = 0;
+};
+SeekRes do_seek(V4Fixture& f, const std::vector<std::byte>& fh, const nfsv4::Stateid& sid,
+                uint64_t offset, uint32_t what) {
+  xdr::XdrEnc ops(f.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(fh);
+  ops.u32(static_cast<uint32_t>(Op::kSeek));
+  sid.encode(ops);
+  ops.u64(offset);
+  ops.u32(what);
+  auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+  SeekRes out;
+  out.status = reply.status;
+  if (reply.status != 0) return out;
+  V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+  reply.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kSeek, 0);
+  out.eof = *reply.dec.boolean();
+  out.offset = *reply.dec.u64();
+  return out;
+}
+
+uint32_t do_alloc(V4Fixture& f, const std::vector<std::byte>& fh, const nfsv4::Stateid& sid,
+                  Op op, uint64_t offset, uint64_t length) {
+  xdr::XdrEnc ops(f.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(fh);
+  ops.u32(static_cast<uint32_t>(op));
+  sid.encode(ops);
+  ops.u64(offset);
+  ops.u64(length);
+  return f.parse(f.compound_raw(f.session_body(2, ops.take()))).status;
+}
+
+// {PUTFH src, SAVEFH, PUTFH dst, COPY|CLONE}; for COPY returns the copied count.
+struct CopyRes {
+  uint32_t status = 0;
+  uint64_t count = 0;
+  uint32_t committed = 9;
+  bool consecutive = false, synchronous = false;
+};
+CopyRes do_copy(V4Fixture& f, const std::vector<std::byte>& src, const nfsv4::Stateid& ssid,
+                const std::vector<std::byte>& dst, const nfsv4::Stateid& dsid,
+                uint64_t soff, uint64_t doff, uint64_t count, bool clone = false,
+                uint32_t nservers = 0) {
+  xdr::XdrEnc ops(f.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(src);
+  ops.u32(static_cast<uint32_t>(Op::kSavefh));
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(dst);
+  ops.u32(static_cast<uint32_t>(clone ? Op::kClone : Op::kCopy));
+  ssid.encode(ops);
+  dsid.encode(ops);
+  ops.u64(soff);
+  ops.u64(doff);
+  ops.u64(count);
+  if (!clone) {
+    ops.boolean(true);   // ca_consecutive
+    ops.boolean(false);  // ca_synchronous: ask async, server answers sync
+    ops.u32(nservers);   // ca_source_server<> (intra-server: empty)
+  }
+  auto reply = f.parse(f.compound_raw(f.session_body(4, ops.take())));
+  CopyRes out;
+  out.status = reply.status;
+  if (reply.status != 0) return out;
+  V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+  reply.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kSavefh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(reply.dec, clone ? Op::kClone : Op::kCopy, 0);
+  if (clone) return out;
+  EXPECT_EQ(*reply.dec.u32(), 0u);  // no callback stateid: synchronous
+  out.count = *reply.dec.u64();
+  out.committed = *reply.dec.u32();
+  (void)reply.dec.opaque_fixed(8);
+  out.consecutive = *reply.dec.boolean();
+  out.synchronous = *reply.dec.boolean();
+  return out;
+}
+
+}  // namespace
+
+TEST(Nfs4, MinorversionTwoOpcodeTable) {
+  V4Fixture f;
+  // minorversion 3 is not served.
+  {
+    xdr::XdrEnc body(f.pool);
+    body.u32(0);
+    body.u32(3);
+    body.u32(1);
+    body.u32(static_cast<uint32_t>(Op::kPutrootfh));
+    auto reply = f.parse(f.compound_raw(body.take()));
+    EXPECT_EQ(reply.status, stv(Status::kMinorVersMismatch));
+  }
+  // At minorversion 1 the 4.2 opcodes are beyond the table: OP_ILLEGAL.
+  f.establish_session();
+  auto fh = f.path_fh({"export", "data", "hello"});
+  ASSERT_TRUE(!fh.empty());
+  nfsv4::Stateid anon{};
+  {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(fh);
+    ops.u32(static_cast<uint32_t>(Op::kSeek));
+    anon.encode(ops);
+    ops.u64(0);
+    ops.u32(nfsv4::kContentData);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    EXPECT_EQ(reply.status, stv(Status::kOpIllegal));
+    V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+    reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(reply.dec, Op::kIllegal, stv(Status::kOpIllegal));
+  }
+  // The same session serves minorversion 2 (state is shared, RFC 7862 §1.4): SEEK works,
+  // an unimplemented 4.2 op (IO_ADVISE) is NOTSUPP, 72+ stays ILLEGAL.
+  f.minor = 2;
+  auto s = do_seek(f, fh, anon, 0, nfsv4::kContentData);
+  EXPECT_EQ(s.status, 0u);
+  EXPECT_EQ(s.offset, 0u);
+  EXPECT_FALSE(s.eof);
+  {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(fh);
+    ops.u32(static_cast<uint32_t>(Op::kIoAdvise));
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    EXPECT_EQ(reply.status, stv(Status::kNotsupp));
+  }
+  {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(fh);
+    ops.u32(72);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    EXPECT_EQ(reply.status, stv(Status::kOpIllegal));
+  }
+}
+
+TEST(Nfs4, V42SeekAllocateDeallocate) {
+  V4Fixture f;
+  f.minor = 2;
+  f.establish_session();
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "sparse.bin", 3, 0, "owner-s", 0, encode_empty_fattr);
+  ASSERT_TRUE(o.status == 0);
+  ASSERT_TRUE(do_write(f, o.fh, o.stateid, 0, "0123456789", 2) == 0);
+
+  // SEEK: data at 0; hole = implicit EOF hole (eof=true, offset=size); past EOF -> NXIO.
+  auto d = do_seek(f, o.fh, o.stateid, 3, nfsv4::kContentData);
+  EXPECT_EQ(d.status, 0u);
+  EXPECT_EQ(d.offset, 3u);
+  EXPECT_FALSE(d.eof);
+  auto h = do_seek(f, o.fh, o.stateid, 3, nfsv4::kContentHole);
+  EXPECT_EQ(h.status, 0u);
+  EXPECT_EQ(h.offset, 10u);
+  EXPECT_TRUE(h.eof);
+  EXPECT_EQ(do_seek(f, o.fh, o.stateid, 10, nfsv4::kContentData).status, stv(Status::kNxio));
+  EXPECT_EQ(do_seek(f, o.fh, o.stateid, 0, 7).status, stv(Status::kUnionNotsupp));
+  // Current-stateid placeholder works for SEEK too: {PUTFH, OPEN, SEEK(current)}.
+  {
+    nfsv4::Stateid current{};
+    current.seqid = 1;
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(dir_fh);
+    ops.u32(static_cast<uint32_t>(Op::kOpen));
+    ops.u32(0);
+    ops.u32(1);
+    ops.u32(0);
+    ops.u64(f.clientid);
+    ops.string("owner-s-cur");  // distinct owner: o.stateid stays current
+    ops.u32(0);
+    ops.u32(0);
+    ops.string("sparse.bin");
+    ops.u32(static_cast<uint32_t>(Op::kSeek));
+    current.encode(ops);
+    ops.u64(0);
+    ops.u32(nfsv4::kContentHole);
+    auto reply = f.parse(f.compound_raw(f.session_body(3, ops.take())));
+    EXPECT_EQ(reply.status, 0u);
+  }
+
+  // ALLOCATE past EOF grows the file with zeroes; DEALLOCATE zeroes without shrinking.
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kAllocate, 10, 6), 0u);
+  EXPECT_EQ(file_size(f, o.fh), 16u);
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kDeallocate, 2, 3), 0u);
+  EXPECT_EQ(file_size(f, o.fh), 16u);
+  auto data = do_read(f, o.fh, o.stateid, 0, 64);
+  EXPECT_STREQ(data, std::string("01\0\0\0" "56789" "\0\0\0\0\0\0", 16));
+  // Argument discipline: zero length / overflow -> INVAL.
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kAllocate, 0, 0), stv(Status::kInval));
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kDeallocate, UINT64_MAX - 1, 5),
+            stv(Status::kInval));
+  // Stateid discipline: a read-only open may SEEK but not ALLOCATE (OPENMODE); the
+  // anonymous stateid is fine for SEEK; a directory is ISDIR.
+  auto ro = do_open(f, dir_fh, "sparse.bin", 1, 0, "owner-ro");
+  ASSERT_TRUE(ro.status == 0);
+  EXPECT_EQ(do_seek(f, o.fh, ro.stateid, 0, nfsv4::kContentData).status, 0u);
+  EXPECT_EQ(do_alloc(f, o.fh, ro.stateid, Op::kAllocate, 0, 1), stv(Status::kOpenmode));
+  nfsv4::Stateid anon{};
+  EXPECT_EQ(do_seek(f, o.fh, anon, 0, nfsv4::kContentData).status, 0u);
+  EXPECT_EQ(do_seek(f, dir_fh, anon, 0, nfsv4::kContentData).status, stv(Status::kIsdir));
+  EXPECT_EQ(do_close(f, o.fh, ro.stateid), 0u);
+  EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+}
+
+TEST(Nfs4, V42CopyAndClone) {
+  V4Fixture f;
+  f.minor = 2;
+  f.establish_session();
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto src = do_open(f, dir_fh, "src.bin", 3, 0, "owner-c", 0, encode_empty_fattr);
+  auto dst = do_open(f, dir_fh, "dst.bin", 3, 0, "owner-c", 0, encode_empty_fattr);
+  ASSERT_TRUE(src.status == 0 && dst.status == 0);
+  ASSERT_TRUE(do_write(f, src.fh, src.stateid, 0, "abcdefghij", 2) == 0);
+  ASSERT_TRUE(do_write(f, dst.fh, dst.stateid, 0, "ZZZZ", 2) == 0);
+
+  // Whole-file COPY (count 0 = to EOF): synchronous, UNSTABLE + verifier, consecutive.
+  auto c = do_copy(f, src.fh, src.stateid, dst.fh, dst.stateid, 0, 2, 0);
+  ASSERT_TRUE(c.status == 0);
+  EXPECT_EQ(c.count, 10u);
+  EXPECT_EQ(c.committed, 0u);
+  EXPECT_TRUE(c.consecutive);
+  EXPECT_TRUE(c.synchronous);
+  EXPECT_STREQ(do_read(f, dst.fh, dst.stateid, 0, 64), "ZZabcdefghij");
+  // Ranged COPY beyond the source EOF copies what exists.
+  c = do_copy(f, src.fh, src.stateid, dst.fh, dst.stateid, 8, 0, 100);
+  ASSERT_TRUE(c.status == 0);
+  EXPECT_EQ(c.count, 2u);
+  EXPECT_STREQ(do_read(f, dst.fh, dst.stateid, 0, 64), "ijabcdefghij");
+  // Placeholder stateids: source = saved (with SAVEFH), destination = current.
+  {
+    nfsv4::Stateid cur{};
+    cur.seqid = 1;
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(dir_fh);
+    ops.u32(static_cast<uint32_t>(Op::kOpen));  // src via OPEN -> current stateid
+    ops.u32(0);
+    ops.u32(1);
+    ops.u32(0);
+    ops.u64(f.clientid);
+    ops.string("owner-c-src");
+    ops.u32(0);
+    ops.u32(0);
+    ops.string("src.bin");
+    ops.u32(static_cast<uint32_t>(Op::kSavefh));
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(dir_fh);
+    ops.u32(static_cast<uint32_t>(Op::kOpen));  // dst via OPEN -> current stateid
+    ops.u32(0);
+    ops.u32(2);
+    ops.u32(0);
+    ops.u64(f.clientid);
+    ops.string("owner-c-dst");
+    ops.u32(0);
+    ops.u32(0);
+    ops.string("dst.bin");
+    ops.u32(static_cast<uint32_t>(Op::kCopy));
+    cur.encode(ops);
+    cur.encode(ops);
+    ops.u64(0);
+    ops.u64(12);
+    ops.u64(3);
+    ops.boolean(true);
+    ops.boolean(true);
+    ops.u32(0);
+    auto reply = f.parse(f.compound_raw(f.session_body(6, ops.take())));
+    EXPECT_EQ(reply.status, 0u);
+    EXPECT_STREQ(do_read(f, dst.fh, dst.stateid, 0, 64), "ijabcdefghijabc");
+  }
+  // Inter-server (non-empty source list) and overflow are refused before any IO.
+  EXPECT_EQ(do_copy(f, src.fh, src.stateid, dst.fh, dst.stateid, 0, 0, 0, false, 1).status,
+            stv(Status::kNotsupp));
+  EXPECT_EQ(do_copy(f, src.fh, src.stateid, dst.fh, dst.stateid, UINT64_MAX, 0, 2).status,
+            stv(Status::kInval));
+  // Destination needs a write-mode stateid; a read-only one is OPENMODE; a directory
+  // as either side is ISDIR; missing SAVEFH is NOFILEHANDLE.
+  auto ro = do_open(f, dir_fh, "dst.bin", 1, 0, "owner-ro");
+  ASSERT_TRUE(ro.status == 0);
+  EXPECT_EQ(do_copy(f, src.fh, src.stateid, dst.fh, ro.stateid, 0, 0, 1).status,
+            stv(Status::kOpenmode));
+  EXPECT_EQ(do_copy(f, dir_fh, src.stateid, dst.fh, dst.stateid, 0, 0, 1).status,
+            stv(Status::kIsdir));
+  {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(dst.fh);
+    ops.u32(static_cast<uint32_t>(Op::kCopy));
+    src.stateid.encode(ops);
+    dst.stateid.encode(ops);
+    ops.u64(0);
+    ops.u64(0);
+    ops.u64(1);
+    ops.boolean(true);
+    ops.boolean(true);
+    ops.u32(0);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    EXPECT_EQ(reply.status, stv(Status::kNofilehandle));
+  }
+
+  // CLONE: whole file (count 0) and a range; the memory backend clones by copying.
+  auto cl = do_open(f, dir_fh, "clone.bin", 3, 0, "owner-c", 0, encode_empty_fattr);
+  ASSERT_TRUE(cl.status == 0);
+  EXPECT_EQ(do_copy(f, src.fh, src.stateid, cl.fh, cl.stateid, 0, 0, 0, true).status, 0u);
+  EXPECT_STREQ(do_read(f, cl.fh, cl.stateid, 0, 64), "abcdefghij");
+  EXPECT_EQ(do_copy(f, src.fh, src.stateid, cl.fh, cl.stateid, 0, 10, 3, true).status, 0u);
+  EXPECT_STREQ(do_read(f, cl.fh, cl.stateid, 0, 64), "abcdefghijabc");
+  EXPECT_EQ(do_copy(f, src.fh, src.stateid, cl.fh, ro.stateid, 0, 0, 1, true).status,
+            stv(Status::kBadStateid));  // ro stateid belongs to dst.bin, not clone.bin
+  EXPECT_EQ(do_close(f, dst.fh, ro.stateid), 0u);
+  EXPECT_EQ(do_close(f, cl.fh, cl.stateid), 0u);
+  EXPECT_EQ(do_close(f, dst.fh, dst.stateid), 0u);
+  EXPECT_EQ(do_close(f, src.fh, src.stateid), 0u);
 }

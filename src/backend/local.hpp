@@ -63,6 +63,9 @@ class LocalBackend final : public Backend {
   // Applies requested ownership to a freshly created object; EPERM from an unprivileged
   // server process is tolerated (files stay owned by the process user; documented mode).
   static void apply_created_owner(int fd, const Cred& cred);
+  // Runtime probe of the v4.2 capability bits (kSparseOps / kCopyRange / kCloneRange)
+  // on the export filesystem; result is logged by the caller at startup.
+  void probe_v42_caps();
 
   Config cfg_;
   int root_fd_ = -1;
@@ -120,6 +123,16 @@ class LocalObject final : public Object {
   rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const std::byte> in,
                                    Stability) override;
   rt::Task<Result<void>> commit(OpenCtx, uint64_t off, uint64_t len) override;
+  // v4.2 sweets (design 06 §6.x mapping table): lseek(SEEK_DATA/HOLE), fallocate(0 /
+  // PUNCH_HOLE|KEEP_SIZE), ioctl(FICLONERANGE), copy_file_range with a pread/pwrite
+  // fallback — all on the offload pool, fds from the fd cache.
+  rt::Task<Result<uint64_t>> seek(OpenCtx, uint64_t off, SeekWhat) override;
+  rt::Task<Result<void>> allocate(OpenCtx, uint64_t off, uint64_t len) override;
+  rt::Task<Result<void>> deallocate(OpenCtx, uint64_t off, uint64_t len) override;
+  rt::Task<Result<void>> clone(OpenCtx, Object& dst, OpenCtx, uint64_t src_off,
+                               uint64_t dst_off, uint64_t len) override;
+  rt::Task<Result<uint64_t>> copy_range(OpenCtx, Object& dst, OpenCtx, uint64_t src_off,
+                                        uint64_t dst_off, uint64_t len) override;
 
  private:
   friend class LocalBackend;
@@ -132,6 +145,9 @@ class LocalObject final : public Object {
   rt::Task<Result<Created>> created_child(std::string_view name);
   Result<Created> created_child_sync(std::string_view name);
   rt::Task<Result<void>> require_dir_write(const Cred& cred);
+  // Regular-file precondition + the read/write permission gate shared by read/write and
+  // the v4.2 ops (owner relaxation; skipped for writes in setfsuid identity mode).
+  rt::Task<Result<void>> io_gate(const Cred& cred, bool write);
 
   LocalBackend& backend_;
   int path_fd_ = -1;  // O_PATH|O_NOFOLLOW, safe for statx/lookup.

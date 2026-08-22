@@ -178,7 +178,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
     co_await conn.send(enc.take());
   };
 
-  if (*minor != 1) {  // decision D5: minorversion 0 (and 2, for now) rejected
+  if (!minor_supported(*minor)) {  // decision D5: minorversion 0 rejected; 1 and 2 served
     co_await finish(st(Status::kMinorVersMismatch), 0);
     co_return;
   }
@@ -198,6 +198,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
   }
 
   Ctx ctx{.conn = conn, .cred = cred};
+  ctx.minor = *minor;
   uint32_t status;
   uint32_t done = 0;
 
@@ -356,7 +357,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
   }
 
   // Unknown opcodes answer OP_ILLEGAL even ahead of session discipline.
-  if (*first_op < kFirstOp || *first_op > kLastKnownOp) {
+  if (*first_op < kFirstOp || *first_op > last_op_for(ctx.minor)) {
     enc.u32(static_cast<uint32_t>(Op::kIllegal));
     enc.u32(st(Status::kOpIllegal));
     co_await finish(st(Status::kOpIllegal), 1);
@@ -547,17 +548,32 @@ rt::Task<uint32_t> Engine::exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
       enc.u32(st(Status::kSequencePos));
       co_return st(Status::kSequencePos);
     }
-    default: {
-      if (opcode >= kFirstOp && opcode <= kLastKnownOp) {
-        enc.u32(opcode);
-        enc.u32(st(Status::kNotsupp));
-        co_return st(Status::kNotsupp);
+    case Op::kSeek:
+    case Op::kAllocate:
+    case Op::kDeallocate:
+    case Op::kCopy:
+    case Op::kClone: {
+      if (ctx.minor < 2) break;  // 4.1 table ends at 58 -> OP_ILLEGAL below
+      enc.u32(opcode);
+      switch (static_cast<Op>(opcode)) {
+        case Op::kSeek: co_return co_await op_seek(ctx, dec, enc);
+        case Op::kAllocate: co_return co_await op_allocate(ctx, dec, enc, false);
+        case Op::kDeallocate: co_return co_await op_allocate(ctx, dec, enc, true);
+        case Op::kCopy: co_return co_await op_copy(ctx, dec, enc);
+        default: co_return co_await op_clone(ctx, dec, enc);
       }
-      enc.u32(static_cast<uint32_t>(Op::kIllegal));
-      enc.u32(st(Status::kOpIllegal));
-      co_return st(Status::kOpIllegal);
     }
+    default: break;
   }
+  // Inside the minor version's table but unimplemented -> NOTSUPP; beyond it -> ILLEGAL.
+  if (opcode >= kFirstOp && opcode <= last_op_for(ctx.minor)) {
+    enc.u32(opcode);
+    enc.u32(st(Status::kNotsupp));
+    co_return st(Status::kNotsupp);
+  }
+  enc.u32(static_cast<uint32_t>(Op::kIllegal));
+  enc.u32(st(Status::kOpIllegal));
+  co_return st(Status::kOpIllegal);
 }
 
 // ---- filehandle ops --------------------------------------------------------
@@ -2440,6 +2456,351 @@ rt::Task<uint32_t> Engine::op_secinfo(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
 }
 
 // ---- sessionless operations ------------------------------------------------
+
+// ---- v4.2 sweets (RFC 7862 §15; development plan §8 item 1) ------------------------
+
+rt::Task<Result<Engine::Resolved>> Engine::resolve_regular(Ctx& ctx, const FhBytes& fh,
+                                                           Op op, uint32_t* status) {
+  *status = 0;
+  if (fh.empty()) {
+    *status = st(Status::kNofilehandle);
+    co_return Err(errno_from(EINVAL));
+  }
+  auto resolved = co_await resolve(fh, ctx.conn.peer.addr);
+  if (!resolved) {
+    *status = st(core::to_v4(resolved.error(), op));
+    co_return Err(resolved.error());
+  }
+  if (resolved->pseudo() || resolved->obj->type() == backend::FType::kDir) {
+    *status = st(Status::kIsdir);
+    co_return Err(errno_from(EISDIR));
+  }
+  if (resolved->obj->type() != backend::FType::kReg) {
+    *status = st(Status::kWrongType);
+    co_return Err(errno_from(EINVAL));
+  }
+  co_return resolved;
+}
+
+rt::Task<uint32_t> Engine::op_seek(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto sid = Stateid::decode(dec);
+  auto offset = dec.u64();
+  auto what = dec.u32();
+  if (!sid || !offset || !what) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  uint32_t status = 0;
+  auto resolved = co_await resolve_regular(ctx, ctx.cfh, Op::kSeek, &status);
+  if (!resolved) {
+    enc.u32(status);
+    co_return status;
+  }
+  if (*what != kContentData && *what != kContentHole) {
+    enc.u32(st(Status::kUnionNotsupp));
+    co_return st(Status::kUnionNotsupp);
+  }
+  if (!resolved->exp->backend->caps().has(backend::Cap::kSparseOps)) {
+    enc.u32(st(Status::kNotsupp));
+    co_return st(Status::kNotsupp);
+  }
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  auto check = co_await state_.check_io(*sid, ctx.clientid, resolved->exp->fsid,
+                                        resolved->oid, state::kShareRead);
+  if (check.status != 0) {
+    enc.u32(check.status);
+    co_return check.status;
+  }
+  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
+  auto cred = mapped.view();
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock_shared();
+  backend::OpenCtx open{cred, check.bopen.get()};
+  auto found = co_await resolved->obj->seek(
+      open, *offset, *what == kContentData ? backend::SeekWhat::kData : backend::SeekWhat::kHole);
+  if (!found) {
+    uint32_t code = st(core::to_v4(found.error(), Op::kSeek));
+    enc.u32(code);
+    co_return code;
+  }
+  // eof mirrors knfsd: the returned position is at/after the current size.
+  auto attr = co_await resolved->obj->getattr();
+  bool eof = attr ? *found >= attr->size : false;
+  enc.u32(st(Status::kOk));
+  enc.boolean(eof);
+  enc.u64(*found);
+  co_return st(Status::kOk);
+}
+
+rt::Task<uint32_t> Engine::op_allocate(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc,
+                                       bool deallocate) {
+  const Op op = deallocate ? Op::kDeallocate : Op::kAllocate;
+  auto sid = Stateid::decode(dec);
+  auto offset = dec.u64();
+  auto length = dec.u64();
+  if (!sid || !offset || !length) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  uint32_t status = 0;
+  auto resolved = co_await resolve_regular(ctx, ctx.cfh, op, &status);
+  if (!resolved) {
+    enc.u32(status);
+    co_return status;
+  }
+  if (!resolved->exp->backend->caps().has(backend::Cap::kSparseOps)) {
+    enc.u32(st(Status::kNotsupp));
+    co_return st(Status::kNotsupp);
+  }
+  if (*length == 0 || *offset + *length < *offset) {  // RFC 7862 §15.1.3 / §15.4.3
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  auto check = co_await state_.check_io(*sid, ctx.clientid, resolved->exp->fsid,
+                                        resolved->oid, state::kShareWrite);
+  if (check.status != 0) {
+    enc.u32(check.status);
+    co_return check.status;
+  }
+  if (resolved->exp->readonly) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
+  auto cred = mapped.view();
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock();
+  backend::OpenCtx open{cred, check.bopen.get()};
+  auto done = deallocate ? co_await resolved->obj->deallocate(open, *offset, *length)
+                         : co_await resolved->obj->allocate(open, *offset, *length);
+  if (!done) {
+    uint32_t code = st(core::to_v4(done.error(), op));
+    enc.u32(code);
+    co_return code;
+  }
+  enc.u32(st(Status::kOk));
+  co_return st(Status::kOk);
+}
+
+// COPY/CLONE: src = SFH, dst = CFH, both regular files on the same export (cross-export
+// -> XDEV: the backend boundary is the copy domain).
+rt::Task<uint32_t> Engine::op_copy(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto src_sid = Stateid::decode(dec);
+  auto dst_sid = Stateid::decode(dec);
+  auto src_off = dec.u64();
+  auto dst_off = dec.u64();
+  auto count = dec.u64();
+  auto consecutive = dec.boolean();
+  auto synchronous = dec.boolean();
+  auto nservers = dec.u32();
+  if (!src_sid || !dst_sid || !src_off || !dst_off || !count || !consecutive ||
+      !synchronous || !nservers) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  uint32_t status = 0;
+  auto dst = co_await resolve_regular(ctx, ctx.cfh, Op::kCopy, &status);
+  if (!dst) {
+    enc.u32(status);
+    co_return status;
+  }
+  auto src = co_await resolve_regular(ctx, ctx.sfh, Op::kCopy, &status);
+  if (!src) {
+    enc.u32(status);
+    co_return status;
+  }
+  if (*nservers != 0) {  // inter-server copy: not offered (research 08 §8.1)
+    enc.u32(st(Status::kNotsupp));
+    co_return st(Status::kNotsupp);
+  }
+  if (!dst->exp->backend->caps().has(backend::Cap::kCopyRange)) {
+    enc.u32(st(Status::kNotsupp));
+    co_return st(Status::kNotsupp);
+  }
+  if (src->exp != dst->exp) {
+    enc.u32(st(Status::kXdev));
+    co_return st(Status::kXdev);
+  }
+  if (*src_off + *count < *src_off || *dst_off + *count < *dst_off) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  // Stateids: the destination follows the current-stateid rule; a placeholder source
+  // stateid refers to the one saved with SAVEFH (falls back to current).
+  if (is_current_placeholder(*src_sid)) {
+    if (ctx.saved_valid) *src_sid = ctx.saved_sid;
+    else if (uint32_t cur = resolve_current(ctx, *src_sid); cur != st(Status::kOk)) {
+      enc.u32(cur);
+      co_return cur;
+    }
+  }
+  if (uint32_t cur = resolve_current(ctx, *dst_sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  auto scheck = co_await state_.check_io(*src_sid, ctx.clientid, src->exp->fsid, src->oid,
+                                         state::kShareRead);
+  if (scheck.status != 0) {
+    enc.u32(scheck.status);
+    co_return scheck.status;
+  }
+  auto dcheck = co_await state_.check_io(*dst_sid, ctx.clientid, dst->exp->fsid, dst->oid,
+                                         state::kShareWrite);
+  if (dcheck.status != 0) {
+    enc.u32(dcheck.status);
+    co_return dcheck.status;
+  }
+  if (dst->exp->readonly) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  auto mapped = exports_.squash_cred(ctx.cred, *dst->exp);
+  auto cred = mapped.view();
+  // Deterministic lock order across the two objects (same object: one exclusive hold).
+  bool same = src->oid == dst->oid;
+  auto first = locks_.get(dst->exp->fsid, same || src->oid < dst->oid ? src->oid : dst->oid);
+  auto second = same ? nullptr
+                     : locks_.get(dst->exp->fsid, src->oid < dst->oid ? dst->oid : src->oid);
+  auto held1 = co_await first->lock();
+  std::optional<decltype(held1)> held2;
+  if (second) held2.emplace(co_await second->lock());
+  backend::OpenCtx sopen{cred, scheck.bopen.get()};
+  backend::OpenCtx dopen{cred, dcheck.bopen.get()};
+  uint64_t length = *count;
+  if (length == 0) {  // ca_count 0: through the source EOF (RFC 7862 §15.2.3)
+    auto attr = co_await src->obj->getattr();
+    if (!attr) {
+      uint32_t code = st(core::to_v4(attr.error(), Op::kCopy));
+      enc.u32(code);
+      co_return code;
+    }
+    length = attr->size > *src_off ? attr->size - *src_off : 0;
+  }
+  Result<uint64_t> copied = length == 0 ? Result<uint64_t>{0}
+                                        : co_await src->obj->copy_range(
+                                              sopen, *dst->obj, dopen, *src_off, *dst_off,
+                                              length);
+  if (!copied) {
+    uint32_t code = st(core::to_v4(copied.error(), Op::kCopy));
+    enc.u32(code);
+    co_return code;
+  }
+  obs::Metrics::instance().write_bytes.fetch_add(*copied, std::memory_order_relaxed);
+  enc.u32(st(Status::kOk));
+  // write_response4: no callback stateid (synchronous), count, UNSTABLE + verifier —
+  // the client COMMITs like after WRITE (RFC 7862 §15.2.3).
+  enc.u32(0);
+  enc.u64(*copied);
+  enc.u32(0);
+  enc.opaque_fixed(write_verf_);
+  enc.boolean(true);  // cr_consecutive
+  enc.boolean(true);  // cr_synchronous (asynchronous requests are served synchronously)
+  co_return st(Status::kOk);
+}
+
+rt::Task<uint32_t> Engine::op_clone(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto src_sid = Stateid::decode(dec);
+  auto dst_sid = Stateid::decode(dec);
+  auto src_off = dec.u64();
+  auto dst_off = dec.u64();
+  auto count = dec.u64();
+  if (!src_sid || !dst_sid || !src_off || !dst_off || !count) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  uint32_t status = 0;
+  auto dst = co_await resolve_regular(ctx, ctx.cfh, Op::kClone, &status);
+  if (!dst) {
+    enc.u32(status);
+    co_return status;
+  }
+  auto src = co_await resolve_regular(ctx, ctx.sfh, Op::kClone, &status);
+  if (!src) {
+    enc.u32(status);
+    co_return status;
+  }
+  if (!dst->exp->backend->caps().has(backend::Cap::kCloneRange)) {
+    enc.u32(st(Status::kNotsupp));
+    co_return st(Status::kNotsupp);
+  }
+  if (src->exp != dst->exp) {
+    enc.u32(st(Status::kXdev));
+    co_return st(Status::kXdev);
+  }
+  if (*src_off + *count < *src_off || *dst_off + *count < *dst_off) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (is_current_placeholder(*src_sid)) {
+    if (ctx.saved_valid) *src_sid = ctx.saved_sid;
+    else if (uint32_t cur = resolve_current(ctx, *src_sid); cur != st(Status::kOk)) {
+      enc.u32(cur);
+      co_return cur;
+    }
+  }
+  if (uint32_t cur = resolve_current(ctx, *dst_sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  auto scheck = co_await state_.check_io(*src_sid, ctx.clientid, src->exp->fsid, src->oid,
+                                         state::kShareRead);
+  if (scheck.status != 0) {
+    enc.u32(scheck.status);
+    co_return scheck.status;
+  }
+  auto dcheck = co_await state_.check_io(*dst_sid, ctx.clientid, dst->exp->fsid, dst->oid,
+                                         state::kShareWrite);
+  if (dcheck.status != 0) {
+    enc.u32(dcheck.status);
+    co_return dcheck.status;
+  }
+  if (dst->exp->readonly) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  auto mapped = exports_.squash_cred(ctx.cred, *dst->exp);
+  auto cred = mapped.view();
+  bool same = src->oid == dst->oid;
+  auto first = locks_.get(dst->exp->fsid, same || src->oid < dst->oid ? src->oid : dst->oid);
+  auto second = same ? nullptr
+                     : locks_.get(dst->exp->fsid, src->oid < dst->oid ? dst->oid : src->oid);
+  auto held1 = co_await first->lock();
+  std::optional<decltype(held1)> held2;
+  if (second) held2.emplace(co_await second->lock());
+  backend::OpenCtx sopen{cred, scheck.bopen.get()};
+  backend::OpenCtx dopen{cred, dcheck.bopen.get()};
+  uint64_t length = *count;
+  if (length == 0) {  // cl_count 0: through the source EOF (RFC 7862 §15.13.3)
+    auto attr = co_await src->obj->getattr();
+    if (!attr) {
+      uint32_t code = st(core::to_v4(attr.error(), Op::kClone));
+      enc.u32(code);
+      co_return code;
+    }
+    if (attr->size <= *src_off) {
+      enc.u32(st(Status::kInval));
+      co_return st(Status::kInval);
+    }
+    length = attr->size - *src_off;
+  }
+  auto cloned = co_await src->obj->clone(sopen, *dst->obj, dopen, *src_off, *dst_off, length);
+  if (!cloned) {
+    uint32_t code = st(core::to_v4(cloned.error(), Op::kClone));
+    enc.u32(code);
+    co_return code;
+  }
+  enc.u32(st(Status::kOk));
+  co_return st(Status::kOk);
+}
+
+// ---- sessionless ops --------------------------------------------------------
 
 rt::Task<uint32_t> Engine::op_exchange_id(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
   auto verf = dec.opaque_fixed(8);

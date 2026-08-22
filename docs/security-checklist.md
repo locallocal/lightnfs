@@ -79,7 +79,7 @@ fuzz：`fuzz/fuzz_handle_request.cpp` 直喂 `Dispatcher::handle_request`，阶�
 - seccomp：`SystemCallFilter=@system-service` 去掉 `@clock @debug @module @mount @obsolete
   @raw-io @reboot @swap @cpu-emulation`，再显式加入 `io_uring_{setup,enter,register}` 与
   `name_to_handle_at`/`open_by_handle_at`；越权系统调用返回 EPERM。
-- 白名单来源：`scripts/gen_seccomp_allowlist.sh` 对真实 v3+v4.1 读写+锁负载做 strace 取全量
+- 白名单来源：`scripts/gen_seccomp_allowlist.sh` 对真实 v3+v4.1 读写+锁+v4.2 稀疏/拷贝负载做 strace 取全量
   系统调用集（本机实测集：io_uring_{setup,enter} / name_to_handle_at / open_by_handle_at /
   openat / statx / fsync / linkat / renameat / unlinkat / getdents64 / socket 族 等，
   全部落在上述白名单内）。运行时集变更需重跑并复核单元文件。
