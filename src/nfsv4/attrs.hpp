@@ -18,8 +18,9 @@ inline constexpr uint32_t kSupportedAttrs = 0, kType = 1, kFhExpireType = 2, kCh
     kMaxfilesize = 27, kMaxlink = 28, kMaxname = 29, kMaxread = 30, kMaxwrite = 31,
     kMode = 33, kNoTrunc = 34, kNumlinks = 35, kOwner = 36, kOwnerGroup = 37,
     kRawdev = 41, kSpaceAvail = 42, kSpaceFree = 43, kSpaceTotal = 44, kSpaceUsed = 45,
-    kTimeAccess = 47, kTimeDelta = 51, kTimeMetadata = 52, kTimeModify = 53,
-    kMountedOnFileid = 55;
+    kTimeAccess = 47, kTimeAccessSet = 48, kTimeDelta = 51, kTimeMetadata = 52,
+    kTimeModify = 53, kTimeModifySet = 54, kMountedOnFileid = 55,
+    kSuppattrExclCreat = 75;
 }
 
 const Bitmap& supported_attrs();
@@ -35,7 +36,17 @@ struct AttrSource {
   bool link_support = true;
   bool symlink_support = true;
   bool case_insensitive = false;
+  uint32_t lease_seconds = kLeaseSeconds;     // attr 10 (lease_time)
 };
+
+// Decodes a fattr4 carrying settable attributes (SETATTR / OPEN create / CREATE) into
+// a backend SetAttr.  `set` receives the bits actually applied.  Returns kOk, kBadxdr,
+// kInval (read-only attribute requested), kAttrnotsupp (unsupported settable attribute,
+// e.g. ACL) or kBadowner (non-numeric owner string; AUTH_SYS convention).
+Status decode_settable_fattr(xdr::XdrDec& dec, backend::SetAttr& out, Bitmap& set);
+
+// The settable subset of supported_attrs() (size/mode/owner/owner_group/time_*_set).
+const Bitmap& settable_attrs();
 
 // True if the mask requests attrs that need a statfs() prefetch.
 bool wants_stats(const Bitmap& wanted);

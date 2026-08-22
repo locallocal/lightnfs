@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "core/boot_epoch.hpp"
 #include "core/errmap.hpp"
 #include "transport/connection.hpp"
 #include "core/readdir.hpp"
@@ -34,10 +35,24 @@ void patch_u32(std::byte* gap, uint32_t value) {
 constexpr uint32_t kAccessRead = 0x01, kAccessLookup = 0x02, kAccessModify = 0x04,
                    kAccessExtend = 0x08, kAccessDelete = 0x10, kAccessExecute = 0x20;
 
+bool valid_utf8(std::span<const std::byte> bytes);
+
 bool valid_component4(std::string_view name) {
   return !name.empty() && name.size() <= kMaxName &&
          name.find('/') == std::string_view::npos &&
          name.find('\0') == std::string_view::npos && name != "." && name != "..";
+}
+
+// utf8str_cs component discipline (RFC 8881 §14.1): malformed UTF-8 is INVAL.
+bool utf8_component(std::string_view name) {
+  return valid_utf8(std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(name.data()), name.size()));
+}
+
+bool is_current_placeholder(const Stateid& sid) {
+  if (sid.seqid != 1) return false;
+  return std::all_of(sid.other.begin(), sid.other.end(),
+                     [](std::byte b) { return b == std::byte{0}; });
 }
 
 bool valid_utf8(std::span<const std::byte> bytes) {
@@ -77,6 +92,13 @@ bool sessionless_op(uint32_t op) {
 }
 
 }  // namespace
+
+uint32_t Engine::resolve_current(const Ctx& ctx, Stateid& sid) {
+  if (!is_current_placeholder(sid)) return st(Status::kOk);
+  if (!ctx.current_valid) return st(Status::kBadStateid);
+  sid = ctx.current_sid;
+  return st(Status::kOk);
+}
 
 void Engine::register_with(rpc::Dispatcher& dispatcher) {
   dispatcher.add({kProgram, kVersion, kVersion,
@@ -354,10 +376,12 @@ rt::Task<uint32_t> Engine::exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
     case Op::kPutrootfh:
     case Op::kPutpubfh: {
       enc.u32(opcode);
+      ctx.current_valid = false;
       co_return co_await op_putrootfh(ctx, enc);
     }
     case Op::kPutfh: {
       enc.u32(opcode);
+      ctx.current_valid = false;
       co_return co_await op_putfh(ctx, dec, enc);
     }
     case Op::kGetfh: {
@@ -371,6 +395,8 @@ rt::Task<uint32_t> Engine::exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
         co_return st(Status::kNofilehandle);
       }
       ctx.sfh = ctx.cfh;
+      ctx.saved_sid = ctx.current_sid;
+      ctx.saved_valid = ctx.current_valid;
       enc.u32(st(Status::kOk));
       co_return st(Status::kOk);
     }
@@ -381,15 +407,19 @@ rt::Task<uint32_t> Engine::exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
         co_return st(Status::kRestorefh);
       }
       ctx.cfh = ctx.sfh;
+      ctx.current_sid = ctx.saved_sid;
+      ctx.current_valid = ctx.saved_valid;
       enc.u32(st(Status::kOk));
       co_return st(Status::kOk);
     }
     case Op::kLookup: {
       enc.u32(opcode);
+      ctx.current_valid = false;
       co_return co_await op_lookup(ctx, dec, enc);
     }
     case Op::kLookupp: {
       enc.u32(opcode);
+      ctx.current_valid = false;
       co_return co_await op_lookupp(ctx, enc);
     }
     case Op::kGetattr: {
@@ -420,8 +450,47 @@ rt::Task<uint32_t> Engine::exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
       enc.u32(opcode);
       co_return co_await op_close(ctx, dec, enc);
     }
+    case Op::kOpenDowngrade: {
+      enc.u32(opcode);
+      co_return co_await op_open_downgrade(ctx, dec, enc);
+    }
+    case Op::kWrite: {
+      enc.u32(opcode);
+      co_return co_await op_write(ctx, dec, enc);
+    }
+    case Op::kCommit: {
+      enc.u32(opcode);
+      co_return co_await op_commit(ctx, dec, enc);
+    }
+    case Op::kSetattr: {
+      enc.u32(opcode);
+      co_return co_await op_setattr(ctx, dec, enc);
+    }
+    case Op::kCreate: {
+      enc.u32(opcode);
+      ctx.current_valid = false;
+      co_return co_await op_create(ctx, dec, enc);
+    }
+    case Op::kRemove: {
+      enc.u32(opcode);
+      co_return co_await op_remove(ctx, dec, enc);
+    }
+    case Op::kRename: {
+      enc.u32(opcode);
+      co_return co_await op_rename(ctx, dec, enc);
+    }
+    case Op::kLink: {
+      enc.u32(opcode);
+      co_return co_await op_link(ctx, dec, enc);
+    }
+    case Op::kVerify:
+    case Op::kNverify: {
+      enc.u32(opcode);
+      co_return co_await op_verify(ctx, dec, enc, static_cast<Op>(opcode) == Op::kNverify);
+    }
     case Op::kSecinfoNoName: {
       enc.u32(opcode);
+      ctx.current_valid = false;
       co_return co_await op_secinfo_no_name(ctx, dec, enc);
     }
     case Op::kFreeStateid: {
@@ -535,7 +604,8 @@ rt::Task<uint32_t> Engine::op_lookup(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  if (name->empty()) {  // zero-length component: INVAL, not BADNAME (RFC 8881 §18.10)
+  if (name->empty() || !utf8_component(*name)) {
+    // zero-length or malformed UTF-8 component: INVAL, not BADNAME (RFC 8881 §18.10)
     enc.u32(st(Status::kInval));
     co_return st(Status::kInval);
   }
@@ -668,6 +738,7 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
     src.link_support = caps.has(backend::Cap::kHardlink);
     src.symlink_support = caps.has(backend::Cap::kSymlink);
     src.case_insensitive = caps.has(backend::Cap::kCaseInsensitive);
+    src.lease_seconds = state_.config().lease_seconds;
     if (wants_stats(wanted)) {
       auto s = co_await resolved.exp->backend->statfs();
       if (s) {
@@ -685,6 +756,7 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
   }
   src.attr = &attr;
   src.fh = ctx.cfh;
+  src.lease_seconds = state_.config().lease_seconds;
   enc.u32(st(Status::kOk));
   encode_fattr(enc, wanted, src, ctx.conn.pool);
   co_return st(Status::kOk);
@@ -820,14 +892,23 @@ rt::Task<uint32_t> Engine::op_read(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     enc.u32(st(Status::kIsdir));
     co_return st(Status::kIsdir);
   }
-  auto check = co_await state_.lookup_stateid(*sid);
+  if (resolved->obj->type() == backend::FType::kDir) {
+    enc.u32(st(Status::kIsdir));
+    co_return st(Status::kIsdir);
+  }
+  if (resolved->obj->type() != backend::FType::kReg) {
+    enc.u32(st(Status::kWrongType));
+    co_return st(Status::kWrongType);
+  }
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  auto check = co_await state_.check_io(*sid, ctx.clientid, resolved->exp->fsid,
+                                        resolved->oid, state::kShareRead);
   if (check.status != 0) {
     enc.u32(check.status);
     co_return check.status;
-  }
-  if (!check.special && !(check.rec.oid == resolved->oid)) {
-    enc.u32(st(Status::kBadStateid));
-    co_return st(Status::kBadStateid);
   }
   auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
   auto cred = mapped.view();
@@ -842,7 +923,7 @@ rt::Task<uint32_t> Engine::op_read(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   bool eof = false;
   auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
   auto held = co_await lock->lock_shared();
-  backend::OpenCtx open{cred, nullptr};
+  backend::OpenCtx open{cred, check.bopen.get()};
   auto n = co_await resolved->obj->read(open, *offset,
                                         std::span<std::byte>(data.data(), len), eof);
   if (!n) {
@@ -945,6 +1026,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     src.limits = lim_ptr;
     src.link_support = ent_link_sup;
     src.symlink_support = ent_symlink_sup;
+    src.lease_seconds = state_.config().lease_seconds;
     encode_fattr(entry, *wanted, src, ctx.conn.pool);
     auto bytes = entry.take().to_bytes();
     size_t name_part = 8 + 4 + ((name.size() + 3) & ~size_t(3));
@@ -1030,7 +1112,32 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
   co_return st(Status::kOk);
 }
 
-// ---- minimal open-state ops ------------------------------------------------
+// ---- open state ops (phase 4: design 07 §6.1) -------------------------------
+
+namespace {
+
+// v4 createmode4 / opentype4 / open_claim_type4 / nf4type wire values.
+constexpr uint32_t kOpenNocreate = 0, kOpenCreate = 1;
+constexpr uint32_t kCreateUnchecked = 0, kCreateGuarded = 1, kCreateExclusive = 2,
+                   kCreateExclusive41 = 3;
+constexpr uint32_t kClaimNull = 0, kClaimPrevious = 1, kClaimDelegateCur = 2,
+                   kClaimDelegatePrev = 3, kClaimFh = 4, kClaimDelegCurFh = 5,
+                   kClaimDelegPrevFh = 6;
+constexpr uint32_t kNf4Reg = 1, kNf4Dir = 2, kNf4Blk = 3, kNf4Chr = 4, kNf4Lnk = 5,
+                   kNf4Sock = 6, kNf4Fifo = 7;
+constexpr uint32_t kOpenResultLocktypePosix = 0x4;
+
+void encode_change_info(xdr::XdrEnc& enc, bool atomic, uint64_t before, uint64_t after) {
+  enc.boolean(atomic);
+  enc.u64(before);
+  enc.u64(after);
+}
+
+uint64_t change_of(const Result<backend::Attr>& attr) {
+  return attr ? attr->change : 0;
+}
+
+}  // namespace
 
 rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
   auto seqid = dec.u32();
@@ -1043,6 +1150,83 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     enc.u32(st(Status::kBadxdr));
     co_return st(Status::kBadxdr);
   }
+  // openhow
+  uint32_t create_mode = kCreateUnchecked;
+  bool create = false;
+  backend::SetAttr create_attrs;
+  Bitmap attrset;
+  backend::ExclVerf excl_verf{};
+  if (*opentype == kOpenCreate) {
+    create = true;
+    auto mode = dec.u32();
+    if (!mode) {
+      enc.u32(st(Status::kBadxdr));
+      co_return st(Status::kBadxdr);
+    }
+    create_mode = *mode;
+    if (create_mode == kCreateExclusive || create_mode == kCreateExclusive41) {
+      auto verf = dec.opaque_fixed(8);
+      if (!verf) {
+        enc.u32(st(Status::kBadxdr));
+        co_return st(Status::kBadxdr);
+      }
+      std::copy(verf->begin(), verf->end(), excl_verf.begin());
+    }
+    if (create_mode == kCreateUnchecked || create_mode == kCreateGuarded ||
+        create_mode == kCreateExclusive41) {
+      Status code = decode_settable_fattr(dec, create_attrs, attrset);
+      if (code != Status::kOk) {
+        enc.u32(st(code));
+        co_return st(code);
+      }
+    }
+    if (create_mode > kCreateExclusive41) {
+      enc.u32(st(Status::kInval));
+      co_return st(Status::kInval);
+    }
+  } else if (*opentype != kOpenNocreate) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  // claim
+  auto claim = dec.u32();
+  if (!claim) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  std::string name;
+  switch (*claim) {
+    case kClaimNull: {
+      auto n = dec.string(kMaxName + 1);
+      if (!n) {
+        enc.u32(st(Status::kBadxdr));
+        co_return st(Status::kBadxdr);
+      }
+      name = *n;
+      break;
+    }
+    case kClaimPrevious: {
+      auto deleg = dec.u32();  // delegate_type: no delegations are ever granted
+      if (!deleg) {
+        enc.u32(st(Status::kBadxdr));
+        co_return st(Status::kBadxdr);
+      }
+      break;
+    }
+    case kClaimFh: break;
+    case kClaimDelegateCur:
+    case kClaimDelegatePrev:
+    case kClaimDelegCurFh:
+    case kClaimDelegPrevFh: {
+      enc.u32(st(Status::kNotsupp));  // delegation claims (roadmap M8)
+      co_return st(Status::kNotsupp);
+    }
+    default: {
+      enc.u32(st(Status::kInval));
+      co_return st(Status::kInval);
+    }
+  }
+
   if (!ctx.session) {
     enc.u32(st(Status::kOpNotInSession));
     co_return st(Status::kOpNotInSession);
@@ -1052,19 +1236,13 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     co_return st(Status::kNofilehandle);
   }
   uint32_t access = *share_access & 0x3;  // high bits carry deleg-want flags: ignored
-  if (*opentype == 1) {  // OPEN4_CREATE on the read-only milestone
-    enc.u32(st(Status::kRofs));
-    co_return st(Status::kRofs);
+  uint32_t deny = *share_deny;
+  if (access == 0 || deny > state::kShareBoth) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
   }
-  if (*opentype != 0) {
-    enc.u32(st(Status::kBadxdr));
-    co_return st(Status::kBadxdr);
-  }
-  auto claim = dec.u32();
-  if (!claim) {
-    enc.u32(st(Status::kBadxdr));
-    co_return st(Status::kBadxdr);
-  }
+  // open_owner4.clientid is ignored in 4.1 (RFC 8881 §18.16.3): the session says who.
+  std::string owner_bytes(reinterpret_cast<const char*>(owner->data()), owner->size());
 
   auto dir = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
   if (!dir) {
@@ -1072,59 +1250,139 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     enc.u32(code);
     co_return code;
   }
-  if (dir->pseudo() && *claim == 0) {
-    enc.u32(st(Status::kRofs));  // cannot open files in the synthesized tree
-    co_return st(Status::kRofs);
-  }
 
   backend::ObjPtr file;
+  bool created_new = false;  // skip the permission check the creator implicitly passed
+  bool atomic = false;
   uint64_t change_before = 0, change_after = 0;
   core::ExportEntry* exp = dir->exp;
-  if (*claim == 0) {  // CLAIM_NULL: CFH = directory, name follows
-    auto name = dec.string(kMaxName + 1);
-    if (!name) {
-      enc.u32(st(Status::kBadxdr));
-      co_return st(Status::kBadxdr);
+
+  if (*claim == kClaimNull) {
+    if (name.empty()) {
+      enc.u32(st(Status::kInval));
+      co_return st(Status::kInval);
     }
-    if (!valid_component4(*name)) {
+    if (!utf8_component(name)) {
+      enc.u32(st(Status::kInval));
+      co_return st(Status::kInval);
+    }
+    if (!valid_component4(name)) {
       enc.u32(st(Status::kBadname));
       co_return st(Status::kBadname);
+    }
+    if (dir->pseudo()) {  // the synthesized tree holds only directories
+      if (create) {
+        enc.u32(st(Status::kRofs));
+        co_return st(Status::kRofs);
+      }
+      uint32_t code = dir->node->children.contains(name) ? st(Status::kIsdir)
+                                                         : st(Status::kNoent);
+      enc.u32(code);
+      co_return code;
+    }
+    if (dir->obj->type() != backend::FType::kDir) {
+      enc.u32(st(Status::kNotdir));
+      co_return st(Status::kNotdir);
+    }
+    if (create && exp->readonly) {
+      enc.u32(st(Status::kRofs));
+      co_return st(Status::kRofs);
     }
     auto mapped = exports_.squash_cred(ctx.cred, *exp);
     auto cred = mapped.view();
     auto lock = locks_.get(exp->fsid, dir->oid);
-    auto held = co_await lock->lock_shared();
-    auto before = co_await dir->obj->getattr();
-    if (before) change_before = before->change;
-    auto found = co_await dir->obj->lookup(cred, *name);
-    auto after = co_await dir->obj->getattr();
-    if (after) change_after = after->change;
-    if (!found) {
-      uint32_t code = st(core::to_v4(found.error(), Op::kOpen));
-      enc.u32(code);
-      co_return code;
+    if (!create) {
+      auto held = co_await lock->lock_shared();
+      auto before = co_await dir->obj->getattr();
+      auto found = co_await dir->obj->lookup(cred, name);
+      auto after = co_await dir->obj->getattr();
+      change_before = change_of(before);
+      change_after = change_of(after);
+      if (!found) {
+        uint32_t code = st(core::to_v4(found.error(), Op::kOpen));
+        enc.u32(code);
+        co_return code;
+      }
+      file = std::move(*found);
+    } else {
+      auto held = co_await lock->lock();  // exclusive: change_info is atomic
+      atomic = true;
+      auto before = co_await dir->obj->getattr();
+      change_before = change_of(before);
+      Result<backend::Created> made = Err(errno_from(EIO));
+      if (create_mode == kCreateExclusive || create_mode == kCreateExclusive41) {
+        made = co_await dir->obj->create(cred, name, {}, &excl_verf);
+        if (made && create_mode == kCreateExclusive41) {
+          // EXCLUSIVE4_1: the verifier lives in the timestamps, so only the other
+          // attributes are applied; attrset tells the client which ones were used.
+          backend::SetAttr rest = create_attrs;
+          rest.atime_how = backend::SetAttr::TimeHow::kOmit;
+          rest.mtime_how = backend::SetAttr::TimeHow::kOmit;
+          rest.size.reset();
+          if (rest.mode || rest.uid || rest.gid) {
+            auto set = co_await made->obj->setattr(cred, rest);
+            if (set) made->attr = *set;
+          }
+          Bitmap used;
+          if (rest.mode) used.set(attr::kMode);
+          if (rest.uid) used.set(attr::kOwner);
+          if (rest.gid) used.set(attr::kOwnerGroup);
+          attrset = used;
+        } else {
+          attrset = Bitmap{};
+        }
+        if (made) {
+          attrset.set(attr::kTimeAccess);  // verifier storage: client must not reset
+          attrset.set(attr::kTimeModify);
+        }
+        created_new = made.has_value();
+      } else {
+        made = co_await dir->obj->create(cred, name, create_attrs, nullptr);
+        created_new = made.has_value();
+        if (!made && made.error() == errno_from(EEXIST) &&
+            create_mode == kCreateUnchecked) {
+          // UNCHECKED on an existing file succeeds; only a requested size applies.
+          auto existing = co_await dir->obj->lookup(cred, name);
+          if (existing) {
+            if ((*existing)->type() == backend::FType::kDir) {
+              enc.u32(st(Status::kIsdir));
+              co_return st(Status::kIsdir);
+            }
+            backend::Attr attr{};
+            if (create_attrs.size && (*existing)->type() == backend::FType::kReg) {
+              backend::SetAttr size_only;
+              size_only.size = create_attrs.size;
+              auto set = co_await (*existing)->setattr(cred, size_only);
+              if (!set) {
+                uint32_t code = st(core::to_v4(set.error(), Op::kOpen));
+                enc.u32(code);
+                co_return code;
+              }
+              attr = *set;
+              attrset = Bitmap{};
+              attrset.set(attr::kSize);
+            } else {
+              attrset = Bitmap{};
+            }
+            made = backend::Created{*existing, attr};
+          }
+        }
+      }
+      auto after = co_await dir->obj->getattr();
+      change_after = change_of(after);
+      if (!made) {
+        uint32_t code = st(core::to_v4(made.error(), Op::kOpen));
+        enc.u32(code);
+        co_return code;
+      }
+      file = std::move(made->obj);
     }
-    file = std::move(*found);
-  } else if (*claim == 1) {  // CLAIM_PREVIOUS: reclaim after restart
-    auto deleg = dec.u32();
-    (void)deleg;
-    if (!state_.in_grace()) {
-      enc.u32(st(Status::kNoGrace));
-      co_return st(Status::kNoGrace);
-    }
-    // Phase 3 carries no reopenable state across restarts (read-only opens are not
-    // persisted); an honest RECLAIM_BAD sends the client to a fresh CLAIM_NULL.
-    enc.u32(st(Status::kReclaimBad));
-    co_return st(Status::kReclaimBad);
-  } else if (*claim == 4) {  // CLAIM_FH: CFH is the file itself
+  } else {  // CLAIM_FH / CLAIM_PREVIOUS: CFH is the file itself
     if (dir->pseudo()) {
-      enc.u32(st(Status::kRofs));
-      co_return st(Status::kRofs);
+      enc.u32(st(Status::kIsdir));
+      co_return st(Status::kIsdir);
     }
     file = dir->obj;
-  } else {
-    enc.u32(st(Status::kNotsupp));
-    co_return st(Status::kNotsupp);
   }
 
   if (file->type() == backend::FType::kDir) {
@@ -1135,22 +1393,84 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     enc.u32(st(Status::kSymlink));
     co_return st(Status::kSymlink);
   }
-  if ((access & 0x2) && exp->readonly) {  // WRITE access on a read-only export
+  if (file->type() != backend::FType::kReg) {
+    enc.u32(st(Status::kWrongType));  // devices/fifos/sockets are not OPENable here
+    co_return st(Status::kWrongType);
+  }
+  if ((access & state::kShareWrite) && exp->readonly) {
     enc.u32(st(Status::kRofs));
     co_return st(Status::kRofs);
   }
+  auto mapped = exports_.squash_cred(ctx.cred, *exp);
+  auto cred = mapped.view();
+  if (!created_new) {  // POSIX permission check for the requested modes
+    backend::AccessMask want;
+    if (access & state::kShareRead) want.set(backend::Access::kRead);
+    if (access & state::kShareWrite) want.set(backend::Access::kModify);
+    auto lock = locks_.get(exp->fsid, file->id());
+    auto held = co_await lock->lock_shared();
+    auto allowed = co_await file->access(cred, want);
+    if (!allowed) {
+      uint32_t code = st(core::to_v4(allowed.error(), Op::kOpen));
+      enc.u32(code);
+      co_return code;
+    }
+    if (((access & state::kShareRead) && !allowed->has(backend::Access::kRead)) ||
+        ((access & state::kShareWrite) && !allowed->has(backend::Access::kModify))) {
+      enc.u32(st(Status::kAccess));
+      co_return st(Status::kAccess);
+    }
+  }
+  // Backend open handle (design 05): optional; backends without open state say so.
+  backend::OpenFlags oflags;
+  if (access & state::kShareRead) oflags.set(backend::OpenFlag::kRead);
+  if (access & state::kShareWrite) oflags.set(backend::OpenFlag::kWrite);
+  backend::OpenPtr bopen;
+  {
+    auto opened = co_await file->open(cred, oflags);
+    if (opened) bopen = std::move(*opened);
+    else if (opened.error() != errno_from(EOPNOTSUPP)) {
+      uint32_t code = st(core::to_v4(opened.error(), Op::kOpen));
+      enc.u32(code);
+      co_return code;
+    }
+  }
 
-  auto stateid = co_await state_.open_read(ctx.clientid, exp->fsid, file->id());
+  state::StateMgr::OpenArgs args;
+  args.clientid = ctx.clientid;
+  args.fsid = exp->fsid;
+  args.oid = file->id();
+  args.owner = std::move(owner_bytes);
+  args.access = access;
+  args.deny = deny;
+  args.reclaim = *claim == kClaimPrevious;
+  auto opened = co_await state_.open(std::move(args), std::move(bopen));
+  if (opened.status != 0) {
+    enc.u32(opened.status);
+    co_return opened.status;
+  }
   ctx.cfh = export_fh(*exp, file->id());
+  ctx.current_sid = opened.stateid;
+  ctx.current_valid = true;
   enc.u32(st(Status::kOk));
-  stateid.encode(enc);
-  enc.boolean(false);  // change_info4.atomic
-  enc.u64(change_before);
-  enc.u64(change_after);
-  enc.u32(0x4);  // OPEN4_RESULT_LOCKTYPE_POSIX
-  Bitmap attrset;
+  opened.stateid.encode(enc);
+  encode_change_info(enc, atomic, change_before, change_after);
+  enc.u32(kOpenResultLocktypePosix);
   attrset.encode(enc);
-  enc.u32(0);  // open_delegation4: OPEN_DELEGATE_NONE
+  // open_delegation4: no delegations are granted (M8).  A client that stated a want
+  // gets OPEN_DELEGATE_NONE_EXT with the reason (RFC 8881 §18.16.3).
+  uint32_t want = *share_access & 0xFF00;
+  if (want == 0) {
+    enc.u32(0);  // OPEN_DELEGATE_NONE
+  } else {
+    enc.u32(3);  // OPEN_DELEGATE_NONE_EXT
+    if (want == 0x0400 || want == 0x0500) {
+      enc.u32(0);  // WND4_NOT_WANTED (WANT_NO_DELEG / WANT_CANCEL)
+    } else {
+      enc.u32(2);          // WND4_RESOURCE
+      enc.boolean(false);  // will_signal_deleg_avail
+    }
+  }
   co_return st(Status::kOk);
 }
 
@@ -1165,15 +1485,619 @@ rt::Task<uint32_t> Engine::op_close(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  uint32_t code = co_await state_.close_state(*sid);
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  Stateid out;
+  uint32_t code = co_await state_.close_state(*sid, ctx.clientid, &out);
   if (code != 0) {
     enc.u32(code);
     co_return code;
   }
+  ctx.current_sid = out;
+  ctx.current_valid = true;
   enc.u32(st(Status::kOk));
-  Stateid out = *sid;
-  out.seqid += 1;
   out.encode(enc);
+  co_return st(Status::kOk);
+}
+
+rt::Task<uint32_t> Engine::op_open_downgrade(Ctx& ctx, xdr::XdrDec& dec,
+                                             xdr::XdrEnc& enc) {
+  auto sid = Stateid::decode(dec);
+  auto seqid = dec.u32();
+  auto access = dec.u32();
+  auto deny = dec.u32();
+  if (!sid || !seqid || !access || !deny) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  if ((*access & 0x3) == 0 || (*access & ~0x3u) != 0 || *deny > state::kShareBoth) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  Stateid out;
+  uint32_t code = co_await state_.open_downgrade(*sid, ctx.clientid, *access, *deny, &out);
+  if (code != 0) {
+    enc.u32(code);
+    co_return code;
+  }
+  ctx.current_sid = out;
+  ctx.current_valid = true;
+  enc.u32(st(Status::kOk));
+  out.encode(enc);
+  co_return st(Status::kOk);
+}
+
+// ---- write-side IO ---------------------------------------------------------
+
+rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto sid = Stateid::decode(dec);
+  auto offset = dec.u64();
+  auto stable = dec.u32();
+  auto data = dec.opaque(UINT32_MAX);
+  if (!sid || !offset || !stable || !data) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  if (*stable > 2) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!resolved) {
+    uint32_t code = st(core::to_v4(resolved.error(), Op::kWrite));
+    enc.u32(code);
+    co_return code;
+  }
+  if (resolved->pseudo()) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  if (resolved->obj->type() == backend::FType::kDir) {
+    enc.u32(st(Status::kIsdir));
+    co_return st(Status::kIsdir);
+  }
+  if (resolved->obj->type() != backend::FType::kReg) {
+    enc.u32(st(Status::kWrongType));
+    co_return st(Status::kWrongType);
+  }
+  // Stateid discipline first (special → table → OPENMODE), then the same backend call
+  // the v3 path makes.
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  auto check = co_await state_.check_io(*sid, ctx.clientid, resolved->exp->fsid,
+                                        resolved->oid, state::kShareWrite);
+  if (check.status != 0) {
+    enc.u32(check.status);
+    co_return check.status;
+  }
+  if (resolved->exp->readonly) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  if (*offset + data->size() < *offset) {  // offset+length overflow
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
+  auto cred = mapped.view();
+  uint32_t count = static_cast<uint32_t>(
+      std::min<size_t>(data->size(), resolved->exp->backend->limits().max_write));
+  backend::Stability stability = *stable == 0   ? backend::Stability::kUnstable
+                                 : *stable == 1 ? backend::Stability::kDataSync
+                                                : backend::Stability::kFileSync;
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock();
+  backend::OpenCtx open{cred, check.bopen.get()};
+  auto written = co_await resolved->obj->write(open, *offset, data->first(count), stability);
+  if (!written) {
+    uint32_t code = st(core::to_v4(written.error(), Op::kWrite));
+    enc.u32(code);
+    co_return code;
+  }
+  obs::Metrics::instance().write_bytes.fetch_add(*written, std::memory_order_relaxed);
+  enc.u32(st(Status::kOk));
+  enc.u32(*written);
+  enc.u32(*stable);  // the backend honored the requested stability exactly
+  enc.opaque_fixed(write_verf_);
+  co_return st(Status::kOk);
+}
+
+rt::Task<uint32_t> Engine::op_commit(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto offset = dec.u64();
+  auto count = dec.u32();
+  if (!offset || !count) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!resolved) {
+    uint32_t code = st(core::to_v4(resolved.error(), Op::kCommit));
+    enc.u32(code);
+    co_return code;
+  }
+  if (resolved->pseudo() || resolved->obj->type() == backend::FType::kDir) {
+    enc.u32(st(Status::kIsdir));
+    co_return st(Status::kIsdir);
+  }
+  if (resolved->obj->type() != backend::FType::kReg) {
+    enc.u32(st(Status::kWrongType));
+    co_return st(Status::kWrongType);
+  }
+  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
+  auto cred = mapped.view();
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock_shared();  // flushing does not mutate
+  backend::OpenCtx open{cred, nullptr};
+  auto committed = co_await resolved->obj->commit(open, *offset, *count);
+  if (!committed) {
+    uint32_t code = st(core::to_v4(committed.error(), Op::kCommit));
+    enc.u32(code);
+    co_return code;
+  }
+  enc.u32(st(Status::kOk));
+  enc.opaque_fixed(write_verf_);
+  co_return st(Status::kOk);
+}
+
+rt::Task<uint32_t> Engine::op_setattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto sid = Stateid::decode(dec);
+  if (!sid) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  backend::SetAttr attrs;
+  Bitmap wanted;
+  Status decoded = decode_settable_fattr(dec, attrs, wanted);
+  // SETATTR4res always carries attrsset (empty on failure).
+  auto fail = [&](uint32_t code) {
+    enc.u32(code);
+    Bitmap none;
+    none.encode(enc);
+    return code;
+  };
+  if (decoded != Status::kOk) co_return fail(st(decoded));
+  if (ctx.cfh.empty()) co_return fail(st(Status::kNofilehandle));
+  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!resolved) co_return fail(st(core::to_v4(resolved.error(), Op::kSetattr)));
+  if (resolved->pseudo()) co_return fail(st(Status::kRofs));
+  if (attrs.size) {
+    if (resolved->obj->type() == backend::FType::kDir) co_return fail(st(Status::kIsdir));
+    if (resolved->obj->type() != backend::FType::kReg)
+      co_return fail(st(Status::kWrongType));
+    // Truncation is a write: the stateid must grant WRITE (or be special).
+    if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk))
+      co_return fail(cur);
+    auto check = co_await state_.check_io(*sid, ctx.clientid, resolved->exp->fsid,
+                                          resolved->oid, state::kShareWrite);
+    if (check.status != 0) co_return fail(check.status);
+  }
+  if (resolved->exp->readonly) co_return fail(st(Status::kRofs));
+  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
+  auto cred = mapped.view();
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock();
+  auto result = co_await resolved->obj->setattr(cred, attrs);
+  if (!result) co_return fail(st(core::to_v4(result.error(), Op::kSetattr)));
+  enc.u32(st(Status::kOk));
+  wanted.encode(enc);
+  co_return st(Status::kOk);
+}
+
+// VERIFY / NVERIFY (RFC 8881 §18.31/§18.15): the client's fattr4 is compared with
+// the server's encoding of the same mask.  Byte comparison is exact because attrlist4
+// encoding is canonical for every attribute we support.
+rt::Task<uint32_t> Engine::op_verify(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc,
+                                     bool nverify) {
+  auto mask = Bitmap::decode(dec);
+  auto vals = mask ? dec.opaque(1u << 20) : Result<std::span<const std::byte>>(Err(Errno::kGarbage));
+  if (!mask || !vals) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  const Bitmap& sup = supported_attrs();
+  for (uint32_t bit = 0; bit < 96; ++bit) {
+    if (!mask->test(bit)) continue;
+    if (bit == attr::kRdattrError) {  // never meaningful in a VERIFY
+      enc.u32(st(Status::kInval));
+      co_return st(Status::kInval);
+    }
+    if (!sup.test(bit)) {
+      enc.u32(st(Status::kAttrnotsupp));
+      co_return st(Status::kAttrnotsupp);
+    }
+  }
+  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!resolved) {
+    uint32_t code = st(core::to_v4(resolved.error(), Op::kGetattr));
+    enc.u32(code);
+    co_return code;
+  }
+  xdr::XdrEnc staged(ctx.conn.pool);
+  uint32_t code = co_await attr_reply(ctx, *resolved, *mask, staged);
+  if (code != st(Status::kOk)) {
+    enc.u32(code);
+    co_return code;
+  }
+  auto bytes = staged.take().to_bytes();
+  xdr::XdrDec mine(std::span<const std::byte>(bytes.data(), bytes.size()));
+  (void)mine.u32();  // status
+  (void)Bitmap::decode(mine);
+  auto ours = mine.opaque(1u << 20);
+  bool same = ours && std::equal(ours->begin(), ours->end(), vals->begin(), vals->end());
+  if (nverify) code = same ? st(Status::kSame) : st(Status::kOk);
+  else code = same ? st(Status::kOk) : st(Status::kNotSame);
+  enc.u32(code);
+  co_return code;
+}
+
+// ---- namespace ops ---------------------------------------------------------
+
+rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto type = dec.u32();
+  if (!type) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  std::string linkdata;
+  backend::DevT rdev{};
+  if (*type == kNf4Lnk) {
+    auto target = dec.string(kMaxSymlink);
+    if (!target) {
+      enc.u32(st(Status::kBadxdr));
+      co_return st(Status::kBadxdr);
+    }
+    linkdata = *target;
+  } else if (*type == kNf4Blk || *type == kNf4Chr) {
+    auto major = dec.u32();
+    auto minor = dec.u32();
+    if (!major || !minor) {
+      enc.u32(st(Status::kBadxdr));
+      co_return st(Status::kBadxdr);
+    }
+    rdev = {*major, *minor};
+  }
+  auto name = dec.string(kMaxName + 1);
+  if (!name) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  backend::SetAttr attrs;
+  Bitmap attrset;
+  Status decoded = decode_settable_fattr(dec, attrs, attrset);
+  if (decoded != Status::kOk) {
+    enc.u32(st(decoded));
+    co_return st(decoded);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  bool known = *type == kNf4Dir || *type == kNf4Lnk || *type == kNf4Blk ||
+               *type == kNf4Chr || *type == kNf4Sock || *type == kNf4Fifo;
+  if (!known) {  // regular files are created by OPEN (RFC 8881 §18.4.3)
+    enc.u32(st(Status::kBadtype));
+    co_return st(Status::kBadtype);
+  }
+  if (name->empty()) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!utf8_component(*name)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!valid_component4(*name)) {
+    enc.u32(st(Status::kBadname));
+    co_return st(Status::kBadname);
+  }
+  if (*type == kNf4Lnk && linkdata.empty()) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  auto dir = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!dir) {
+    uint32_t code = st(core::to_v4(dir.error(), Op::kCreate));
+    enc.u32(code);
+    co_return code;
+  }
+  if (dir->pseudo() || dir->exp->readonly) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  if (dir->obj->type() != backend::FType::kDir) {
+    enc.u32(st(Status::kNotdir));
+    co_return st(Status::kNotdir);
+  }
+  auto caps = dir->exp->backend->caps();
+  if ((*type == kNf4Lnk && !caps.has(backend::Cap::kSymlink)) ||
+      ((*type == kNf4Blk || *type == kNf4Chr || *type == kNf4Sock ||
+        *type == kNf4Fifo) &&
+       !caps.has(backend::Cap::kMknod))) {
+    enc.u32(st(Status::kNotsupp));
+    co_return st(Status::kNotsupp);
+  }
+  attrs.size.reset();  // size is meaningless for these object types
+  auto mapped = exports_.squash_cred(ctx.cred, *dir->exp);
+  auto cred = mapped.view();
+  auto lock = locks_.get(dir->exp->fsid, dir->oid);
+  auto held = co_await lock->lock();
+  auto before = co_await dir->obj->getattr();
+  Result<backend::Created> made = Err(errno_from(EIO));
+  switch (*type) {
+    case kNf4Dir: made = co_await dir->obj->mkdir(cred, *name, attrs); break;
+    case kNf4Lnk: made = co_await dir->obj->symlink(cred, *name, linkdata, attrs); break;
+    case kNf4Blk:
+      made = co_await dir->obj->mknod(cred, *name, backend::FType::kBlk, rdev, attrs);
+      break;
+    case kNf4Chr:
+      made = co_await dir->obj->mknod(cred, *name, backend::FType::kChr, rdev, attrs);
+      break;
+    case kNf4Sock:
+      made = co_await dir->obj->mknod(cred, *name, backend::FType::kSock, {}, attrs);
+      break;
+    case kNf4Fifo:
+      made = co_await dir->obj->mknod(cred, *name, backend::FType::kFifo, {}, attrs);
+      break;
+    default: break;
+  }
+  auto after = co_await dir->obj->getattr();
+  if (!made) {
+    uint32_t code = st(core::to_v4(made.error(), Op::kCreate));
+    enc.u32(code);
+    co_return code;
+  }
+  ctx.cfh = export_fh(*dir->exp, made->obj->id());
+  enc.u32(st(Status::kOk));
+  encode_change_info(enc, true, change_of(before), change_of(after));
+  attrset.encode(enc);
+  co_return st(Status::kOk);
+}
+
+rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto name = dec.string(kMaxName + 1);
+  if (!name) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  if (name->empty()) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!utf8_component(*name)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!valid_component4(*name)) {
+    enc.u32(st(Status::kBadname));
+    co_return st(Status::kBadname);
+  }
+  auto dir = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!dir) {
+    uint32_t code = st(core::to_v4(dir.error(), Op::kRemove));
+    enc.u32(code);
+    co_return code;
+  }
+  if (dir->pseudo() || dir->exp->readonly) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  if (dir->obj->type() != backend::FType::kDir) {
+    enc.u32(st(Status::kNotdir));
+    co_return st(Status::kNotdir);
+  }
+  auto mapped = exports_.squash_cred(ctx.cred, *dir->exp);
+  auto cred = mapped.view();
+  auto lock = locks_.get(dir->exp->fsid, dir->oid);
+  auto held = co_await lock->lock();
+  auto before = co_await dir->obj->getattr();
+  auto target = co_await dir->obj->lookup(cred, *name);
+  if (!target) {
+    uint32_t code = st(core::to_v4(target.error(), Op::kRemove));
+    enc.u32(code);
+    co_return code;
+  }
+  Result<void> removed = (*target)->type() == backend::FType::kDir
+                             ? co_await dir->obj->rmdir(cred, *name)
+                             : co_await dir->obj->unlink(cred, *name);
+  auto after = co_await dir->obj->getattr();
+  if (!removed) {
+    uint32_t code = st(core::to_v4(removed.error(), Op::kRemove));
+    enc.u32(code);
+    co_return code;
+  }
+  enc.u32(st(Status::kOk));
+  encode_change_info(enc, true, change_of(before), change_of(after));
+  co_return st(Status::kOk);
+}
+
+rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto oldname = dec.string(kMaxName + 1);
+  auto newname = dec.string(kMaxName + 1);
+  if (!oldname || !newname) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  if (ctx.sfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  if (oldname->empty() || newname->empty()) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!utf8_component(*oldname) || !utf8_component(*newname)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!valid_component4(*oldname) || !valid_component4(*newname)) {
+    enc.u32(st(Status::kBadname));
+    co_return st(Status::kBadname);
+  }
+  auto from = co_await resolve(ctx.sfh, ctx.conn.peer.addr);
+  if (!from) {
+    uint32_t code = st(core::to_v4(from.error(), Op::kRename));
+    enc.u32(code);
+    co_return code;
+  }
+  auto to = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!to) {
+    uint32_t code = st(core::to_v4(to.error(), Op::kRename));
+    enc.u32(code);
+    co_return code;
+  }
+  if (from->pseudo() || to->pseudo()) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  if (from->obj->type() != backend::FType::kDir || to->obj->type() != backend::FType::kDir) {
+    enc.u32(st(Status::kNotdir));
+    co_return st(Status::kNotdir);
+  }
+  if (from->exp != to->exp) {  // not expressible for the backend (design 04 §4.2)
+    enc.u32(st(Status::kXdev));
+    co_return st(Status::kXdev);
+  }
+  if (from->exp->readonly) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  // Two-directory lock ordering by ObjId (design 04 §4.2).
+  auto lock_a = locks_.get(from->exp->fsid, from->oid);
+  auto lock_b = locks_.get(to->exp->fsid, to->oid);
+  bool same = lock_a.get() == lock_b.get();
+  if (!same && to->oid < from->oid) std::swap(lock_a, lock_b);
+  auto held_a = co_await lock_a->lock();
+  std::optional<decltype(held_a)> held_b;
+  if (!same) held_b.emplace(co_await lock_b->lock());
+
+  auto mapped = exports_.squash_cred(ctx.cred, *from->exp);
+  auto cred = mapped.view();
+  auto before_from = co_await from->obj->getattr();
+  auto before_to = same ? before_from : co_await to->obj->getattr();
+  auto renamed = co_await from->obj->rename(cred, *oldname, *to->obj, *newname);
+  auto after_from = co_await from->obj->getattr();
+  auto after_to = same ? after_from : co_await to->obj->getattr();
+  if (!renamed) {
+    uint32_t code = st(core::to_v4(renamed.error(), Op::kRename));
+    enc.u32(code);
+    co_return code;
+  }
+  enc.u32(st(Status::kOk));
+  encode_change_info(enc, true, change_of(before_from), change_of(after_from));
+  encode_change_info(enc, true, change_of(before_to), change_of(after_to));
+  co_return st(Status::kOk);
+}
+
+rt::Task<uint32_t> Engine::op_link(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto newname = dec.string(kMaxName + 1);
+  if (!newname) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty() || ctx.sfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  if (newname->empty()) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!utf8_component(*newname)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  if (!valid_component4(*newname)) {
+    enc.u32(st(Status::kBadname));
+    co_return st(Status::kBadname);
+  }
+  auto file = co_await resolve(ctx.sfh, ctx.conn.peer.addr);
+  if (!file) {
+    uint32_t code = st(core::to_v4(file.error(), Op::kLink));
+    enc.u32(code);
+    co_return code;
+  }
+  auto dir = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  if (!dir) {
+    uint32_t code = st(core::to_v4(dir.error(), Op::kLink));
+    enc.u32(code);
+    co_return code;
+  }
+  if (file->pseudo() || dir->pseudo()) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  if (file->obj->type() == backend::FType::kDir) {
+    enc.u32(st(Status::kIsdir));
+    co_return st(Status::kIsdir);
+  }
+  if (dir->obj->type() != backend::FType::kDir) {
+    enc.u32(st(Status::kNotdir));
+    co_return st(Status::kNotdir);
+  }
+  if (file->exp != dir->exp) {
+    enc.u32(st(Status::kXdev));
+    co_return st(Status::kXdev);
+  }
+  if (dir->exp->readonly) {
+    enc.u32(st(Status::kRofs));
+    co_return st(Status::kRofs);
+  }
+  if (!dir->exp->backend->caps().has(backend::Cap::kHardlink)) {
+    enc.u32(st(Status::kNotsupp));
+    co_return st(Status::kNotsupp);
+  }
+  auto lock_a = locks_.get(file->exp->fsid, file->oid);
+  auto lock_b = locks_.get(dir->exp->fsid, dir->oid);
+  bool same = lock_a.get() == lock_b.get();
+  if (!same && dir->oid < file->oid) std::swap(lock_a, lock_b);
+  auto held_a = co_await lock_a->lock();
+  std::optional<decltype(held_a)> held_b;
+  if (!same) held_b.emplace(co_await lock_b->lock());
+
+  auto mapped = exports_.squash_cred(ctx.cred, *dir->exp);
+  auto cred = mapped.view();
+  auto before = co_await dir->obj->getattr();
+  auto linked = co_await dir->obj->link(cred, *file->obj, *newname);
+  auto after = co_await dir->obj->getattr();
+  if (!linked) {
+    uint32_t code = st(core::to_v4(linked.error(), Op::kLink));
+    enc.u32(code);
+    co_return code;
+  }
+  enc.u32(st(Status::kOk));
+  encode_change_info(enc, true, change_of(before), change_of(after));
   co_return st(Status::kOk);
 }
 
@@ -1212,6 +2136,10 @@ rt::Task<uint32_t> Engine::op_free_stateid(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrE
   if (!sid) {
     enc.u32(st(Status::kBadxdr));
     co_return st(Status::kBadxdr);
+  }
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
   }
   uint32_t code = co_await state_.free_stateid(*sid);
   enc.u32(code);

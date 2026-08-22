@@ -238,8 +238,22 @@ Result<Config> parse_config(std::string_view text) {
     } else if (section == Section::kProtocol) {
       if (key == "v3") LNFS_TRY(bool_value(value));
       else if (key == "v4") config.server.enable_v4 = LNFS_TRY(bool_value(value));
-      else if (key == "lease" || key == "grace")
-        LNFS_TRY(string_value(value));
+      else if (key == "lease" || key == "grace") {
+        // Seconds, with optional "s" suffix ("90s").  grace == lease by design (07 §7.5).
+        std::string s = LNFS_TRY(string_value(value));
+        uint64_t n = 0;
+        size_t digits = 0;
+        while (digits < s.size() && std::isdigit(static_cast<unsigned char>(s[digits])))
+          n = n * 10 + static_cast<uint64_t>(s[digits++] - '0');
+        std::string_view suffix = std::string_view(s).substr(digits);
+        if (digits == 0 || !(suffix.empty() || suffix == "s") || n == 0 || n > 3600)
+          return Err(errno_from(EINVAL));
+        config.server.lease_seconds = static_cast<uint32_t>(n);
+      } else if (key == "courtesy_multiplier") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n == 0 || n > 1000) return Err(errno_from(EINVAL));
+        config.server.courtesy_multiplier = static_cast<uint32_t>(n);
+      }
       else if (key == "drc_ttl") {
         // Duration string, seconds ("120s") or milliseconds ("500ms").
         std::string s = LNFS_TRY(string_value(value));

@@ -14,6 +14,10 @@ metrics_port = 0                          # Prometheus text endpoint; 0 = disabl
 
 [protocol]
 v3 = true
+v4 = true
+lease = "90s"            # v4.1 lease; also the grace window after a restart
+courtesy_multiplier = 24 # expired clients are kept (courtesy) up to 24 × lease
+                         # unless a conflicting OPEN reclaims them first
 drc_ttl = "120s"    # duplicate request cache entry lifetime
 drc_mem = "64MiB"   # duplicate request cache memory cap
 

@@ -43,6 +43,8 @@ struct ServerConfig {
   uint64_t drc_ttl_ms = 120000;
   uint64_t drc_mem = 64u << 20;
   bool enable_v4 = true;
+  uint32_t lease_seconds = 90;        // v4 lease (also the grace window)
+  uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
   std::string ctl_socket;   // default: <state_dir>/ctl.sock; "" resolves at startup
   uint16_t metrics_port = 0;  // 0 = disabled
 };

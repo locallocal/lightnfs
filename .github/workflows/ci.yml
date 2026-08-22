@@ -102,6 +102,25 @@ jobs:
       - name: real-mount acceptance (vers=4.1,ro + v3/v4 dual mount)
         run: scripts/accept_m3_vm.sh
 
+  # Phase-4 v4.1 read-write + full state acceptance (development plan §6.3): loopback
+  # userspace v4.1 rw client, restart reclaim, lease/courtesy reclaim, ctl state dump,
+  # pynfs open/rename/verify/courteous groups (+ the phase-3 groups), then a real
+  # vers=4.1 rw mount on the runner VM with cthon b/g/s, fsx, kill -9 reclaim and
+  # v3/v4 mixed writes.
+  m4-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev ninja-build nfs-common python3-ply
+      - name: loopback v4.1 rw acceptance (v4rw + reclaim + courtesy + pynfs + ASAN)
+        run: scripts/accept_m4_local.sh
+      - name: real-mount acceptance (vers=4.1 rw: cthon + fsx + restart reclaim)
+        run: scripts/accept_m4_vm.sh 50000
+
   fuzz-short:
     runs-on: ubuntu-latest
     steps:

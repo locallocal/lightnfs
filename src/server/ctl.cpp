@@ -12,6 +12,7 @@
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
+#include "state/state_mgr.hpp"
 #include "runtime/io.hpp"
 #include "util/log.hpp"
 
@@ -58,7 +59,37 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     }
     return out.empty() ? "no local exports\n" : out;
   }
-  return "unknown command (ping|metrics|dump-errors|drc|fdcache)\n";
+  return "unknown command (ping|metrics|dump-errors|drc|fdcache|state|expire-client <clientid>)\n";
+}
+
+rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string command) {
+  if (command == "state") {
+    if (!deps.state) co_return "v4 disabled\n";
+    auto s = deps.state->stats();
+    std::string out = std::format(
+        "clients={} sessions={} opens={} files={} courtesy={} grace={} grace_remaining={}s "
+        "lease_expirations={} reclaim_conflict={} reclaim_timeout={} reclaim_forced={} "
+        "share_denied={} open_merges={}\n",
+        s.clients, s.sessions, s.opens, s.files, s.courtesy, s.grace ? 1 : 0,
+        s.grace_remaining, s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout,
+        s.reclaim_forced, s.share_denied, s.open_merges);
+    out += co_await deps.state->dump();
+    co_return out;
+  }
+  if (command.starts_with("expire-client ")) {
+    if (!deps.state) co_return "v4 disabled\n";
+    std::string arg = command.substr(14);
+    uint64_t id = 0;
+    try {
+      id = std::stoull(arg, nullptr, 0);
+    } catch (...) {
+      co_return "expire-client: bad clientid\n";
+    }
+    uint32_t status = co_await deps.state->expire_client(id);
+    co_return status == 0 ? std::format("client {:#x} reclaimed\n", id)
+                          : std::format("client {:#x}: nfs4 status {}\n", id, status);
+  }
+  co_return answer(deps, command);
 }
 
 Result<std::unique_ptr<CtlServer>> CtlServer::create(const std::string& socket_path,
@@ -98,7 +129,7 @@ rt::Task<void> CtlServer::serve(int cfd) {
                           static_cast<size_t>(n));
     while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
       line.remove_suffix(1);
-    co_await send_all(cfd, answer(deps_, line));
+    co_await send_all(cfd, co_await answer_async(deps_, std::string(line)));
   }
   co_await uring_close(cfd);
 }

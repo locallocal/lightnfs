@@ -43,10 +43,12 @@ HTTP 端点暴露。
 
 ## 当前状态
 
-阶段 3（M5）完成：NFSv4.1 只读挂载可用——COMPOUND 解释器、会话层（EXCHANGE_ID 全记录
-语义、SEQUENCE 槽表精确一次）、bitmap 属性层、伪文件系统命名空间、最小 open-state 读
-路径；pynfs 4.1 会话组通过（写依赖用例除外）。v3 读写（阶段 2：21 过程、DRC、
-boot-epoch 校验子、fd 缓存、可观测性工具）保持回归保护。
-详见 [M3 v4.1 只读说明](m3-v41-readonly.md)、[M2 读写说明](m2-readwrite.md)、
+阶段 4（M6）完成：NFSv4.1 读写 + 状态机全量——open 状态表（share reservation 裁决、
+同 owner 合并）、CLOSE/OPEN_DOWNGRADE、带 stateid 校验的 READ/WRITE/COMMIT/SETATTR、
+名字空间 op、VERIFY/NVERIFY、租约扫描与 courtesy 回收链（冲突/超时/`lightnfs-ctl` 强制）、
+完整 grace/reclaim 门禁（稳定名单、CLAIM_PREVIOUS、提前出 grace）。阶段 3（M5，v4.1 只读：
+COMPOUND 解释器、会话层、伪根）与阶段 2（v3 读写）保持回归保护。
+详见 [M4 v4.1 读写说明](m4-v41-readwrite.md)、[M3 v4.1 只读说明](m3-v41-readonly.md)、
+[M2 读写说明](m2-readwrite.md)、
 [M1 只读说明](m1-readonly.md)；安全清单见 [security-checklist.md](security-checklist.md)；
 接口评审结论见 [Backend API v1 评审](backend-api-review.md)。
