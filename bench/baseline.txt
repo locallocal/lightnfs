@@ -1,0 +1,10 @@
+# Reference throughput (rps) for the three layer benchmarks (design 02 §2.8), measured
+# on the maintainer's dev box: 1 reactor, 4 conns, pipeline 32, 20k calls/conn, io_uring.
+# scripts/bench_gate.sh fails when a run drops below LNFS_BENCH_FLOOR x these values
+# (default 0.5 locally, 0.2 in CI — shared runners are slow and noisy; the gate exists
+# to catch order-of-magnitude regressions such as an accidental sync path, not 10% drift).
+# Update after a deliberate, measured change; never to silence the gate.
+nullrpc      350000
+echo         375000
+fullpath     345000
+fullpath_read 275000

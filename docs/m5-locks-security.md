@@ -51,6 +51,9 @@ SECINFO_NO_NAME（阶段 3 已有）保持。
   RECLAIM_COMPLETE、无参句柄 op 的允许集；越界结果降级 IO/SERVERFAULT。
 - 单测 `Nfs4.ErrmapV4Whitelist` 扩充 v3/v4 对照断言。
 
+补记（2026-08-23，阶段 6 §9 基建）：v3 白名单改为由调研分册 §8.2 表生成式对照
+（`scripts/gen_errmap_cases.py`），首轮即发现 LINK 行遗漏 NOSPC（RFC 1813 §3.3.15），已补。
+
 ### 安全加固收尾（08 §8.5 第 5/7/8 项）
 
 - **最小特权**：`packaging/systemd/lightnfs.service`——专用用户 + 仅

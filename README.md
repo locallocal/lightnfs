@@ -56,7 +56,12 @@ Every milestone ships one-click acceptance scripts:
 clients driving a real server over TCP, byte-verified against the backing tree);
 `scripts/accept_m*_vm.sh` run real kernel mounts on a root VM and are wired into
 CI (`m1-acceptance` … `m6-acceptance` jobs), including cthon04,
-fsx, and pynfs integration.
+fsx, and pynfs integration. Per-PR CI also runs a six-way build matrix (ASAN, TSAN,
+epoll fallback ring, two runner kernel generations), a doc-derived error-whitelist
+check (`scripts/gen_errmap_cases.py`), a three-layer benchmark threshold gate
+(`scripts/bench_gate.sh`) and a seeded 120 s fuzz run; `nightly.yml` adds the 1 h
+fuzz long run, overnight fsx / full pynfs conformance, and a weekly fault-injection
+run (`scripts/fault_inject.sh`: kill -9 loops, fsync EIO injection, client kill).
 
 ## Status
 

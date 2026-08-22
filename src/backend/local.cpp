@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -989,6 +990,28 @@ rt::Task<Result<void>> LocalObject::link(const Cred& cred, Object& file,
   });
 }
 
+namespace {
+// Fault injection for the weekly fault-injection run (development plan §9 "故障注入":
+// fsync EIO).  LNFS_FAULT_FSYNC_EIO=N makes the first N fsync/fdatasync calls of the
+// process fail with EIO — exercising the sticky-poison contract end to end without a
+// faulty disk.  Unset in production; read once.
+std::atomic<int>& fsync_faults_left() {
+  static std::atomic<int> left = [] {
+    const char* v = std::getenv("LNFS_FAULT_FSYNC_EIO");
+    return v ? std::atoi(v) : 0;
+  }();
+  return left;
+}
+bool take_fsync_fault() {
+  auto& left = fsync_faults_left();
+  int cur = left.load(std::memory_order_relaxed);
+  while (cur > 0) {
+    if (left.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed)) return true;
+  }
+  return false;
+}
+}  // namespace
+
 rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
                                               std::span<const std::byte> in,
                                               Stability stability) {
@@ -1015,7 +1038,8 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
     done += static_cast<size_t>(n);
   }
   if (stability != Stability::kUnstable) {
-    int rc = co_await rt::uring_fsync(fd, stability == Stability::kDataSync);
+    int rc = take_fsync_fault() ? -EIO
+                                : co_await rt::uring_fsync(fd, stability == Stability::kDataSync);
     if (rc < 0) {
       backend_.poison(id());
       co_return Err(errno_from_neg(rc));
@@ -1030,7 +1054,7 @@ rt::Task<Result<void>> LocalObject::commit(OpenCtx, uint64_t, uint64_t) {
   if (backend_.is_poisoned(id())) co_return Err(errno_from(EIO));
   auto ref = co_await backend_.fd_cache_->acquire(id(), false);
   if (!ref) co_return Err(ref.error());
-  int rc = co_await rt::uring_fsync((*ref)->fd, true);
+  int rc = take_fsync_fault() ? -EIO : co_await rt::uring_fsync((*ref)->fd, true);
   if (rc < 0) {
     backend_.poison(id());
     co_return Err(errno_from_neg(rc));
