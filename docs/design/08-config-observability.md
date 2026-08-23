@@ -39,6 +39,9 @@ clients = ["192.168.0.0/24"]; squash = "root"; readonly = false
 ## 8.2 日志
 
 - 结构化（logfmt/JSON 可选），全异步（per-reactor ring buffer → 落盘线程），热路径日志零分配。
+  **实现偏差（2026-08-23）**：落地为 spdlog（third_party/spdlog 子模块）异步 logger——
+  有界队列 + 单落盘线程 + 满则丢弃新条目（不阻塞 reactor），`util/log.hpp` 门面与
+  logfmt 输出格式不变；"零分配"弱化为 fmt 栈内联缓冲（超长消息堆分配）。
 - 级别约定：`error`=数据/协议正确性风险（fsync 失败、白名单外错误映射）；`warn`=可疑客户端行为（BADHANDLE、SEQ_MISORDERED）；`info`=生命周期（挂载、grace、回收）；`debug`=每请求单行摘要。
 - **每请求摘要行**（debug，v4 调试第一生产力，nfsv4/11.6）：
   `xid=… peer=… v4 tag="…" ops=[SEQUENCE,PUTFH,OPEN,GETFH,GETATTR] st=OK dur=1.2ms`
