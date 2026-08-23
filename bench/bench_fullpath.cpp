@@ -3,7 +3,7 @@
 // Measures protocol-stack overhead beyond null-RPC: GETATTR (metadata path) and READ
 // (data path with attach()).
 //
-//   bench_fullpath [reactors=1] [conns=8] [per_conn=50000] [pipeline=64] [proc=getattr|read]
+//   lightnfs-ctl bench fullpath [reactors=1] [conns=8] [per_conn=50000] [pipeline=64] [proc=getattr|read]
 
 #include <arpa/inet.h>
 
@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "backend/memory.hpp"
+#include "bench/bench_main.hpp"
 #include "bench/bench_util.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
@@ -52,7 +53,7 @@ std::vector<std::byte> build_record(BufferPool& pool, uint32_t proc,
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int lnfs::bench::fullpath_main(int argc, char** argv) {
   int reactors = argc > 1 ? atoi(argv[1]) : 1;
   int conns = argc > 2 ? atoi(argv[2]) : 8;
   uint64_t per_conn = argc > 3 ? strtoull(argv[3], nullptr, 10) : 50000;

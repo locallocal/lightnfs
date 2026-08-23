@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Three-layer benchmark regression gate (development plan §9 "性能" row, design 02 §2.8).
-# Runs bench_echo / bench_nullrpc / bench_fullpath(GETATTR, READ4k) and compares the
-# measured rps against bench/baseline.txt x LNFS_BENCH_FLOOR.  Exit 1 on any miss.
+# Three-layer benchmark regression gate (design 02 §2.8). Runs `lightnfs-ctl bench`
+# echo / nullrpc / fullpath(GETATTR, READ4k) and compares the measured rps against
+# bench/baseline.txt x LNFS_BENCH_FLOOR.  Exit 1 on any miss.
 #
 # usage: bench_gate.sh [BUILD_DIR]      (env: LNFS_BENCH_FLOOR=0.5, LNFS_BENCH_CALLS=20000)
 set -euo pipefail
@@ -32,9 +32,9 @@ run() {  # $1 key, $2.. command
 }
 
 status=0
-run nullrpc       "$build/bench_nullrpc"  1 4 "$calls" 32     || status=1
-run echo          "$build/bench_echo"     1 4 "$calls" 32 128 || status=1
-run fullpath      "$build/bench_fullpath" 1 4 "$calls" 32     || status=1
-run fullpath_read "$build/bench_fullpath" 1 4 "$calls" 32 read || status=1
+run nullrpc       "$build/lightnfs-ctl" bench nullrpc  1 4 "$calls" 32      || status=1
+run echo          "$build/lightnfs-ctl" bench echo     1 4 "$calls" 32 128  || status=1
+run fullpath      "$build/lightnfs-ctl" bench fullpath 1 4 "$calls" 32      || status=1
+run fullpath_read "$build/lightnfs-ctl" bench fullpath 1 4 "$calls" 32 read || status=1
 [[ $status -eq 0 ]] && echo "bench_gate PASSED (floor $floor)" || echo "bench_gate FAILED" >&2
 exit $status

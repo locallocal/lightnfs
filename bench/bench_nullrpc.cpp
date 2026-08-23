@@ -2,10 +2,11 @@
 // (record marking, header parse, auth, dispatch, reply encode). Phase-0 exit gate
 // (roadmap stage 0): >= 100k rps on a single reactor.
 //
-//   bench_nullrpc [reactors=1] [conns=8] [per_conn=50000] [pipeline=64]
+//   lightnfs-ctl bench nullrpc [reactors=1] [conns=8] [per_conn=50000] [pipeline=64]
 
 #include <cstdlib>
 
+#include "bench/bench_main.hpp"
 #include "bench/bench_util.hpp"
 #include "transport/listener.hpp"
 #include "util/log.hpp"
@@ -47,7 +48,7 @@ std::vector<std::byte> build_null_call() {
 }
 }  // namespace
 
-int main(int argc, char** argv) {
+int lnfs::bench::nullrpc_main(int argc, char** argv) {
   int reactors = argc > 1 ? atoi(argv[1]) : 1;
   int conns = argc > 2 ? atoi(argv[2]) : 8;
   uint64_t per_conn = argc > 3 ? strtoull(argv[3], nullptr, 10) : 50000;
