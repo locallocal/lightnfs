@@ -176,7 +176,10 @@ docs/         design, protocol research and deployment docs
 Dependencies: CMake ≥ 3.22, Ninja, GCC ≥ 13 or Clang ≥ 17, liburing
 (`apt install liburing-dev`; run `scripts/fetch_liburing.sh` for a vendored build when
 no system package is available). Linux ≥ 5.19 recommended (io_uring); any kernel with
-epoll works through the fallback ring.
+epoll works through the fallback ring. The command-line entry point uses the
+[ccmd](https://github.com/locallocal/ccmd) git submodule — clone with
+`--recurse-submodules`, or run `git submodule update --init --recursive` in an
+existing clone.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

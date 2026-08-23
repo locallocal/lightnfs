@@ -154,7 +154,9 @@ docs/         设计、协议调研与部署文档
 
 依赖：CMake ≥ 3.22、Ninja、GCC ≥ 13 或 Clang ≥ 17、liburing（`apt install liburing-dev`；
 无系统包时运行 `scripts/fetch_liburing.sh` 做 vendor 构建）。推荐 Linux ≥ 5.19（io_uring）；
-任何有 epoll 的内核都能通过兜底 ring 运行。
+任何有 epoll 的内核都能通过兜底 ring 运行。命令行入口使用
+[ccmd](https://github.com/locallocal/ccmd) git 子模块——克隆时加 `--recurse-submodules`，
+已有克隆运行 `git submodule update --init --recursive`。
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

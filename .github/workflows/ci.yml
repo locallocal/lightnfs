@@ -60,6 +60,8 @@ jobs:
             ring: auto
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build
       - name: configure
@@ -91,6 +93,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build nfs-common
       - name: loopback acceptance (Release + ASAN userspace client, 100k bigdir)
@@ -107,6 +111,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build nfs-common libtirpc-dev
       - name: loopback rw acceptance (Release + ASAN, crash recovery, connstorm)
@@ -122,6 +128,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: |
           sudo apt-get update
@@ -141,6 +149,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: |
           sudo apt-get update
@@ -159,6 +169,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: |
           sudo apt-get update
@@ -176,6 +188,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: |
           sudo apt-get update
@@ -189,6 +203,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build clang
       - name: configure
@@ -215,6 +231,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: clang-format check
         run: |
           sudo apt-get update && sudo apt-get install -y clang-format

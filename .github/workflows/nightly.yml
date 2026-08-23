@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build clang
       - name: configure
@@ -61,6 +63,8 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: |
           sudo apt-get update
@@ -118,6 +122,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y liburing-dev ninja-build
       - name: crash loop x20 + fsync EIO + client kill + v4 restart
