@@ -1013,7 +1013,6 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
   backend::Cred cred{};
   backend::FsLimits limits;
   bool link_sup = false, symlink_sup = false;
-  std::optional<decltype(locks_.get(0, backend::ObjId{})->lock_shared())> unused;
   std::shared_ptr<rt::AsyncSharedMutex> lock;
   if (!resolved->pseudo()) {
     mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
@@ -1156,8 +1155,9 @@ constexpr uint32_t kCreateUnchecked = 0, kCreateGuarded = 1, kCreateExclusive = 
 constexpr uint32_t kClaimNull = 0, kClaimPrevious = 1, kClaimDelegateCur = 2,
                    kClaimDelegatePrev = 3, kClaimFh = 4, kClaimDelegCurFh = 5,
                    kClaimDelegPrevFh = 6;
-constexpr uint32_t kNf4Reg = 1, kNf4Dir = 2, kNf4Blk = 3, kNf4Chr = 4, kNf4Lnk = 5,
-                   kNf4Sock = 6, kNf4Fifo = 7;
+[[maybe_unused]] constexpr uint32_t kNf4Reg = 1;  // CREATE rejects REG (OPEN creates files)
+constexpr uint32_t kNf4Dir = 2, kNf4Blk = 3, kNf4Chr = 4, kNf4Lnk = 5, kNf4Sock = 6,
+                   kNf4Fifo = 7;
 constexpr uint32_t kOpenResultLocktypePosix = 0x4;
 
 void encode_change_info(xdr::XdrEnc& enc, bool atomic, uint64_t before, uint64_t after) {
@@ -2225,7 +2225,8 @@ rt::Task<uint32_t> Engine::op_reclaim_complete(Ctx& ctx, xdr::XdrDec& dec,
 
 namespace {
 
-constexpr uint32_t kReadLt = 1, kWriteLt = 2, kReadWLt = 3, kWriteWLt = 4;
+constexpr uint32_t kReadLt = 1, kWriteLt = 2, kWriteWLt = 4;
+[[maybe_unused]] constexpr uint32_t kReadWLt = 3;  // range-checked via kWriteWLt bound only
 
 // Validates locktype/offset/length per RFC 8881 §18.10.3; returns 0 or a status.
 uint32_t check_lock_range(uint32_t locktype, uint64_t offset, uint64_t length) {

@@ -1282,7 +1282,8 @@ int cmd_fsync_eio(const char* host, uint16_t nfs_port, uint16_t mount_port,
 
 namespace v4 {
 
-constexpr uint32_t kOpAccess = 3, kOpClose = 4, kOpGetattr = 9, kOpGetfh = 10,
+[[maybe_unused]] constexpr uint32_t kOpAccess = 3, kOpGetattr = 9;
+constexpr uint32_t kOpClose = 4, kOpGetfh = 10,
                    kOpLookup = 15, kOpOpen = 18, kOpPutfh = 22, kOpPutrootfh = 24,
                    kOpRead = 25, kOpReaddir = 26, kOpReadlink = 27,
                    kOpExchangeId = 42, kOpCreateSession = 43, kOpDestroySession = 44,
@@ -1337,7 +1338,7 @@ struct V4Client {
   }
   static void skip_sequence_res(XdrDec& d) {
     expect_op(d, kOpSequence);
-    d.skip(16 + 5 * 4);
+    (void)d.skip(16 + 5 * 4);
   }
 
   void establish(bool send_reclaim_complete = true) {
@@ -1449,7 +1450,7 @@ void parse_entry_attrs(XdrDec& d, V4Entry& out) {
   }
   if (w0 & (1u << kAttrFileid)) (void)ru64(d);
   size_t consumed = before - d.remaining();
-  if (consumed < vals_len) d.skip(vals_len - consumed);
+  if (consumed < vals_len) (void)d.skip(vals_len - consumed);
 }
 
 std::vector<std::byte> lookup_path(V4Client& c,
@@ -2350,7 +2351,8 @@ int cmd_v4walk(const char* host, uint16_t nfs_port, const std::string& export_pa
 namespace v4 {
 
 constexpr uint32_t kOpAllocate = 59, kOpCopy = 60, kOpDeallocate = 62, kOpSeek = 69,
-                   kOpClone = 71, kOpIllegal = 10044;
+                   kOpClone = 71;
+[[maybe_unused]] constexpr uint32_t kOpIllegal = 10044;
 constexpr uint32_t kNxio = 6, kNotsupp = 10004, kOpIllegalStatus = 10044, kInval = 22;
 
 struct SeekOut {

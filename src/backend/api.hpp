@@ -68,8 +68,8 @@ struct Attr {
 };
 
 struct SetAttr {
-  std::optional<uint32_t> mode, uid, gid;
-  std::optional<uint64_t> size;
+  std::optional<uint32_t> mode{}, uid{}, gid{};
+  std::optional<uint64_t> size{};
   enum class TimeHow { kOmit, kServer, kClient };
   TimeHow atime_how = TimeHow::kOmit;
   Timespec atime{};
