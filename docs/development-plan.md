@@ -58,13 +58,13 @@
 - [x] `rpc/auth.cpp`：AUTH_NONE/AUTH_SYS 解析 + Authenticator 插槽注册表（squash 随阶段 1 导出表落地，接口已留注）
 - [x] fuzz 骨架：libFuzzer 直喂 `handle_request`（fuzz/fuzz_handle_request.cpp）；非 clang 配置以 fuzz_regress 回放语料进 ctest
 
-### 2.4 三层基准（第 6 周，出口门禁）✅（前两项）
+### 2.4 三层基准（第 6 周，出口门禁）✅
 
 按 02 分册 §2.8 建立并入 CI 回归：
 
 1. [x] echo 服务器（纯传输层，bench/bench_echo.cpp）
 2. [x] null-RPC（L2，bench/bench_nullrpc.cpp，**出口指标：单 reactor ≥ 100k rps**，程序退出码即门禁）
-3. [ ] 伪后端全链路（L4 以上，后端零延迟）——阶段 1 后补齐
+3. [x] 伪后端全链路（L4 以上，bench/bench_fullpath.cpp，零延迟内存伪后端，GETATTR/READ-4k 双路径）——阶段 2 补齐（见 4.7），随 `scripts/bench_gate.sh` 入 CI 阈值门禁（bench/baseline.txt：fullpath 345k / fullpath_read 275k）
 
 **阶段 0 DoD**：三项基准前两项达标 ✅；四配置 CI 全绿 ✅；fuzz 跑 24h 无 crash（短跑无 crash ✅，24h 长跑随 CI 每日任务累计，遗留项）。
 
