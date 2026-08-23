@@ -88,8 +88,7 @@ sudo systemctl enable --now lightnfs
 - **v4.2 按 op 宣告**：启动时对每个导出探测 `kSparseOps`/`kCopyRange`/`kCloneRange` 并写
   日志（`export <path> v4.2 capabilities: …`）；无能力位的 op 回 NOTSUPP，Linux 客户端自动
   降级（`cp --reflink=auto` 退到 COPY 再退到读写）。不做异步/跨服 COPY、READ_PLUS、xattr、
-  sec_label（见 [m6-v42-sweets.md](m6-v42-sweets.md)）。CLONE 仅在 XFS(reflink=1)/Btrfs 导出
-  上可用。
+  sec_label。CLONE 仅在 XFS(reflink=1)/Btrfs 导出上可用。
 - **无委托、无 pNFS、无 SECINFO(带名之外) 的多 flavor**：SECINFO/SECINFO_NO_NAME 恒返回
   `[AUTH_SYS]`（AUTH_SYS-only 服务器的合规简化，永不发 WRONGSEC）。
 - **句柄稳定性**：`handles="auto"` 在无 `CAP_DAC_READ_SEARCH` 且文件系统无 STATX_BTIME

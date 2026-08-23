@@ -10,10 +10,9 @@ reactor (epoll fallback), with no kernel NFS server involved.
 
 - Design documents: [docs/design/](docs/design/README.md)
 - Protocol research: [docs/nfsv3/](docs/nfsv3/README.md), [docs/nfsv4/](docs/nfsv4/README.md)
-- Development plan and milestone records: [docs/development-plan.md](docs/development-plan.md)
 - Deployment guide: [docs/deployment.md](docs/deployment.md)
 
-Note: the design, research, plan and milestone documents are written in Chinese.
+Note: the design and research documents are written in Chinese.
 
 ---
 
@@ -169,7 +168,7 @@ scripts/      one-click acceptance (loopback and VM), dataset/tool fetchers,
               bench gate, fault injection, seccomp allowlist generator
 packaging/    systemd unit
 config/       example configuration
-docs/         design, protocol research, plan, milestone and deployment docs
+docs/         design, protocol research and deployment docs
 ```
 
 ## Building
@@ -340,8 +339,8 @@ mounts on a root runner. CI (`.github/workflows/ci.yml`) runs a six-way build ma
 
 ## Project status and roadmap
 
-Development follows [docs/development-plan.md](docs/development-plan.md) in phases,
-each closed by an acceptance record:
+Development followed the roadmap in [docs/design/09-roadmap.md](docs/design/09-roadmap.md)
+in phases, each closed by an acceptance run:
 
 | Phase | Milestone | Content |
 |-------|-----------|---------|
@@ -374,10 +373,5 @@ and locks.
   transport/RPC/XDR, NFS core, backend API, backend mappings, state management,
   configuration/observability, roadmap
 - Protocol research: [docs/nfsv3/](docs/nfsv3/README.md), [docs/nfsv4/](docs/nfsv4/README.md)
-- Plan and records: [docs/development-plan.md](docs/development-plan.md)
-- Milestone notes: [M1](docs/m1-readonly.md), [M2](docs/m2-readwrite.md),
-  [M3](docs/m3-v41-readonly.md), [M4](docs/m4-v41-readwrite.md),
-  [M5](docs/m5-locks-security.md), [M6](docs/m6-v42-sweets.md)
 - Operations: [deployment guide](docs/deployment.md),
   [security checklist](docs/security-checklist.md)
-- Interface review: [Backend API v1 review](docs/backend-api-review.md)
