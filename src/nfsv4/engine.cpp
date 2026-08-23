@@ -1,13 +1,16 @@
 #include "nfsv4/engine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <string>
 
 #include "core/boot_epoch.hpp"
 #include "core/errmap.hpp"
 #include "transport/connection.hpp"
 #include "core/readdir.hpp"
 #include "nfsv4/attrs.hpp"
+#include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "util/log.hpp"
 
@@ -155,6 +158,7 @@ rt::Task<Result<Engine::Resolved>> Engine::resolve(const FhBytes& fh,
 
 rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& cred) {
   auto& dec = call.args;
+  auto t0 = std::chrono::steady_clock::now();
   size_t request_size = dec.remaining() + 44;  // + RPC call header approximation
   auto tag = dec.opaque(kMaxTag);
   auto minor = dec.u32();
@@ -166,6 +170,34 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
   std::vector<std::byte> tag_bytes(tag->begin(), tag->end());
   bool tag_ok = valid_utf8(tag_bytes);
 
+  // Per-request summary line (design 08 §8.2): op names are only collected when debug
+  // logging is on; the error-reply sampling ring records non-OK compounds regardless.
+  const bool dbg = log_enabled(LogLevel::kDebug);
+  std::string dbg_ops;
+  uint32_t fail_op = 0;  // last opcode executed; 0 = failed before any op
+  auto note_op = [&](uint32_t opcode) {
+    fail_op = opcode;
+    if (dbg) {
+      if (!dbg_ops.empty()) dbg_ops += ',';
+      dbg_ops += op_name(opcode);
+    }
+  };
+  auto log_summary = [&](uint32_t status, uint32_t ops_done) {
+    if (dbg) {
+      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+      LNFS_DEBUG("v4 xid={:#x} peer={} tag=\"{}\" minor={} ops={}/[{}] st={} dur={}us",
+                 call.xid, conn.peer.to_string(),
+                 std::string_view(reinterpret_cast<const char*>(tag_bytes.data()),
+                                  tag_ok ? tag_bytes.size() : 0),
+                 *minor, ops_done, dbg_ops, status, us);
+    }
+    if (status != 0)
+      obs::record_error_reply(conn.peer.to_string(),
+                              fail_op ? op_name(fail_op) : "COMPOUND", call.xid, status);
+  };
+
   xdr::XdrEnc enc(conn.pool);
   rpc::encode_reply_success(enc, call.xid);
   std::byte* status_gap = enc.raw_gap(4);
@@ -173,6 +205,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
   std::byte* count_gap = enc.raw_gap(4);
 
   auto finish = [&](uint32_t status, uint32_t ops_done) -> rt::Task<void> {
+    log_summary(status, ops_done);
     patch_u32(status_gap, status);
     patch_u32(count_gap, ops_done);
     co_await conn.send(enc.take());
@@ -197,6 +230,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
     co_return;
   }
 
+  note_op(*first_op);
   Ctx ctx{.conn = conn, .cred = cred};
   ctx.minor = *minor;
   uint32_t status;
@@ -233,6 +267,9 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
       xdr::XdrEnc replay(conn.pool);
       rpc::encode_reply_success(replay, call.xid);
       replay.opaque_fixed(seq.replay_bytes);
+      if (dbg)
+        LNFS_DEBUG("v4 xid={:#x} peer={} slot={} seq={} replay (cached compound)",
+                   call.xid, conn.peer.to_string(), ctx.slotid, ctx.seqid);
       co_await conn.send(replay.take());
       co_return;
     }
@@ -292,6 +329,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
         status = st(Status::kBadxdr);
         break;
       }
+      note_op(*opcode);
       Op op = static_cast<Op>(*opcode);
       if (saw_destroy_session || op == Op::kBindConnToSession) {
         // BIND_CONN_TO_SESSION never rides a session compound; DESTROY_SESSION may,
@@ -338,6 +376,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
       // Strip the 24-byte RPC reply header: replays re-encode it for their own xid.
       cache_bytes.assign(all.begin() + 24, all.end());
     }
+    log_summary(status, done);
     co_await state_.sequence_complete(ctx.sessionid, ctx.slotid, ctx.seqid,
                                       ctx.cachethis, std::move(cache_bytes));
     co_await conn.send(std::move(buf));

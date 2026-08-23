@@ -47,6 +47,7 @@ struct ServerConfig {
   uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
   std::string ctl_socket;   // default: <state_dir>/ctl.sock; "" resolves at startup
   uint16_t metrics_port = 0;  // 0 = disabled
+  std::string log_level = "info";  // debug enables the per-request summary line (08 §8.2)
 };
 
 struct ExportConfig {

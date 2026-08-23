@@ -227,6 +227,11 @@ Result<Config> parse_config(std::string_view text) {
         uint64_t n = LNFS_TRY(size_value(value));
         if (n > UINT32_MAX) return Err(errno_from(EINVAL));
         config.server.max_request_size = static_cast<uint32_t>(n);
+      } else if (key == "log_level") {
+        auto lv = LNFS_TRY(string_value(value));
+        if (lv != "debug" && lv != "info" && lv != "warn" && lv != "error")
+          return Err(errno_from(EINVAL));
+        config.server.log_level = lv;
       }
     } else if (section == Section::kLimits) {
       if (key == "inflight_per_conn") {

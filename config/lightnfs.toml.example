@@ -11,6 +11,9 @@ per_peer_limit = 128
 max_request_size = "2MiB"
 # ctl_socket = "/run/lightnfs/ctl.sock"   # default: <state_dir>/ctl.sock
 metrics_port = 0                          # Prometheus text endpoint; 0 = disabled
+log_level = "info"  # debug | info | warn | error; debug adds a per-request summary line
+                    # (with it off, recent error replies stay visible via
+                    # `lightnfs-ctl dump-errors`)
 
 [protocol]
 v3 = true

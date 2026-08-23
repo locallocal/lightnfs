@@ -36,7 +36,7 @@ void begin_result(xdr::XdrEnc& enc, ConnCtx& ctx, const RpcCall& call, Status st
   if (status != Status::kOk) {
     obs::Metrics::instance().v3_errors[call.proc % obs::Metrics::kV3Procs].fetch_add(
         1, std::memory_order_relaxed);
-    obs::record_error_reply(ctx.peer.to_string(), call.proc, call.xid,
+    obs::record_error_reply(ctx.peer.to_string(), obs::v3_proc_name(call.proc), call.xid,
                             static_cast<uint32_t>(status));
   }
   if (log_enabled(LogLevel::kDebug))
