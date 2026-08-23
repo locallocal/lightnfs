@@ -45,6 +45,9 @@ if(NOT LIBURING_INCLUDE_DIR OR NOT LIBURING_LIBRARY)
 endif()
 message(STATUS "liburing: ${LIBURING_LIBRARY} (${LIBURING_INCLUDE_DIR})")
 
+# spdlog: logging implementation (git submodule, static lib; util/log.hpp is the facade)
+add_subdirectory(third_party/spdlog EXCLUDE_FROM_ALL)
+
 # ---- core library ----
 add_library(lnfs_core STATIC
   src/backend/api.cpp
@@ -85,7 +88,8 @@ add_library(lnfs_core STATIC
   src/rpc/dispatch.cpp
 )
 target_include_directories(lnfs_core PUBLIC src ${LIBURING_INCLUDE_DIR})
-target_link_libraries(lnfs_core PUBLIC ${LIBURING_LIBRARY} Threads::Threads)
+target_link_libraries(lnfs_core PUBLIC ${LIBURING_LIBRARY} Threads::Threads
+  spdlog::spdlog)
 if(LNFS_RING STREQUAL "epoll")
   target_compile_definitions(lnfs_core PUBLIC LNFS_DEFAULT_RING_EPOLL=1)
 endif()

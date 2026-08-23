@@ -155,7 +155,8 @@ docs/         设计、协议调研与部署文档
 依赖：CMake ≥ 3.22、Ninja、GCC ≥ 13 或 Clang ≥ 17、liburing（`apt install liburing-dev`，
 或运行 `scripts/fetch_liburing.sh` 构建 `third_party/liburing` 子模块——已构建的子模块
 优先于系统包）。推荐 Linux ≥ 5.19（io_uring）；任何有 epoll 的内核都能通过兜底 ring 运行。
-[ccmd](https://github.com/locallocal/ccmd)（命令行入口）与
+[ccmd](https://github.com/locallocal/ccmd)（命令行入口）、
+[spdlog](https://github.com/gabime/spdlog)（日志）与
 [liburing](https://github.com/axboe/liburing) 依赖均为 git 子模块——克隆时加
 `--recurse-submodules`，已有克隆运行 `git submodule update --init --recursive`。
 
