@@ -27,7 +27,7 @@ Note: the design and research documents are written in Chinese.
 7. [Running and mounting](#running-and-mounting)
 8. [Administration and observability](#administration-and-observability)
 9. [Deployment and security](#deployment-and-security)
-10. [Testing and CI](#testing-and-ci)
+10. [Testing](#testing)
 11. [Project status and roadmap](#project-status-and-roadmap)
 12. [Known limitations](#known-limitations)
 13. [Documentation index](#documentation-index)
@@ -49,7 +49,7 @@ be auditable and testable in userspace. lightnfs targets exactly that gap:
 - **One semantics core for v3 and v4.** The two protocol engines share a single
   protocol-neutral core (exports, handles, permission/squash, per-object serialisation,
   change/WCC sampling). A file looks the same whether mounted with `vers=3` or
-  `vers=4.2`, and v3/v4 mixed-mount consistency is part of CI.
+  `vers=4.2`, and v3/v4 mixed-mount consistency is covered by the acceptance suite.
 - **Pluggable storage boundary.** Backends speak filesystem objects, attributes and
   POSIX errno only; nothing NFS-specific crosses the boundary. Capability bits
   (symlinks, hard links, native change cookies, stable handles, sparse ops, clone,
@@ -192,7 +192,7 @@ Build options:
 
 | Option | Values | Purpose |
 |--------|--------|---------|
-| `LNFS_SANITIZE` | `address`, `thread` | sanitizer builds (both run in CI) |
+| `LNFS_SANITIZE` | `address`, `thread` | sanitizer builds (both part of the regular sweep) |
 | `LNFS_RING` | `auto` (default), `uring`, `epoll` | default ring backend; `epoll` forces the fallback path |
 | `LNFS_BUILD_FUZZ` | `ON` | libFuzzer targets (clang only): `./build/fuzz_handle_request fuzz/corpus` |
 
@@ -319,7 +319,7 @@ version:
 The release checklist with per-item verification is in
 [docs/security-checklist.md](docs/security-checklist.md).
 
-## Testing and CI
+## Testing
 
 Test layers (development plan §9):
 
@@ -328,18 +328,19 @@ Test layers (development plan §9):
 | Runtime | fake-ring timing tests, ASAN + TSAN builds, EINTR/short-read injection |
 | XDR / request path | round-trip tests; libFuzzer over the whole request path (120 s seeded run per PR, 1 h nightly with a growing corpus) |
 | Backend contract | handle stability, 100k-entry cookie stability, write stability levels + sticky fsync EIO, v4.2 sparse/copy/clone |
-| Error mapping | the v3 whitelist test is **generated from the research document** (`scripts/gen_errmap_cases.py`), so doc/code drift fails CI; v4 rows checked against RFC tables |
+| Error mapping | the v3 whitelist test is **generated from the research document** (`scripts/gen_errmap_cases.py`), so doc/code drift fails the test; v4 rows checked against RFC tables |
 | Performance | three-layer benchmark gate against `bench/baseline.txt` |
-| Conformance | cthon04, fsx, pynfs (4.1) on real kernel mounts in CI; overnight fsx and the full pynfs suite nightly |
+| Conformance | cthon04, fsx, pynfs (4.1) on real kernel mounts via `accept_m*_vm.sh`; overnight fsx and the full pynfs suite as soak runs |
 | v3/v4 consistency | dual-mount comparisons and mixed-version writes |
 | Fault injection | weekly: kill -9 restart loops, fsync EIO injection, client kill, v4 restart reclaim (`scripts/fault_inject.sh`) |
 
 Every milestone ships one-click acceptance scripts: `scripts/accept_m*_local.sh` run
 without root (a userspace NFS client drives a real server over loopback, byte-verified
 against the backing tree, Release + ASAN), `scripts/accept_m*_vm.sh` run real kernel
-mounts on a root runner. CI (`.github/workflows/ci.yml`) runs a six-way build matrix
-(GCC/Clang, ASAN, TSAN, epoll ring, two runner kernel generations) plus the
-`m1`…`m6-acceptance` jobs on every PR; `nightly.yml` holds the daily and weekly runs.
+mounts on a root machine. The whole suite is driven from these scripts — build-matrix
+sweeps (GCC/Clang, ASAN, TSAN, epoll ring), per-change regressions, and the long runs
+(24h fuzz, overnight fsx, weekly fault injection) are all invocable locally or from
+any scheduler of your choice; the repository does not carry hosted CI pipelines.
 
 ## Project status and roadmap
 
@@ -354,7 +355,7 @@ in phases, each closed by an acceptance run:
 | 3 | M5 | NFSv4.1 read-only: sessions, pseudo-fs, client/session state |
 | 4 | M6 | NFSv4.1 read-write: full open-state machine, leases, courtesy, grace/reclaim |
 | 5 | M7 | byte-range locks, SECINFO, error-whitelist audit, security hardening — **v1 release candidate** |
-| 6 | M8 | **done:** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE, COPY, CLONE; CI/test infrastructure (§9). **Demand-gated:** second backend (Lustre/GlusterFS), read delegations + callback channel, NLM/NSM |
+| 6 | M8 | **done:** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE, COPY, CLONE; test infrastructure. **Demand-gated:** second backend (Lustre/GlusterFS), read delegations + callback channel, NLM/NSM |
 
 Longer-term observations (not commitments): RPC-over-TLS, write/directory delegations,
 pNFS flexfiles MDS, multi-gateway consistency on backends with native change cookies

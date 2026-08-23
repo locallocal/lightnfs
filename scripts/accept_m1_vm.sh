@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-click M1 mount acceptance on a host/VM with root (sudo) and a kernel NFS client
-# — e.g. a GitHub Actions runner or any test VM (development plan §3.5).
+# — e.g. any root test VM (development plan §3.5).
 #
 # Builds lightnfsd (Release), generates the dataset, fetches cthon04, starts the
 # server on loopback, then runs scripts/accept_m1.sh (real mount -o vers=3, ls -lR /
