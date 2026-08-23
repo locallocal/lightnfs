@@ -1,9 +1,9 @@
-// Userspace NFSv3/MOUNTv3 acceptance client (development plan §3.5, milestone M1).
+// Userspace NFSv3/MOUNTv3/NFSv4.1 acceptance client.
 //
-// Drives a *running* lightnfsd over real TCP and verifies the read-only protocol
-// surface against the export's backing directory — no kernel mount, no root. This is
-// the loopback half of the M1 acceptance: the kernel-client half lives in
-// scripts/accept_m1.sh (real mount inside a privileged container/VM).
+// Drives a *running* lightnfsd over real TCP and verifies the protocol surface
+// against the export's backing directory — no kernel mount, no root. This is the
+// loopback half of the acceptance suite (scripts/accept_m2_local.sh and
+// accept_m6_local.sh); the kernel-client half lives in the accept_m*_vm.sh scripts.
 //
 //   accept_client walk   HOST NFS_PORT MOUNT_PORT EXPORT BACKING_DIR
 //       full recursive traversal via READDIRPLUS; every entry name-set compared with

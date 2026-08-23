@@ -306,9 +306,10 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 | v3/v4 一致 | 双挂载对比与混合版本写 |
 | 故障注入 | 每周：kill -9 重启循环、fsync EIO 注入、客户端消失、v4 带状态重启 reclaim（`scripts/fault_inject.sh`） |
 
-每个里程碑配一键验收脚本：`scripts/accept_m*_local.sh` 无 root（用户态 NFS 客户端经
-回环驱动真实服务器，与后备目录树逐字节对照，Release + ASAN），`scripts/accept_m*_vm.sh`
-在 root 机器上做真实内核挂载。全部测试都由这些脚本驱动——构建矩阵（GCC/Clang、ASAN、
+验收全部脚本化，按协议代际各留一对：`scripts/accept_m2_local.sh`（NFSv3 读写）与
+`scripts/accept_m6_local.sh`（NFSv4.1/4.2 含锁、reclaim、courtesy）无 root——用户态
+NFS 客户端经回环驱动真实服务器，与后备目录树逐字节对照，Release + ASAN；对应的
+`accept_m2_vm.sh`/`accept_m6_vm.sh` 在 root 机器上做真实内核挂载。全部测试都由这些脚本驱动——构建矩阵（GCC/Clang、ASAN、
 TSAN、epoll ring）、逐次改动回归与长稳任务（24h fuzz、fsx 过夜、每周故障注入）均可
 本地或用任意调度器按需执行；仓库不携带托管 CI 流水线。
 

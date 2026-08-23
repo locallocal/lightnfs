@@ -335,10 +335,12 @@ Test layers (development plan §9):
 | v3/v4 consistency | dual-mount comparisons and mixed-version writes |
 | Fault injection | weekly: kill -9 restart loops, fsync EIO injection, client kill, v4 restart reclaim (`scripts/fault_inject.sh`) |
 
-Every milestone ships one-click acceptance scripts: `scripts/accept_m*_local.sh` run
-without root (a userspace NFS client drives a real server over loopback, byte-verified
-against the backing tree, Release + ASAN), `scripts/accept_m*_vm.sh` run real kernel
-mounts on a root machine. The whole suite is driven from these scripts — build-matrix
+Acceptance is fully scripted, one pair per protocol generation:
+`scripts/accept_m2_local.sh` (NFSv3 read-write) and `scripts/accept_m6_local.sh`
+(NFSv4.1/4.2 with locks, reclaim, courtesy) run without root — a userspace NFS client
+drives a real server over loopback, byte-verified against the backing tree, Release +
+ASAN — while the matching `accept_m2_vm.sh`/`accept_m6_vm.sh` run real kernel mounts
+on a root machine. The whole suite is driven from these scripts — build-matrix
 sweeps (GCC/Clang, ASAN, TSAN, epoll ring), per-change regressions, and the long runs
 (24h fuzz, overnight fsx, weekly fault injection) are all invocable locally or from
 any scheduler of your choice; the repository does not carry hosted CI pipelines.

@@ -137,8 +137,8 @@ add_executable(lnfs_tests
 target_link_libraries(lnfs_tests PRIVATE lnfs_core)
 add_test(NAME lnfs_tests COMMAND lnfs_tests)
 
-# M1 acceptance client (development plan §3.5): userspace NFSv3 client that drives a
-# running lightnfsd over TCP. Invoked by scripts/accept_m1_local.sh, not by ctest.
+# Acceptance client: userspace NFSv3/v4.1 client that drives a running lightnfsd over
+# TCP. Invoked by scripts/accept_m2_local.sh and accept_m6_local.sh, not by ctest.
 add_executable(lnfs_accept_client tests/accept_client.cpp)
 target_link_libraries(lnfs_accept_client PRIVATE lnfs_core)
 
