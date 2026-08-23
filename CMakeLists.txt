@@ -110,10 +110,10 @@ target_link_libraries(lightnfsd PRIVATE lnfs_core ccmd::ccmd)
 # design 02 §2.8), so it carries the bench sources and links the core.
 add_executable(lightnfs-ctl tools/lightnfs_ctl.cpp
   tools/bench/bench_echo.cpp tools/bench/bench_nullrpc.cpp tools/bench/bench_fullpath.cpp)
-target_link_libraries(lightnfs-ctl PRIVATE lnfs_core)
+target_link_libraries(lightnfs-ctl PRIVATE lnfs_core ccmd::ccmd)
 target_include_directories(lightnfs-ctl PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(lightnfs-fh tools/lightnfs_fh.cpp)
-target_link_libraries(lightnfs-fh PRIVATE lnfs_core)
+target_link_libraries(lightnfs-fh PRIVATE lnfs_core ccmd::ccmd)
 
 # ---- tests ----
 enable_testing()

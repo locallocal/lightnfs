@@ -1,22 +1,33 @@
 // lightnfs-fh (design 08 §8.6): decodes a hex-encoded lightnfs file handle for
 // wireshark-assisted debugging.
 //
-//   lightnfs-fh [--key STATE_DIR/hmac.key] <hex-handle>
+//   lightnfs-fh <hex-handle> [--key=STATE_DIR/hmac.key]
 //
 // Prints version, fsid, backend ObjId (hex) and, when the HMAC key file is supplied,
-// whether the SipHash authentication tag verifies.
+// whether the SipHash authentication tag verifies. cflag takes long-option values
+// only as --name=value; the historical `--key PATH` spelling (including before the
+// handle) is folded by normalize_argv.
 
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <ccmd.h>
+
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "core/file_handle.hpp"
 
 namespace {
+
+using Cmd = std::shared_ptr<ccmd::c_command>;
+
+// ccmd callbacks return void; the exit code travels through this
+// (0 success / 1 runtime failure / 2 usage error).
+int g_exit = 0;
 
 int hex_nibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -25,20 +36,7 @@ int hex_nibble(char c) {
   return -1;
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
-  std::string key_path;
-  int argi = 1;
-  if (argi + 1 < argc && std::string(argv[argi]) == "--key") {
-    key_path = argv[argi + 1];
-    argi += 2;
-  }
-  if (argi >= argc) {
-    std::fprintf(stderr, "usage: lightnfs-fh [--key HMAC_KEY_FILE] <hex-handle>\n");
-    return 2;
-  }
-  std::string hex = argv[argi];
+int inspect_handle(const std::string& key_path, std::string hex) {
   std::erase_if(hex, [](char c) { return c == ':' || c == ' '; });
   if (hex.size() % 2 != 0) {
     std::fprintf(stderr, "odd hex length\n");
@@ -83,6 +81,52 @@ int main(int argc, char** argv) {
   if (have_key)
     std::printf("hmac:    %s\n", info->hmac_ok ? "VALID" : "INVALID");
   else
-    std::printf("hmac:    (no key supplied; pass --key STATE_DIR/hmac.key to verify)\n");
+    std::printf("hmac:    (no key supplied; pass --key=STATE_DIR/hmac.key to verify)\n");
   return 0;
+}
+
+// Folds `--key PATH`/`-k PATH` into --key=PATH (the only form cflag takes).
+std::vector<std::string> normalize_argv(int argc, char** argv) {
+  std::vector<std::string> out;
+  out.reserve(static_cast<size_t>(argc));
+  for (int i = 0; i < argc; ++i) {
+    std::string a = argv[i];
+    if ((a == "--key" || a == "-k") && i + 1 < argc) {
+      out.push_back("--key=" + std::string(argv[++i]));
+    } else {
+      out.push_back(std::move(a));
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  auto root = std::make_shared<ccmd::c_command>(
+      "lightnfs-fh", "lightnfs-fh 01000000010009... --key=/var/lib/lightnfs/hmac.key",
+      "lightnfs-fh <hex-handle> [--key=HMAC_KEY_FILE]",
+      "Offline decoder for lightnfs file handles (wireshark-assisted debugging): "
+      "prints version, fsid and backend ObjId; with the server's hmac.key it also "
+      "verifies the SipHash authentication tag. ':' and spaces in the hex are "
+      "ignored, so wireshark copy-paste works as-is.",
+      "file-handle decoder", [](const Cmd& c) {
+        const auto& pos = c->args();
+        if (pos.size() != 1) {
+          c->print_help();
+          g_exit = 2;
+          return;
+        }
+        g_exit = inspect_handle(c->var<std::string>("key"), pos[0]);
+      });
+  root->varp<std::string>("key", "k", "",
+                          "HMAC key file (STATE_DIR/hmac.key) to verify the tag");
+
+  try {
+    root->execute(normalize_argv(argc, argv));
+    return g_exit;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "lightnfs-fh: %s\n", e.what());
+    return 2;
+  }
 }
