@@ -1,7 +1,10 @@
 // lightnfs-ctl (design 08 §8.6, minimal): sends one command over the server's unix
-// admin socket and prints the text reply.
+// admin socket and prints the text reply. Also hosts the three-layer benchmarks
+// (design 02 §2.8) as a local subcommand family — those spin up their own in-process
+// stack and never touch the socket.
 //
 //   lightnfs-ctl [--socket PATH] <ping|metrics|dump-errors|drc|fdcache|state|expire-client ID>
+//   lightnfs-ctl bench <echo|nullrpc|fullpath> [args…]
 //
 // Default socket: $LIGHTNFS_CTL, else /tmp/lightnfs-state/ctl.sock.
 
@@ -14,6 +17,8 @@
 #include <cstring>
 #include <string>
 
+#include "bench/bench_main.hpp"
+
 int main(int argc, char** argv) {
   const char* env = std::getenv("LIGHTNFS_CTL");
   std::string path = env ? env : "/tmp/lightnfs-state/ctl.sock";
@@ -24,7 +29,22 @@ int main(int argc, char** argv) {
   }
   if (argi >= argc) {
     std::fprintf(stderr,
-                 "usage: lightnfs-ctl [--socket PATH] <ping|metrics|dump-errors|drc|fdcache|state|expire-client ID>\n");
+                 "usage: lightnfs-ctl [--socket PATH] <ping|metrics|dump-errors|drc|fdcache|state|expire-client ID>\n"
+                 "       lightnfs-ctl bench <echo|nullrpc|fullpath> [args...]\n");
+    return 2;
+  }
+  if (std::string(argv[argi]) == "bench") {
+    if (argi + 1 >= argc) {
+      std::fprintf(stderr, "usage: lightnfs-ctl bench <echo|nullrpc|fullpath> [args...]\n");
+      return 2;
+    }
+    std::string which = argv[argi + 1];
+    int sub_argc = argc - argi - 1;
+    char** sub_argv = argv + argi + 1;  // sub_argv[0] = the bench name
+    if (which == "echo") return lnfs::bench::echo_main(sub_argc, sub_argv);
+    if (which == "nullrpc") return lnfs::bench::nullrpc_main(sub_argc, sub_argv);
+    if (which == "fullpath") return lnfs::bench::fullpath_main(sub_argc, sub_argv);
+    std::fprintf(stderr, "unknown bench %s (echo|nullrpc|fullpath)\n", which.c_str());
     return 2;
   }
   std::string cmd = argv[argi];

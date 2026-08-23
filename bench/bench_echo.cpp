@@ -1,10 +1,11 @@
 // Layer-1 benchmark (design 02 §2.8): raw record echo — accept, read_record, write the same
 // chain back (zero-copy). Measures transport + record-marking overhead with no RPC parsing.
 //
-//   bench_echo [reactors=1] [conns=8] [per_conn=20000] [pipeline=32] [payload=128]
+//   lightnfs-ctl bench echo [reactors=1] [conns=8] [per_conn=20000] [pipeline=32] [payload=128]
 
 #include <cstdlib>
 
+#include "bench/bench_main.hpp"
 #include "bench/bench_util.hpp"
 #include "runtime/io.hpp"
 #include "runtime/runtime.hpp"
@@ -40,7 +41,7 @@ Task<void> echo_accept(int lfd, Runtime* rt, BufferPool* pool) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int lnfs::bench::echo_main(int argc, char** argv) {
   int reactors = argc > 1 ? atoi(argv[1]) : 1;
   int conns = argc > 2 ? atoi(argv[2]) : 8;
   uint64_t per_conn = argc > 3 ? strtoull(argv[3], nullptr, 10) : 20000;

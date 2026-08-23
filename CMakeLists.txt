@@ -106,7 +106,12 @@ add_executable(lightnfsd src/main.cpp)
 target_link_libraries(lightnfsd PRIVATE lnfs_core ccmd::ccmd)
 
 # ---- admin tools (design 08 §8.6) ----
-add_executable(lightnfs-ctl tools/lightnfs_ctl.cpp)
+# lightnfs-ctl also hosts the three-layer benchmarks (`lightnfs-ctl bench …`,
+# design 02 §2.8), so it carries the bench sources and links the core.
+add_executable(lightnfs-ctl tools/lightnfs_ctl.cpp
+  bench/bench_echo.cpp bench/bench_nullrpc.cpp bench/bench_fullpath.cpp)
+target_link_libraries(lightnfs-ctl PRIVATE lnfs_core)
+target_include_directories(lightnfs-ctl PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(lightnfs-fh tools/lightnfs_fh.cpp)
 target_link_libraries(lightnfs-fh PRIVATE lnfs_core)
 
@@ -141,17 +146,6 @@ add_test(NAME lnfs_tests COMMAND lnfs_tests)
 # TCP. Invoked by scripts/accept_m2_local.sh and accept_m6_local.sh, not by ctest.
 add_executable(lnfs_accept_client tests/accept_client.cpp)
 target_link_libraries(lnfs_accept_client PRIVATE lnfs_core)
-
-# ---- benchmarks ----
-add_executable(bench_echo bench/bench_echo.cpp)
-target_link_libraries(bench_echo PRIVATE lnfs_core)
-target_include_directories(bench_echo PRIVATE ${CMAKE_SOURCE_DIR})
-add_executable(bench_nullrpc bench/bench_nullrpc.cpp)
-target_link_libraries(bench_nullrpc PRIVATE lnfs_core)
-target_include_directories(bench_nullrpc PRIVATE ${CMAKE_SOURCE_DIR})
-add_executable(bench_fullpath bench/bench_fullpath.cpp)
-target_link_libraries(bench_fullpath PRIVATE lnfs_core)
-target_include_directories(bench_fullpath PRIVATE ${CMAKE_SOURCE_DIR})
 
 # ---- fuzz ----
 if(LNFS_BUILD_FUZZ)

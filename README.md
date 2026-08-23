@@ -200,9 +200,9 @@ Build options:
 Benchmarks (design 02 §2.8 three layers):
 
 ```sh
-./build/bench_echo      1 4 20000 32 128   # L1: transport echo
-./build/bench_nullrpc   1 4 20000 32       # L2: null RPC (gate: ≥100k rps single reactor)
-./build/bench_fullpath  1 4 20000 32 read  # L4: full NFS path over the memory backend
+./build/lightnfs-ctl bench echo     1 4 20000 32 128  # L1: transport echo
+./build/lightnfs-ctl bench nullrpc  1 4 20000 32      # L2: null RPC (gate: ≥100k rps single reactor)
+./build/lightnfs-ctl bench fullpath 1 4 20000 32 read # L4: full NFS path over the memory backend
 scripts/bench_gate.sh                       # all three against bench/baseline.txt
 ```
 

@@ -177,9 +177,9 @@ ctest --test-dir build            # 单测 + 集成测试（约 120 项，< 1 �
 基准（设计 02 §2.8 三层）：
 
 ```sh
-./build/bench_echo      1 4 20000 32 128   # L1：传输层 echo
-./build/bench_nullrpc   1 4 20000 32       # L2：null RPC（门禁：单 reactor ≥100k rps）
-./build/bench_fullpath  1 4 20000 32 read  # L4：全链路（memory 后端）
+./build/lightnfs-ctl bench echo     1 4 20000 32 128  # L1：传输层 echo
+./build/lightnfs-ctl bench nullrpc  1 4 20000 32      # L2：null RPC（门禁：单 reactor ≥100k rps）
+./build/lightnfs-ctl bench fullpath 1 4 20000 32 read # L4：全链路（memory 后端）
 scripts/bench_gate.sh                       # 三项对照 bench/baseline.txt
 ```
 

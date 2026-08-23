@@ -70,7 +70,9 @@ sudo systemctl enable --now lightnfs
 - **ctl 套接字**（`state_dir/ctl.sock`，或 `[server] ctl_socket`）：
   `lightnfs-ctl <cmd>`——`ping`、`metrics`（Prometheus 文本）、`dump-errors`、`drc`、
   `fdcache`、`state`（v4 状态表：clients/sessions/opens/locks 计数 + 三表 dump）、
-  `expire-client <clientid>`（强制回收某客户端全部状态，排查挂死/泄漏）。
+  `expire-client <clientid>`（强制回收某客户端全部状态，排查挂死/泄漏）。另有本地
+  子命令 `lightnfs-ctl bench <echo|nullrpc|fullpath>`——三层基准（02 分册 §2.8），
+  自起进程内栈压测，不经 ctl 套接字、不涉运行中的服务。
 - **Prometheus**：`[server] metrics_port` 开一个 HTTP 文本端点；关键指标包括
   `lightnfs_v4_{clients,sessions,opens,files_with_state,courtesy_clients,in_grace,
   grace_remaining_seconds,lock_states,lock_segments}`、`lightnfs_v4_reclaims_total{reason}`、
