@@ -23,7 +23,7 @@
 7. [运行与挂载](#运行与挂载)
 8. [管理与可观测性](#管理与可观测性)
 9. [部署与安全](#部署与安全)
-10. [测试与 CI](#测试与-ci)
+10. [测试](#测试)
 11. [项目状态与路线](#项目状态与路线)
 12. [已知限制](#已知限制)
 13. [文档索引](#文档索引)
@@ -41,7 +41,7 @@
   有测试覆盖，不做近似。
 - **v3 与 v4 共用一个语义核心。** 两个协议引擎共享协议无关的 core（导出表、句柄、权限
   与 squash、per-object 串行化、change/WCC 采样）。同一文件用 `vers=3` 与 `vers=4.2` 挂载
-  行为一致，v3/v4 混合挂载对比进了 CI。
+  行为一致，v3/v4 混合挂载对比属验收套件常规项。
 - **可插拔的存储边界。** 后端只谈文件系统对象、属性与 POSIX errno，任何 NFS 概念都不
   跨越边界。能力位（符号链接、硬链接、原生 change、稳定句柄、稀疏操作、clone、copy、
   字节锁……）让协议表面自动收缩——后端永远不需要"假装支持"。
@@ -169,7 +169,7 @@ ctest --test-dir build            # 单测 + 集成测试（约 120 项，< 1 �
 
 | 选项 | 取值 | 用途 |
 |------|------|------|
-| `LNFS_SANITIZE` | `address`、`thread` | sanitizer 构建（CI 两者都跑） |
+| `LNFS_SANITIZE` | `address`、`thread` | sanitizer 构建（常规矩阵两者都跑） |
 | `LNFS_RING` | `auto`（默认）、`uring`、`epoll` | 默认 ring 后端；`epoll` 强制兜底路径 |
 | `LNFS_BUILD_FUZZ` | `ON` | libFuzzer 目标（仅 clang）：`./build/fuzz_handle_request fuzz/corpus` |
 
@@ -290,7 +290,7 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 
 逐项验证记录见 [security-checklist.md](security-checklist.md)。
 
-## 测试与 CI
+## 测试
 
 测试层次（开发计划 §9）：
 
@@ -299,17 +299,17 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 | 运行时 | fake ring 时序测试、ASAN + TSAN 构建、EINTR/短读注入 |
 | XDR / 请求路径 | round-trip 测试；覆盖完整请求路径的 libFuzzer（每 PR 120s 种子跑，每日 1h 长跑并增长语料） |
 | 后端契约 | 句柄稳定性、10 万项 cookie 稳定性、写稳定级 + 粘性 fsync EIO、v4.2 稀疏/拷贝/clone |
-| 错误映射 | v3 白名单测试**由调研文档生成**（`scripts/gen_errmap_cases.py`），文档/代码偏差即 CI 失败；v4 行对照 RFC 表 |
+| 错误映射 | v3 白名单测试**由调研文档生成**（`scripts/gen_errmap_cases.py`），文档/代码偏差即测试失败；v4 行对照 RFC 表 |
 | 性能 | 三层基准对照 `bench/baseline.txt` 的门禁 |
-| 一致性 | cthon04、fsx、pynfs（4.1）在 CI 真实内核挂载上运行；每日过夜 fsx 与 pynfs 全量 |
+| 一致性 | cthon04、fsx、pynfs（4.1）经 `accept_m*_vm.sh` 在真实内核挂载上运行；过夜 fsx 与 pynfs 全量为长稳项 |
 | v3/v4 一致 | 双挂载对比与混合版本写 |
 | 故障注入 | 每周：kill -9 重启循环、fsync EIO 注入、客户端消失、v4 带状态重启 reclaim（`scripts/fault_inject.sh`） |
 
 每个里程碑配一键验收脚本：`scripts/accept_m*_local.sh` 无 root（用户态 NFS 客户端经
 回环驱动真实服务器，与后备目录树逐字节对照，Release + ASAN），`scripts/accept_m*_vm.sh`
-在 root runner 上做真实内核挂载。CI（`.github/workflows/ci.yml`）每 PR 跑六路构建矩阵
-（GCC/Clang、ASAN、TSAN、epoll ring、两代 runner 内核）与 `m1`…`m6-acceptance` 作业；
-`nightly.yml` 承载每日与每周任务。
+在 root 机器上做真实内核挂载。全部测试都由这些脚本驱动——构建矩阵（GCC/Clang、ASAN、
+TSAN、epoll ring）、逐次改动回归与长稳任务（24h fuzz、fsx 过夜、每周故障注入）均可
+本地或用任意调度器按需执行；仓库不携带托管 CI 流水线。
 
 ## 项目状态与路线
 
@@ -323,7 +323,7 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 | 3 | M5 | NFSv4.1 只读：会话、伪根、客户端/会话状态 |
 | 4 | M6 | NFSv4.1 读写：open 状态机全量、租约、courtesy、宽限期/reclaim |
 | 5 | M7 | 字节区间锁、SECINFO、错误白名单复查、安全加固——**v1 发布候选** |
-| 6 | M8 | **已完成：** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE、COPY、CLONE；CI/测试基建（§9）。**按需触发：** 第二后端（Lustre/GlusterFS）、读委托 + 回传通道、NLM/NSM |
+| 6 | M8 | **已完成：** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE、COPY、CLONE；测试基建。**按需触发：** 第二后端（Lustre/GlusterFS）、读委托 + 回传通道、NLM/NSM |
 
 长期观察项（不承诺）：RPC-over-TLS、写/目录委托、pNFS flexfiles MDS、基于原生 change
 与锁的多网关一致性。

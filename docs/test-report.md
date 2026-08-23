@@ -9,9 +9,9 @@
 
 - **本机（无特权）**：回环 TCP 打真实 `lightnfsd`，客户端为自研用户态 NFSv3/v4.1 客户端
   `lnfs_accept_client`（协议级等价校验，全部数据逐字节比对后端目录）；pynfs 用户态直连。
-- **CI VM（root）**：`m1..m6-acceptance` 作业在 runner VM 内真实 `mount -o vers=3/4.1/4.2`，
-  跑 cthon04 / fsx / 内核 POSIX 字节锁；nightly 作业跑 24h fuzz 累计、fsx 过夜
-  （FSX_OPS=200 万）与 pynfs 全量套件漂移比对。
+- **root VM**：`accept_m1..m6_vm.sh` 在 VM 内真实 `mount -o vers=3/4.1/4.2`，
+  跑 cthon04 / fsx / 内核 POSIX 字节锁；长稳任务（24h fuzz 累计、fsx 过夜
+  FSX_OPS=200 万、pynfs 全量套件漂移比对）由同一批脚本按需或定时执行。
 - 构建矩阵：Debug / Release / ASAN+UBSAN / TSAN / epoll 兜底（Release）/ libFuzzer，
   GCC 15 与 clang 双工具链。
 
@@ -32,10 +32,10 @@ DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放
 
 ## 3. 协议一致性
 
-### cthon04（真实 mount，CI VM）
+### cthon04（真实 mount，root VM）
 
-- **vers=3**：basic / general / special 全量通过（M2，`accept_m2_vm.sh` → CI
-  `m2-acceptance`）；M1 阶段先行的只读子集（test3/5b/9）另有 `cthon_ro.sh` 常态回归。
+- **vers=3**：basic / general / special 全量通过（M2，`accept_m2_vm.sh`）；M1 阶段
+  先行的只读子集（test3/5b/9）另有 `cthon_ro.sh` 常态回归。
 - **vers=4.1**：basic / general / special 通过（M4）；**lock 组** + 内核 fcntl 字节锁
   冲突/释放通过（M5，`accept_m5_vm.sh -l`）。
 - **vers=4.2**：basic / general 回归通过（M8 第 1 项，`accept_m6_vm.sh`）。
@@ -49,12 +49,13 @@ DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放
 | M7（阶段 5） | 锁 / secinfo / courtesy 组 | 26 通过 / 1 失败（CSID7 为 pynfs 自身 NameError） |
 | M8（阶段 6.1） | + secinfo_no_name/SEC1/SEC2 等 | **186 用例：168 通过，18 失败全部命中预期排除表**（`pynfs_m5_expected.txt`：委托/回传属 M8 遗留、需 root 的设备节点、CSID7） |
 
-预期排除表随 nightly `conformance-overnight` 作业做全量套件漂移比对（新失败即告警）。
+预期排除表用于 pynfs 全量套件的漂移比对（对照 `scripts/pynfs_m5_expected.txt`，
+新失败即为回归信号），按需或定时执行。
 
 ### fsx（xfstests）
 
-- 每 PR：5 万 ops（CI `m2-acceptance`/`m4-acceptance`）；本机 5000 ops 冒烟。
-- 过夜：nightly 作业 FSX_OPS=200 万（vers=3 与 4.1），与 24h fuzz 同批。
+- 常规回归：5 万 ops（`accept_m2_vm.sh`/`accept_m4_vm.sh` 默认参数）；本机 5000 ops 冒烟。
+- 过夜：同脚本传 FSX_OPS=200 万（vers=3 与 4.1），与 24h fuzz 同批长稳执行。
 
 ### 回环端到端（本机，2026-08-23 全量复跑通过）
 
@@ -65,7 +66,7 @@ DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放
   minor 1 下 OP_ILLEGAL）、v4rw/v4lock/v4walk/walk、重启 reclaim（CLAIM_PREVIOUS/
   GRACE/NO_GRACE 门禁）、courtesy 双路径回收、ctl 工具链，Release 与 ASAN 双配置。
 - **fuzz**：libFuzzer 直喂 `handle_request` 60s 短跑无 crash（~10 万 exec/s），语料
-  持续累积；24h 长跑随 nightly 累计。
+  持续累积；24h 长跑为按需长稳任务。
 
 ## 4. 三层基准（02 分册 §2.8）
 
@@ -80,7 +81,7 @@ DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放
 
 - 阶段 0 出口指标（null-RPC 单 reactor ≥100k）达成时实测 ~398k（8 连接 ×64 流水线）。
 - 阈值门禁：`scripts/bench_gate.sh` 每 PR 以基线 × `LNFS_BENCH_FLOOR`
-  （本地 0.5 / CI 0.2）判定，防数量级退化；近期门禁全绿。
+  （本地 0.5；共享 runner 等噪声环境可降至 0.2）判定，防数量级退化；近期门禁全绿。
 
 ## 5. 安全清单验收（08 分册 §8.5）
 
@@ -96,4 +97,5 @@ lightnfs.service` + `gen_seccomp_allowlist.sh`）、AUTH_SYS 信任边界入部�
   （生产指引见 [deployment.md](deployment.md)）。
 - pynfs 预期排除：委托/回传（roadmap M8 遗留）、需 root 的块/字符设备树对象、
   CSID7（pynfs 自身缺陷）。
-- fsx ≥12h 过夜首轮记录与 24h fuzz 累计随 nightly 在 CI 环境执行（日历项）。
+- fsx ≥12h 过夜首轮记录与 24h fuzz 累计为按需长稳执行项（日历项），脚本即入口
+  （`fetch_fsx.sh` + 大 FSX_OPS、`fuzz_handle_request`）。
