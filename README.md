@@ -174,11 +174,12 @@ docs/         design, protocol research and deployment docs
 ## Building
 
 Dependencies: CMake ≥ 3.22, Ninja, GCC ≥ 13 or Clang ≥ 17, liburing
-(`apt install liburing-dev`; run `scripts/fetch_liburing.sh` for a vendored build when
-no system package is available). Linux ≥ 5.19 recommended (io_uring); any kernel with
-epoll works through the fallback ring. The command-line entry point uses the
-[ccmd](https://github.com/locallocal/ccmd) git submodule — clone with
-`--recurse-submodules`, or run `git submodule update --init --recursive` in an
+(`apt install liburing-dev`, or build the vendored `third_party/liburing` submodule
+with `scripts/fetch_liburing.sh` — a built submodule takes precedence over the system
+package). Linux ≥ 5.19 recommended (io_uring); any kernel with epoll works through the
+fallback ring. The [ccmd](https://github.com/locallocal/ccmd) (command-line entry) and
+[liburing](https://github.com/axboe/liburing) dependencies are git submodules — clone
+with `--recurse-submodules`, or run `git submodule update --init --recursive` in an
 existing clone.
 
 ```sh

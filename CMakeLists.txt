@@ -29,11 +29,17 @@ elseif(LNFS_SANITIZE STREQUAL "thread")
   add_link_options(-fsanitize=thread)
 endif()
 
-# ---- liburing: system first, then vendored (scripts/fetch_liburing.sh) ----
-find_path(LIBURING_INCLUDE_DIR liburing.h
-  PATHS ${CMAKE_SOURCE_DIR}/third_party/liburing/src/include /usr/include /usr/local/include)
-find_library(LIBURING_LIBRARY NAMES uring
-  PATHS ${CMAKE_SOURCE_DIR}/third_party/liburing/src /usr/lib /usr/local/lib)
+# ---- liburing: vendored submodule when built, system otherwise ----
+# third_party/liburing is a git submodule (pinned upstream tag); its headers alone are
+# not usable before `scripts/fetch_liburing.sh` runs configure+make (compat.h is
+# generated), so only a built submodule takes precedence over the system package.
+if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/liburing/src/liburing.a)
+  set(LIBURING_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/third_party/liburing/src/include)
+  set(LIBURING_LIBRARY ${CMAKE_SOURCE_DIR}/third_party/liburing/src/liburing.a)
+else()
+  find_path(LIBURING_INCLUDE_DIR liburing.h PATHS /usr/include /usr/local/include)
+  find_library(LIBURING_LIBRARY NAMES uring PATHS /usr/lib /usr/local/lib)
+endif()
 if(NOT LIBURING_INCLUDE_DIR OR NOT LIBURING_LIBRARY)
   message(FATAL_ERROR "liburing not found; install liburing-dev or run scripts/fetch_liburing.sh")
 endif()
