@@ -426,10 +426,16 @@ ubuntu-22.04 / ubuntu-latest 两代 runner 覆盖；epoll 兜底以 `LNFS_RING=e
 
 ---
 
-## 11. 交付物清单（v1 = 阶段 5 末）
+## 11. 交付物清单（v1 = 阶段 5 末）✅（核查于 2026-08-23）
 
-- `lightnfsd` 二进制（uring/epoll 双构建）、`lightnfs-ctl`、`lightnfs-fh`
-- systemd 单元（seccomp 白名单、最小 capability）
-- 配置样例与校验文档（08 分册 §8.1）
-- 部署/运维文档：信任边界、降级模式限制、多网关限制（kNativeChange）、grace/重启行为说明
-- 测试报告：cthon/pynfs/fsx 通过记录、三层基准数据、8.5 安全清单验收记录
+- [x] `lightnfsd` 二进制（uring/epoll 双构建：uring 原生 + `LNFS_DEFAULT_RING_EPOLL`
+      变体与运行时 auto 回退）、`lightnfs-ctl`、`lightnfs-fh`
+- [x] systemd 单元（seccomp 白名单、最小 capability）——`packaging/systemd/lightnfs.service`
+      + `scripts/gen_seccomp_allowlist.sh`
+- [x] 配置样例与校验文档（08 分册 §8.1）——`config/lightnfs.toml.example` +
+      `--check-config` + `docs/deployment.md` 配置要点
+- [x] 部署/运维文档：信任边界、降级模式限制、多网关限制（kNativeChange）、grace/重启
+      行为说明——`docs/deployment.md`
+- [x] 测试报告：cthon/pynfs/fsx 通过记录、三层基准数据、8.5 安全清单验收记录——
+      汇总于 `docs/test-report.md`（明细在各阶段完成记录与 m1–m6 文档、
+      `docs/security-checklist.md`）
