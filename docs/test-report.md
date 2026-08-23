@@ -73,7 +73,7 @@ DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放
 
 ## 4. 三层基准（02 分册 §2.8）
 
-基线（`bench/baseline.txt`，单 reactor、4 连接、32 流水线、io_uring、本机 Release）：
+基线（`tools/bench/baseline.txt`，单 reactor、4 连接、32 流水线、io_uring、本机 Release）：
 
 | 层 | 基准 | 基线 rps | 近期实测（2026-08-23） |
 |----|------|----------|------------------------|

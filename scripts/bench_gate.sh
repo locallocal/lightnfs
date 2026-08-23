@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Three-layer benchmark regression gate (design 02 §2.8). Runs `lightnfs-ctl bench`
 # echo / nullrpc / fullpath(GETATTR, READ4k) and compares the measured rps against
-# bench/baseline.txt x LNFS_BENCH_FLOOR.  Exit 1 on any miss.
+# tools/bench/baseline.txt x LNFS_BENCH_FLOOR.  Exit 1 on any miss.
 #
 # usage: bench_gate.sh [BUILD_DIR]      (env: LNFS_BENCH_FLOOR=0.5, LNFS_BENCH_CALLS=20000)
 set -euo pipefail
@@ -10,7 +10,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 build=${1:-$repo/build-rel}
 floor=${LNFS_BENCH_FLOOR:-0.5}
 calls=${LNFS_BENCH_CALLS:-20000}
-baseline="$repo/bench/baseline.txt"
+baseline="$repo/tools/bench/baseline.txt"
 
 ref() { awk -v k="$1" '$1==k {print $2}' "$baseline"; }
 rps_of() { sed -nE 's/.* = ([0-9]+) rps.*/\1/p' <<<"$1" | tail -1; }

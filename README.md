@@ -159,10 +159,10 @@ src/
   backend/    backend API, local and memory backends
   obs/        metrics, error log
   main.cpp    lightnfsd
-tools/        lightnfs-ctl, lightnfs-fh
+tools/        lightnfs-ctl (admin CLI + the three-layer benchmarks under
+              tools/bench/ with their baseline), lightnfs-fh
 tests/        unit/integration tests (mini test framework, fake ring) and the
               userspace acceptance client
-bench/        three-layer benchmarks + baseline
 fuzz/         libFuzzer entry over the full request path + checked-in corpus
 scripts/      one-click acceptance (loopback and VM), dataset/tool fetchers,
               bench gate, fault injection, seccomp allowlist generator
@@ -203,7 +203,7 @@ Benchmarks (design 02 §2.8 three layers):
 ./build/lightnfs-ctl bench echo     1 4 20000 32 128  # L1: transport echo
 ./build/lightnfs-ctl bench nullrpc  1 4 20000 32      # L2: null RPC (gate: ≥100k rps single reactor)
 ./build/lightnfs-ctl bench fullpath 1 4 20000 32 read # L4: full NFS path over the memory backend
-scripts/bench_gate.sh                       # all three against bench/baseline.txt
+scripts/bench_gate.sh                       # all three against tools/bench/baseline.txt
 ```
 
 ## Configuration
@@ -330,7 +330,7 @@ Test layers (development plan §9):
 | XDR / request path | round-trip tests; libFuzzer over the whole request path (120 s seeded run per PR, 1 h nightly with a growing corpus) |
 | Backend contract | handle stability, 100k-entry cookie stability, write stability levels + sticky fsync EIO, v4.2 sparse/copy/clone |
 | Error mapping | the v3 whitelist test is **generated from the research document** (`scripts/gen_errmap_cases.py`), so doc/code drift fails the test; v4 rows checked against RFC tables |
-| Performance | three-layer benchmark gate against `bench/baseline.txt` |
+| Performance | three-layer benchmark gate against `tools/bench/baseline.txt` |
 | Conformance | cthon04, fsx, pynfs (4.1) on real kernel mounts via `accept_m*_vm.sh`; overnight fsx and the full pynfs suite as soak runs |
 | v3/v4 consistency | dual-mount comparisons and mixed-version writes |
 | Fault injection | weekly: kill -9 restart loops, fsync EIO injection, client kill, v4 restart reclaim (`scripts/fault_inject.sh`) |

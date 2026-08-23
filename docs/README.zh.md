@@ -140,9 +140,8 @@ src/
   backend/    后端接口、local 与 memory 后端
   obs/        指标、错误日志
   main.cpp    lightnfsd
-tools/        lightnfs-ctl、lightnfs-fh
+tools/        lightnfs-ctl（管理 CLI + tools/bench/ 下的三层基准与基线）、lightnfs-fh
 tests/        单测/集成测试（迷你测试框架、fake ring）与用户态验收客户端
-bench/        三层基准 + 基线
 fuzz/         覆盖完整请求路径的 libFuzzer 入口 + 入库语料
 scripts/      一键验收（回环与 VM）、数据集/工具获取、基准门禁、故障注入、seccomp 白名单生成
 packaging/    systemd 单元
@@ -180,7 +179,7 @@ ctest --test-dir build            # 单测 + 集成测试（约 120 项，< 1 �
 ./build/lightnfs-ctl bench echo     1 4 20000 32 128  # L1：传输层 echo
 ./build/lightnfs-ctl bench nullrpc  1 4 20000 32      # L2：null RPC（门禁：单 reactor ≥100k rps）
 ./build/lightnfs-ctl bench fullpath 1 4 20000 32 read # L4：全链路（memory 后端）
-scripts/bench_gate.sh                       # 三项对照 bench/baseline.txt
+scripts/bench_gate.sh                       # 三项对照 tools/bench/baseline.txt
 ```
 
 ## 配置
@@ -301,7 +300,7 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 | XDR / 请求路径 | round-trip 测试；覆盖完整请求路径的 libFuzzer（每 PR 120s 种子跑，每日 1h 长跑并增长语料） |
 | 后端契约 | 句柄稳定性、10 万项 cookie 稳定性、写稳定级 + 粘性 fsync EIO、v4.2 稀疏/拷贝/clone |
 | 错误映射 | v3 白名单测试**由调研文档生成**（`scripts/gen_errmap_cases.py`），文档/代码偏差即测试失败；v4 行对照 RFC 表 |
-| 性能 | 三层基准对照 `bench/baseline.txt` 的门禁 |
+| 性能 | 三层基准对照 `tools/bench/baseline.txt` 的门禁 |
 | 一致性 | cthon04、fsx、pynfs（4.1）经 `accept_m*_vm.sh` 在真实内核挂载上运行；过夜 fsx 与 pynfs 全量为长稳项 |
 | v3/v4 一致 | 双挂载对比与混合版本写 |
 | 故障注入 | 每周：kill -9 重启循环、fsync EIO 注入、客户端消失、v4 带状态重启 reclaim（`scripts/fault_inject.sh`） |
