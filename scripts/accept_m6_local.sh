@@ -193,9 +193,8 @@ EOC
        noEID9 noEID50 > "$work/pynfs.log" 2>&1) || true
     tail -3 "$work/pynfs.log"
     grep -q "Of those" "$work/pynfs.log" || { echo "pynfs did not complete" >&2; exit 1; }
-    # Expected failures on this milestone, by test code (scripts/pynfs_m5_expected.txt,
-    # rationale in docs/m4-v41-readwrite.md): LOCK-dependent (phase 5), delegation /
-    # callback-dependent (M8), one pynfs-internal NameError (CSID7), and block/char
+    # Expected failures on this milestone, by test code (scripts/pynfs_m5_expected.txt):
+    # LOCK-dependent (phase 5), delegation / callback-dependent (M8), one pynfs-internal NameError (CSID7), and block/char
     # tree objects that need root to create.
     expected=$(tr '\n' ' ' < "$repo/scripts/pynfs_m5_expected.txt")
     unexpected=""

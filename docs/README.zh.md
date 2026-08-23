@@ -8,7 +8,6 @@
 
 - 设计文档：[design/](design/README.md)
 - 协议调研：[nfsv3/](nfsv3/README.md)、[nfsv4/](nfsv4/README.md)
-- 开发计划与里程碑记录：[development-plan.md](development-plan.md)
 - 部署指南：[deployment.md](deployment.md)
 
 ---
@@ -148,7 +147,7 @@ fuzz/         覆盖完整请求路径的 libFuzzer 入口 + 入库语料
 scripts/      一键验收（回环与 VM）、数据集/工具获取、基准门禁、故障注入、seccomp 白名单生成
 packaging/    systemd 单元
 config/       配置样例
-docs/         设计、协议调研、计划、里程碑与部署文档
+docs/         设计、协议调研与部署文档
 ```
 
 ## 构建
@@ -311,7 +310,7 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 
 ## 项目状态与路线
 
-按 [development-plan.md](development-plan.md) 分阶段推进，每阶段以验收记录收尾：
+按 [design/09-roadmap.md](design/09-roadmap.md) 的路线分阶段推进，每阶段以验收收尾：
 
 | 阶段 | 里程碑 | 内容 |
 |------|--------|------|
@@ -341,8 +340,4 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 - 设计：[design/](design/README.md)——架构、运行时/并发、传输/RPC/XDR、NFS 核心、
   后端接口、后端映射、状态管理、配置/可观测性、路线图
 - 协议调研：[nfsv3/](nfsv3/README.md)、[nfsv4/](nfsv4/README.md)
-- 计划与记录：[development-plan.md](development-plan.md)
-- 里程碑说明：[M1](m1-readonly.md)、[M2](m2-readwrite.md)、[M3](m3-v41-readonly.md)、
-  [M4](m4-v41-readwrite.md)、[M5](m5-locks-security.md)、[M6](m6-v42-sweets.md)
 - 运维：[部署指南](deployment.md)、[安全清单](security-checklist.md)
-- 接口评审：[Backend API v1 评审](backend-api-review.md)
