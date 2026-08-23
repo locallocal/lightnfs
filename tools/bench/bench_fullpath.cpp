@@ -11,8 +11,8 @@
 #include <cstring>
 
 #include "backend/memory.hpp"
-#include "bench/bench_main.hpp"
-#include "bench/bench_util.hpp"
+#include "tools/bench/bench_main.hpp"
+#include "tools/bench/bench_util.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
 #include "core/obj_lock.hpp"

@@ -109,7 +109,7 @@ target_link_libraries(lightnfsd PRIVATE lnfs_core ccmd::ccmd)
 # lightnfs-ctl also hosts the three-layer benchmarks (`lightnfs-ctl bench …`,
 # design 02 §2.8), so it carries the bench sources and links the core.
 add_executable(lightnfs-ctl tools/lightnfs_ctl.cpp
-  bench/bench_echo.cpp bench/bench_nullrpc.cpp bench/bench_fullpath.cpp)
+  tools/bench/bench_echo.cpp tools/bench/bench_nullrpc.cpp tools/bench/bench_fullpath.cpp)
 target_link_libraries(lightnfs-ctl PRIVATE lnfs_core)
 target_include_directories(lightnfs-ctl PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(lightnfs-fh tools/lightnfs_fh.cpp)

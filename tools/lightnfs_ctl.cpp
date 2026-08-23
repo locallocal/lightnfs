@@ -17,7 +17,7 @@
 #include <cstring>
 #include <string>
 
-#include "bench/bench_main.hpp"
+#include "tools/bench/bench_main.hpp"
 
 int main(int argc, char** argv) {
   const char* env = std::getenv("LIGHTNFS_CTL");

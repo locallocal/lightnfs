@@ -6,8 +6,8 @@
 
 #include <cstdlib>
 
-#include "bench/bench_main.hpp"
-#include "bench/bench_util.hpp"
+#include "tools/bench/bench_main.hpp"
+#include "tools/bench/bench_util.hpp"
 #include "transport/listener.hpp"
 #include "util/log.hpp"
 
