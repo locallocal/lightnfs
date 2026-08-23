@@ -9,9 +9,11 @@
 
 - **本机（无特权）**：回环 TCP 打真实 `lightnfsd`，客户端为自研用户态 NFSv3/v4.1 客户端
   `lnfs_accept_client`（协议级等价校验，全部数据逐字节比对后端目录）；pynfs 用户态直连。
-- **root VM**：`accept_m1..m6_vm.sh` 在 VM 内真实 `mount -o vers=3/4.1/4.2`，
-  跑 cthon04 / fsx / 内核 POSIX 字节锁；长稳任务（24h fuzz 累计、fsx 过夜
-  FSX_OPS=200 万、pynfs 全量套件漂移比对）由同一批脚本按需或定时执行。
+- **root VM**：`accept_m2_vm.sh`/`accept_m6_vm.sh` 在 VM 内真实
+  `mount -o vers=3/4.2`，跑 cthon04 / fsx / 内核 POSIX 字节锁；长稳任务（24h fuzz
+  累计、fsx 过夜 FSX_OPS=200 万、pynfs 全量套件漂移比对）由同一批脚本按需或定时执行。
+  下文按里程碑记录中提到的早期验收脚本（accept_m1/m3/m4/m5、cthon_ro）已随发布收尾
+  清理，保留在 git 历史中；其覆盖面已并入 m2/m6 两套或可用 fetch 脚本手动复现。
 - 构建矩阵：Debug / Release / ASAN+UBSAN / TSAN / epoll 兜底（Release）/ libFuzzer，
   GCC 15 与 clang 双工具链。
 
@@ -35,7 +37,7 @@ DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放
 ### cthon04（真实 mount，root VM）
 
 - **vers=3**：basic / general / special 全量通过（M2，`accept_m2_vm.sh`）；M1 阶段
-  先行的只读子集（test3/5b/9）另有 `cthon_ro.sh` 常态回归。
+  先行的只读子集（test3/5b/9）当时由 `cthon_ro.sh` 驱动。
 - **vers=4.1**：basic / general / special 通过（M4）；**lock 组** + 内核 fcntl 字节锁
   冲突/释放通过（M5，`accept_m5_vm.sh -l`）。
 - **vers=4.2**：basic / general 回归通过（M8 第 1 项，`accept_m6_vm.sh`）。
@@ -54,7 +56,8 @@ DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放
 
 ### fsx（xfstests）
 
-- 常规回归：5 万 ops（`accept_m2_vm.sh`/`accept_m4_vm.sh` 默认参数）；本机 5000 ops 冒烟。
+- 常规回归：5 万 ops（`accept_m2_vm.sh` 默认参数，vers=3；vers=4.1 当时由
+  accept_m4_vm.sh 驱动，现以 `fetch_fsx.sh` + 手动挂载复现）；本机 5000 ops 冒烟。
 - 过夜：同脚本传 FSX_OPS=200 万（vers=3 与 4.1），与 24h fuzz 同批长稳执行。
 
 ### 回环端到端（本机，2026-08-23 全量复跑通过）
