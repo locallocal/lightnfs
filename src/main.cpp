@@ -90,6 +90,11 @@ int main(int argc, char** argv) {
   }
 
   lnfs::core::ServerConfig server_cfg = config_result->server;
+  lnfs::set_log_level(server_cfg.log_level == "debug"  ? lnfs::LogLevel::kDebug
+                      : server_cfg.log_level == "warn" ? lnfs::LogLevel::kWarn
+                      : server_cfg.log_level == "error"
+                          ? lnfs::LogLevel::kError
+                          : lnfs::LogLevel::kInfo);
   auto exports_result = lnfs::core::ExportTable::build(std::move(*config_result));
   if (!exports_result) {
     LNFS_ERROR("cannot initialize exports: {}", lnfs::errno_name(exports_result.error()));

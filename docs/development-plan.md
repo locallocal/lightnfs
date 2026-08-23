@@ -399,16 +399,30 @@ ubuntu-22.04 / ubuntu-latest 两代 runner 覆盖；epoll 兜底以 `LNFS_RING=e
 
 ---
 
-## 10. 风险与应对（登记于 09 分册，此处补执行动作）
+## 10. 风险与应对（登记于 09 分册，此处补执行动作）✅
 
-| 风险 | 执行动作 |
-|------|---------|
-| 自研 runtime 正确性 | 阶段 0 独立交付、fake ring 先行、三层基准阈值进 CI 门禁；阶段 1 前不动协议代码 |
-| v4 状态机复杂度失控 | 严格按 nfsv4/11.4 骨架清单裁剪，超出清单的 op 一律 NOTSUPP；pynfs 从阶段 3 起每日跑；每请求摘要日志在写第一个 v4 op 前先落地 |
-| Backend API 返工 | 阶段 1 第 1 周接口评审为硬关口（两张映射表逐项勾选归档）；此后改动走 5.10 规则 |
-| open_by_handle_at 特权依赖 | 降级模式与主路径同期实现（阶段 1），容器 capability 配置写入部署文档 |
-| io_uring 内核差异 | epoll 兜底纳入 CI 矩阵；statx/copy_file_range 的 uring 支持运行时探测，探测结果进启动日志 |
-| 验收环境成本 | 阶段 1 即搭好 VM 验收脚本框架（mount/cthon/fsx 一键），后续阶段复用 |
+| 风险 | 执行动作 | 落实 |
+|------|---------|------|
+| 自研 runtime 正确性 | 阶段 0 独立交付、fake ring 先行、三层基准阈值进 CI 门禁；阶段 1 前不动协议代码 | ✅ 2.5/2.4；`bench_gate.sh` 每 PR |
+| v4 状态机复杂度失控 | 严格按 nfsv4/11.4 骨架清单裁剪，超出清单的 op 一律 NOTSUPP；pynfs 从阶段 3 起每日跑；每请求摘要日志在写第一个 v4 op 前先落地 | ✅ NOTSUPP/OP_ILLEGAL 纪律在 exec_op；pynfs 入 nightly `conformance-overnight`；摘要日志（08 §8.2 格式）补齐于 2026-08-23（迟于"第一个 v4 op"，见 10.1） |
+| Backend API 返工 | 阶段 1 第 1 周接口评审为硬关口（两张映射表逐项勾选归档）；此后改动走 5.10 规则 | ✅ `docs/backend-api-review.md`；05 分册 §5.10 |
+| open_by_handle_at 特权依赖 | 降级模式与主路径同期实现（阶段 1），容器 capability 配置写入部署文档 | ✅ 3.2；`docs/deployment.md`（CAP_DAC_READ_SEARCH/setcap/句柄稳定性注意事项） |
+| io_uring 内核差异 | epoll 兜底纳入 CI 矩阵；statx/copy_file_range 的 uring 支持运行时探测，探测结果进启动日志 | ✅ CI `gcc-release-epoll`；uring 建环时逐 opcode 探测（statx 等 10 个），缺失则 auto 回退 epoll、结果进启动日志（2026-08-23）；copy_file_range 非 uring op，走 per-export v4.2 能力启动日志 + 运行时 pread/pwrite 兜底 |
+| 验收环境成本 | 阶段 1 即搭好 VM 验收脚本框架（mount/cthon/fsx 一键），后续阶段复用 | ✅ `accept_m1..m6_{local,vm}.sh` 全套 |
+
+### 10.1 风险动作补齐记录（2026-08-23）
+
+核查发现两项动作未落地，本次补齐：
+
+- **v4 每请求摘要日志**（08 §8.2）：`Engine::compound` 出口统一打
+  `v4 xid=… peer=… tag="…" minor=… ops=n/[SEQUENCE,…] st=… dur=…us`（debug 级，
+  关闭时零收集开销）；replay 命中另有一行。错误应答采样环（`lightnfs-ctl dump-errors`）
+  由 v3 专用扩展为 v3/v4 共用（按名字记录失败过程/op）。配套补了 `[server] log_level`
+  配置项（此前服务端无法开 debug 级）。
+- **uring opcode 启动探测**：`UringRing::create` 以 `io_uring_get_probe_ring` 校验全部
+  在用 opcode（read/write/writev/recv/accept/openat/close/fsync/statx/cancel），缺失时
+  WARN 列明并返回 ENOSYS——`ring="auto"` 由此干净回退 epoll，不再等到请求期 EINVAL；
+  探测结果进启动 INFO 日志。
 
 ---
 

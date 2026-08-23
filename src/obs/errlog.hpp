@@ -8,7 +8,9 @@
 
 namespace lnfs::obs {
 
-void record_error_reply(std::string_view peer, uint32_t proc, uint32_t xid,
+// `what` names the failing procedure/operation (e.g. "GETATTR", "OPEN"); the caller
+// resolves it so both the v3 and v4 engines can share the ring.
+void record_error_reply(std::string_view peer, std::string_view what, uint32_t xid,
                         uint32_t status);
 std::string dump_error_replies();
 

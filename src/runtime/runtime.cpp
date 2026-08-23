@@ -38,6 +38,9 @@ Runtime::Runtime(Config cfg) {
   for (auto& r : reactors_) r->set_offload_pool(offload_.get());
   LNFS_INFO("runtime: {} reactors, ring={}, offload_threads={}", reactors_.size(), ring_kind_,
             cfg.offload_threads);
+  if (ring_kind_ == "uring")
+    LNFS_INFO("uring probe: required opcodes supported "
+              "(read/write/writev/recv/accept/openat/close/fsync/statx/cancel)");
 }
 
 Runtime::~Runtime() { stop_and_join(); }

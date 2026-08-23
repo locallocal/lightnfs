@@ -1,6 +1,7 @@
 #include <string>
 
 #include "mini_test.hpp"
+#include "obs/errlog.hpp"
 #include "util/flags.hpp"
 #include "util/result.hpp"
 #include "util/small_vec.hpp"
@@ -81,4 +82,25 @@ TEST(SmallVec, CopySemantics) {
   EXPECT_EQ(w.size(), 10u);
   EXPECT_EQ(w[9], 9);
   EXPECT_EQ(v[9], 9);
+}
+
+// Error-reply sampling ring (design 08 §8.2): shared by the v3 and v4 engines, so the
+// `what` column is a caller-resolved name rather than a v3 procedure number.
+TEST(ErrLog, RecordAndDump) {
+  obs::record_error_reply("127.0.0.1:1024", "GETATTR", 0x1234, 70);
+  obs::record_error_reply("127.0.0.1:1024", "OPEN", 0x1235, 10011);
+  auto out = obs::dump_error_replies();
+  EXPECT_TRUE(out.find("proc=GETATTR") != std::string::npos);
+  EXPECT_TRUE(out.find("proc=OPEN") != std::string::npos);
+  EXPECT_TRUE(out.find("xid=0x1235") != std::string::npos);
+  EXPECT_TRUE(out.find("status=10011") != std::string::npos);
+}
+
+TEST(ErrLog, RingKeepsMostRecent) {
+  for (uint32_t i = 0; i < 100; ++i)
+    obs::record_error_reply("peer", "COMPOUND", 0x9000 + i, 1);
+  auto out = obs::dump_error_replies();
+  EXPECT_TRUE(out.find("xid=0x9063") != std::string::npos);   // newest (i=99)
+  EXPECT_TRUE(out.find("xid=0x9024") != std::string::npos);   // oldest kept (i=36)
+  EXPECT_TRUE(out.find("xid=0x9023") == std::string::npos);   // evicted
 }

@@ -4,14 +4,53 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <cerrno>
+#include <string>
+#include <utility>
+
+#include "util/log.hpp"
 
 namespace lnfs::rt {
+
+namespace {
+
+// Every opcode this ring issues (kernel-differences risk, design 02 §2.3 / plan §10):
+// probed once at ring creation so an old kernel degrades to the epoll fallback at
+// startup instead of failing per-op with EINVAL mid-request.
+constexpr std::pair<int, const char*> kRequiredOps[] = {
+    {IORING_OP_READ, "read"},     {IORING_OP_WRITE, "write"},
+    {IORING_OP_WRITEV, "writev"}, {IORING_OP_RECV, "recv"},
+    {IORING_OP_ACCEPT, "accept"}, {IORING_OP_OPENAT, "openat"},
+    {IORING_OP_CLOSE, "close"},   {IORING_OP_FSYNC, "fsync"},
+    {IORING_OP_STATX, "statx"},   {IORING_OP_ASYNC_CANCEL, "cancel"},
+};
+
+// Empty string = all supported. A null probe (pre-5.6 kernel, no IORING_REGISTER_PROBE)
+// reports everything missing — those kernels predate IORING_OP_READ/STATX anyway.
+std::string missing_opcodes(io_uring* ring) {
+  io_uring_probe* p = io_uring_get_probe_ring(ring);
+  std::string missing;
+  for (auto [op, name] : kRequiredOps) {
+    if (p && io_uring_opcode_supported(p, op)) continue;
+    if (!missing.empty()) missing += ',';
+    missing += name;
+  }
+  if (p) io_uring_free_probe(p);
+  return missing;
+}
+
+}  // namespace
 
 Result<std::unique_ptr<UringRing>> UringRing::create(unsigned entries) {
   auto r = std::unique_ptr<UringRing>(new UringRing());
   int rc = io_uring_queue_init(entries, &r->ring_, 0);
   if (rc < 0) return Err(errno_from_neg(rc));
   r->ring_init_ = true;
+  if (auto missing = missing_opcodes(&r->ring_); !missing.empty()) {
+    LNFS_WARN("io_uring lacks required opcodes: {} (kernel too old for the uring ring)",
+              missing);
+    return Err(errno_from(ENOSYS));
+  }
   r->evfd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (r->evfd_ < 0) return Err(errno_from(errno));
   r->arm_wake();
