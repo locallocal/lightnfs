@@ -13,6 +13,8 @@ namespace lnfs {
 
 template <class T, size_t N>
 class SmallVec {
+  static_assert(N > 0, "inline capacity must be nonzero (cap_ starts at N)");
+
  public:
   SmallVec() = default;
   SmallVec(const SmallVec& o) { append_from(o); }
@@ -81,6 +83,8 @@ class SmallVec {
 
  private:
   void grow(size_t ncap) {
+    if (ncap == 0) ncap = 1;  // unreachable (cap_ >= N >= 1); keeps GCC15 -Warray-bounds
+                              // from assuming a zero-size allocation below
     T* nh = static_cast<T*>(::operator new(ncap * sizeof(T)));
     T* old = data();
     for (size_t i = 0; i < size_; ++i) {

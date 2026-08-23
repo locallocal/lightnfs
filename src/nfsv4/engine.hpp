@@ -47,7 +47,7 @@ class Engine {
   struct Ctx {
     transport::ConnCtx& conn;
     const rpc::Cred& cred;
-    FhBytes cfh, sfh;
+    FhBytes cfh{}, sfh{};
     uint32_t minor = 1;  // 1 or 2; gates the v4.2 opcode range
     bool session = false;
     state::SessionId sessionid{};

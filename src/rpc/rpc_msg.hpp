@@ -47,7 +47,7 @@ struct RpcCall {
   uint32_t prog = 0;
   uint32_t vers = 0;
   uint32_t proc = 0;
-  OpaqueAuth cred, verf;
+  OpaqueAuth cred{}, verf{};
   uint64_t args_hash = 0;  // FNV over the first 256 bytes of args (DRC key component)
   xdr::XdrDec args;        // positioned at the start of procedure arguments
 };

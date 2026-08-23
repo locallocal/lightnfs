@@ -141,10 +141,10 @@ TEST(Loopback, NullAndEcho) {
   ASSERT_TRUE(read_record(fd, rep));
   xdr::XdrDec dec2{std::span<const std::byte>(rep.data(), rep.size())};
   EXPECT_EQ(*dec2.u32(), 2u);
-  dec2.u32();  // REPLY
-  dec2.u32();  // MSG_ACCEPTED
-  dec2.u32();  // verf flavor
-  dec2.u32();  // verf len
+  (void)dec2.u32();  // REPLY
+  (void)dec2.u32();  // MSG_ACCEPTED
+  (void)dec2.u32();  // verf flavor
+  (void)dec2.u32();  // verf len
   EXPECT_EQ(*dec2.u32(), 0u);  // accept stat SUCCESS
   auto echoed = *dec2.opaque(1 << 16);
   EXPECT_STREQ(std::string((const char*)echoed.data(), echoed.size()), "the quick brown fox");

@@ -138,8 +138,8 @@ TEST(Rpc, NullProcSuccess) {
   EXPECT_EQ(rep.xid, 0x1001u);
   EXPECT_EQ(rep.mtype, (uint32_t)kReply);
   EXPECT_EQ(rep.stat, (uint32_t)kMsgAccepted);
-  rep.rest.u32();  // verf flavor
-  rep.rest.u32();  // verf len
+  (void)rep.rest.u32();  // verf flavor
+  (void)rep.rest.u32();  // verf len
   EXPECT_EQ(*rep.rest.u32(), (uint32_t)kSuccess);
 }
 
@@ -153,8 +153,8 @@ TEST(Rpc, EchoWithAuthSys) {
   f.dispatch(make_call(f.pool, 7, kTestProg, 2, 1, 2, 1, body, argbytes));
   auto rep = parse_reply(f.take_reply());
   EXPECT_EQ(rep.stat, (uint32_t)kMsgAccepted);
-  rep.rest.u32();
-  rep.rest.u32();  // verf
+  (void)rep.rest.u32();
+  (void)rep.rest.u32();  // verf
   EXPECT_EQ(*rep.rest.u32(), (uint32_t)kSuccess);
   EXPECT_EQ(*rep.rest.u32(), 1000u);  // uid seen by handler
   auto echoed = *rep.rest.opaque(64);
@@ -176,8 +176,8 @@ TEST(Rpc, ProgUnavail) {
   f.dispatch(make_call(f.pool, 9, 999999, 1, 0));
   auto rep = parse_reply(f.take_reply());
   EXPECT_EQ(rep.stat, (uint32_t)kMsgAccepted);
-  rep.rest.u32();
-  rep.rest.u32();  // verf
+  (void)rep.rest.u32();
+  (void)rep.rest.u32();  // verf
   EXPECT_EQ(*rep.rest.u32(), (uint32_t)kProgUnavail);
 }
 
@@ -185,8 +185,8 @@ TEST(Rpc, ProgMismatchReportsRange) {
   Fixture f;
   f.dispatch(make_call(f.pool, 10, kTestProg, 7, 0));  // vers 7 not in [2,3]
   auto rep = parse_reply(f.take_reply());
-  rep.rest.u32();
-  rep.rest.u32();  // verf
+  (void)rep.rest.u32();
+  (void)rep.rest.u32();  // verf
   EXPECT_EQ(*rep.rest.u32(), (uint32_t)kProgMismatch);
   EXPECT_EQ(*rep.rest.u32(), 2u);
   EXPECT_EQ(*rep.rest.u32(), 3u);
@@ -216,8 +216,8 @@ TEST(Rpc, GarbageArgs) {
   // proc 1 expects an opaque; give it nothing
   f.dispatch(make_call(f.pool, 13, kTestProg, 2, 1));
   auto rep = parse_reply(f.take_reply());
-  rep.rest.u32();
-  rep.rest.u32();  // verf
+  (void)rep.rest.u32();
+  (void)rep.rest.u32();  // verf
   EXPECT_EQ(*rep.rest.u32(), (uint32_t)kGarbageArgs);
 }
 
@@ -225,8 +225,8 @@ TEST(Rpc, HandlerExceptionBecomesSystemErr) {
   Fixture f;
   f.dispatch(make_call(f.pool, 14, kTestProg, 2, 99));
   auto rep = parse_reply(f.take_reply());
-  rep.rest.u32();
-  rep.rest.u32();  // verf
+  (void)rep.rest.u32();
+  (void)rep.rest.u32();  // verf
   EXPECT_EQ(*rep.rest.u32(), (uint32_t)kSystemErr);
 }
 

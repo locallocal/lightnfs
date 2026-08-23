@@ -235,7 +235,7 @@ struct V4Fixture {
     auto reply = parse(compound_raw(session_body(2 + (uint32_t)path.size(), ops.take())));
     if (reply.status != 0) return {};
     expect_op(reply.dec, Op::kSequence, 0);
-    reply.dec.skip(16 + 5 * 4);
+    (void)reply.dec.skip(16 + 5 * 4);
     expect_op(reply.dec, Op::kPutrootfh, 0);
     for (auto name : path) {
       (void)name;
@@ -377,7 +377,7 @@ TEST(Nfs4, PseudoFsCrossingAndAttrs) {
     auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
     if (reply.status != 0) return ~0ull;
     V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-    reply.dec.skip(16 + 5 * 4);
+    (void)reply.dec.skip(16 + 5 * 4);
     V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(reply.dec, Op::kGetattr, 0);
     auto mask = nfsv4::Bitmap::decode(reply.dec);
@@ -420,7 +420,7 @@ TEST(Nfs4, OpenReadCloseAndSpecialStateids) {
   auto reply = f.parse(f.compound_raw(f.session_body(3, ops.take())));
   ASSERT_TRUE(reply.status == 0);
   V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-  reply.dec.skip(16 + 5 * 4);
+  (void)reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(reply.dec, Op::kOpen, 0);
   auto stateid = *nfsv4::Stateid::decode(reply.dec);
@@ -448,7 +448,7 @@ TEST(Nfs4, OpenReadCloseAndSpecialStateids) {
   auto ok = read_with(stateid);
   ASSERT_TRUE(ok.status == 0);
   V4Fixture::expect_op(ok.dec, Op::kSequence, 0);
-  ok.dec.skip(16 + 5 * 4);
+  (void)ok.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(ok.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(ok.dec, Op::kRead, 0);
   EXPECT_TRUE(*ok.dec.boolean());  // eof
@@ -512,7 +512,7 @@ TEST(Nfs4, ReaddirPaginatesWithinBudget) {
     auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
     ASSERT_TRUE(reply.status == 0);
     V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-    reply.dec.skip(16 + 5 * 4);
+    (void)reply.dec.skip(16 + 5 * 4);
     V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(reply.dec, Op::kReaddir, 0);
     (void)reply.dec.opaque_fixed(8);
@@ -608,7 +608,7 @@ OpenRes do_open(V4Fixture& f, const std::vector<std::byte>& dir_fh, std::string_
   out.status = reply.status;
   if (reply.status != 0) return out;
   V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-  reply.dec.skip(16 + 5 * 4);
+  (void)reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(reply.dec, Op::kOpen, 0);
   out.stateid = *nfsv4::Stateid::decode(reply.dec);
@@ -645,7 +645,7 @@ uint32_t do_write(V4Fixture& f, const std::vector<std::byte>& fh, const nfsv4::S
   auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
   if (reply.status != 0) return reply.status;
   V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-  reply.dec.skip(16 + 5 * 4);
+  (void)reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(reply.dec, Op::kWrite, 0);
   uint32_t n = *reply.dec.u32();
@@ -671,7 +671,7 @@ std::string do_read(V4Fixture& f, const std::vector<std::byte>& fh, const nfsv4:
   if (status) *status = reply.status;
   if (reply.status != 0) return {};
   V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-  reply.dec.skip(16 + 5 * 4);
+  (void)reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(reply.dec, Op::kRead, 0);
   (void)reply.dec.boolean();
@@ -701,7 +701,7 @@ uint64_t file_size(V4Fixture& f, const std::vector<std::byte>& fh) {
   auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
   if (reply.status != 0) return ~0ull;
   V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-  reply.dec.skip(16 + 5 * 4);
+  (void)reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(reply.dec, Op::kGetattr, 0);
   (void)nfsv4::Bitmap::decode(reply.dec);
@@ -775,7 +775,7 @@ TEST(Nfs4, OpenCreateWriteCommitReadback) {
   auto cr = f.parse(f.compound_raw(f.session_body(2, c.take())));
   ASSERT_TRUE(cr.status == 0);
   V4Fixture::expect_op(cr.dec, Op::kSequence, 0);
-  cr.dec.skip(16 + 5 * 4);
+  (void)cr.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(cr.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(cr.dec, Op::kCommit, 0);
   auto verf = *cr.dec.opaque_fixed(8);
@@ -879,7 +879,7 @@ TEST(Nfs4, ShareDenyDowngradeAndLocked) {
   auto dr = f.parse(f.compound_raw(f.session_body(2, dg.take())));
   ASSERT_TRUE(dr.status == 0);
   V4Fixture::expect_op(dr.dec, Op::kSequence, 0);
-  dr.dec.skip(16 + 5 * 4);
+  (void)dr.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(dr.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(dr.dec, Op::kOpenDowngrade, 0);
   auto downgraded = *nfsv4::Stateid::decode(dr.dec);
@@ -915,7 +915,7 @@ TEST(Nfs4, SetattrSizeModeOwner) {
   auto r1 = setattr(o.stateid, [&](xdr::XdrEnc& e) { fattr_mode(e, f.pool, 0600, 5); });
   ASSERT_TRUE(r1.status == 0);
   V4Fixture::expect_op(r1.reply.dec, Op::kSequence, 0);
-  r1.reply.dec.skip(16 + 5 * 4);
+  (void)r1.reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(r1.reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(r1.reply.dec, Op::kSetattr, 0);
   auto set = *nfsv4::Bitmap::decode(r1.reply.dec);
@@ -1177,7 +1177,7 @@ TEST(Nfs4, CurrentStateidAndReclaimCompleteGate) {
   auto reply = f.parse(f.compound_raw(f.session_body(7, ops.take())));
   ASSERT_TRUE(reply.status == 0);
   V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-  reply.dec.skip(16 + 5 * 4);
+  (void)reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(reply.dec, Op::kOpen, 0);
   (void)nfsv4::Stateid::decode(reply.dec);
@@ -1252,7 +1252,7 @@ TEST(Nfs4, LockOpsAndSecinfo) {
   auto r1 = lock_op(2, 0, 100, true, o.stateid, "lo-1");  // WRITE_LT
   ASSERT_TRUE(r1.status == 0);
   V4Fixture::expect_op(r1.dec, Op::kSequence, 0);
-  r1.dec.skip(16 + 5 * 4);
+  (void)r1.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(r1.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(r1.dec, Op::kLock, 0);
   auto lsid = *nfsv4::Stateid::decode(r1.dec);
@@ -1261,7 +1261,7 @@ TEST(Nfs4, LockOpsAndSecinfo) {
   auto r2 = lock_op(1, 50, 10, true, o.stateid, "lo-2");
   EXPECT_EQ(r2.status, stv(Status::kDenied));
   V4Fixture::expect_op(r2.dec, Op::kSequence, 0);
-  r2.dec.skip(16 + 5 * 4);
+  (void)r2.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(r2.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(r2.dec, Op::kLock, stv(Status::kDenied));
   EXPECT_EQ(*r2.dec.u64(), 0u);
@@ -1332,7 +1332,7 @@ TEST(Nfs4, LockOpsAndSecinfo) {
     auto r = f.parse(f.compound_raw(f.session_body(2, ops.take())));
     ASSERT_TRUE(r.status == 0);
     V4Fixture::expect_op(r.dec, Op::kSequence, 0);
-    r.dec.skip(16 + 5 * 4);
+    (void)r.dec.skip(16 + 5 * 4);
     V4Fixture::expect_op(r.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(r.dec, Op::kLocku, 0);
     EXPECT_EQ(nfsv4::Stateid::decode(r.dec)->seqid, 2u);
@@ -1355,7 +1355,7 @@ TEST(Nfs4, LockOpsAndSecinfo) {
   auto s1 = secinfo("hello", false);
   ASSERT_TRUE(s1.status == 0);
   V4Fixture::expect_op(s1.dec, Op::kSequence, 0);
-  s1.dec.skip(16 + 5 * 4);
+  (void)s1.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(s1.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(s1.dec, Op::kSecinfo, 0);
   EXPECT_EQ(*s1.dec.u32(), 1u);
@@ -1387,7 +1387,7 @@ SeekRes do_seek(V4Fixture& f, const std::vector<std::byte>& fh, const nfsv4::Sta
   out.status = reply.status;
   if (reply.status != 0) return out;
   V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-  reply.dec.skip(16 + 5 * 4);
+  (void)reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(reply.dec, Op::kSeek, 0);
   out.eof = *reply.dec.boolean();
@@ -1440,7 +1440,7 @@ CopyRes do_copy(V4Fixture& f, const std::vector<std::byte>& src, const nfsv4::St
   out.status = reply.status;
   if (reply.status != 0) return out;
   V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-  reply.dec.skip(16 + 5 * 4);
+  (void)reply.dec.skip(16 + 5 * 4);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(reply.dec, Op::kSavefh, 0);
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
@@ -1485,7 +1485,7 @@ TEST(Nfs4, MinorversionTwoOpcodeTable) {
     auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
     EXPECT_EQ(reply.status, stv(Status::kOpIllegal));
     V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
-    reply.dec.skip(16 + 5 * 4);
+    (void)reply.dec.skip(16 + 5 * 4);
     V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(reply.dec, Op::kIllegal, stv(Status::kOpIllegal));
   }

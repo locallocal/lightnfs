@@ -75,7 +75,7 @@ inline LoadResult run_load(uint16_t port, int conns, uint64_t per_conn, int pipe
   auto t0 = std::chrono::steady_clock::now();
   std::vector<std::thread> threads;
   for (int c = 0; c < conns; ++c) {
-    threads.emplace_back([&, c] {
+    threads.emplace_back([&] {
       int fd = connect_loopback(port);
       if (fd < 0) return;
       uint64_t sent = 0, recvd = 0;
