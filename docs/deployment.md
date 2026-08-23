@@ -95,4 +95,8 @@ sudo systemctl enable --now lightnfs
   （如 tmpfs）时，句柄不跨重启稳定——生产用 `CAP_DAC_READ_SEARCH` + 内核句柄，或
   `handles="kernel"` 强制（启动即校验，不满足则拒绝启动）。
 - **单机网关**：状态在进程内存 + `state_dir` 名单；不做多网关状态共享（后端原生锁接口
-  `native_locks()` 已定型，留待 Lustre/Gluster 后端切换）。
+  `native_locks()` 已定型，留待 Lustre/Gluster 后端切换）。同一后端目录**不要**同时由
+  多个 lightnfsd 网关导出：即便内核提供原生 change cookie（`Cap::kNativeChange`，需
+  STATX_CHANGE_COOKIE；否则由 ctime 合成、仅本网关内可靠），v4 open/deny/字节锁状态
+  也只存在于各网关进程内、互不可见，旁路写同样绕过它们。多网关一致性需具备原生
+  change/锁下推的集群后端（06 分册）。
