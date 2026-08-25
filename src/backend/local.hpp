@@ -36,6 +36,7 @@ class LocalBackend final : public Backend {
 
   bool stable_handles() const { return caps_.has(Cap::kStableHandles); }
   const std::string& root_path() const { return cfg_.path; }
+  const Config& config() const { return cfg_; }
 
   struct FdCacheStats {
     uint64_t hits = 0, misses = 0, upgrades = 0, evictions = 0;

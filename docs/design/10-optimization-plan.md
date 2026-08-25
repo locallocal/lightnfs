@@ -26,7 +26,7 @@
 
 这些不是优化，是缺陷。建议全部在下一个 patch 版本内修复，且每项补一个针对性测试。
 
-### 1.1 P0：local 后端配置接线 bug——`identity` / `readdir_enrich` 被静默忽略
+### 1.1 P0：local 后端配置接线 bug——`identity` / `readdir_enrich` 被静默忽略 ✅ 已修复
 
 `core/config.cpp:352-362` 对 `backend == "local"` 特判、绕过后端工厂注册表，只读
 `fd_cache` 与 `handles` 两个键；而完整解析 `identity`、`readdir_enrich` 的

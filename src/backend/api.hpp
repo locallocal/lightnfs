@@ -274,6 +274,11 @@ void register_backend(BackendFactory factory);
 const BackendFactory* find_backend(std::string_view name);
 std::vector<std::string> registered_backends();
 
+// Registers the backends compiled into this binary (idempotent). Config loading calls
+// this before find_backend: with lnfs_core linked as a static archive, nothing else
+// guarantees the built-in backends' registrar TUs are pulled into the link.
+void register_builtin_backends();
+
 #define LNFS_BACKEND_CAT_(a, b) a##b
 #define LNFS_BACKEND_CAT(a, b) LNFS_BACKEND_CAT_(a, b)
 #define LNFS_REGISTER_BACKEND(name_literal, make_fn)                                  \

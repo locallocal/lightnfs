@@ -290,6 +290,13 @@ int run_server(const std::string& config_path, bool check_only) {
   auto config = load_validated_config(config_path);
   if (!config) return 1;
   if (check_only) {
+    // Also constructs the backends so per-backend keys ([export.local] identity, ...)
+    // are validated exactly as a real startup would.
+    auto exports = lnfs::core::ExportTable::build(std::move(*config));
+    if (!exports) {
+      LNFS_ERROR("invalid config {}: {}", config_path, lnfs::errno_name(exports.error()));
+      return 1;
+    }
     std::printf("configuration is valid\n");
     return 0;
   }

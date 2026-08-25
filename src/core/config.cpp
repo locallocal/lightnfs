@@ -11,7 +11,7 @@
 #include <set>
 #include <sstream>
 
-#include "backend/local.hpp"
+#include "backend/api.hpp"
 
 namespace lnfs::core {
 namespace {
@@ -321,6 +321,7 @@ Result<Config> load_config(const std::string& path) {
 }
 
 Result<void> validate_config(const Config& config) {
+  backend::register_builtin_backends();
   if (config.exports.empty() || config.server.offload_threads <= 0 ||
       config.server.max_connections <= 0 || config.server.inflight_per_conn <= 0)
     return Err(errno_from(EINVAL));
@@ -333,8 +334,7 @@ Result<void> validate_config(const Config& config) {
     struct stat st {};
     if (stat(exp.path.c_str(), &st) < 0) return Err(errno_from(errno));
     if (!S_ISDIR(st.st_mode)) return Err(errno_from(ENOTDIR));
-    if (!backend::find_backend(exp.backend) && exp.backend != "local")
-      return Err(errno_from(ENODEV));
+    if (!backend::find_backend(exp.backend)) return Err(errno_from(ENODEV));
     if (exp.clients.empty()) return Err(errno_from(EINVAL));
     for (const auto& client : exp.clients)
       if (!Cidr::parse(client)) return Err(errno_from(EINVAL));
@@ -348,23 +348,10 @@ Result<std::unique_ptr<ExportTable>> ExportTable::build(Config config) {
   for (auto& cfg : config.exports) {
     cfg.backend_config.path = cfg.path;
     cfg.backend_config.fsid = cfg.fsid;
-    std::unique_ptr<backend::Backend> made;
-    if (cfg.backend == "local") {
-      backend::LocalBackend::Config local{.path = cfg.path, .fsid = cfg.fsid};
-      if (auto it = cfg.backend_config.values.find("fd_cache"); it != cfg.backend_config.values.end())
-        local.fd_cache = std::stoull(it->second);
-      if (auto it = cfg.backend_config.values.find("handles"); it != cfg.backend_config.values.end()) {
-        if (it->second == "kernel") local.handles = backend::LocalBackend::HandleMode::kKernel;
-        if (it->second == "fallback") local.handles = backend::LocalBackend::HandleMode::kFallback;
-      }
-      auto local_result = backend::LocalBackend::create(std::move(local));
-      if (!local_result) return Err(local_result.error());
-      made = std::move(*local_result);
-    } else {
-      const auto* factory = backend::find_backend(cfg.backend);
-      made = factory ? factory->make(cfg.backend_config) : nullptr;
-      if (!made) return Err(errno_from(ENODEV));
-    }
+    const auto* factory = backend::find_backend(cfg.backend);
+    if (!factory) return Err(errno_from(ENODEV));
+    auto made = factory->make(cfg.backend_config);
+    if (!made) return Err(errno_from(EINVAL));
     LNFS_TRY(table->add(std::move(cfg), std::move(made)));
   }
   return table;

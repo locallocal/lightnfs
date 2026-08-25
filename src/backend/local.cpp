@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +23,7 @@
 
 #include "runtime/io.hpp"
 #include "runtime/offload_pool.hpp"
+#include "util/log.hpp"
 
 namespace lnfs::backend {
 namespace {
@@ -1219,27 +1221,56 @@ rt::Task<Result<uint64_t>> LocalObject::copy_range(OpenCtx sctx, Object& dst, Op
 }
 
 namespace {
+// A mistyped key or value must fail startup, not silently fall back to a default.
 std::unique_ptr<Backend> make_local(const BackendConfig& cfg) {
   LocalBackend::Config local;
   local.path = cfg.path;
   local.fsid = cfg.fsid;
-  if (auto it = cfg.values.find("fd_cache"); it != cfg.values.end())
-    local.fd_cache = std::stoull(it->second);
-  if (auto it = cfg.values.find("handles"); it != cfg.values.end()) {
-    if (it->second == "kernel") local.handles = LocalBackend::HandleMode::kKernel;
-    else if (it->second == "fallback") local.handles = LocalBackend::HandleMode::kFallback;
-  }
-  if (auto it = cfg.values.find("readdir_enrich"); it != cfg.values.end())
-    local.enrich_readdir = it->second != "false";
-  if (auto it = cfg.values.find("identity"); it != cfg.values.end()) {
-    if (it->second == "strict") local.identity = LocalBackend::Identity::kStrict;
-    else if (it->second == "setfsuid") local.identity = LocalBackend::Identity::kSetFsuid;
+  for (const auto& [key, value] : cfg.values) {
+    if (key == "fd_cache") {
+      auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(),
+                                       local.fd_cache);
+      if (ec != std::errc{} || ptr != value.data() + value.size()) {
+        LNFS_ERROR("export {}: bad local backend fd_cache value '{}'", cfg.path, value);
+        return nullptr;
+      }
+    } else if (key == "handles") {
+      if (value == "kernel") local.handles = LocalBackend::HandleMode::kKernel;
+      else if (value == "fallback") local.handles = LocalBackend::HandleMode::kFallback;
+      else if (value != "auto") {
+        LNFS_ERROR("export {}: bad local backend handles value '{}'", cfg.path, value);
+        return nullptr;
+      }
+    } else if (key == "readdir_enrich") {
+      if (value != "true" && value != "false") {
+        LNFS_ERROR("export {}: bad local backend readdir_enrich value '{}'", cfg.path,
+                   value);
+        return nullptr;
+      }
+      local.enrich_readdir = value == "true";
+    } else if (key == "identity") {
+      if (value == "strict") local.identity = LocalBackend::Identity::kStrict;
+      else if (value == "setfsuid") local.identity = LocalBackend::Identity::kSetFsuid;
+      else if (value != "check") {
+        LNFS_ERROR("export {}: bad local backend identity value '{}'", cfg.path, value);
+        return nullptr;
+      }
+    } else {
+      LNFS_ERROR("export {}: unknown local backend key '{}'", cfg.path, key);
+      return nullptr;
+    }
   }
   auto made = LocalBackend::create(std::move(local));
   return made ? std::move(*made) : nullptr;
 }
 }  // namespace
 
-LNFS_REGISTER_BACKEND("local", make_local)
+void register_builtin_backends() {
+  static const bool once = [] {
+    register_backend({"local", kBackendApiVersion, make_local});
+    return true;
+  }();
+  (void)once;
+}
 
 }  // namespace lnfs::backend

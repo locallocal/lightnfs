@@ -280,6 +280,48 @@ fd_cache = 32
   EXPECT_FALSE(core::Cidr::parse("127.0.0.1/99").has_value());
 }
 
+TEST(Core, LocalBackendConfigKeysReachFactory) {
+  char tmpl[] = "/tmp/lnfs-cfgkeys-XXXXXX";
+  ASSERT_TRUE(::mkdtemp(tmpl) != nullptr);
+  std::string dir = tmpl;
+  auto config_text = [&](std::string_view backend_table) {
+    return "[server]\nstate_dir = \"/tmp/lightnfs-test\"\n\n[[export]]\npath = \"" + dir +
+           "\"\nbackend = \"local\"\nfsid = 9\nclients = [\"127.0.0.0/8\"]\n"
+           "[export.local]\n" +
+           std::string(backend_table);
+  };
+
+  // Every documented [export.local] key must reach the backend: the build path used to
+  // special-case "local" and silently drop identity/readdir_enrich.
+  auto parsed = core::parse_config(config_text("handles = \"fallback\"\nfd_cache = 123\n"
+                                               "readdir_enrich = false\nidentity = \"strict\"\n"));
+  ASSERT_TRUE(parsed.has_value());
+  auto table = core::ExportTable::build(std::move(*parsed));
+  ASSERT_TRUE(table.has_value());
+  auto* exp = (*table)->by_fsid(9);
+  ASSERT_TRUE(exp != nullptr);
+  auto* local = dynamic_cast<backend::LocalBackend*>(exp->backend.get());
+  ASSERT_TRUE(local != nullptr);
+  EXPECT_EQ(local->config().fd_cache, 123u);
+  EXPECT_TRUE(local->config().handles == backend::LocalBackend::HandleMode::kFallback);
+  EXPECT_TRUE(local->config().identity == backend::LocalBackend::Identity::kStrict);
+  EXPECT_TRUE(!local->config().enrich_readdir);
+
+  // Bad values and unknown keys fail the build instead of being silently ignored (and a
+  // non-numeric fd_cache must not throw out of ExportTable::build).
+  auto bad_number = core::parse_config(config_text("fd_cache = \"abc\"\n"));
+  ASSERT_TRUE(bad_number.has_value());
+  EXPECT_FALSE(core::ExportTable::build(std::move(*bad_number)).has_value());
+  auto bad_value = core::parse_config(config_text("identity = \"strck\"\n"));
+  ASSERT_TRUE(bad_value.has_value());
+  EXPECT_FALSE(core::ExportTable::build(std::move(*bad_value)).has_value());
+  auto unknown_key = core::parse_config(config_text("bogus = true\n"));
+  ASSERT_TRUE(unknown_key.has_value());
+  EXPECT_FALSE(core::ExportTable::build(std::move(*unknown_key)).has_value());
+
+  std::filesystem::remove_all(dir);
+}
+
 TEST(Core, FileHandleAuthenticatesAndClassifiesFailures) {
   core::ExportTable table;
   core::ExportConfig cfg;
