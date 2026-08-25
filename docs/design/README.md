@@ -17,6 +17,7 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 7. [状态管理](07-state-management.md) —— v3 DRC、v4 clientid/会话/槽表/租约/宽限期、持久化
 8. [配置、可观测性与安全](08-config-observability.md) —— 导出表、日志/指标/追踪、资源限制
 9. [路线图与里程碑](09-roadmap.md) —— 与 v3/v4 调研分册中 M1–M8 的合并计划
+10. [优化与功能规划](10-optimization-plan.md) —— v1 完成后的全量代码审查：待修缺陷、性能优化、可观测性/运维缺口、v1.x→v2 功能规划
 
 ## 一页纸架构
 
