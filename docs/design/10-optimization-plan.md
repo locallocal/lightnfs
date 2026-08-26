@@ -60,7 +60,7 @@
 - 修复：改为侵入式 LRU 链表（同时消掉线性扫描），全在用时至少计数 + 告警；
   参见 §2.4 的整体 fd cache 改造。
 
-### 1.4 P0：io_uring 提交路径的两个健壮性缺陷
+### 1.4 P0：io_uring 提交路径的两个健壮性缺陷 ✅ 已修复
 
 - `io_uring_submit()` 返回值三处全部被丢弃（`runtime/uring_ring.cpp:57、69、141`）。
   CQ overflow 时 submit 返回 `-EBUSY`，SQE 静默不提交，等待的协程**永久挂起**且无日志。

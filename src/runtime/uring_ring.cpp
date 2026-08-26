@@ -3,8 +3,8 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
-#include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <string>
 #include <utility>
 
@@ -54,7 +54,8 @@ Result<std::unique_ptr<UringRing>> UringRing::create(unsigned entries) {
   r->evfd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (r->evfd_ < 0) return Err(errno_from(errno));
   r->arm_wake();
-  io_uring_submit(&r->ring_);
+  if (int submitted = io_uring_submit(&r->ring_); submitted < 0)
+    return Err(errno_from_neg(submitted));
   return r;
 }
 
@@ -63,13 +64,38 @@ UringRing::~UringRing() {
   if (evfd_ >= 0) close(evfd_);
 }
 
+int UringRing::submit_all() {
+  int rc = io_uring_submit(&ring_);
+  if (rc < 0) {
+    // -EBUSY is CQ-overflow backpressure: the kernel wants CQ room before accepting
+    // more SQEs. The old code dropped this return entirely, so the unsubmitted ops
+    // stranded their coroutines forever with no log (plan doc 10 §1.4).
+    uint64_t n = ++submit_failures_;
+    if ((n & (n - 1)) == 0)
+      LNFS_WARN("io_uring_submit failed: errno={} ({} failures total, {} SQEs queued "
+                "for retry)",
+                -rc, n, io_uring_sq_ready(&ring_));
+  }
+  return rc;
+}
+
 io_uring_sqe* UringRing::get_sqe() {
   io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-  if (!sqe) {
-    io_uring_submit(&ring_);
+  // SQ exhausted: flush queued SQEs to recycle slots. Under -EBUSY the flush itself is
+  // refused until the CQ drains, so pull kernel-side overflow into the CQ ring and
+  // park ready completions in the backlog (served by the next wait()). NDEBUG builds
+  // used to hand the null slot straight to io_uring_prep_* (plan doc 10 §1.4).
+  for (int attempt = 0; !sqe && attempt < 64; ++attempt) {
+    if (submit_all() < 0) {
+      (void)io_uring_get_events(&ring_);
+      park_ready();
+    }
     sqe = io_uring_get_sqe(&ring_);
   }
-  assert(sqe && "SQ ring exhausted even after submit");
+  if (!sqe) {
+    LNFS_ERROR("io_uring SQ still exhausted after 64 submit/park rounds; aborting");
+    std::abort();
+  }
   return sqe;
 }
 
@@ -136,11 +162,57 @@ void UringRing::prep_cancel_fd(OpHandle* op, int fd) {
   io_uring_sqe_set_data(sqe, op);
 }
 
+size_t UringRing::reap_ready(std::span<Completion> out) {
+  size_t n = 0;
+  unsigned head = 0;
+  unsigned consumed = 0;
+  io_uring_cqe* cqe;
+  io_uring_for_each_cqe(&ring_, head, cqe) {
+    if (n == out.size()) break;
+    uint64_t ud = cqe->user_data;
+    if (ud == LIBURING_UDATA_TIMEOUT) {
+      ++consumed;
+      continue;
+    }
+    void* p = io_uring_cqe_get_data(cqe);
+    if (p == &wake_tag_) {
+      ++consumed;
+      wake_rearm_pending_ = true;  // prepped at the top of the next wait()
+      continue;
+    }
+    out[n++] = Completion{static_cast<OpHandle*>(p), cqe->res};
+    ++consumed;
+  }
+  io_uring_cq_advance(&ring_, consumed);
+  return n;
+}
+
+void UringRing::park_ready() {
+  unsigned ready = io_uring_cq_ready(&ring_);
+  if (ready == 0) return;
+  size_t base = backlog_.size();
+  backlog_.resize(base + ready);
+  size_t n = reap_ready(std::span<Completion>(backlog_).subspan(base));
+  backlog_.resize(base + n);
+}
+
 size_t UringRing::wait(std::span<Completion> out,
                        std::optional<std::chrono::nanoseconds> timeout) {
-  io_uring_submit(&ring_);
+  // Completions parked by get_sqe() backpressure relief go out first, in order.
+  size_t n = 0;
+  while (n < out.size() && backlog_head_ < backlog_.size())
+    out[n++] = backlog_[backlog_head_++];
+  if (backlog_head_ == backlog_.size()) {
+    backlog_.clear();
+    backlog_head_ = 0;
+  }
+  if (wake_rearm_pending_) {  // must be armed before this pass may block
+    wake_rearm_pending_ = false;
+    arm_wake();
+  }
+  bool submitted = submit_all() >= 0;
 
-  if (io_uring_cq_ready(&ring_) == 0) {
+  if (n == 0 && io_uring_cq_ready(&ring_) == 0) {
     if (timeout && timeout->count() == 0) {
       // pure poll
     } else {
@@ -156,27 +228,10 @@ size_t UringRing::wait(std::span<Completion> out,
     }
   }
 
-  size_t n = 0;
-  unsigned head = 0;
-  unsigned consumed = 0;
-  io_uring_cqe* cqe;
-  io_uring_for_each_cqe(&ring_, head, cqe) {
-    if (n == out.size()) break;
-    uint64_t ud = cqe->user_data;
-    if (ud == LIBURING_UDATA_TIMEOUT) {
-      ++consumed;
-      continue;
-    }
-    void* p = io_uring_cqe_get_data(cqe);
-    if (p == &wake_tag_) {
-      ++consumed;
-      arm_wake();  // submitted on the next wait()
-      continue;
-    }
-    out[n++] = Completion{static_cast<OpHandle*>(p), cqe->res};
-    ++consumed;
-  }
-  io_uring_cq_advance(&ring_, consumed);
+  n += reap_ready(out.subspan(n));
+  // A refused submit left SQEs queued; the reap above made CQ room, so retry now
+  // instead of stranding those ops until the next prep or pump.
+  if (!submitted) submit_all();
   return n;
 }
 

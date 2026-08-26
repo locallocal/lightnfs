@@ -126,6 +126,45 @@ TEST(UringSmoke, SocketPair) {
   run_socket_scenario(*ring);
 }
 
+// Plan doc 10 §1.4: SQ exhaustion and CQ-overflow backpressure must neither crash nor
+// lose ops. A 4-entry ring gets 256 immediate /dev/null writes prepped back-to-back
+// with no intervening wait(): get_sqe() has to recycle SQ slots by flushing, ride out
+// -EBUSY by parking ready completions, and every op must still complete exactly once.
+TEST(UringSmoke, SqExhaustionAndCqOverflow) {
+  auto made = UringRing::create(4);
+  if (!made) {
+    std::printf("  (io_uring unavailable: errno=%d — skipped)\n", raw(made.error()));
+    return;
+  }
+  auto& ring = **made;
+  int fd = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+  ASSERT_TRUE(fd >= 0);
+  constexpr size_t kOps = 256;
+  std::vector<OpHandle> ops(kOps);
+  const char byte = 'x';
+  std::span<const std::byte> one(reinterpret_cast<const std::byte*>(&byte), 1);
+  for (auto& op : ops) ring.prep_write(&op, fd, one, 0);
+
+  std::vector<int> seen(kOps, 0);
+  size_t total = 0;
+  Completion comps[32];
+  for (int round = 0; total < kOps && round < 1000; ++round) {
+    size_t n = ring.wait(std::span<Completion>(comps),
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::milliseconds(10)));
+    for (size_t i = 0; i < n; ++i) {
+      EXPECT_EQ(comps[i].res, 1);
+      size_t idx = static_cast<size_t>(comps[i].op - ops.data());
+      ASSERT_TRUE(idx < kOps);
+      ++seen[idx];
+      ++total;
+    }
+  }
+  EXPECT_EQ(total, kOps);
+  for (size_t i = 0; i < kOps; ++i) EXPECT_EQ(seen[i], 1);
+  close(fd);
+}
+
 TEST(EpollSmoke, FileIo) {
   EpollRing ring(2);
   run_file_io_scenario(ring);
