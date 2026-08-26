@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -22,6 +23,9 @@ class MemoryBackend final : public Backend {
   rt::Task<Result<ObjPtr>> root() override;
   rt::Task<Result<ObjPtr>> resolve(const ObjId&) override;
   rt::Task<Result<FsStats>> statfs() override;
+
+  // Test observability: how many times resolve() ran (per-COMPOUND cache assertions).
+  uint64_t resolve_calls() const { return resolve_calls_.load(std::memory_order_relaxed); }
 
   Result<ObjId> add_dir(std::string_view path, uint32_t mode = 0755);
   Result<ObjId> add_file(std::string_view path, std::span<const std::byte> data,
@@ -52,6 +56,7 @@ class MemoryBackend final : public Backend {
 
   uint64_t fsid_;
   mutable std::mutex mu_;
+  std::atomic<uint64_t> resolve_calls_{0};
   uint64_t next_id_ = 2;
   uint64_t next_cookie_ = 1;
   int64_t tick_ = 1;

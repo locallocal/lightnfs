@@ -10,6 +10,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -33,10 +34,14 @@ class MpscQueue {
     std::lock_guard lk(mu_);
     q_.push_back(h);
   }
+  // Swaps the queue into `out` (cleared first).  The caller keeps reusing the same
+  // buffer, so the two vectors ping-pong their capacity and steady-state drains never
+  // allocate (plan doc 10 §2.2 — the old local-vector pattern freed the capacity of
+  // both sides every pump).
   void drain(std::vector<std::coroutine_handle<>>& out) {
+    out.clear();
     std::lock_guard lk(mu_);
     out.swap(q_);
-    q_.clear();
   }
   bool empty() {
     std::lock_guard lk(mu_);
@@ -65,7 +70,9 @@ class Reactor {
   void run();
   void stop();  // thread-safe
 
-  // Thread-safe: schedule h to be resumed on this reactor's thread.
+  // Thread-safe: schedule h to be resumed on this reactor's thread.  Calls from this
+  // reactor's own thread take a syscall-free fast path (plan doc 10 §2.2): the handle
+  // goes to a plain local queue instead of the locked MPSC queue + eventfd wake.
   void post(std::coroutine_handle<> h);
 
   RingOps& ring() { return ring_; }
@@ -107,6 +114,10 @@ class Reactor {
   uint64_t timer_seq_ = 0;
 
   MpscQueue remote_;
+  // Same-thread post() targets; drained by pump() with no lock or wake involved.
+  // A deque so handles queued by a resumed handle land behind the current batch.
+  std::deque<std::coroutine_handle<>> local_ready_;
+  std::vector<std::coroutine_handle<>> drain_buf_;  // reused across pumps (see drain())
   std::atomic<bool> stop_{false};
   std::atomic<int64_t> live_tasks_{0};
   int64_t pending_ops_ = 0;

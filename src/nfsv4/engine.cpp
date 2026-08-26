@@ -135,15 +135,21 @@ Engine::FhBytes Engine::export_fh(const core::ExportEntry& exp,
   return handles_.encode(exp, oid);
 }
 
-rt::Task<Result<Engine::Resolved>> Engine::resolve(const FhBytes& fh,
-                                                   const sockaddr_storage& peer) {
-  auto decoded = handles_.decode_v4(fh, peer);
+rt::Task<Result<Engine::Resolved>> Engine::resolve(Ctx& ctx, const FhBytes& fh) {
+  // Per-COMPOUND cache (plan doc 10 §2.1): typical chains (SEQUENCE,PUTFH,GETATTR,...)
+  // resolve the same filehandle once per op.  A filehandle names one object identity
+  // (oids embed inode+generation), so reuse within one compound is sound; staleness
+  // detection is deferred to the next compound at worst.
+  if (ctx.resolved && ctx.resolved_fh == fh) co_return *ctx.resolved;
+  auto decoded = handles_.decode_v4(fh, ctx.conn.peer.addr);
   if (!decoded) co_return Err(decoded.error());
   Resolved out;
   if (decoded->fsid == 0) {
     out.node = pseudo_.resolve(decoded->oid);
     if (!out.node) co_return Err(errno_from(ESTALE));
     out.oid = decoded->oid;
+    ctx.resolved_fh = fh;
+    ctx.resolved = out;
     co_return out;
   }
   out.exp = decoded->exp;
@@ -151,6 +157,8 @@ rt::Task<Result<Engine::Resolved>> Engine::resolve(const FhBytes& fh,
   if (!obj) co_return Err(obj.error());
   out.obj = std::move(*obj);
   out.oid = decoded->oid;
+  ctx.resolved_fh = fh;
+  ctx.resolved = out;
   co_return out;
 }
 
@@ -685,7 +693,7 @@ rt::Task<uint32_t> Engine::op_lookup(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kBadname));
     co_return st(Status::kBadname);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kLookup));
     enc.u32(code);
@@ -736,7 +744,7 @@ rt::Task<uint32_t> Engine::op_lookupp(Ctx& ctx, xdr::XdrEnc& enc) {
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kLookupp));
     enc.u32(code);
@@ -844,7 +852,7 @@ rt::Task<uint32_t> Engine::op_getattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kGetattr));
     enc.u32(code);
@@ -865,7 +873,7 @@ rt::Task<uint32_t> Engine::op_access(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kAccess));
     enc.u32(code);
@@ -917,7 +925,7 @@ rt::Task<uint32_t> Engine::op_readlink(Ctx& ctx, xdr::XdrEnc& enc) {
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kReadlink));
     enc.u32(code);
@@ -954,7 +962,7 @@ rt::Task<uint32_t> Engine::op_read(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kRead));
     enc.u32(code);
@@ -1029,7 +1037,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     enc.u32(st(Status::kBadCookie));
     co_return st(Status::kBadCookie);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kReaddir));
     enc.u32(code);
@@ -1316,7 +1324,7 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   // open_owner4.clientid is ignored in 4.1 (RFC 8881 §18.16.3): the session says who.
   std::string owner_bytes(reinterpret_cast<const char*>(owner->data()), owner->size());
 
-  auto dir = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto dir = co_await resolve(ctx, ctx.cfh);
   if (!dir) {
     uint32_t code = st(core::to_v4(dir.error(), Op::kOpen));
     enc.u32(code);
@@ -1628,7 +1636,7 @@ rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     enc.u32(st(Status::kInval));
     co_return st(Status::kInval);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kWrite));
     enc.u32(code);
@@ -1701,7 +1709,7 @@ rt::Task<uint32_t> Engine::op_commit(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kCommit));
     enc.u32(code);
@@ -1749,7 +1757,7 @@ rt::Task<uint32_t> Engine::op_setattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
   };
   if (decoded != Status::kOk) co_return fail(st(decoded));
   if (ctx.cfh.empty()) co_return fail(st(Status::kNofilehandle));
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) co_return fail(st(core::to_v4(resolved.error(), Op::kSetattr)));
   if (resolved->pseudo()) co_return fail(st(Status::kRofs));
   if (attrs.size) {
@@ -1802,7 +1810,7 @@ rt::Task<uint32_t> Engine::op_verify(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
       co_return st(Status::kAttrnotsupp);
     }
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kGetattr));
     enc.u32(code);
@@ -1890,7 +1898,7 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kInval));
     co_return st(Status::kInval);
   }
-  auto dir = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto dir = co_await resolve(ctx, ctx.cfh);
   if (!dir) {
     uint32_t code = st(core::to_v4(dir.error(), Op::kCreate));
     enc.u32(code);
@@ -1971,7 +1979,7 @@ rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kBadname));
     co_return st(Status::kBadname);
   }
-  auto dir = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto dir = co_await resolve(ctx, ctx.cfh);
   if (!dir) {
     uint32_t code = st(core::to_v4(dir.error(), Op::kRemove));
     enc.u32(code);
@@ -2037,13 +2045,13 @@ rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kBadname));
     co_return st(Status::kBadname);
   }
-  auto from = co_await resolve(ctx.sfh, ctx.conn.peer.addr);
+  auto from = co_await resolve(ctx, ctx.sfh);
   if (!from) {
     uint32_t code = st(core::to_v4(from.error(), Op::kRename));
     enc.u32(code);
     co_return code;
   }
-  auto to = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto to = co_await resolve(ctx, ctx.cfh);
   if (!to) {
     uint32_t code = st(core::to_v4(to.error(), Op::kRename));
     enc.u32(code);
@@ -2114,13 +2122,13 @@ rt::Task<uint32_t> Engine::op_link(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     enc.u32(st(Status::kBadname));
     co_return st(Status::kBadname);
   }
-  auto file = co_await resolve(ctx.sfh, ctx.conn.peer.addr);
+  auto file = co_await resolve(ctx, ctx.sfh);
   if (!file) {
     uint32_t code = st(core::to_v4(file.error(), Op::kLink));
     enc.u32(code);
     co_return code;
   }
-  auto dir = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto dir = co_await resolve(ctx, ctx.cfh);
   if (!dir) {
     uint32_t code = st(core::to_v4(dir.error(), Op::kLink));
     enc.u32(code);
@@ -2185,7 +2193,7 @@ rt::Task<uint32_t> Engine::op_secinfo_no_name(Ctx& ctx, xdr::XdrDec& dec,
     co_return st(Status::kNofilehandle);
   }
   if (*style == 1) {  // SECINFO_STYLE4_PARENT: answer for the parent directory
-    auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+    auto resolved = co_await resolve(ctx, ctx.cfh);
     if (!resolved) {
       uint32_t code = st(core::to_v4(resolved.error(), Op::kSecinfoNoName));
       enc.u32(code);
@@ -2293,7 +2301,7 @@ rt::Task<Result<Engine::Resolved>> Engine::resolve_lock_target(Ctx& ctx, uint32_
     *status = st(Status::kNofilehandle);
     co_return Err(errno_from(EINVAL));
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     *status = st(core::to_v4(resolved.error(), Op::kLock));
     co_return Err(resolved.error());
@@ -2460,7 +2468,7 @@ rt::Task<uint32_t> Engine::op_secinfo(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     enc.u32(st(Status::kBadname));
     co_return st(Status::kBadname);
   }
-  auto resolved = co_await resolve(ctx.cfh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
     uint32_t code = st(core::to_v4(resolved.error(), Op::kSecinfo));
     enc.u32(code);
@@ -2506,7 +2514,7 @@ rt::Task<Result<Engine::Resolved>> Engine::resolve_regular(Ctx& ctx, const FhByt
     *status = st(Status::kNofilehandle);
     co_return Err(errno_from(EINVAL));
   }
-  auto resolved = co_await resolve(fh, ctx.conn.peer.addr);
+  auto resolved = co_await resolve(ctx, fh);
   if (!resolved) {
     *status = st(core::to_v4(resolved.error(), op));
     co_return Err(resolved.error());

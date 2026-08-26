@@ -10,6 +10,8 @@
 // minorversion 0 is permanently rejected (decision D5); unimplemented ops answer
 // NOTSUPP, opcodes beyond the minor version's table answer OP_ILLEGAL.
 
+#include <optional>
+
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
@@ -68,12 +70,16 @@ class Engine {
     bool current_valid = false;
     Stateid saved_sid{};
     bool saved_valid = false;
+    // Per-COMPOUND resolve cache (plan doc 10 §2.1): the last filehandle resolved and
+    // its result, so op chains touching the same CFH resolve it once per compound.
+    FhBytes resolved_fh{};
+    std::optional<Resolved> resolved{};
   };
   // Substitutes the current stateid for its placeholder; BAD_STATEID if none is set.
   static uint32_t resolve_current(const Ctx& ctx, Stateid& sid);
 
   rt::Task<void> compound(transport::ConnCtx&, rpc::RpcCall&, const rpc::Cred&);
-  rt::Task<Result<Resolved>> resolve(const FhBytes& fh, const sockaddr_storage& peer);
+  rt::Task<Result<Resolved>> resolve(Ctx& ctx, const FhBytes& fh);
 
   // Each op encodes {opcode, status, body} into enc and returns the status.
   rt::Task<uint32_t> exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,

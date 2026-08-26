@@ -89,3 +89,29 @@ TEST(FakeRing, CompletionReordering) {
   EXPECT_EQ(done[0], 2);
   EXPECT_EQ(done[1], 1);
 }
+
+// Plan doc 10 §2.2: a post() from the reactor's own thread takes the local queue —
+// no eventfd wake — and still runs promptly, including handles that re-post
+// themselves (queued, not recursively resumed).
+TEST(FakeRing, SameThreadPostRunsWithoutWake) {
+  FakeRing ring;
+  Reactor r(ring);
+  int steps = 0;
+  struct Repost {
+    Reactor* r;
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> h) { r->post(h); }
+    void await_resume() const noexcept {}
+  };
+  spawn(
+      [](int* s, Reactor* rr) -> Task<void> {
+        for (int i = 0; i < 64; ++i) {
+          co_await Repost{rr};
+          ++*s;
+        }
+      }(&steps, &r),
+      r);
+  while (r.poll_once()) {
+  }
+  EXPECT_EQ(steps, 64);
+}

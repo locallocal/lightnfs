@@ -403,3 +403,49 @@ TEST(Backend, LocalFallbackPathTableIsCapped) {
   std::error_code ec;
   std::filesystem::remove_all(path, ec);
 }
+
+// Plan doc 10 §2.1: repeated resolve of the same handle hits the O_PATH cache instead
+// of paying an offload round-trip + open per request; the object stays fully usable.
+TEST(Backend, LocalResolvePathCache) {
+  char path_template[] = "/tmp/lightnfs-pc-XXXXXX";
+  char* path = mkdtemp(path_template);
+  ASSERT_TRUE(path != nullptr);
+  std::string file_path = std::string(path) + "/data";
+  int fd = open(file_path.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+  ASSERT_TRUE(fd >= 0);
+  ASSERT_TRUE(write(fd, "payload", 7) == 7);
+  close(fd);
+  auto made = backend::LocalBackend::create({.path = path, .fsid = 33});
+  ASSERT_TRUE(made.has_value());
+  auto be = std::move(*made);
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2, .ring = "epoll"});
+  runtime.start();
+  {
+    backend::Cred cred{0, 0, {}};
+    auto root = run_runtime(runtime, be->root());
+    ASSERT_TRUE(root.has_value());
+    auto file = run_runtime(runtime, (*root)->lookup(cred, "data"));
+    ASSERT_TRUE(file.has_value());
+    backend::ObjId id = (*file)->id();
+
+    auto first = run_runtime(runtime, be->resolve(id));
+    ASSERT_TRUE(first.has_value());
+    auto before = be->fd_cache_stats();
+    auto second = run_runtime(runtime, be->resolve(id));
+    ASSERT_TRUE(second.has_value());
+    auto after = be->fd_cache_stats();
+    EXPECT_TRUE(after.path_hits > before.path_hits);
+    EXPECT_TRUE(after.path_entries >= 1);
+
+    // The cache-hit object works end to end (statx via the shared O_PATH fd).
+    auto attr = run_runtime(runtime, (*second)->getattr());
+    ASSERT_TRUE(attr.has_value());
+    EXPECT_EQ(attr->size, 7u);
+    // Both objects (shared fd) can be alive and used at once.
+    auto attr1 = run_runtime(runtime, (*first)->getattr());
+    ASSERT_TRUE(attr1.has_value());
+  }
+  runtime.stop_and_join();
+  std::error_code ec;
+  std::filesystem::remove_all(path, ec);
+}
