@@ -40,7 +40,7 @@
   异常穿透 `ExportTable::build`。
 - 回归：加一个"配置键端到端生效"的测试，防止再次出现声明了但接不上的键。
 
-### 1.2 P0：lock stateid 检查中的数据竞争
+### 1.2 P0：lock stateid 检查中的数据竞争 ✅ 已修复
 
 `state/state_mgr.cpp:824` 在 state 分片锁已释放（:810 作用域结束）后读取
 `open.bopen`（父 open state 的 `shared_ptr<backend::Object>`），而并发 CLOSE 走

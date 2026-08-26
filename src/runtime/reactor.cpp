@@ -66,6 +66,12 @@ bool Reactor::pump(std::optional<std::chrono::nanoseconds> block_for) {
 
   run_expired_timers();
 
+  // Handles resumed above can arm new timers; blocking on a timeout computed before
+  // they ran would sleep straight past those deadlines (a post is covered by the ring's
+  // wake fd, but a timer touches nothing the ring can see). Re-clamp to the nearest
+  // deadline as it stands now.
+  if (auto d = next_timer_delay(); d && (!block_for || *d < *block_for)) block_for = *d;
+
   Completion comps[256];
   size_t n = ring_.wait(std::span<Completion>(comps), block_for);
   for (size_t i = 0; i < n; ++i) {
