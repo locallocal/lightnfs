@@ -1,11 +1,13 @@
 #pragma once
 // Management endpoints (design 08 §8.3/8.6, minimal phase-2 versions):
 //  - CtlServer: line-oriented unix-socket admin interface for lightnfs-ctl
-//    (ping / metrics / dump-errors / fdcache / drc / state / expire-client <id>)
+//    (ping / metrics / dump-errors / fdcache / drc / clear-poison / state /
+//    expire-client <id>); owner-only socket, SO_PEERCRED-gated
 //  - MetricsHttp: one-shot HTTP responder serving the Prometheus text exposition
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/config.hpp"
 #include "runtime/cancel.hpp"
@@ -54,18 +56,26 @@ class CtlServer {
 
 class MetricsHttp {
  public:
-  static Result<std::unique_ptr<MetricsHttp>> create(uint16_t port);
+  // Binds to `bind_addr` (IPv4 or IPv6 literal; loopback by default at the config
+  // layer, plan doc 10 §1.8).  `allow` is a CIDR allowlist checked per accepted
+  // connection; empty = no filtering beyond the bind address.
+  static Result<std::unique_ptr<MetricsHttp>> create(uint16_t port,
+                                                     const std::string& bind_addr,
+                                                     std::vector<core::Cidr> allow);
   ~MetricsHttp();
   rt::Task<void> run();
   void request_stop();
   uint16_t port() const { return port_; }
 
  private:
-  MetricsHttp(int fd, uint16_t port) : fd_(fd), port_(port) {}
+  MetricsHttp(int fd, uint16_t port, std::vector<core::Cidr> allow)
+      : fd_(fd), port_(port), allow_(std::move(allow)) {}
   rt::Task<void> serve(int cfd);
+  bool allowed(const sockaddr_storage& peer) const;
 
   int fd_;
   uint16_t port_;
+  std::vector<core::Cidr> allow_;
   rt::CancelSource stop_;
   std::atomic<rt::Reactor*> run_reactor_{nullptr};
 };

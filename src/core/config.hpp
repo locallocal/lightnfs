@@ -47,6 +47,16 @@ struct ServerConfig {
   uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
   std::string ctl_socket;   // default: <state_dir>/ctl.sock; "" resolves at startup
   uint16_t metrics_port = 0;  // 0 = disabled
+  // Metrics exposure (plan doc 10 §1.8): loopback by default; widening the bind and
+  // the CIDR allowlist are both explicit choices.  Empty allowlist = no per-peer
+  // filtering beyond the bind address.
+  std::string metrics_bind = "127.0.0.1";
+  std::vector<std::string> metrics_allow;
+  // NFSv4.1 server identity (RFC 8881 §2.10.4): distinct servers must present
+  // distinct owner/scope or clients will treat them as trunking paths of one server.
+  // Empty = derived from hostname + state_dir at startup.
+  std::string server_owner;
+  std::string server_scope;
   std::string log_level = "info";  // debug enables the per-request summary line (08 §8.2)
 };
 

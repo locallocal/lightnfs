@@ -655,3 +655,75 @@ TEST(StateMgr, LockStateidIoRacesParentClose) {
   watchdog.join();
   runtime.stop_and_join();
 }
+
+// Plan doc 10 §1.5: resource caps answer NFS4ERR_RESOURCE instead of letting a runaway
+// client grow the tables without bound, and the lock-owner resolution table shrinks
+// again when its client goes away.
+TEST(StateMgr, ResourceCapsReturnResource) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  state::StateMgr mgr({.boot_epoch = 9,
+                       .state_dir = dir.path,
+                       .max_clients = 2,
+                       .max_states_per_client = 2,
+                       .max_lock_segments_per_owner = 2});
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(mgr, "cap-a", 1);
+    auto b = co_await connect(mgr, "cap-b", 2);
+    EXPECT_TRUE(a.clientid != 0 && b.clientid != 0);
+
+    // Third distinct client: over max_clients.
+    nfsv4::Verifier verf{};
+    verf[0] = std::byte{3};
+    auto over = co_await mgr.exchange_id("cap-c", verf, "sys/t/0", false);
+    EXPECT_EQ(over.status, st4(nfsv4::Status::kResource));
+    // A re-registration of an existing owner is not a new client and still works.
+    verf[0] = std::byte{1};
+    auto again = co_await mgr.exchange_id("cap-a", verf, "sys/t/0", false);
+    EXPECT_EQ(again.status, kOk);
+
+    // Two opens fill the per-client state cap; the third answers RESOURCE.
+    auto o1 = co_await mgr.open(open_args(a.clientid, 1, "ow", state::kShareRead, 0), nullptr);
+    auto o2 = co_await mgr.open(open_args(a.clientid, 2, "ow", state::kShareRead, 0), nullptr);
+    EXPECT_EQ(o1.status, kOk);
+    EXPECT_EQ(o2.status, kOk);
+    auto o3 = co_await mgr.open(open_args(a.clientid, 3, "ow", state::kShareRead, 0), nullptr);
+    EXPECT_EQ(o3.status, st4(nfsv4::Status::kResource));
+    // The other client is unaffected by a's cap.
+    auto ob = co_await mgr.open(open_args(b.clientid, 3, "ow", state::kShareBoth, 0), nullptr);
+    EXPECT_EQ(ob.status, kOk);
+
+    // Lock segment fragmentation: two disjoint exclusive ranges fill the per-owner
+    // cap on the file; the third answers RESOURCE.
+    state::StateMgr::LockArgs la;
+    la.clientid = b.clientid;
+    la.fsid = 1;
+    la.oid = oid_of(3);
+    la.exclusive = true;
+    la.new_owner = true;
+    la.open_stateid = ob.stateid;
+    la.owner = "lo";
+    la.offset = 0;
+    la.length = 10;
+    auto l1 = co_await mgr.lock(la);
+    EXPECT_EQ(l1.status, kOk);
+    state::StateMgr::LockArgs la2 = la;
+    la2.new_owner = false;
+    la2.lock_stateid = l1.stateid;
+    la2.offset = 20;
+    auto l2 = co_await mgr.lock(la2);
+    EXPECT_EQ(l2.status, kOk);
+    state::StateMgr::LockArgs la3 = la2;
+    la3.lock_stateid = l2.stateid;
+    la3.offset = 40;
+    auto l3 = co_await mgr.lock(la3);
+    EXPECT_EQ(l3.status, st4(nfsv4::Status::kResource));
+
+    // The lock-owner table shrinks with its client (was insert-only).
+    EXPECT_TRUE(mgr.stats().lock_owners >= 1);
+    EXPECT_EQ(co_await mgr.expire_client(b.clientid), kOk);
+    EXPECT_EQ(mgr.stats().lock_owners, 0u);
+  });
+  runtime.stop_and_join();
+}

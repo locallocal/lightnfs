@@ -1,4 +1,5 @@
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <ccmd.h>
 
@@ -155,7 +156,7 @@ struct ProtocolStack {
       : drc({.ttl = std::chrono::milliseconds(cfg.drc_ttl_ms), .max_memory = cfg.drc_mem}),
         nfs3(*core.exports, core.key, locks),
         mount(*core.exports, core.key),
-        pseudofs(*core.exports),
+        pseudofs(*core.exports, core.epoch),
         state({.boot_epoch = core.epoch,
                .state_dir = cfg.state_dir,
                .lease_seconds = cfg.lease_seconds,
@@ -169,9 +170,17 @@ struct ProtocolStack {
 
   // Grace list + COMPOUND engine + the lease scanner coroutine (07 §7.4: expiry →
   // courtesy → conflict/timeout reclaim) on reactor 0.
-  void enable_v4(CoreState& core, lnfs::rt::Runtime& runtime) {
+  void enable_v4(const lnfs::core::ServerConfig& cfg, CoreState& core,
+                 lnfs::rt::Runtime& runtime) {
     state.load_grace_list();
-    nfs4.emplace(*core.exports, core.key, locks, pseudofs, state);
+    // RFC 8881 §2.10.4 identity: default derives from hostname + state_dir so two
+    // distinct lightnfs instances never look like trunking paths of one server.
+    char host[256] = "lightnfs";
+    (void)::gethostname(host, sizeof host - 1);
+    std::string derived = std::string(host) + ":" + cfg.state_dir;
+    nfs4.emplace(*core.exports, core.key, locks, pseudofs, state,
+                 cfg.server_owner.empty() ? derived : cfg.server_owner,
+                 cfg.server_scope.empty() ? derived : cfg.server_scope);
     nfs4->register_with(dispatcher);
     lnfs::rt::spawn(state.run_lease_scanner(&lease_stop), runtime.reactor(0));
   }
@@ -249,12 +258,18 @@ std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
   }
 
   if (cfg.metrics_port != 0) {
-    auto metrics = lnfs::server::MetricsHttp::create(cfg.metrics_port);
+    std::vector<lnfs::core::Cidr> allow;
+    for (const auto& text : cfg.metrics_allow) {
+      auto cidr = lnfs::core::Cidr::parse(text);  // validated at config load
+      if (cidr) allow.push_back(std::move(*cidr));
+    }
+    auto metrics = lnfs::server::MetricsHttp::create(cfg.metrics_port, cfg.metrics_bind,
+                                                     std::move(allow));
     if (metrics) {
       fe.metrics = std::move(*metrics);
       lnfs::rt::spawn(fe.metrics->run(), runtime.reactor(0));
     } else {
-      LNFS_WARN("metrics port {} unavailable", cfg.metrics_port);
+      LNFS_WARN("metrics endpoint {}:{} unavailable", cfg.metrics_bind, cfg.metrics_port);
     }
   }
 
@@ -317,7 +332,7 @@ int run_server(const std::string& config_path, bool check_only) {
   }
 
   ProtocolStack stack(server_cfg, *core);
-  if (server_cfg.enable_v4) stack.enable_v4(*core, runtime);
+  if (server_cfg.enable_v4) stack.enable_v4(server_cfg, *core, runtime);
   register_metrics_providers(stack);
 
   auto frontend = start_frontend(server_cfg, runtime, stack, *core);

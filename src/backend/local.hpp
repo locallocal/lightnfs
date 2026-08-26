@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <list>
 #include <mutex>
 #include <unordered_map>
@@ -22,6 +23,11 @@ class LocalBackend final : public Backend {
     HandleMode handles = HandleMode::kAuto;
     Identity identity = Identity::kCheck;
     bool enrich_readdir = true;
+    // Hard caps on the fallback-mode bookkeeping tables (plan doc 10 §1.5): past the
+    // cap an arbitrary entry is dropped, so an evicted handle resolves to ESTALE and
+    // the client re-lookups.  Fallback handles are already restart-unstable, so this
+    // only trades unbounded memory for bounded staleness.
+    size_t max_fallback_entries = 262144;
   };
 
   static Result<std::unique_ptr<LocalBackend>> create(Config cfg);
@@ -49,6 +55,11 @@ class LocalBackend final : public Backend {
   // every later commit on it keeps failing instead of silently dropping writeback errors.
   void poison(const ObjId& oid);
   bool is_poisoned(const ObjId& oid) const;
+  // Operator override (lightnfs-ctl clear-poison): drops every sticky mark so COMMIT
+  // can succeed again without a restart; returns how many were cleared.
+  size_t clear_poison();
+
+  size_t fallback_path_count() const;  // observability for the §1.5 cap
 
  private:
   friend class LocalObject;
@@ -63,8 +74,12 @@ class LocalBackend final : public Backend {
                                uint32_t max_entries);
   static bool valid_name(std::string_view name, bool allow_dotdot = false);
   // Applies requested ownership to a freshly created object; EPERM from an unprivileged
-  // server process is tolerated (files stay owned by the process user; documented mode).
+  // server process is tolerated (files stay owned by the process user; documented mode)
+  // but counted and warned about (plan doc 10 §1.8) instead of vanishing silently.
   static void apply_created_owner(int fd, const Cred& cred);
+  // Throttled visibility for creation-path chown/chmod failures that must not fail the
+  // operation itself: warns on the 1st, 2nd, 4th, ... occurrence process-wide.
+  static void note_attr_error(const char* op, int err);
   // Runtime probe of the v4.2 capability bits (kSparseOps / kCopyRange / kCloneRange)
   // on the export filesystem; result is logged by the caller at startup.
   void probe_v42_caps();
@@ -78,6 +93,7 @@ class LocalBackend final : public Backend {
 
   std::mutex path_mu_;
   std::unordered_map<ObjId, std::string, ObjIdHash> fallback_paths_;
+  std::atomic<uint64_t> fallback_evictions_{0};
   struct InodeKey {
     uint64_t dev = 0;
     uint64_t ino = 0;

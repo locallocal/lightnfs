@@ -1691,3 +1691,102 @@ TEST(Nfs4, V42CopyAndClone) {
   EXPECT_EQ(do_close(f, dst.fh, dst.stateid), 0u);
   EXPECT_EQ(do_close(f, src.fh, src.stateid), 0u);
 }
+
+// Plan doc 10 §1.6: pseudo node ids derive from the pseudo path, so a filehandle from a
+// previous incarnation resolves to the same directory even after the export set changed
+// — or goes cleanly stale — never silently to a different node. The change attribute
+// follows the boot epoch so client caches revalidate after restart/reconfig.
+TEST(Nfs4, PseudoIdsStableAcrossReconfig) {
+  core::ExportTable ta;
+  {
+    core::ExportConfig c;
+    c.path = "/exports/data";
+    c.fsid = 1;
+    (void)ta.add(c, std::make_unique<backend::MemoryBackend>(1));
+    core::ExportConfig d;
+    d.path = "/other";
+    d.fsid = 2;
+    (void)ta.add(d, std::make_unique<backend::MemoryBackend>(2));
+  }
+  core::PseudoFs a(ta, 7);
+
+  core::ExportTable tb;  // reconfig: /other dropped, a new export inserted first
+  {
+    core::ExportConfig e;
+    e.path = "/exports/new";
+    e.fsid = 3;
+    (void)tb.add(e, std::make_unique<backend::MemoryBackend>(3));
+    core::ExportConfig c;
+    c.path = "/exports/data";
+    c.fsid = 1;
+    (void)tb.add(c, std::make_unique<backend::MemoryBackend>(1));
+  }
+  core::PseudoFs b(tb, 8);
+
+  auto* na = a.for_export(1);
+  auto* nb = b.for_export(1);
+  ASSERT_TRUE(na != nullptr && nb != nullptr);
+  EXPECT_EQ(na->id, nb->id);  // same pseudo path, same id despite different order
+  EXPECT_EQ(a.root()->id, b.root()->id);
+  EXPECT_TRUE(b.resolve(core::PseudoFs::oid_of(*na)) == nb);
+  // The dropped export's node is stale in the new tree, not silently another node.
+  auto* dropped = a.for_export(2);
+  ASSERT_TRUE(dropped != nullptr);
+  EXPECT_TRUE(b.resolve(core::PseudoFs::oid_of(*dropped)) == nullptr);
+  // change follows the boot epoch.
+  EXPECT_EQ(a.attr_of(*na).change, 7u);
+  EXPECT_EQ(b.attr_of(*nb).change, 8u);
+}
+
+// Plan doc 10 §1.7: BIND_CONN_TO_SESSION grants FORE only (no backchannel exists, so
+// granting CDFS4_BACK would contradict CREATE_SESSION's flags), and EXCHANGE_ID
+// presents the configured server identity instead of a hardcoded literal.
+TEST(Nfs4, BindConnGrantsForeOnlyAndConfiguredIdentity) {
+  V4Fixture fx;
+  fx.engine.emplace(fx.exports, fx.handles, fx.locks, *fx.pseudo, *fx.state, "nodeA",
+                    "scopeX");
+  fx.establish_session();
+
+  // BIND_CONN_TO_SESSION asking for CDFC4_BACK: the grant must still be CDFS4_FORE.
+  xdr::XdrEnc body(fx.pool);
+  body.u32(0);  // tag
+  body.u32(fx.minor);
+  body.u32(1);
+  body.u32(static_cast<uint32_t>(Op::kBindConnToSession));
+  body.opaque_fixed(fx.sessionid);
+  body.u32(2);         // CDFC4_BACK
+  body.boolean(false); // no RDMA
+  auto reply = fx.parse(fx.compound_raw(body.take()));
+  ASSERT_TRUE(reply.status == 0);
+  V4Fixture::expect_op(reply.dec, Op::kBindConnToSession, 0);
+  (void)reply.dec.opaque_fixed(16);
+  EXPECT_EQ(*reply.dec.u32(), 1u);  // CDFS4_FORE
+
+  // EXCHANGE_ID reply carries the configured owner/scope.
+  xdr::XdrEnc ex(fx.pool);
+  ex.u32(0);
+  ex.u32(fx.minor);
+  ex.u32(1);
+  ex.u32(static_cast<uint32_t>(Op::kExchangeId));
+  std::array<std::byte, 8> verf{std::byte{9}};
+  ex.opaque_fixed(verf);
+  ex.string("lnfs-test-client");
+  ex.u32(0);
+  ex.u32(0);  // SP4_NONE
+  ex.u32(0);  // impl_id: none
+  auto exr = fx.parse(fx.compound_raw(ex.take()));
+  ASSERT_TRUE(exr.status == 0);
+  V4Fixture::expect_op(exr.dec, Op::kExchangeId, 0);
+  (void)exr.dec.u64();  // clientid
+  (void)exr.dec.u32();  // sequenceid
+  (void)exr.dec.u32();  // flags
+  (void)exr.dec.u32();  // SP4_NONE
+  (void)exr.dec.u64();  // server_owner.minor_id
+  auto owner = exr.dec.opaque(1024);
+  auto scope = exr.dec.opaque(1024);
+  ASSERT_TRUE(owner && scope);
+  EXPECT_STREQ(std::string(reinterpret_cast<const char*>(owner->data()), owner->size()),
+               "nodeA");
+  EXPECT_STREQ(std::string(reinterpret_cast<const char*>(scope->data()), scope->size()),
+               "scopeX");
+}

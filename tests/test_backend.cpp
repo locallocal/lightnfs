@@ -360,3 +360,46 @@ TEST(Core, FileHandleAuthenticatesAndClassifiesFailures) {
   EXPECT_FALSE(forged.has_value());
   EXPECT_EQ((int)forged.error(), (int)Errno::kBadHandle);
 }
+
+// Plan doc 10 §1.5: fallback-mode handle bookkeeping is hard-capped. Enumerating a big
+// tree used to leave one path string per entry forever; past the cap old handles go
+// ESTALE instead of the maps growing without bound.
+TEST(Backend, LocalFallbackPathTableIsCapped) {
+  char path_template[] = "/tmp/lightnfs-cap-XXXXXX";
+  char* path = mkdtemp(path_template);
+  ASSERT_TRUE(path != nullptr);
+  for (int i = 0; i < 12; ++i) {
+    std::string p = std::string(path) + "/f" + std::to_string(i);
+    int fd = open(p.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    ASSERT_TRUE(fd >= 0);
+    close(fd);
+  }
+  backend::LocalBackend::Config cfg{.path = path,
+                                    .fsid = 32,
+                                    .fd_cache = 8,
+                                    .handles = backend::LocalBackend::HandleMode::kFallback,
+                                    .max_fallback_entries = 4};
+  auto made = backend::LocalBackend::create(cfg);
+  ASSERT_TRUE(made.has_value());
+  auto backend = std::move(*made);
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2, .ring = "epoll"});
+  runtime.start();
+  {
+    backend::Cred cred{0, 0, {}};
+    auto root = run_runtime(runtime, backend->root());
+    ASSERT_TRUE(root.has_value());
+    for (int i = 0; i < 12; ++i) {
+      auto file = run_runtime(runtime, (*root)->lookup(cred, "f" + std::to_string(i)));
+      ASSERT_TRUE(file.has_value());
+    }
+    EXPECT_TRUE(backend->fallback_path_count() <= 4);
+    // The most recent handle still resolves; capped-out old ones answer ESTALE.
+    auto last = run_runtime(runtime, (*root)->lookup(cred, "f11"));
+    ASSERT_TRUE(last.has_value());
+    auto resolved = run_runtime(runtime, backend->resolve((*last)->id()));
+    EXPECT_TRUE(resolved.has_value());
+  }
+  runtime.stop_and_join();
+  std::error_code ec;
+  std::filesystem::remove_all(path, ec);
+}

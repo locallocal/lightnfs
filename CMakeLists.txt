@@ -138,6 +138,7 @@ add_executable(lnfs_tests
   tests/test_nfs4.cpp
   tests/test_state.cpp
   tests/test_lock_mgr.cpp
+  tests/test_ctl.cpp
 )
 target_link_libraries(lnfs_tests PRIVATE lnfs_core)
 add_test(NAME lnfs_tests COMMAND lnfs_tests)

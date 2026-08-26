@@ -126,6 +126,11 @@ class StateMgr {
     uint32_t max_cached_reply = 8u << 10;
     uint32_t max_ops = 64;
     uint32_t max_io = 1u << 20;
+    // Resource caps (plan doc 10 §1.5): a runaway client gets NFS4ERR_RESOURCE
+    // instead of growing server state without bound.  0 = unlimited.
+    uint32_t max_clients = 4096;
+    uint32_t max_states_per_client = 65536;      // open + lock stateids per client
+    uint32_t max_lock_segments_per_owner = 1024; // per (lock-owner, file)
   };
 
   explicit StateMgr(Config cfg);
@@ -284,7 +289,7 @@ class StateMgr {
     uint64_t lease_expirations = 0;  // clients that entered courtesy
     uint64_t reclaim_conflict = 0, reclaim_timeout = 0, reclaim_forced = 0;
     uint64_t share_denied = 0, open_merges = 0;
-    size_t lock_states = 0, lock_segments = 0;
+    size_t lock_states = 0, lock_segments = 0, lock_owners = 0;
     uint64_t lock_denied = 0;
     bool grace = false;
     int64_t grace_remaining = 0;
