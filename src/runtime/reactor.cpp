@@ -25,6 +25,14 @@ Reactor::Reactor(RingOps& ring, Options opts) : ring_(ring), opts_(std::move(opt
 Reactor::~Reactor() = default;
 
 void Reactor::post(std::coroutine_handle<> h) {
+  // Same-thread fast path (plan doc 10 §2.2): the hot paths — per-request spawn, every
+  // sync-primitive handoff, the reply write lock — post from the reactor's own thread,
+  // where a locked queue + eventfd write (a real syscall) buys nothing.  Queueing
+  // instead of resuming inline also keeps resume depth bounded.
+  if (current_reactor_or_null() == this) {
+    local_ready_.push_back(h);
+    return;
+  }
   remote_.push(h);
   ring_.wake();
 }
@@ -57,9 +65,17 @@ std::optional<std::chrono::nanoseconds> Reactor::next_timer_delay() {
 bool Reactor::pump(std::optional<std::chrono::nanoseconds> block_for) {
   bool progress = false;
 
-  std::vector<std::coroutine_handle<>> ready;
-  remote_.drain(ready);
-  for (auto h : ready) {
+  remote_.drain(drain_buf_);
+  for (auto h : drain_buf_) {
+    progress = true;
+    h.resume();
+  }
+
+  // Same-thread posts: run the batch queued before this pump; what a resumed handle
+  // posts now runs next round, mirroring how the remote queue snapshots.
+  for (size_t k = local_ready_.size(); k > 0; --k) {
+    auto h = local_ready_.front();
+    local_ready_.pop_front();
     progress = true;
     h.resume();
   }
@@ -71,6 +87,10 @@ bool Reactor::pump(std::optional<std::chrono::nanoseconds> block_for) {
   // wake fd, but a timer touches nothing the ring can see). Re-clamp to the nearest
   // deadline as it stands now.
   if (auto d = next_timer_delay(); d && (!block_for || *d < *block_for)) block_for = *d;
+
+  // Ready local work must never sit behind a blocking wait — nothing wakes the ring
+  // for a same-thread post.
+  if (!local_ready_.empty()) block_for = std::chrono::nanoseconds(0);
 
   Completion comps[256];
   size_t n = ring_.wait(std::span<Completion>(comps), block_for);
@@ -96,7 +116,7 @@ void Reactor::run() {
     while (pump(std::chrono::nanoseconds(0))) {
     }
     if (stop_.load(std::memory_order_acquire) && live_tasks() == 0 && pending_ops_ == 0 &&
-        remote_.empty()) {
+        remote_.empty() && local_ready_.empty()) {
       break;
     }
     pump(next_timer_delay());

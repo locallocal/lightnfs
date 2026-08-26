@@ -48,6 +48,9 @@ class LocalBackend final : public Backend {
     uint64_t hits = 0, misses = 0, upgrades = 0, evictions = 0;
     uint64_t overflows = 0;  // eviction passes that found every entry in use
     size_t entries = 0;
+    // Parallel O_PATH resolve cache (plan doc 10 §2.1).
+    uint64_t path_hits = 0, path_misses = 0;
+    size_t path_entries = 0;
   };
   FdCacheStats fd_cache_stats() const;
 
@@ -64,6 +67,7 @@ class LocalBackend final : public Backend {
  private:
   friend class LocalObject;
   class FdCache;
+  class PathCache;
 
   LocalBackend(Config cfg, int root_fd, int mount_fd);
   Result<ObjId> oid_from_fd(int fd, std::string_view relative, bool remember = true);
@@ -108,6 +112,7 @@ class LocalBackend final : public Backend {
   std::unordered_map<InodeKey, uint32_t, InodeKeyHash> fallback_generations_;
   uint32_t next_fallback_generation_ = 1;
   std::unique_ptr<FdCache> fd_cache_;
+  std::unique_ptr<PathCache> path_cache_;
 
   mutable std::mutex poison_mu_;
   std::unordered_set<ObjId, ObjIdHash> poisoned_;
@@ -154,10 +159,12 @@ class LocalObject final : public Object {
 
  private:
   friend class LocalBackend;
+  // `keeper` non-null: path_fd is borrowed from the resolve cache (plan doc 10 §2.1)
+  // and stays open as long as the keeper lives; null: this object owns and closes it.
   LocalObject(LocalBackend& backend, ObjId id, FType type, int path_fd,
-              std::string relative)
+              std::string relative, std::shared_ptr<void> keeper = nullptr)
       : Object(std::move(id), type), backend_(backend), path_fd_(path_fd),
-        relative_(std::move(relative)) {}
+        relative_(std::move(relative)), keeper_(std::move(keeper)) {}
 
   // Creation-family shared tail: wraps a just-created child as Created{obj, attr}.
   rt::Task<Result<Created>> created_child(std::string_view name);
@@ -170,6 +177,7 @@ class LocalObject final : public Object {
   LocalBackend& backend_;
   int path_fd_ = -1;  // O_PATH|O_NOFOLLOW, safe for statx/lookup.
   std::string relative_;
+  std::shared_ptr<void> keeper_;  // set: path_fd_ belongs to the resolve cache
 };
 
 }  // namespace lnfs::backend

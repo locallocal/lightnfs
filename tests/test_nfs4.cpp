@@ -1790,3 +1790,30 @@ TEST(Nfs4, BindConnGrantsForeOnlyAndConfiguredIdentity) {
   EXPECT_STREQ(std::string(reinterpret_cast<const char*>(scope->data()), scope->size()),
                "scopeX");
 }
+
+// Plan doc 10 §2.1 (engine side): within one COMPOUND, ops touching the same CFH
+// resolve it against the backend once, not once per op.
+TEST(Nfs4, CompoundResolvesSameFhOnce) {
+  V4Fixture fx;
+  fx.establish_session();
+  auto fh = fx.path_fh({"export", "data", "hello"});
+  ASSERT_TRUE(!fh.empty());
+
+  uint64_t before = fx.memory->resolve_calls();
+  xdr::XdrEnc ops(fx.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(fh);
+  nfsv4::Bitmap want;
+  want.set(nfsv4::attr::kSize);
+  for (int i = 0; i < 3; ++i) {
+    ops.u32(static_cast<uint32_t>(Op::kGetattr));
+    want.encode(ops);
+  }
+  auto reply = fx.parse(fx.compound_raw(fx.session_body(4, ops.take())));
+  ASSERT_TRUE(reply.status == 0);
+  V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+  (void)reply.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+  // Three GETATTRs on one CFH: exactly one backend resolve for the whole compound.
+  EXPECT_EQ(fx.memory->resolve_calls() - before, 1u);
+}

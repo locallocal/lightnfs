@@ -117,7 +117,7 @@ boot epoch 令其显式 STALE。同族问题：伪节点 `change` 恒为 1（`ps
 固定开销"。以下按预期收益排序；#1–#4 建议合并为一个"热路径优化"里程碑，用
 `bench fullpath` 与真实挂载的 fio 双重验证。
 
-### 2.1 消除每请求的强制 offload + open：resolve 路径加 O_PATH fd 缓存 ⭐
+### 2.1 消除每请求的强制 offload + open：resolve 路径加 O_PATH fd 缓存 ⭐ ✅ 已完成
 
 `LocalBackend::resolve`（`local.cpp:406-407`）无条件 offload 一次
 `open_oid(O_PATH)`，而引擎在**每个请求/每个 COMPOUND 操作**开头都要 resolve
@@ -129,7 +129,7 @@ READ/WRITE/COMMIT 的数据 fd，resolve 完全没有缓存。这是全服务器
 - 引擎侧：v4 增加 per-COMPOUND 的 `{cfh → Resolved}` 缓存——`SEQUENCE,PUTFH,GETATTR`
   这类典型链目前对同一 CFH 重复 resolve。
 
-### 2.2 runtime 快路径：去掉每请求 3~5 次多余系统调用 ⭐
+### 2.2 runtime 快路径：去掉每请求 3~5 次多余系统调用 ⭐ ✅ 已完成
 
 `Reactor::post`（`runtime/reactor.cpp:27-30`）无条件 `ring_.wake()`（一次真实
 eventfd write），没有"调用方就在本 reactor 线程"的快路径判断——而同线程 post 遍布

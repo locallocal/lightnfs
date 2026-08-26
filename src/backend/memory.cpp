@@ -462,6 +462,7 @@ ObjPtr MemoryBackend::wrap(const std::shared_ptr<Node>& node) {
 rt::Task<Result<ObjPtr>> MemoryBackend::root() { co_return wrap(root_); }
 
 rt::Task<Result<ObjPtr>> MemoryBackend::resolve(const ObjId& oid) {
+  resolve_calls_.fetch_add(1, std::memory_order_relaxed);
   std::lock_guard lock(mu_);
   auto it = objects_.find(oid);
   if (it == objects_.end()) co_return Err(errno_from(ESTALE));

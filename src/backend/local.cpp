@@ -214,7 +214,116 @@ class LocalBackend::FdCache {
   std::atomic<uint64_t> hits_{0}, misses_{0}, upgrades_{0}, evictions_{0}, overflows_{0};
 };
 
-LocalBackend::FdCacheStats LocalBackend::fd_cache_stats() const { return fd_cache_->stats(); }
+// O_PATH resolve cache (plan doc 10 §2.1): the engines resolve the current filehandle
+// at the top of every request / COMPOUND op, and each resolve used to cost an offload
+// round-trip + a full open.  A hit here costs a shard mutex only.  Entries pin their
+// inode until eviction, so a deleted object can stay resolvable slightly longer than
+// strictly fresh — the same bounded-staleness trade the data fd cache already makes.
+class LocalBackend::PathCache {
+ public:
+  struct Entry {
+    Entry(const ObjId& id, int value, FType t) : oid(id), fd(value), type(t) {}
+    ~Entry() {
+      if (fd >= 0) ::close(fd);
+    }
+    ObjId oid;
+    int fd;  // O_PATH|O_NOFOLLOW
+    FType type;
+    Entry* prev = nullptr;  // intrusive LRU, guarded by the shard mutex
+    Entry* next = nullptr;
+  };
+  using Ref = std::shared_ptr<Entry>;
+
+  explicit PathCache(size_t capacity)
+      : per_shard_capacity_(std::max<size_t>((capacity + kShards - 1) / kShards, 1)) {}
+
+  Ref find(const ObjId& oid) {
+    Shard& shard = shards_[ObjIdHash{}(oid) % kShards];
+    std::lock_guard lock(shard.mu);
+    auto it = shard.entries.find(oid);
+    if (it == shard.entries.end()) {
+      misses_.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    touch(shard, it->second.get());
+    hits_.fetch_add(1, std::memory_order_relaxed);
+    return it->second;
+  }
+
+  // Adopts `value` (or the winner of a racing insert).  Same second-chance eviction
+  // pass as the data fd cache; pinned = an object still holds the Ref.
+  Ref insert(const ObjId& oid, Ref value) {
+    Shard& shard = shards_[ObjIdHash{}(oid) % kShards];
+    std::lock_guard lock(shard.mu);
+    auto [it, inserted] = shard.entries.emplace(oid, value);
+    if (inserted) push_back(shard, value.get());
+    else {
+      touch(shard, it->second.get());
+      value = it->second;  // lost the race: adopt the winner, our fd closes
+    }
+    size_t budget = shard.entries.size();
+    while (shard.entries.size() > per_shard_capacity_ && budget-- > 0) {
+      Entry* victim = shard.lru_head;
+      auto vit = shard.entries.find(victim->oid);
+      if (vit->second.use_count() == 1) {
+        unlink(shard, victim);
+        shard.entries.erase(vit);
+      } else {
+        touch(shard, victim);
+      }
+    }
+    return value;
+  }
+
+  uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
+  uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
+  size_t entries() const {
+    size_t n = 0;
+    for (const auto& shard : shards_) {
+      std::lock_guard lock(const_cast<std::mutex&>(shard.mu));
+      n += shard.entries.size();
+    }
+    return n;
+  }
+
+ private:
+  static constexpr size_t kShards = 16;
+  struct Shard {
+    std::mutex mu;
+    std::unordered_map<ObjId, Ref, ObjIdHash> entries;
+    Entry* lru_head = nullptr;
+    Entry* lru_tail = nullptr;
+  };
+
+  static void push_back(Shard& shard, Entry* e) {
+    e->prev = shard.lru_tail;
+    e->next = nullptr;
+    (shard.lru_tail ? shard.lru_tail->next : shard.lru_head) = e;
+    shard.lru_tail = e;
+  }
+  static void unlink(Shard& shard, Entry* e) {
+    (e->prev ? e->prev->next : shard.lru_head) = e->next;
+    (e->next ? e->next->prev : shard.lru_tail) = e->prev;
+    e->prev = e->next = nullptr;
+  }
+  static void touch(Shard& shard, Entry* e) {
+    if (shard.lru_tail == e) return;
+    unlink(shard, e);
+    push_back(shard, e);
+  }
+
+  size_t per_shard_capacity_;
+  std::array<Shard, kShards> shards_;
+  std::atomic<uint64_t> hits_{0}, misses_{0};
+};
+
+LocalBackend::FdCacheStats LocalBackend::fd_cache_stats() const {
+  auto out = fd_cache_->stats();
+  out.path_hits = path_cache_->hits();
+  out.path_misses = path_cache_->misses();
+  out.path_entries = path_cache_->entries();
+  return out;
+}
 
 void LocalBackend::poison(const ObjId& oid) {
   std::lock_guard lock(poison_mu_);
@@ -237,6 +346,7 @@ LocalBackend::LocalBackend(Config cfg, int root_fd, int mount_fd)
     : cfg_(std::move(cfg)), root_fd_(root_fd), mount_fd_(mount_fd) {
   caps_.set(Cap::kSymlink).set(Cap::kHardlink).set(Cap::kMknod);
   fd_cache_ = std::make_unique<FdCache>(*this, cfg_.fd_cache);
+  path_cache_ = std::make_unique<PathCache>(cfg_.fd_cache);  // same knob, parallel cache
   long name = fpathconf(root_fd_, _PC_NAME_MAX);
   long link = fpathconf(root_fd_, _PC_LINK_MAX);
   if (name > 0) limits_.max_name = static_cast<uint32_t>(name);
@@ -481,6 +591,19 @@ rt::Task<Result<ObjPtr>> LocalBackend::root() {
 }
 
 rt::Task<Result<ObjPtr>> LocalBackend::resolve(const ObjId& oid) {
+  // Fast path (plan doc 10 §2.1): reuse a cached O_PATH fd — no offload round-trip,
+  // no open, no fd churn.  The object borrows the fd via the shared entry.
+  if (auto ref = path_cache_->find(oid)) {
+    std::string path = ".";
+    if (!stable_handles()) {
+      std::lock_guard lock(path_mu_);
+      auto it = fallback_paths_.find(oid);
+      if (it == fallback_paths_.end()) co_return Err(errno_from(ESTALE));
+      path = it->second;
+    }
+    co_return std::static_pointer_cast<Object>(std::shared_ptr<LocalObject>(
+        new LocalObject(*this, oid, ref->type, ref->fd, std::move(path), ref)));
+  }
   auto opened = co_await rt::offload([this, oid] { return open_oid(oid, O_PATH | O_NOFOLLOW); });
   if (!opened) co_return Err(opened.error());
   std::string path = ".";
@@ -493,7 +616,17 @@ rt::Task<Result<ObjPtr>> LocalBackend::resolve(const ObjId& oid) {
     }
     path = it->second;
   }
-  co_return object_from_fd(*opened, std::move(path));
+  auto attr = attr_from_fd(*opened);
+  if (!attr) {
+    ::close(*opened);
+    co_return Err(attr.error());
+  }
+  // open_oid already verified identity (kernel handle / fallback oid recompute), so
+  // the object can carry the requested oid directly; the cache adopts the fd.
+  auto ref = path_cache_->insert(oid, std::make_shared<PathCache::Entry>(oid, *opened,
+                                                                        attr->type));
+  co_return std::static_pointer_cast<Object>(std::shared_ptr<LocalObject>(
+      new LocalObject(*this, oid, ref->type, ref->fd, std::move(path), ref)));
 }
 
 rt::Task<Result<FsStats>> LocalBackend::statfs() {
@@ -520,7 +653,8 @@ bool LocalBackend::valid_name(std::string_view name, bool allow_dotdot) {
 }
 
 LocalObject::~LocalObject() {
-  if (path_fd_ >= 0) ::close(path_fd_);
+  // A keeper means the fd belongs to the resolve cache and outlives this object.
+  if (!keeper_ && path_fd_ >= 0) ::close(path_fd_);
 }
 
 rt::Task<Result<Attr>> LocalObject::getattr() {
