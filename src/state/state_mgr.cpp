@@ -821,7 +821,15 @@ rt::Task<StateMgr::IoCheck> StateMgr::check_io(const Stateid& sid, uint64_t clie
   } else if ((open.access & need) == 0) {
     out.status = as_u32(Status::kOpenmode);
   }
-  if (rec.type == StateType::kLock && out.status == 0) out.bopen = open.bopen;
+  if (rec.type == StateType::kLock && out.status == 0) {
+    // The parent open's bopen is only stable under ITS shard lock (hashed by the
+    // parent's `other`, not the lock stateid's): a concurrent CLOSE moves it out
+    // there in unlink_state().  The lock stateid's shard was dropped above, so
+    // reacquiring here keeps the one-lock-at-a-time discipline.
+    StateShard& shard = state_shard(open.other);
+    auto lock = co_await shard.mu.lock();
+    out.bopen = open.bopen;
+  }
   co_return out;
 }
 

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 #include "runtime/io.hpp"
 #include "runtime/runtime.hpp"
@@ -580,5 +581,77 @@ TEST(StateMgr, ByteRangeLocksLifecycle) {
     EXPECT_TRUE(dump.find("lock ") != std::string::npos);
     EXPECT_TRUE(dump.find("[0,10)W") != std::string::npos);
   });
+  runtime.stop_and_join();
+}
+
+// Targeted reproducer for plan doc 10 §1.2: IO through a lock stateid copies the parent
+// open's backend handle, while a concurrent CLOSE of that open moves the handle out
+// under the parent's shard lock — the copy must hold that same lock. The two sides run
+// on different reactors; TSAN builds flag the unlocked copy, and the loop shape keeps
+// each round's copy/move pair genuinely unordered.
+TEST(StateMgr, LockStateidIoRacesParentClose) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 2, .offload_threads = 2});
+  runtime.start();
+  state::StateMgr mgr({.boot_epoch = 5, .state_dir = dir.path});
+  // Hang guard: mini_test has no per-test timeout, and this test's first find was a
+  // reactor stall (stale block timeout vs a timer armed mid-pump), which froze the
+  // whole suite rather than failing.
+  std::atomic<bool> test_done{false};
+  std::thread watchdog([&] {
+    for (int i = 0; i < 600 && !test_done.load(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!test_done.load()) {
+      fprintf(stderr, "LockStateidIoRacesParentClose: no progress in 60s; aborting\n");
+      std::abort();
+    }
+  });
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(mgr, "client-a", 1);
+    for (int round = 0; round < 100; ++round) {
+      auto owner = "own-" + std::to_string(round);
+      auto args = open_args(a.clientid, 1, owner.c_str(), state::kShareBoth, 0);
+      auto o = co_await mgr.open(std::move(args), std::make_shared<backend::OpenState>());
+      EXPECT_EQ(o.status, kOk);
+      state::StateMgr::LockArgs la;
+      la.clientid = a.clientid;
+      la.fsid = 1;
+      la.oid = oid_of(1);
+      la.exclusive = true;
+      la.offset = 0;
+      la.length = 10;
+      la.new_owner = true;
+      la.open_stateid = o.stateid;
+      la.owner = "proc-" + std::to_string(round);
+      auto l = co_await mgr.lock(la);
+      EXPECT_EQ(l.status, kOk);
+
+      std::atomic<bool> closed{false};
+      rt::spawn(
+          [](state::StateMgr* mgr, nfsv4::Stateid sid, uint64_t clientid,
+             std::atomic<bool>* closed) -> rt::Task<void> {
+            nfsv4::Stateid out;
+            co_await mgr->close_state(sid, clientid, &out);
+            closed->store(true, std::memory_order_release);
+          }(&mgr, o.stateid, a.clientid, &closed),
+          runtime.reactor(1));
+      // Hammer the lock stateid until the close cascade unlinks it or the spin budget
+      // runs out; each successful check copies the parent handle. The final copy of a
+      // round is never ordered against the close's move-out, so even when the tight
+      // loop starves the closer until the budget is spent, every round still puts one
+      // unsynchronized copy/move pair in front of TSAN.
+      for (int spin = 0; spin < 200; ++spin) {
+        auto io = co_await mgr.check_io(l.stateid, a.clientid, 1, oid_of(1),
+                                        state::kShareWrite);
+        if (io.status != kOk) break;
+      }
+      while (!closed.load(std::memory_order_acquire))
+        co_await rt::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(mgr.stats().opens, 0u);
+    EXPECT_EQ(mgr.stats().lock_states, 0u);
+  });
+  test_done.store(true);
+  watchdog.join();
   runtime.stop_and_join();
 }
