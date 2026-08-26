@@ -4,20 +4,49 @@
 
 namespace lnfs::core {
 
-PseudoFs::PseudoFs(const ExportTable& exports) {
-  root_.id = next_id_++;
+namespace {
+
+uint64_t fnv64(std::string_view bytes) {
+  uint64_t h = 1469598103934665603ull;
+  for (char c : bytes) {
+    h ^= static_cast<uint8_t>(c);
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+}  // namespace
+
+uint64_t PseudoFs::stable_id(std::string_view path) {
+  // Path-hash ids replace the construction-order counter (plan doc 10 §1.6): the old
+  // scheme made a restart with a changed export set silently re-point old pseudo
+  // filehandles at different nodes.  Collisions are probed away; the probe order is a
+  // theoretical (1-in-2^64) determinism caveat, not a practical one.
+  uint64_t id = fnv64(path);
+  while (id == 0 || by_id_.contains(id)) ++id;
+  return id;
+}
+
+PseudoFs::PseudoFs(const ExportTable& exports, uint64_t boot_epoch)
+    : boot_epoch_(boot_epoch) {
+  root_.id = stable_id("/");
   root_.name = "/";
   by_id_[root_.id] = &root_;
   for (const auto& entry : exports.entries()) {
     Node* cur = &root_;
     std::string_view path = entry->path;
+    std::string full;
     size_t pos = 0;
     while (pos < path.size() && path[pos] == '/') ++pos;
     while (pos < path.size()) {
       size_t slash = path.find('/', pos);
       std::string_view part =
           path.substr(pos, slash == std::string_view::npos ? path.size() - pos : slash - pos);
-      if (!part.empty()) cur = ensure_child(cur, part);
+      if (!part.empty()) {
+        full += '/';
+        full += part;
+        cur = ensure_child(cur, part, full);
+      }
       if (slash == std::string_view::npos) break;
       pos = slash + 1;
     }
@@ -30,11 +59,12 @@ PseudoFs::PseudoFs(const ExportTable& exports) {
   }
 }
 
-PseudoFs::Node* PseudoFs::ensure_child(Node* parent, std::string_view name) {
+PseudoFs::Node* PseudoFs::ensure_child(Node* parent, std::string_view name,
+                                       std::string_view full_path) {
   auto it = parent->children.find(name);
   if (it != parent->children.end()) return it->second.get();
   auto node = std::make_unique<Node>();
-  node->id = next_id_++;
+  node->id = stable_id(full_path);
   node->name = std::string(name);
   node->parent = parent;
   Node* raw = node.get();
@@ -63,7 +93,9 @@ backend::Attr PseudoFs::attr_of(const Node& node) const {
   a.size = 4096;
   a.used = 4096;
   a.fileid = node.id;
-  a.change = 1;  // synthesized tree only changes on restart/reconfig
+  // The synthesized tree only changes on restart/reconfig — which is exactly when the
+  // boot epoch moves, so client caches revalidate then (plan doc 10 §1.6).
+  a.change = boot_epoch_;
   return a;
 }
 

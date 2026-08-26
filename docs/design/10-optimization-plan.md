@@ -67,7 +67,7 @@
 - `get_sqe()`（`uring_ring.cpp:66-74`）在 SQ 耗尽时靠 `assert` 兜底，`NDEBUG` 下
   返回 nullptr 直接被 `io_uring_prep_*` 解引用。
 
-### 1.5 P1：状态资源无上限（DoS 面）
+### 1.5 P1：状态资源无上限（DoS 面） ✅ 已修复
 
 `NFS4ERR_RESOURCE` 已定义（`nfsv4/nfs4_types.hpp:131`）但从未被返回；没有
 max clients / max opens per client / max lock segments 任何限制。失控客户端可无限
@@ -79,7 +79,7 @@ max clients / max opens per client / max lock segments 任何限制。失控客�
 - `poisoned_` 集合只插不删（`local.cpp:170-173`），且无 ctl 命令可清除中毒标记
   ——fsync EIO 后该文件 COMMIT 永久失败，只能重启进程。
 
-### 1.6 P1：伪文件系统 fileid 跨重启不稳定——旧句柄静默指错节点
+### 1.6 P1：伪文件系统 fileid 跨重启不稳定——旧句柄静默指错节点 ✅ 已修复
 
 伪节点 id 是构造时的自增计数器（`core/pseudofs.cpp:9、37`），`oid_of` 直接 memcpy
 该 id（:68-73）。重启后（尤其导出增删后）老的伪 filehandle 会解析到**不同节点**——
@@ -87,7 +87,7 @@ max clients / max opens per client / max lock segments 任何限制。失控客�
 boot epoch 令其显式 STALE。同族问题：伪节点 `change` 恒为 1（`pseudofs.cpp:63`），
 重启/重配后客户端缓存无法失效，应改用 boot epoch。
 
-### 1.7 P1：协议行为不一致与标识问题
+### 1.7 P1：协议行为不一致与标识问题 ✅ 已修复
 
 - `op_bind_conn`（`nfsv4/engine.cpp:3024`）对 `CDFC4_BACK` 请求授予 `CDFS4_BACK`，
   与 CREATE_SESSION 声明的"无 backchannel"（`engine.cpp:2967` flags 恒 0）矛盾。
@@ -99,7 +99,7 @@ boot epoch 令其显式 STALE。同族问题：伪节点 `change` 恒为 1（`ps
 - `state_mgr.cpp:406` 在 shard 锁内做同步 state_dir 文件写入，违反"锁内不做 IO"
   的自述不变式（`state_mgr.hpp:9-13`）；建议移出锁或改为异步落盘。
 
-### 1.8 P1：管理面加固
+### 1.8 P1：管理面加固 ✅ 已修复
 
 - ctl unix socket（`server/ctl.cpp:99-110`）不做 `SO_PEERCRED` 校验、不显式
   `fchmod`，权限取决于 umask，而 `expire-client` 是破坏性操作。协议上只做一次

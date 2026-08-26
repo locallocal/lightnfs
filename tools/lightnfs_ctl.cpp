@@ -3,7 +3,7 @@
 // up its own in-process stack and never touches the socket.
 //
 // Command tree (ccmd, third_party/ccmd):
-//   lightnfs-ctl <ping|metrics|dump-errors|drc|fdcache|state> [--socket=PATH]
+//   lightnfs-ctl <ping|metrics|dump-errors|drc|fdcache|clear-poison|state> [--socket=PATH]
 //   lightnfs-ctl expire-client <clientid> [--socket=PATH]
 //   lightnfs-ctl bench <echo|nullrpc|fullpath> [args...]
 //
@@ -194,6 +194,11 @@ int main(int argc, char** argv) {
                                         "lightnfs-ctl fdcache",
                                         "Per-export fd cache statistics.",
                                         "fd cache statistics"));
+  root->add_subcommand(make_socket_leaf(
+      "clear-poison", "lightnfs-ctl clear-poison", "lightnfs-ctl clear-poison",
+      "Clear sticky fsync-EIO marks on every local export so COMMIT can succeed "
+      "again after the underlying media problem is fixed.",
+      "clear sticky fsync-EIO marks"));
   root->add_subcommand(make_socket_leaf(
       "state", "lightnfs-ctl state", "lightnfs-ctl state",
       "v4 state tables: client/session/open/lock counts plus the table dumps.",

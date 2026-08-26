@@ -1,12 +1,16 @@
 #include "server/ctl.hpp"
 
+#include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <format>
+#include <memory>
 
 #include "backend/local.hpp"
 #include "obs/errlog.hpp"
@@ -61,7 +65,23 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     }
     return out.empty() ? "no local exports\n" : out;
   }
-  return "unknown command (ping|metrics|dump-errors|drc|fdcache|state|expire-client <clientid>)\n";
+  if (command == "clear-poison") {
+    // Sticky fsync-EIO marks (design 06 §6.2) previously survived until restart
+    // (plan doc 10 §1.5); this is the operator's way out after fixing the media.
+    size_t total = 0;
+    bool any = false;
+    if (deps.exports) {
+      for (const auto& entry : deps.exports->entries()) {
+        auto* local = dynamic_cast<backend::LocalBackend*>(entry->backend.get());
+        if (!local) continue;
+        any = true;
+        total += local->clear_poison();
+      }
+    }
+    return any ? std::format("cleared {} poison marks\n", total) : "no local exports\n";
+  }
+  return "unknown command (ping|metrics|dump-errors|drc|fdcache|clear-poison|state|"
+         "expire-client <clientid>)\n";
 }
 
 rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string command) {
@@ -109,6 +129,9 @@ Result<std::unique_ptr<CtlServer>> CtlServer::create(const std::string& socket_p
     ::close(fd);
     return Err(errno_from(e));
   }
+  // Owner-only socket permissions independent of umask (plan doc 10 §1.8); the tiny
+  // bind→chmod window is covered by the SO_PEERCRED gate in serve().
+  (void)::chmod(socket_path.c_str(), 0600);
   return std::unique_ptr<CtlServer>(new CtlServer(fd, socket_path, deps));
 }
 
@@ -124,14 +147,32 @@ void CtlServer::request_stop() {
 }
 
 rt::Task<void> CtlServer::serve(int cfd) {
+  // Only root or the server's own user may issue ctl commands — expire-client is
+  // destructive, and the socket path permissions alone depend on the filesystem
+  // (plan doc 10 §1.8).
+  ucred peer{};
+  socklen_t plen = sizeof peer;
+  if (::getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &peer, &plen) != 0 ||
+      (peer.uid != 0 && peer.uid != ::geteuid())) {
+    co_await send_all(cfd, "permission denied\n");
+    co_await uring_close(cfd);
+    co_return;
+  }
+  // One command per connection, terminated by newline or EOF (lightnfs-ctl shuts down
+  // its write side): loop so a fragmented send is not silently truncated.
+  std::string line;
   std::array<std::byte, 256> buf{};
-  int n = co_await uring_recv(cfd, buf);
-  if (n > 0) {
-    std::string_view line(reinterpret_cast<const char*>(buf.data()),
-                          static_cast<size_t>(n));
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-      line.remove_suffix(1);
-    co_await send_all(cfd, co_await answer_async(deps_, std::string(line)));
+  size_t received = 0;
+  while (line.size() < 4096 && line.find('\n') == std::string::npos) {
+    int n = co_await uring_recv(cfd, buf);
+    if (n <= 0) break;
+    received += static_cast<size_t>(n);
+    line.append(reinterpret_cast<const char*>(buf.data()), static_cast<size_t>(n));
+  }
+  if (received > 0) {
+    if (auto nl = line.find('\n'); nl != std::string::npos) line.resize(nl);
+    while (!line.empty() && line.back() == '\r') line.pop_back();
+    co_await send_all(cfd, co_await answer_async(deps_, std::move(line)));
   }
   co_await uring_close(cfd);
 }
@@ -151,26 +192,43 @@ rt::Task<void> CtlServer::run() {
   }
 }
 
-Result<std::unique_ptr<MetricsHttp>> MetricsHttp::create(uint16_t port) {
-  int fd = ::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+Result<std::unique_ptr<MetricsHttp>> MetricsHttp::create(uint16_t port,
+                                                         const std::string& bind_addr,
+                                                         std::vector<core::Cidr> allow) {
+  // Bind the configured address instead of in6addr_any (plan doc 10 §1.8): the config
+  // default is loopback, so exposing metrics beyond the host is an explicit choice.
+  sockaddr_storage ss{};
+  socklen_t slen = 0;
+  auto* v6 = reinterpret_cast<sockaddr_in6*>(&ss);
+  auto* v4 = reinterpret_cast<sockaddr_in*>(&ss);
+  if (inet_pton(AF_INET6, bind_addr.c_str(), &v6->sin6_addr) == 1) {
+    v6->sin6_family = AF_INET6;
+    v6->sin6_port = htons(port);
+    slen = sizeof(*v6);
+  } else if (inet_pton(AF_INET, bind_addr.c_str(), &v4->sin_addr) == 1) {
+    v4->sin_family = AF_INET;
+    v4->sin_port = htons(port);
+    slen = sizeof(*v4);
+  } else {
+    return Err(errno_from(EINVAL));
+  }
+  int fd = ::socket(ss.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) return Err(errno_from(errno));
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  int zero = 0;
-  setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
-  sockaddr_in6 addr{};
-  addr.sin6_family = AF_INET6;
-  addr.sin6_addr = in6addr_any;
-  addr.sin6_port = htons(port);
-  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 ||
-      ::listen(fd, 64) < 0) {
+  if (ss.ss_family == AF_INET6) {
+    int zero = 0;  // "::" keeps serving mapped v4 peers as before
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
+  }
+  if (::bind(fd, reinterpret_cast<sockaddr*>(&ss), slen) < 0 || ::listen(fd, 64) < 0) {
     int e = errno;
     ::close(fd);
     return Err(errno_from(e));
   }
-  socklen_t alen = sizeof(addr);
-  getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &alen);
-  return std::unique_ptr<MetricsHttp>(new MetricsHttp(fd, ntohs(addr.sin6_port)));
+  socklen_t alen = slen;
+  getsockname(fd, reinterpret_cast<sockaddr*>(&ss), &alen);
+  uint16_t bound = ntohs(ss.ss_family == AF_INET6 ? v6->sin6_port : v4->sin_port);
+  return std::unique_ptr<MetricsHttp>(new MetricsHttp(fd, bound, std::move(allow)));
 }
 
 MetricsHttp::~MetricsHttp() {
@@ -183,9 +241,27 @@ void MetricsHttp::request_stop() {
     spawn([](int fd) -> Task<void> { co_await uring_cancel_fd(fd); }(fd_), *r);
 }
 
+bool MetricsHttp::allowed(const sockaddr_storage& peer) const {
+  if (allow_.empty()) return true;
+  return std::any_of(allow_.begin(), allow_.end(),
+                     [&](const core::Cidr& c) { return c.contains(peer); });
+}
+
 rt::Task<void> MetricsHttp::serve(int cfd) {
-  std::array<std::byte, 1024> buf{};
-  (void)co_await uring_recv(cfd, buf);  // request line + headers, contents ignored
+  // Request line + headers, contents ignored.  A half-open peer used to park this
+  // coroutine forever (plan doc 10 §1.8): bound the read.  The buffer is shared with
+  // the detached recv so a timed-out read can never scribble on a dead frame.
+  auto buf = std::make_shared<std::array<std::byte, 1024>>();
+  auto got = co_await rt::with_timeout(
+      [](int fd, std::shared_ptr<std::array<std::byte, 1024>> b) -> rt::Task<int> {
+        co_return co_await uring_recv(fd, std::span<std::byte>(b->data(), b->size()));
+      }(cfd, buf),
+      std::chrono::seconds(5));
+  if (!got) {
+    co_await uring_cancel_fd(cfd);  // release the parked recv before the fd goes away
+    co_await uring_close(cfd);
+    co_return;
+  }
   std::string body = obs::prometheus_text();
   std::string response = std::format(
       "HTTP/1.0 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n"
@@ -199,13 +275,19 @@ rt::Task<void> MetricsHttp::run() {
   run_reactor_.store(&current_reactor());
   auto token = stop_.token();
   for (;;) {
-    int cfd = co_await uring_accept(fd_, nullptr, nullptr);
+    sockaddr_storage peer{};
+    socklen_t plen = sizeof peer;
+    int cfd = co_await uring_accept(fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
     if (token.cancel_requested()) {
       if (cfd >= 0) ::close(cfd);
       break;
     }
     if (cfd == -EINTR || cfd == -ECANCELED) continue;
     if (cfd < 0) continue;
+    if (!allowed(peer)) {  // CIDR allowlist (plan doc 10 §1.8)
+      ::close(cfd);
+      continue;
+    }
     spawn(serve(cfd), current_reactor());
   }
 }

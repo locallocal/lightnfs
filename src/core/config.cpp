@@ -223,6 +223,14 @@ Result<Config> parse_config(std::string_view text) {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n > 65535) return Err(errno_from(EINVAL));
         config.server.metrics_port = static_cast<uint16_t>(n);
+      } else if (key == "metrics_bind") {
+        config.server.metrics_bind = LNFS_TRY(string_value(value));
+      } else if (key == "metrics_allow") {
+        config.server.metrics_allow = LNFS_TRY(string_array(value));
+      } else if (key == "server_owner") {
+        config.server.server_owner = LNFS_TRY(string_value(value));
+      } else if (key == "server_scope") {
+        config.server.server_scope = LNFS_TRY(string_value(value));
       } else if (key == "max_request_size") {
         uint64_t n = LNFS_TRY(size_value(value));
         if (n > UINT32_MAX) return Err(errno_from(EINVAL));
@@ -325,6 +333,8 @@ Result<void> validate_config(const Config& config) {
   if (config.exports.empty() || config.server.offload_threads <= 0 ||
       config.server.max_connections <= 0 || config.server.inflight_per_conn <= 0)
     return Err(errno_from(EINVAL));
+  for (const auto& cidr : config.server.metrics_allow)
+    if (!Cidr::parse(cidr)) return Err(errno_from(EINVAL));
   std::set<uint32_t> fsids;
   std::set<std::string> paths;
   for (const auto& exp : config.exports) {

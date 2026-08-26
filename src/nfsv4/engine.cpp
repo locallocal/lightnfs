@@ -2890,9 +2890,9 @@ rt::Task<uint32_t> Engine::op_exchange_id(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEn
   enc.u32(0x00010000 | (result.confirmed_r ? kEidConfirmedR : 0));
   enc.u32(0);           // SP4_NONE
   enc.u64(0);           // server_owner.minor_id
-  enc.string("lightnfs");  // server_owner.major_id (stable across restarts)
-  enc.string("lightnfs");  // server_scope
-  enc.u32(0);              // server_impl_id: empty
+  enc.string(server_owner_);  // server_owner.major_id (stable across restarts)
+  enc.string(server_scope_);  // server_scope
+  enc.u32(0);                 // server_impl_id: empty
   co_return st(Status::kOk);
 }
 
@@ -3023,7 +3023,10 @@ rt::Task<uint32_t> Engine::op_bind_conn(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc&
   }
   enc.u32(st(Status::kOk));
   enc.opaque_fixed(id);
-  enc.u32(*dir == 2 ? 2 : 1);  // grant FORE (or BACK when explicitly asked)
+  // No backchannel is implemented (CREATE_SESSION flags are always 0), so granting
+  // CDFS4_BACK would contradict the session's own declaration (plan doc 10 §1.7):
+  // grant FORE unconditionally until a backchannel exists.
+  enc.u32(1);  // CDFS4_FORE
   enc.boolean(false);
   co_return st(Status::kOk);
 }

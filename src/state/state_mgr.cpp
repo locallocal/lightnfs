@@ -265,6 +265,16 @@ rt::Task<StateMgr::ExchangeResult> StateMgr::exchange_id(std::string owner_id,
   if (slot.unconfirmed) {  // always replaced by a fresh registration
     shard.by_id.erase(slot.unconfirmed->clientid);
     client_count_.fetch_sub(1, std::memory_order_relaxed);
+    slot.unconfirmed.reset();
+  }
+  // Client cap (plan doc 10 §1.5): refuse registrations past the limit instead of
+  // letting a churning client id flood grow the tables without bound.
+  if (cfg_.max_clients != 0 &&
+      client_count_.load(std::memory_order_relaxed) >=
+          static_cast<int64_t>(cfg_.max_clients)) {
+    if (!slot.confirmed) shard.by_owner.erase(owner_id);
+    out.status = as_u32(Status::kResource);
+    co_return out;
   }
   auto rec = std::make_shared<ClientRec>();
   rec->clientid = (cfg_.boot_epoch << 32) |
@@ -395,18 +405,24 @@ rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(
 
 rt::Task<void> StateMgr::confirm_create_session(uint64_t clientid,
                                                 std::vector<std::byte> reply) {
+  std::shared_ptr<ClientRec> to_persist;
   for (auto& shard : clients_) {
-    auto lock = co_await shard.mu.lock();
-    auto it = shard.by_id.find(clientid);
-    if (it == shard.by_id.end()) continue;
-    auto& rec = *it->second;
-    rec.cs_cached_reply = std::move(reply);
-    if (!rec.persisted) {
-      rec.persisted = true;
-      persist_client(rec);  // small state_dir write; acceptable under this shard lock
+    {
+      auto lock = co_await shard.mu.lock();
+      auto it = shard.by_id.find(clientid);
+      if (it == shard.by_id.end()) continue;
+      auto& rec = *it->second;
+      rec.cs_cached_reply = std::move(reply);
+      if (!rec.persisted) {
+        rec.persisted = true;  // claimed under the lock; the write happens outside
+        to_persist = it->second;
+      }
     }
-    co_return;
+    break;
   }
+  // open+write+fsync must not run under a shard lock (invariant at the top of
+  // state_mgr.hpp; plan doc 10 §1.7).  owner_id is immutable after registration.
+  if (to_persist) persist_client(*to_persist);
 }
 
 rt::Task<uint32_t> StateMgr::destroy_session(const SessionId& id, uint64_t conn_id) {
@@ -450,6 +466,11 @@ rt::Task<uint32_t> StateMgr::destroy_clientid(uint64_t clientid) {
       courtesy_count_.fetch_sub(1, std::memory_order_relaxed);
     shard.by_id.erase(it);
     client_count_.fetch_sub(1, std::memory_order_relaxed);
+    lock.reset();
+    std::lock_guard g(lock_owner_mu_);
+    std::erase_if(lock_owners_, [&](const auto& kv) {
+      return kv.second.client->clientid == clientid;
+    });
     co_return 0;
   }
   co_return as_u32(Status::kStaleClientid);
@@ -638,10 +659,12 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
   // that never sent RECLAIM_COMPLETE may not create non-reclaim state at all
   // (RFC 8881 §18.51.3), grace or not.
   bool reclaim_done;
+  size_t held_states;
   {
     ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
     auto lock = co_await shard.mu.lock();
     reclaim_done = client->reclaim_complete;
+    held_states = client->states.size();
   }
   if (args.reclaim) {
     if (!in_grace()) {
@@ -658,6 +681,13 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
     }
   } else if (in_grace() || !reclaim_done) {
     out.status = as_u32(Status::kGrace);
+    co_return out;
+  }
+  // Per-client state cap (plan doc 10 §1.5).  Checked before arbitration, so a client
+  // sitting exactly at the cap is refused even a same-owner merge — acceptable for a
+  // limit this size, and it keeps the check outside the file-shard critical section.
+  if (cfg_.max_states_per_client != 0 && held_states >= cfg_.max_states_per_client) {
+    out.status = as_u32(Status::kResource);
     co_return out;
   }
 
@@ -991,10 +1021,12 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
     co_return out;
   }
   bool reclaim_done;
+  size_t held_states;
   {
     ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
     auto lock = co_await shard.mu.lock();
     reclaim_done = client->reclaim_complete;
+    held_states = client->states.size();
   }
   if (args.reclaim) {  // same grace gate as OPEN(CLAIM_PREVIOUS)
     if (!in_grace() || reclaim_done) {
@@ -1080,6 +1112,20 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
   backend::LockOwnerId lowner = make_lowner(args.clientid, owner_bytes);
   FileKey key{args.fsid, args.oid};
   backend::LockRange range{args.offset, args.length};
+
+  // Resource caps (plan doc 10 §1.5): a new lock stateid counts against the client's
+  // state cap, and per-(owner,file) segment fragmentation is bounded so alternating
+  // ranges cannot grow the interval list without limit.
+  if (args.new_owner && cfg_.max_states_per_client != 0 &&
+      held_states >= cfg_.max_states_per_client) {
+    out.status = as_u32(Status::kResource);
+    co_return out;
+  }
+  if (cfg_.max_lock_segments_per_owner != 0 &&
+      locks_.count_owner(key, lowner) >= cfg_.max_lock_segments_per_owner) {
+    out.status = as_u32(Status::kResource);
+    co_return out;
+  }
 
   // Arbitrate; a conflict held by a courtesy client reclaims it first (07 §7.4).
   for (int attempt = 0;; ++attempt) {
@@ -1335,6 +1381,14 @@ rt::Task<uint32_t> StateMgr::expire_client_impl(uint64_t clientid, int reason) {
     shard.cv.notify_all();
   }
   unpersist_client(*client);
+  {
+    // The lock-owner resolution table only ever grew (plan doc 10 §1.5): drop the
+    // reclaimed client's entries so it is bounded by live clients' owners.
+    std::lock_guard g(lock_owner_mu_);
+    std::erase_if(lock_owners_, [&](const auto& kv) {
+      return kv.second.client->clientid == clientid;
+    });
+  }
   switch (reason) {
     case kReasonConflict: reclaim_conflict_.fetch_add(1, std::memory_order_relaxed); break;
     case kReasonTimeout: reclaim_timeout_.fetch_add(1, std::memory_order_relaxed); break;
@@ -1376,6 +1430,10 @@ StateMgr::Stats StateMgr::stats() const {
   out.open_merges = open_merges_.load(std::memory_order_relaxed);
   out.lock_states = nonneg(lock_count_);
   out.lock_segments = locks_.total_segments();
+  {
+    std::lock_guard g(const_cast<std::mutex&>(lock_owner_mu_));
+    out.lock_owners = lock_owners_.size();
+  }
   out.lock_denied = lock_denied_.load(std::memory_order_relaxed);
   out.grace = in_grace();
   out.grace_remaining = grace_remaining_seconds();

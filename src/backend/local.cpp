@@ -226,6 +226,13 @@ bool LocalBackend::is_poisoned(const ObjId& oid) const {
   return poisoned_.contains(oid);
 }
 
+size_t LocalBackend::clear_poison() {
+  std::lock_guard lock(poison_mu_);
+  size_t n = poisoned_.size();
+  poisoned_.clear();
+  return n;
+}
+
 LocalBackend::LocalBackend(Config cfg, int root_fd, int mount_fd)
     : cfg_(std::move(cfg)), root_fd_(root_fd), mount_fd_(mount_fd) {
   caps_.set(Cap::kSymlink).set(Cap::kHardlink).set(Cap::kMknod);
@@ -358,6 +365,9 @@ Result<ObjId> LocalBackend::oid_from_fd(int fd, std::string_view relative, bool 
   } else {
     std::lock_guard lock(generation_mu_);
     InodeKey key{static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino)};
+    if (fallback_generations_.size() >= cfg_.max_fallback_entries &&
+        !fallback_generations_.contains(key))
+      fallback_generations_.erase(fallback_generations_.begin());  // §1.5 hard cap
     auto [it, inserted] = fallback_generations_.try_emplace(key, next_fallback_generation_);
     if (inserted && ++next_fallback_generation_ == 0) ++next_fallback_generation_;
     generation = it->second;
@@ -369,9 +379,26 @@ Result<ObjId> LocalBackend::oid_from_fd(int fd, std::string_view relative, bool 
   auto oid = ObjId::from(encoded);
   if (oid && remember) {
     std::lock_guard lock(path_mu_);
+    if (fallback_paths_.size() >= cfg_.max_fallback_entries &&
+        !fallback_paths_.contains(*oid)) {
+      // §1.5 hard cap: the table only ever grew (readdir enrich on a large tree left
+      // one path string per entry forever).  Dropping an arbitrary victim turns its
+      // handle into ESTALE, which fallback-mode clients already have to survive.
+      fallback_paths_.erase(fallback_paths_.begin());
+      uint64_t n = ++fallback_evictions_;
+      if ((n & (n - 1)) == 0)
+        LNFS_WARN("fallback handle table at cap {}: {} evictions total (old handles "
+                  "go stale early)",
+                  cfg_.max_fallback_entries, n);
+    }
     fallback_paths_[*oid] = relative;
   }
   return oid;
+}
+
+size_t LocalBackend::fallback_path_count() const {
+  std::lock_guard lock(const_cast<std::mutex&>(path_mu_));
+  return fallback_paths_.size();
 }
 
 Result<int> LocalBackend::open_oid(const ObjId& oid, int flags) {
@@ -690,11 +717,20 @@ timespec to_timespec(const Timespec& t) {
 
 }  // namespace
 
+void LocalBackend::note_attr_error(const char* op, int err) {
+  static std::atomic<uint64_t> count{0};
+  uint64_t n = ++count;
+  if ((n & (n - 1)) == 0)
+    LNFS_WARN("created-object {} failed: errno={} ({} occurrences total) — "
+              "ownership/mode of new objects differs from what the client asked",
+              op, err, n);
+}
+
 void LocalBackend::apply_created_owner(int fd, const Cred& cred) {
   if (cred.uid == 0) return;
   // Unprivileged servers cannot chown; created objects stay owned by the process user.
-  if (::fchown(fd, cred.uid, cred.gid) < 0 && errno != EPERM && errno != EINVAL) {
-  }
+  // That degraded mode is documented but no longer silent (plan doc 10 §1.8).
+  if (::fchown(fd, cred.uid, cred.gid) < 0) note_attr_error("fchown", errno);
 }
 
 rt::Task<Result<AccessMask>> LocalObject::access(const Cred& cred, AccessMask want) {
@@ -867,7 +903,8 @@ rt::Task<Result<Created>> LocalObject::create(const Cred& cred, std::string_view
             return Err(errno_from(e));
           }
         } else {
-          (void)::fchmod(fd, mode);  // exact mode regardless of process umask
+          // exact mode regardless of process umask
+          if (::fchmod(fd, mode) < 0) LocalBackend::note_attr_error("fchmod", errno);
           if (attrs.size && ::ftruncate(fd, static_cast<off_t>(*attrs.size)) < 0) {
             int e = errno;
             ::close(fd);
@@ -901,7 +938,7 @@ rt::Task<Result<Created>> LocalObject::mkdir(const Cred& cred, std::string_view 
     if (!created) return created;
     int fd = ::openat(path_fd_, owned.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd >= 0) {
-      (void)::fchmod(fd, mode);
+      if (::fchmod(fd, mode) < 0) LocalBackend::note_attr_error("fchmod", errno);
       LocalBackend::apply_created_owner(fd, cred);
       ::close(fd);
     }
@@ -925,9 +962,8 @@ rt::Task<Result<Created>> LocalObject::symlink(const Cred& cred, std::string_vie
           return Err(errno_from(errno));
         if (cred.uid != 0 &&
             ::fchownat(path_fd_, owned.c_str(), cred.uid, cred.gid,
-                       AT_SYMLINK_NOFOLLOW) < 0 &&
-            errno != EPERM) {
-        }
+                       AT_SYMLINK_NOFOLLOW) < 0)
+          LocalBackend::note_attr_error("fchownat(symlink)", errno);
         return created_child_sync(owned);
       });
 }
@@ -956,9 +992,8 @@ rt::Task<Result<Created>> LocalObject::mknod(const Cred& cred, std::string_view 
           return Err(errno_from(errno));
         if (cred.uid != 0 &&
             ::fchownat(path_fd_, owned.c_str(), cred.uid, cred.gid,
-                       AT_SYMLINK_NOFOLLOW) < 0 &&
-            errno != EPERM) {
-        }
+                       AT_SYMLINK_NOFOLLOW) < 0)
+          LocalBackend::note_attr_error("fchownat(mknod)", errno);
         return created_child_sync(owned);
       });
 }
@@ -1300,6 +1335,15 @@ std::unique_ptr<Backend> make_local(const BackendConfig& cfg) {
       else if (value == "setfsuid") local.identity = LocalBackend::Identity::kSetFsuid;
       else if (value != "check") {
         LNFS_ERROR("export {}: bad local backend identity value '{}'", cfg.path, value);
+        return nullptr;
+      }
+    } else if (key == "max_fallback_entries") {
+      auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(),
+                                       local.max_fallback_entries);
+      if (ec != std::errc{} || ptr != value.data() + value.size() ||
+          local.max_fallback_entries == 0) {
+        LNFS_ERROR("export {}: bad local backend max_fallback_entries value '{}'",
+                   cfg.path, value);
         return nullptr;
       }
     } else {

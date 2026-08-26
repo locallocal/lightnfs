@@ -23,10 +23,16 @@ namespace lnfs::nfsv4 {
 
 class Engine {
  public:
+  // server_owner/server_scope: RFC 8881 §2.10.4 identity presented by EXCHANGE_ID.
+  // Distinct servers must present distinct values or clients treat them as trunking
+  // paths of one server (plan doc 10 §1.7); main derives the default from
+  // hostname + state_dir.  The literal fallback only serves tests.
   Engine(core::ExportTable& exports, core::FileHandleCodec& handles,
-         core::ObjLockRegistry& locks, core::PseudoFs& pseudo, state::StateMgr& state)
+         core::ObjLockRegistry& locks, core::PseudoFs& pseudo, state::StateMgr& state,
+         std::string server_owner = "lightnfs", std::string server_scope = "lightnfs")
       : exports_(exports), handles_(handles), locks_(locks), pseudo_(pseudo),
-        state_(state), write_verf_(core::verifier_from_epoch(state.config().boot_epoch)) {}
+        state_(state), write_verf_(core::verifier_from_epoch(state.config().boot_epoch)),
+        server_owner_(std::move(server_owner)), server_scope_(std::move(server_scope)) {}
 
   void register_with(rpc::Dispatcher& dispatcher);
   rt::Task<void> dispatch(transport::ConnCtx&, rpc::RpcCall&, const rpc::Cred&);
@@ -135,6 +141,7 @@ class Engine {
   core::PseudoFs& pseudo_;
   state::StateMgr& state_;
   core::WriteVerf write_verf_;
+  std::string server_owner_, server_scope_;
 };
 
 }  // namespace lnfs::nfsv4

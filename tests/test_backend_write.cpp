@@ -129,6 +129,12 @@ TEST(BackendWrite, CreateWriteCommitAndSetattr) {
     auto poisoned = run_runtime(runtime, created->obj->commit(open, 0, 0));
     ASSERT_TRUE(!poisoned.has_value());
     EXPECT_EQ(raw(poisoned.error()), EIO);
+    // Operator override (plan doc 10 §1.5): clearing the marks makes COMMIT work
+    // again without a process restart.
+    EXPECT_EQ(be.clear_poison(), 1u);
+    EXPECT_TRUE(!be.is_poisoned(created->obj->id()));
+    auto healed = run_runtime(runtime, created->obj->commit(open, 0, 0));
+    EXPECT_TRUE(healed.has_value());
   }
   runtime.stop_and_join();
 }

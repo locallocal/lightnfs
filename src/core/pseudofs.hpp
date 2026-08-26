@@ -23,7 +23,9 @@ class PseudoFs {
     ExportEntry* exp = nullptr;  // set: this node crosses into that export
   };
 
-  explicit PseudoFs(const ExportTable& exports);
+  // `boot_epoch` feeds the synthesized change attribute so clients revalidate the
+  // pseudo tree after a restart/reconfig (plan doc 10 §1.6).
+  explicit PseudoFs(const ExportTable& exports, uint64_t boot_epoch = 1);
 
   Node* root() { return &root_; }
   Node* find(uint64_t id) const;
@@ -35,12 +37,16 @@ class PseudoFs {
   Node* resolve(const backend::ObjId& oid) const;
 
  private:
-  Node* ensure_child(Node* parent, std::string_view name);
+  Node* ensure_child(Node* parent, std::string_view name, std::string_view full_path);
+  // Node id derived from the node's pseudo path (plan doc 10 §1.6): stable across
+  // restarts and export-set changes, so an old pseudo filehandle either resolves to
+  // the same directory or goes cleanly stale — never silently to a different node.
+  uint64_t stable_id(std::string_view path);
 
   Node root_;
   std::unordered_map<uint64_t, Node*> by_id_;
   std::unordered_map<uint32_t, Node*> by_export_;
-  uint64_t next_id_ = 1;
+  uint64_t boot_epoch_ = 1;
 };
 
 }  // namespace lnfs::core
