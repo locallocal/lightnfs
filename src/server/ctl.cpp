@@ -53,8 +53,10 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
         if (!local) continue;
         auto s = local->fd_cache_stats();
         out += std::format(
-            "export={} hits={} misses={} upgrades={} evictions={} entries={}\n",
-            entry->path, s.hits, s.misses, s.upgrades, s.evictions, s.entries);
+            "export={} hits={} misses={} upgrades={} evictions={} overflows={} "
+            "entries={}\n",
+            entry->path, s.hits, s.misses, s.upgrades, s.evictions, s.overflows,
+            s.entries);
       }
     }
     return out.empty() ? "no local exports\n" : out;

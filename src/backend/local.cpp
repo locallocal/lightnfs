@@ -82,13 +82,18 @@ struct LinuxDirent64 {
 class LocalBackend::FdCache {
  public:
   struct Entry {
-    Entry(int value, int mode) : fd(value), accmode(mode) {}
+    Entry(const ObjId& id, int value, int mode) : oid(id), fd(value), accmode(mode) {}
     ~Entry() {
       if (fd >= 0) ::close(fd);
     }
+    ObjId oid;  // map key copy: lets the LRU walk erase without a reverse lookup
     int fd;
     int accmode;  // O_RDONLY or O_RDWR
-    uint64_t used = 0;
+    // Intrusive LRU links (plan doc 10 §1.3), guarded by the owning shard's mutex.
+    // Dangling once the entry leaves the list (upgrade replacement or eviction), but
+    // nothing touches them afterwards: drained refs only ever read fd/accmode.
+    Entry* prev = nullptr;
+    Entry* next = nullptr;
   };
   using Ref = std::shared_ptr<Entry>;
 
@@ -107,7 +112,7 @@ class LocalBackend::FdCache {
       std::lock_guard lock(shard.mu);
       auto it = shard.entries.find(oid);
       if (it != shard.entries.end() && (!write || it->second->accmode == O_RDWR)) {
-        it->second->used = ++shard.clock;
+        touch(shard, it->second.get());
         hits_.fetch_add(1, std::memory_order_relaxed);
         co_return it->second;
       }
@@ -117,26 +122,21 @@ class LocalBackend::FdCache {
     int flags = write ? O_RDWR : O_RDONLY;
     auto opened = co_await rt::offload([this, oid, flags] { return backend_.open_oid(oid, flags); });
     if (!opened) co_return Err(opened.error());
-    auto value = std::make_shared<Entry>(*opened, flags);
+    auto value = std::make_shared<Entry>(oid, *opened, flags);
     {
       std::lock_guard lock(shard.mu);
       auto [it, inserted] = shard.entries.emplace(oid, value);
-      if (!inserted) {
-        if (write && it->second->accmode != O_RDWR) it->second = value;  // upgrade
-        else value = it->second;
+      if (inserted) {
+        push_back(shard, value.get());
+      } else if (write && it->second->accmode != O_RDWR) {
+        unlink(shard, it->second.get());  // upgrade: old refs drain via shared_ptr
+        it->second = value;
+        push_back(shard, value.get());
+      } else {
+        touch(shard, it->second.get());
+        value = it->second;  // lost an insert race: adopt the winner, our fd closes
       }
-      value->used = ++shard.clock;
-      while (shard.entries.size() > per_shard_capacity_) {
-        auto victim = shard.entries.end();
-        for (auto i = shard.entries.begin(); i != shard.entries.end(); ++i) {
-          if (i->second.use_count() != 1) continue;
-          if (victim == shard.entries.end() || i->second->used < victim->second->used)
-            victim = i;
-        }
-        if (victim == shard.entries.end()) break;
-        shard.entries.erase(victim);  // Entry closes only its fd; ObjId remains valid.
-        evictions_.fetch_add(1, std::memory_order_relaxed);
-      }
+      evict(shard);
     }
     co_return value;
   }
@@ -147,6 +147,7 @@ class LocalBackend::FdCache {
     out.misses = misses_.load(std::memory_order_relaxed);
     out.upgrades = upgrades_.load(std::memory_order_relaxed);
     out.evictions = evictions_.load(std::memory_order_relaxed);
+    out.overflows = overflows_.load(std::memory_order_relaxed);
     for (const auto& shard : shards_) {
       std::lock_guard lock(const_cast<std::mutex&>(shard.mu));
       out.entries += shard.entries.size();
@@ -159,12 +160,58 @@ class LocalBackend::FdCache {
   struct Shard {
     std::mutex mu;
     std::unordered_map<ObjId, Ref, ObjIdHash> entries;
-    uint64_t clock = 0;
+    Entry* lru_head = nullptr;  // least recently used
+    Entry* lru_tail = nullptr;  // most recently used
   };
+
+  static void push_back(Shard& shard, Entry* e) {
+    e->prev = shard.lru_tail;
+    e->next = nullptr;
+    (shard.lru_tail ? shard.lru_tail->next : shard.lru_head) = e;
+    shard.lru_tail = e;
+  }
+  static void unlink(Shard& shard, Entry* e) {
+    (e->prev ? e->prev->next : shard.lru_head) = e->next;
+    (e->next ? e->next->prev : shard.lru_tail) = e->prev;
+    e->prev = e->next = nullptr;
+  }
+  static void touch(Shard& shard, Entry* e) {
+    if (shard.lru_tail == e) return;
+    unlink(shard, e);
+    push_back(shard, e);
+  }
+
+  // Hard-cap enforcement (plan doc 10 §1.3): pop from the LRU head; an entry pinned by
+  // in-flight IO gets a second chance at the tail, so one bounded pass replaces the old
+  // per-insert O(N) scan.  When every entry is pinned the shard has to stay over
+  // capacity — that is counted and warned about (exponentially throttled) rather than
+  // silently growing toward RLIMIT_NOFILE.
+  void evict(Shard& shard) {
+    size_t budget = shard.entries.size();
+    while (shard.entries.size() > per_shard_capacity_ && budget-- > 0) {
+      Entry* victim = shard.lru_head;
+      auto it = shard.entries.find(victim->oid);
+      if (it->second.use_count() == 1) {
+        unlink(shard, victim);
+        shard.entries.erase(it);  // Entry closes only its fd; ObjId remains valid.
+        evictions_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        touch(shard, victim);
+      }
+    }
+    if (shard.entries.size() > per_shard_capacity_) {
+      uint64_t n = overflows_.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((n & (n - 1)) == 0)
+        LNFS_WARN("fd cache shard over capacity: {} entries all in use (cap {}), "
+                  "{} overflows total",
+                  shard.entries.size(), per_shard_capacity_, n);
+    }
+  }
+
   LocalBackend& backend_;
   size_t per_shard_capacity_;
   std::array<Shard, kShards> shards_;
-  std::atomic<uint64_t> hits_{0}, misses_{0}, upgrades_{0}, evictions_{0};
+  std::atomic<uint64_t> hits_{0}, misses_{0}, upgrades_{0}, evictions_{0}, overflows_{0};
 };
 
 LocalBackend::FdCacheStats LocalBackend::fd_cache_stats() const { return fd_cache_->stats(); }

@@ -234,6 +234,69 @@ TEST(BackendWrite, NamespaceOpsAndFdCacheUpgrade) {
   runtime.stop_and_join();
 }
 
+// Plan doc 10 §1.3: the fd-cache capacity is a hard cap. Idle entries past capacity are
+// evicted on insert (LRU), and a shard whose entries are all pinned by in-flight IO is
+// counted as an overflow instead of growing silently toward RLIMIT_NOFILE.
+TEST(BackendWrite, FdCacheHardCapAndOverflow) {
+  TmpTree tree;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  {
+    // fd_cache = 16 spreads to one entry per shard (the cache keeps 16 shards).
+    auto made = backend::LocalBackend::create(
+        {.path = tree.path, .fsid = 5, .fd_cache = 16});
+    ASSERT_TRUE(made.has_value());
+    auto& be = **made;
+    auto root = run_runtime(runtime, be.root());
+    ASSERT_TRUE(root.has_value());
+    auto cred = self_cred();
+    backend::OpenCtx open{cred, nullptr};
+    const char msg[] = "y";
+    std::span<const std::byte> one(reinterpret_cast<const std::byte*>(msg), 1);
+
+    // 64 sequential single writes: nothing stays pinned between ops, so the cache must
+    // never exceed one entry per shard no matter how many distinct files flow through.
+    std::vector<backend::ObjPtr> files;
+    for (int i = 0; i < 64; ++i) {
+      auto f = run_runtime(runtime,
+                           (*root)->create(cred, "f" + std::to_string(i), {}, nullptr));
+      ASSERT_TRUE(f.has_value());
+      auto w = run_runtime(runtime,
+                           f->obj->write(open, 0, one, backend::Stability::kUnstable));
+      ASSERT_TRUE(w.has_value());
+      files.push_back(f->obj);
+    }
+    auto stats = be.fd_cache_stats();
+    EXPECT_TRUE(stats.entries <= 16);
+    EXPECT_TRUE(stats.evictions >= 64 - 16);
+    EXPECT_EQ(stats.overflows, 0u);
+
+    // The last-written file survived its own insert's eviction pass: cached-fd hit.
+    auto again = run_runtime(
+        runtime, files.back()->write(open, 0, one, backend::Stability::kUnstable));
+    ASSERT_TRUE(again.has_value());
+    EXPECT_TRUE(be.fd_cache_stats().hits > stats.hits);
+
+    // Overflow: copy_range pins a source and a destination fd at once. Pick two files
+    // in the same shard (64 files over 16 shards guarantees a collision) so both pinned
+    // entries land in a shard with capacity one — the pass finds nothing evictable.
+    backend::ObjPtr src, dst;
+    for (size_t i = 0; i < files.size() && !dst; ++i)
+      for (size_t j = i + 1; j < files.size() && !dst; ++j)
+        if (backend::ObjIdHash{}(files[i]->id()) % 16 ==
+            backend::ObjIdHash{}(files[j]->id()) % 16) {
+          src = files[i];
+          dst = files[j];
+        }
+    ASSERT_TRUE(src && dst);
+    auto copied =
+        run_runtime(runtime, src->copy_range(open, *dst, open, 0, 0, 1));
+    ASSERT_TRUE(copied.has_value());
+    EXPECT_TRUE(be.fd_cache_stats().overflows >= 1);
+  }
+  runtime.stop_and_join();
+}
+
 // Phase 6 (development plan §8 item 1): the v4.2 backend contract on a real filesystem.
 // Capability bits come from the startup probe; the test asserts behavior consistent with
 // them (tmpfs/ext4: sparse + copy yes; clone only on XFS-reflink/Btrfs).
