@@ -40,6 +40,7 @@ class LocalBackend final : public Backend {
 
   struct FdCacheStats {
     uint64_t hits = 0, misses = 0, upgrades = 0, evictions = 0;
+    uint64_t overflows = 0;  // eviction passes that found every entry in use
     size_t entries = 0;
   };
   FdCacheStats fd_cache_stats() const;
