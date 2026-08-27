@@ -161,7 +161,8 @@ struct ProtocolStack {
                .state_dir = cfg.state_dir,
                .lease_seconds = cfg.lease_seconds,
                .courtesy_multiplier = cfg.courtesy_multiplier,
-               .max_io = cfg.max_request_size}) {
+               .max_io = cfg.max_request_size,
+               .shards = cfg.state_shards}) {
     nfs3.set_write_verifier(lnfs::core::verifier_from_epoch(core.epoch));
     nfs3.set_drc(&drc);
     nfs3.register_with(dispatcher);
@@ -182,7 +183,10 @@ struct ProtocolStack {
                  cfg.server_owner.empty() ? derived : cfg.server_owner,
                  cfg.server_scope.empty() ? derived : cfg.server_scope);
     nfs4->register_with(dispatcher);
-    lnfs::rt::spawn(state.run_lease_scanner(&lease_stop), runtime.reactor(0));
+    // Off reactor 0 (plan doc 10 §2.6): the auxiliary tasks used to pile onto the
+    // same reactor the (old, single) accept loop lived on.
+    lnfs::rt::spawn(state.run_lease_scanner(&lease_stop),
+                    runtime.reactor(runtime.reactor_count() - 1));
   }
 };
 
@@ -252,7 +256,7 @@ std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
       ctl_path, {.exports = core.exports.get(), .drc = &stack.drc, .state = &stack.state});
   if (ctl) {
     fe.ctl = std::move(*ctl);
-    lnfs::rt::spawn(fe.ctl->run(), runtime.reactor(0));
+    lnfs::rt::spawn(fe.ctl->run(), runtime.reactor(1 % runtime.reactor_count()));
   } else {
     LNFS_WARN("ctl socket unavailable at {}: {}", ctl_path, lnfs::errno_name(ctl.error()));
   }
@@ -267,7 +271,7 @@ std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
                                                      std::move(allow));
     if (metrics) {
       fe.metrics = std::move(*metrics);
-      lnfs::rt::spawn(fe.metrics->run(), runtime.reactor(0));
+      lnfs::rt::spawn(fe.metrics->run(), runtime.reactor(2 % runtime.reactor_count()));
     } else {
       LNFS_WARN("metrics endpoint {}:{} unavailable", cfg.metrics_bind, cfg.metrics_port);
     }

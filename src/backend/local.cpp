@@ -89,6 +89,9 @@ class LocalBackend::FdCache {
     ObjId oid;  // map key copy: lets the LRU walk erase without a reverse lookup
     int fd;
     int accmode;  // O_RDONLY or O_RDWR
+    // getdents position guard: readdir pages share this cached fd (plan doc 10 §2.6),
+    // and the directory offset is fd state — concurrent pages must serialize.
+    std::mutex dents_mu;
     // Intrusive LRU links (plan doc 10 §1.3), guarded by the owning shard's mutex.
     // Dangling once the entry leaves the list (upgrade replacement or eviction), but
     // nothing touches them afterwards: drained refs only ever read fd/accmode.
@@ -702,25 +705,19 @@ rt::Task<Result<ObjPtr>> LocalObject::lookup(const Cred& cred, std::string_view 
   co_return backend_.object_from_fd(fd, child_path(relative_, name));
 }
 
-Result<DirPage> LocalBackend::readdir_sync(const LocalObject& dir, uint64_t cookie,
+Result<DirPage> LocalBackend::readdir_sync(const LocalObject& dir, int fd,
+                                            std::mutex& dents_mu, uint64_t cookie,
                                             uint32_t max_entries) {
-  auto opened = open_oid(dir.id(), O_RDONLY | O_DIRECTORY);
-  if (!opened) return Err(opened.error());
-  int fd = *opened;
-  if (cookie != 0 && lseek(fd, static_cast<off_t>(cookie), SEEK_SET) < 0) {
-    int e = errno;
-    ::close(fd);
-    return Err(errno_from(e));
-  }
+  // The fd comes from the fd cache (plan doc 10 §2.6: no per-page open/close); its
+  // directory offset is shared state, so the whole lseek+getdents page holds the
+  // entry's dents mutex. This runs on an offload worker: blocking is fine.
+  std::lock_guard dents(dents_mu);
+  if (lseek(fd, static_cast<off_t>(cookie), SEEK_SET) < 0) return Err(errno_from(errno));
   std::array<std::byte, 64 * 1024> buf{};
   DirPage page;
   while (page.ents.size() < max_entries) {
     int n = static_cast<int>(syscall(SYS_getdents64, fd, buf.data(), buf.size()));
-    if (n < 0) {
-      int e = errno;
-      ::close(fd);
-      return Err(errno_from(e));
-    }
+    if (n < 0) return Err(errno_from(errno));
     if (n == 0) {
       page.eof = true;
       break;
@@ -729,7 +726,6 @@ Result<DirPage> LocalBackend::readdir_sync(const LocalObject& dir, uint64_t cook
     while (pos < static_cast<size_t>(n) && page.ents.size() < max_entries) {
       auto* ent = reinterpret_cast<const LinuxDirent64*>(buf.data() + pos);
       if (ent->reclen < offsetof(LinuxDirent64, name) + 1 || pos + ent->reclen > size_t(n)) {
-        ::close(fd);
         return Err(errno_from(EIO));
       }
       size_t cap = ent->reclen - offsetof(LinuxDirent64, name);
@@ -756,7 +752,6 @@ Result<DirPage> LocalBackend::readdir_sync(const LocalObject& dir, uint64_t cook
     }
     if (page.ents.size() >= max_entries) break;
   }
-  ::close(fd);
   return page;
 }
 
@@ -767,8 +762,11 @@ rt::Task<Result<DirPage>> LocalObject::readdir(const Cred& cred, uint64_t cookie
   if (!allowed) co_return Err(allowed.error());
   if (!allowed->has(Access::kRead)) co_return Err(errno_from(EACCES));
   if (max_entries == 0) co_return DirPage{};
-  co_return co_await rt::offload(
-      [this, cookie, max_entries] { return backend_.readdir_sync(*this, cookie, max_entries); });
+  auto ref = co_await backend_.fd_cache_->acquire(id(), false);
+  if (!ref) co_return Err(ref.error());
+  co_return co_await rt::offload([this, cookie, max_entries, ref = *ref] {
+    return backend_.readdir_sync(*this, ref->fd, ref->dents_mu, cookie, max_entries);
+  });
 }
 
 rt::Task<Result<std::string>> LocalObject::readlink() {
@@ -798,8 +796,15 @@ rt::Task<Result<uint32_t>> LocalObject::read(OpenCtx ctx, uint64_t off,
   if (!ref) co_return Err(ref.error());
   int n = co_await rt::uring_read((*ref)->fd, out, off);
   if (n < 0) co_return Err(errno_from_neg(n));
-  auto attr = co_await getattr();
-  eof = attr ? off + static_cast<uint64_t>(n) >= attr->size : n == 0;
+  if (out.empty()) {  // zero-length read: only a size probe can answer eof
+    auto attr = co_await getattr();
+    eof = attr && off >= attr->size;
+  } else {
+    // A short read on a regular file means EOF (plan doc 10 §2.6: drops the per-READ
+    // statx). A read ending exactly at EOF reports eof=false; the client's next read
+    // returns 0 bytes with eof=true — one extra round trip only at that boundary.
+    eof = static_cast<size_t>(n) < out.size();
+  }
   co_return static_cast<uint32_t>(n);
 }
 

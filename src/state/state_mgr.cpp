@@ -69,19 +69,53 @@ size_t OtherHash::operator()(const StateOther& other) const noexcept {
   return static_cast<size_t>(h ^ (uint64_t(l) << 17));
 }
 
-StateMgr::StateMgr(Config cfg) : cfg_(std::move(cfg)) {}
+StateMgr::StateMgr(Config cfg)
+    : cfg_(std::move(cfg)),
+      shard_count_(std::max<uint32_t>(1, cfg_.shards)),
+      clients_(std::make_unique<ClientShard[]>(shard_count_)),
+      sessions_(std::make_unique<SessionShard[]>(shard_count_)),
+      states_(std::make_unique<StateShard[]>(shard_count_)),
+      files_(std::make_unique<FileShard[]>(shard_count_)) {}
 
-StateMgr::ClientShard& StateMgr::client_shard(uint64_t clientid) {
-  return clients_[clientid % kShards];
+StateMgr::ClientShard& StateMgr::owner_shard(std::string_view owner_id) {
+  return clients_[fnv64(owner_id) % shard_count_];
 }
 StateMgr::SessionShard& StateMgr::session_shard(const SessionId& id) {
-  return sessions_[SessionIdHash{}(id) % kShards];
+  return sessions_[SessionIdHash{}(id) % shard_count_];
 }
 StateMgr::StateShard& StateMgr::state_shard(const StateOther& other) {
-  return states_[OtherHash{}(other) % kShards];
+  return states_[OtherHash{}(other) % shard_count_];
 }
 StateMgr::FileShard& StateMgr::file_shard(const FileKey& key) {
-  return files_[FileKeyHash{}(key) % kShards];
+  return files_[FileKeyHash{}(key) % shard_count_];
+}
+
+void StateMgr::index_client(const std::shared_ptr<ClientRec>& rec) {
+  std::lock_guard g(client_idx_mu_);
+  client_idx_[rec->clientid] = rec;
+}
+void StateMgr::unindex_client(uint64_t clientid) {
+  std::lock_guard g(client_idx_mu_);
+  client_idx_.erase(clientid);
+}
+
+std::shared_ptr<ClientRec> StateMgr::find_client_sync(uint64_t clientid) {
+  if ((clientid >> 32) != cfg_.boot_epoch) return nullptr;
+  std::lock_guard g(client_idx_mu_);
+  auto it = client_idx_.find(clientid);
+  return it == client_idx_.end() ? nullptr : it->second;
+}
+
+void StateMgr::arm_lease_check(ClientRec& client, int64_t when) {
+  std::lock_guard g(lease_heap_mu_);
+  // An earlier live entry pops first and re-arms; only advance towards `when`.
+  if (client.lease_heap_deadline >= 0 && client.lease_heap_deadline <= when) return;
+  client.lease_heap_deadline = when;
+  lease_heap_.emplace(when, client.clientid);
+}
+
+void StateMgr::wake_all_slots(SessionRec& session) {
+  for (uint32_t i = 0; i < session.slot_count; ++i) session.slots[i].cv.notify_all();
 }
 
 int64_t StateMgr::now_coarse() const {
@@ -92,11 +126,16 @@ int64_t StateMgr::now_coarse() const {
 
 void StateMgr::renew(ClientRec& client) {
   // 07 §7.2: the SEQUENCE fast path only does an atomic store; the scanner reads lazily.
-  client.lease_expiry.store(now_coarse() + cfg_.lease_seconds, std::memory_order_relaxed);
+  int64_t expiry = now_coarse() + cfg_.lease_seconds;
+  client.lease_expiry.store(expiry, std::memory_order_relaxed);
   // A courtesy client that comes back before reclaim revives with its state intact
   // (RFC 8881 §8.4.2 server discretion; same policy as Linux nfsd).
-  if (client.courtesy.exchange(false, std::memory_order_relaxed))
+  if (client.courtesy.exchange(false, std::memory_order_relaxed)) {
     courtesy_count_.fetch_sub(1, std::memory_order_relaxed);
+    // Its heap entry sits at the (distant) courtesy deadline: re-arm at the fresh
+    // lease expiry so a renewed-then-vanished client is noticed on time.
+    arm_lease_check(client, expiry);
+  }
 }
 
 StateOther StateMgr::new_other(StateType type) {
@@ -111,13 +150,7 @@ StateOther StateMgr::new_other(StateType type) {
 }
 
 rt::Task<std::shared_ptr<ClientRec>> StateMgr::find_client(uint64_t clientid) {
-  if ((clientid >> 32) != cfg_.boot_epoch) co_return nullptr;
-  for (auto& shard : clients_) {  // clientid lives in its owner-hash shard: scan
-    auto lock = co_await shard.mu.lock();
-    auto it = shard.by_id.find(clientid);
-    if (it != shard.by_id.end()) co_return it->second;
-  }
-  co_return nullptr;
+  co_return find_client_sync(clientid);
 }
 
 // ---- grace -----------------------------------------------------------------
@@ -217,7 +250,7 @@ rt::Task<StateMgr::ExchangeResult> StateMgr::exchange_id(std::string owner_id,
                                                          std::string principal,
                                                          bool update) {
   ExchangeResult out;
-  ClientShard& shard = clients_[fnv64(owner_id) % kShards];
+  ClientShard& shard = owner_shard(owner_id);
   auto lock = co_await shard.mu.lock();
   OwnerSlot& slot = shard.by_owner[owner_id];
 
@@ -250,6 +283,7 @@ rt::Task<StateMgr::ExchangeResult> StateMgr::exchange_id(std::string owner_id,
       // record and register the new principal's incarnation from scratch.
       unpersist_client(c);
       shard.by_id.erase(c.clientid);
+      unindex_client(c.clientid);
       client_count_.fetch_sub(1, std::memory_order_relaxed);
       slot.confirmed.reset();
     } else if (c.verifier == verifier) {  // same incarnation: report confirmed record
@@ -264,6 +298,7 @@ rt::Task<StateMgr::ExchangeResult> StateMgr::exchange_id(std::string owner_id,
   }
   if (slot.unconfirmed) {  // always replaced by a fresh registration
     shard.by_id.erase(slot.unconfirmed->clientid);
+    unindex_client(slot.unconfirmed->clientid);
     client_count_.fetch_sub(1, std::memory_order_relaxed);
     slot.unconfirmed.reset();
   }
@@ -285,6 +320,8 @@ rt::Task<StateMgr::ExchangeResult> StateMgr::exchange_id(std::string owner_id,
   renew(*rec);
   slot.unconfirmed = rec;
   shard.by_id[rec->clientid] = rec;
+  index_client(rec);
+  arm_lease_check(*rec, rec->lease_expiry.load(std::memory_order_relaxed));
   client_count_.fetch_add(1, std::memory_order_relaxed);
   out.clientid = rec->clientid;
   out.sequenceid = rec->cs_sequence;
@@ -303,7 +340,7 @@ rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(
     out.status = as_u32(Status::kStaleClientid);
     co_return out;
   }
-  ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
+  ClientShard& shard = owner_shard(client->owner_id);
   std::shared_ptr<ClientRec> old_incarnation;  // client reboot: its state dies (§4.8)
   std::vector<SessionId> orphaned;
   std::vector<StateOther> orphaned_states;
@@ -336,6 +373,7 @@ rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(
                                old_incarnation->states.end());
         old_incarnation->states.clear();
         shard.by_id.erase(old_incarnation->clientid);
+        unindex_client(old_incarnation->clientid);
         client_count_.fetch_sub(1, std::memory_order_relaxed);
       }
       slot.confirmed = client;
@@ -359,7 +397,8 @@ rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(
     session->fore.max_ops = std::min(fore_req.max_ops, cfg_.max_ops);
     session->fore.max_requests = std::clamp(fore_req.max_requests, 1u, cfg_.max_slots);
     session->back = back_req;  // accepted verbatim; the backchannel is never used (7.7)
-    session->slots.resize(session->fore.max_requests);
+    session->slot_count = session->fore.max_requests;
+    session->slots = std::make_unique<Slot[]>(session->slot_count);
     session->bound_conns.insert(conn_id);
 
     client->cs_sequence = sequence + 1;
@@ -380,9 +419,13 @@ rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(
   for (const auto& id : orphaned) {  // old incarnation's sessions die now
     SessionShard& sshard = session_shard(id);
     auto slock = co_await sshard.mu.lock();
-    if (sshard.table.erase(id))
+    auto sit = sshard.table.find(id);
+    if (sit != sshard.table.end()) {
+      auto dead = std::move(sit->second);
+      sshard.table.erase(sit);
       session_count_.fetch_sub(1, std::memory_order_relaxed);
-    sshard.cv.notify_all();
+      wake_all_slots(*dead);  // before the last reference drops
+    }
   }
   if (old_incarnation) {  // ...and so does its open state (RFC 8881 §8.4.2 / notes 4.8)
     std::vector<backend::OpenPtr> released;
@@ -406,19 +449,16 @@ rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(
 rt::Task<void> StateMgr::confirm_create_session(uint64_t clientid,
                                                 std::vector<std::byte> reply) {
   std::shared_ptr<ClientRec> to_persist;
-  for (auto& shard : clients_) {
-    {
-      auto lock = co_await shard.mu.lock();
-      auto it = shard.by_id.find(clientid);
-      if (it == shard.by_id.end()) continue;
-      auto& rec = *it->second;
-      rec.cs_cached_reply = std::move(reply);
-      if (!rec.persisted) {
-        rec.persisted = true;  // claimed under the lock; the write happens outside
-        to_persist = it->second;
+  if (auto client = find_client_sync(clientid)) {
+    ClientShard& shard = owner_shard(client->owner_id);
+    auto lock = co_await shard.mu.lock();
+    if (shard.by_id.contains(clientid)) {
+      client->cs_cached_reply = std::move(reply);
+      if (!client->persisted) {
+        client->persisted = true;  // claimed under the lock; the write happens outside
+        to_persist = client;
       }
     }
-    break;
   }
   // open+write+fsync must not run under a shard lock (invariant at the top of
   // state_mgr.hpp; plan doc 10 §1.7).  owner_id is immutable after registration.
@@ -437,9 +477,9 @@ rt::Task<uint32_t> StateMgr::destroy_session(const SessionId& id, uint64_t conn_
     session = std::move(it->second);
     shard.table.erase(it);
     session_count_.fetch_sub(1, std::memory_order_relaxed);
-    shard.cv.notify_all();  // wake any in-flight duplicate waiters
+    wake_all_slots(*session);  // wake any in-flight duplicate waiters
   }
-  ClientShard& cshard = clients_[fnv64(session->client->owner_id) % kShards];
+  ClientShard& cshard = owner_shard(session->client->owner_id);
   auto lock = co_await cshard.mu.lock();
   auto& list = session->client->sessions;
   list.erase(std::remove(list.begin(), list.end(), id), list.end());
@@ -447,13 +487,16 @@ rt::Task<uint32_t> StateMgr::destroy_session(const SessionId& id, uint64_t conn_
 }
 
 rt::Task<uint32_t> StateMgr::destroy_clientid(uint64_t clientid) {
-  for (auto& shard : clients_) {
+  auto rec = find_client_sync(clientid);
+  if (!rec) co_return as_u32(Status::kStaleClientid);
+  {
+    ClientShard& shard = owner_shard(rec->owner_id);
     auto lock = co_await shard.mu.lock();
     auto it = shard.by_id.find(clientid);
-    if (it == shard.by_id.end()) continue;
-    if (!it->second->sessions.empty() || !it->second->states.empty())
+    if (it == shard.by_id.end() || it->second != rec)
+      co_return as_u32(Status::kStaleClientid);  // raced with expiry/replacement
+    if (!rec->sessions.empty() || !rec->states.empty())
       co_return as_u32(Status::kClientidBusy);
-    auto rec = it->second;
     unpersist_client(*rec);
     auto slot_it = shard.by_owner.find(rec->owner_id);
     if (slot_it != shard.by_owner.end()) {
@@ -465,15 +508,14 @@ rt::Task<uint32_t> StateMgr::destroy_clientid(uint64_t clientid) {
     if (rec->courtesy.exchange(false, std::memory_order_relaxed))
       courtesy_count_.fetch_sub(1, std::memory_order_relaxed);
     shard.by_id.erase(it);
+    unindex_client(clientid);
     client_count_.fetch_sub(1, std::memory_order_relaxed);
-    lock.reset();
-    std::lock_guard g(lock_owner_mu_);
-    std::erase_if(lock_owners_, [&](const auto& kv) {
-      return kv.second.client->clientid == clientid;
-    });
-    co_return 0;
   }
-  co_return as_u32(Status::kStaleClientid);
+  std::lock_guard g(lock_owner_mu_);
+  std::erase_if(lock_owners_, [&](const auto& kv) {
+    return kv.second.client->clientid == clientid;
+  });
+  co_return 0;
 }
 
 rt::Task<uint32_t> StateMgr::bind_conn(const SessionId& id, uint64_t conn_id) {
@@ -504,20 +546,22 @@ rt::Task<StateMgr::SeqResult> StateMgr::sequence_begin(const SessionId& id,
     }
     SessionRec& session = *it->second;
     session.bound_conns.insert(conn_id);  // implicit bind (trunking-lenient)
-    if (slotid >= session.slots.size()) {
+    if (slotid >= session.slot_count) {
       out.status = as_u32(Status::kBadslot);
       co_return out;
     }
-    if (highest >= session.slots.size()) {
+    if (highest >= session.slot_count) {
       out.status = as_u32(Status::kBadHighSlot);
       co_return out;
     }
     Slot& slot = session.slots[slotid];
     if (slot.in_flight) {
       if (seqid == slot.seqid + 1) {
-        // Retransmission of the request being executed: wait, then re-classify.
+        // Retransmission of the request being executed: wait on this slot, then
+        // re-classify (plan doc 10 §2.6: completing another slot in the shard no
+        // longer wakes us).
         seq_waits_.fetch_add(1, std::memory_order_relaxed);
-        co_await shard.cv.wait(shard.mu, lock);
+        co_await slot.cv.wait(shard.mu, lock);
         continue;
       }
       out.status = as_u32(Status::kSeqMisordered);
@@ -530,7 +574,7 @@ rt::Task<StateMgr::SeqResult> StateMgr::sequence_begin(const SessionId& id,
       out.max_request = session.fore.max_request;
       out.max_response = session.fore.max_response;
       out.max_response_cached = session.fore.max_response_cached;
-      out.highest_slot = static_cast<uint32_t>(session.slots.size() - 1);
+      out.highest_slot = session.slot_count - 1;
       seq_new_.fetch_add(1, std::memory_order_relaxed);
       co_return out;
     }
@@ -556,8 +600,10 @@ rt::Task<void> StateMgr::sequence_abort(const SessionId& id, uint32_t slotid) {
   auto lock = co_await shard.mu.lock();
   auto it = shard.table.find(id);
   if (it == shard.table.end()) co_return;
-  if (slotid < it->second->slots.size()) it->second->slots[slotid].in_flight = false;
-  shard.cv.notify_all();
+  if (slotid < it->second->slot_count) {
+    it->second->slots[slotid].in_flight = false;
+    it->second->slots[slotid].cv.notify_all();
+  }
 }
 
 rt::Task<void> StateMgr::sequence_complete(const SessionId& id, uint32_t slotid,
@@ -568,28 +614,27 @@ rt::Task<void> StateMgr::sequence_complete(const SessionId& id, uint32_t slotid,
   auto it = shard.table.find(id);
   if (it == shard.table.end()) co_return;  // destroyed mid-flight
   SessionRec& session = *it->second;
-  if (slotid >= session.slots.size()) co_return;
+  if (slotid >= session.slot_count) co_return;
   Slot& slot = session.slots[slotid];
   slot.in_flight = false;
   slot.seqid = seqid;
   slot.cached = cache;
   slot.reply = cache ? std::move(reply) : std::vector<std::byte>{};
-  shard.cv.notify_all();
+  slot.cv.notify_all();
 }
 
 rt::Task<uint32_t> StateMgr::reclaim_complete(uint64_t clientid) {
-  for (auto& shard : clients_) {
+  auto client = find_client_sync(clientid);
+  if (!client) co_return as_u32(Status::kStaleClientid);
+  ClientShard& shard = owner_shard(client->owner_id);
+  {
     auto lock = co_await shard.mu.lock();
-    auto it = shard.by_id.find(clientid);
-    if (it == shard.by_id.end()) continue;
-    if (it->second->reclaim_complete) co_return as_u32(Status::kCompleteAlready);
-    it->second->reclaim_complete = true;
-    std::string owner = it->second->owner_id;
-    lock.reset();
-    note_reclaimed(owner);
-    co_return 0;
+    if (!shard.by_id.contains(clientid)) co_return as_u32(Status::kStaleClientid);
+    if (client->reclaim_complete) co_return as_u32(Status::kCompleteAlready);
+    client->reclaim_complete = true;
   }
-  co_return as_u32(Status::kStaleClientid);
+  note_reclaimed(client->owner_id);
+  co_return 0;
 }
 
 // ---- open state ------------------------------------------------------------
@@ -636,7 +681,7 @@ rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from
   // CLOSE releases the byte-range locks held through this open (RFC 8881 §18.2.4).
   for (const auto& l : dependents) (void)co_await unlink_state(l, from_client);
   if (from_client) {
-    ClientShard& shard = clients_[fnv64(rec->client->owner_id) % kShards];
+    ClientShard& shard = owner_shard(rec->client->owner_id);
     auto lock = co_await shard.mu.lock();
     rec->client->states.erase(rec->other);
   }
@@ -661,7 +706,7 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
   bool reclaim_done;
   size_t held_states;
   {
-    ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
+    ClientShard& shard = owner_shard(client->owner_id);
     auto lock = co_await shard.mu.lock();
     reclaim_done = client->reclaim_complete;
     held_states = client->states.size();
@@ -767,7 +812,7 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
     }
     bool dead;
     {
-      ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
+      ClientShard& shard = owner_shard(client->owner_id);
       auto lock = co_await shard.mu.lock();
       dead = client->expired.load(std::memory_order_relaxed);
       if (!dead) client->states.insert(rec->other);
@@ -1023,7 +1068,7 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
   bool reclaim_done;
   size_t held_states;
   {
-    ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
+    ClientShard& shard = owner_shard(client->owner_id);
     auto lock = co_await shard.mu.lock();
     reclaim_done = client->reclaim_complete;
     held_states = client->states.size();
@@ -1190,7 +1235,7 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
     }
     bool dead;
     {
-      ClientShard& shard = clients_[fnv64(client->owner_id) % kShards];
+      ClientShard& shard = owner_shard(client->owner_id);
       auto lock = co_await shard.mu.lock();
       dead = client->expired.load(std::memory_order_relaxed);
       if (!dead) client->states.insert(lock_rec->other);
@@ -1271,51 +1316,78 @@ rt::Task<uint32_t> StateMgr::locku(const Stateid& sid, uint64_t clientid, uint64
 // ---- leases ----------------------------------------------------------------
 
 rt::Task<void> StateMgr::scan_leases() {
+  // Expiry heap (plan doc 10 §2.6): pop due entries and re-check them against the
+  // live record instead of walking every client every second.  Renewals never touch
+  // the heap (the SEQUENCE fast path stays a lone atomic store); a renewed client's
+  // stale entry simply re-arms at its fresh expiry when it pops.
   int64_t now = now_coarse();
   int64_t courtesy_window = static_cast<int64_t>(cfg_.lease_seconds) *
                             std::max<uint32_t>(1, cfg_.courtesy_multiplier);
-  std::vector<uint64_t> timed_out;
-  for (auto& shard : clients_) {
-    auto lock = co_await shard.mu.lock();
-    for (auto it = shard.by_id.begin(); it != shard.by_id.end();) {
-      ClientRec& c = *it->second;
-      if (c.expired.load(std::memory_order_relaxed)) {
-        ++it;
-        continue;
-      }
-      int64_t expiry = c.lease_expiry.load(std::memory_order_relaxed);
-      if (!c.courtesy.load(std::memory_order_relaxed)) {
-        if (expiry > now) {
-          ++it;
-          continue;
-        }
-        if (!c.confirmed || (c.sessions.empty() && c.states.empty())) {
-          // Nothing to protect: an unconfirmed or idle record simply lapses.
-          auto rec = it->second;
-          unpersist_client(*rec);
-          auto slot_it = shard.by_owner.find(rec->owner_id);
-          if (slot_it != shard.by_owner.end()) {
-            if (slot_it->second.confirmed == rec) slot_it->second.confirmed.reset();
-            if (slot_it->second.unconfirmed == rec) slot_it->second.unconfirmed.reset();
-            if (!slot_it->second.confirmed && !slot_it->second.unconfirmed)
-              shard.by_owner.erase(slot_it);
-          }
-          it = shard.by_id.erase(it);
-          client_count_.fetch_sub(1, std::memory_order_relaxed);
-          lease_expirations_.fetch_add(1, std::memory_order_relaxed);
-          continue;
-        }
-        c.courtesy.store(true, std::memory_order_relaxed);
-        c.courtesy_since = now;
-        courtesy_count_.fetch_add(1, std::memory_order_relaxed);
-        lease_expirations_.fetch_add(1, std::memory_order_relaxed);
-        LNFS_INFO("client {:#x} ({} sessions, {} states) lease expired: courtesy",
-                  c.clientid, c.sessions.size(), c.states.size());
-      } else if (now - c.courtesy_since >= courtesy_window) {
-        timed_out.push_back(c.clientid);
-      }
-      ++it;
+  std::vector<std::shared_ptr<ClientRec>> due;
+  {
+    std::lock_guard heap(lease_heap_mu_);
+    std::lock_guard idx(client_idx_mu_);
+    while (!lease_heap_.empty() && lease_heap_.top().first <= now) {
+      auto [when, clientid] = lease_heap_.top();
+      lease_heap_.pop();
+      auto it = client_idx_.find(clientid);
+      if (it == client_idx_.end()) continue;              // client already gone
+      if (it->second->lease_heap_deadline != when) continue;  // superseded duplicate
+      it->second->lease_heap_deadline = -1;
+      due.push_back(it->second);
     }
+  }
+  std::vector<uint64_t> timed_out;
+  for (const auto& client : due) {
+    if (client->expired.load(std::memory_order_relaxed)) continue;
+    if (client->courtesy.load(std::memory_order_relaxed)) {
+      if (now - client->courtesy_since >= courtesy_window) {
+        timed_out.push_back(client->clientid);  // reclaim drops the record
+      } else {
+        arm_lease_check(*client, client->courtesy_since + courtesy_window);
+      }
+      continue;
+    }
+    int64_t expiry = client->lease_expiry.load(std::memory_order_relaxed);
+    if (expiry > now) {  // renewed since the entry was armed
+      arm_lease_check(*client, expiry);
+      continue;
+    }
+    ClientShard& shard = owner_shard(client->owner_id);
+    auto lock = co_await shard.mu.lock();
+    auto it = shard.by_id.find(client->clientid);
+    if (it == shard.by_id.end() || it->second != client) continue;  // replaced/gone
+    ClientRec& c = *client;
+    // Re-check under the lock: a SEQUENCE may have renewed meanwhile.
+    expiry = c.lease_expiry.load(std::memory_order_relaxed);
+    if (c.expired.load(std::memory_order_relaxed)) continue;
+    if (expiry > now || c.courtesy.load(std::memory_order_relaxed)) {
+      arm_lease_check(c, std::max(expiry, now + 1));
+      continue;
+    }
+    if (!c.confirmed || (c.sessions.empty() && c.states.empty())) {
+      // Nothing to protect: an unconfirmed or idle record simply lapses.
+      unpersist_client(c);
+      auto slot_it = shard.by_owner.find(c.owner_id);
+      if (slot_it != shard.by_owner.end()) {
+        if (slot_it->second.confirmed == client) slot_it->second.confirmed.reset();
+        if (slot_it->second.unconfirmed == client) slot_it->second.unconfirmed.reset();
+        if (!slot_it->second.confirmed && !slot_it->second.unconfirmed)
+          shard.by_owner.erase(slot_it);
+      }
+      shard.by_id.erase(it);
+      unindex_client(c.clientid);
+      client_count_.fetch_sub(1, std::memory_order_relaxed);
+      lease_expirations_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    c.courtesy.store(true, std::memory_order_relaxed);
+    c.courtesy_since = now;
+    courtesy_count_.fetch_add(1, std::memory_order_relaxed);
+    lease_expirations_.fetch_add(1, std::memory_order_relaxed);
+    LNFS_INFO("client {:#x} ({} sessions, {} states) lease expired: courtesy",
+              c.clientid, c.sessions.size(), c.states.size());
+    arm_lease_check(c, now + courtesy_window);
   }
   for (uint64_t id : timed_out) (void)co_await expire_client_impl(id, kReasonTimeout);
 }
@@ -1333,14 +1405,16 @@ rt::Task<uint32_t> StateMgr::expire_client(uint64_t clientid) {
 }
 
 rt::Task<uint32_t> StateMgr::expire_client_impl(uint64_t clientid, int reason) {
-  std::shared_ptr<ClientRec> client;
+  std::shared_ptr<ClientRec> client = find_client_sync(clientid);
+  if (!client) co_return as_u32(Status::kStaleClientid);
   std::vector<StateOther> states;
   std::vector<SessionId> sessions;
-  for (auto& shard : clients_) {
+  {
+    ClientShard& shard = owner_shard(client->owner_id);
     auto lock = co_await shard.mu.lock();
     auto it = shard.by_id.find(clientid);
-    if (it == shard.by_id.end()) continue;
-    client = it->second;
+    if (it == shard.by_id.end() || it->second != client)
+      co_return as_u32(Status::kStaleClientid);  // raced with removal/replacement
     if (client->expired.exchange(true, std::memory_order_relaxed)) co_return 0;
     if (client->courtesy.exchange(false, std::memory_order_relaxed))
       courtesy_count_.fetch_sub(1, std::memory_order_relaxed);
@@ -1356,10 +1430,9 @@ rt::Task<uint32_t> StateMgr::expire_client_impl(uint64_t clientid, int reason) {
         shard.by_owner.erase(slot_it);
     }
     shard.by_id.erase(it);
+    unindex_client(clientid);
     client_count_.fetch_sub(1, std::memory_order_relaxed);
-    break;
   }
-  if (!client) co_return as_u32(Status::kStaleClientid);
 
   // Reclaim chain (07 §7.4): StateRec → OpenPtr → files_ back-reference → sessions →
   // stable list.  Every step takes exactly one shard lock.
@@ -1377,8 +1450,13 @@ rt::Task<uint32_t> StateMgr::expire_client_impl(uint64_t clientid, int reason) {
   for (const auto& id : sessions) {
     SessionShard& shard = session_shard(id);
     auto lock = co_await shard.mu.lock();
-    if (shard.table.erase(id)) session_count_.fetch_sub(1, std::memory_order_relaxed);
-    shard.cv.notify_all();
+    auto sit = shard.table.find(id);
+    if (sit != shard.table.end()) {
+      auto dead = std::move(sit->second);
+      shard.table.erase(sit);
+      session_count_.fetch_sub(1, std::memory_order_relaxed);
+      wake_all_slots(*dead);  // before the last reference drops
+    }
   }
   unpersist_client(*client);
   {
@@ -1445,7 +1523,8 @@ rt::Task<std::string> StateMgr::dump() {
   int64_t now = now_coarse();
   out += std::format("grace={} remaining={}s boot_epoch={}\n", in_grace() ? 1 : 0,
                      grace_remaining_seconds(), cfg_.boot_epoch);
-  for (auto& shard : clients_) {
+  for (size_t si = 0; si < shard_count_; ++si) {
+    auto& shard = clients_[si];
     auto lock = co_await shard.mu.lock();
     for (const auto& [id, c] : shard.by_id) {
       std::string owner_hex;
@@ -1459,22 +1538,24 @@ rt::Task<std::string> StateMgr::dump() {
           c->states.size(), c->reclaim_complete ? 1 : 0);
     }
   }
-  for (auto& shard : sessions_) {
+  for (size_t si = 0; si < shard_count_; ++si) {
+    auto& shard = sessions_[si];
     auto lock = co_await shard.mu.lock();
     for (const auto& [id, s] : shard.table) {
       size_t cached = 0, in_flight = 0;
-      for (const auto& slot : s->slots) {
-        cached += slot.cached ? 1 : 0;
-        in_flight += slot.in_flight ? 1 : 0;
+      for (uint32_t k = 0; k < s->slot_count; ++k) {
+        cached += s->slots[k].cached ? 1 : 0;
+        in_flight += s->slots[k].in_flight ? 1 : 0;
       }
       std::string sid_hex;
       for (std::byte b : id) sid_hex += std::format("{:02x}", static_cast<unsigned>(b));
       out += std::format("session {} client={:#x} slots={} cached={} in_flight={} conns={}\n",
-                         sid_hex, s->client->clientid, s->slots.size(), cached, in_flight,
+                         sid_hex, s->client->clientid, s->slot_count, cached, in_flight,
                          s->bound_conns.size());
     }
   }
-  for (auto& shard : states_) {
+  for (size_t si = 0; si < shard_count_; ++si) {
+    auto& shard = states_[si];
     auto lock = co_await shard.mu.lock();
     for (const auto& [other, rec] : shard.table) {
       std::string oid_hex;

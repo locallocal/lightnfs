@@ -6,6 +6,7 @@ offload_threads = 16
 # offload_queue_cap = 4096    # per-class queued-job cap before admissions wait
 # ring = "auto"               # auto | uring | epoll (auto probes io_uring, falls back)
 # ring_sqpoll = false         # io_uring SQPOLL kernel-thread submission
+# state_shards = 16           # v4 client/session/state table shard count
 port = 2049
 mount_port = 20048
 rpcbind = true

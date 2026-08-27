@@ -54,6 +54,7 @@ struct ServerConfig {
   bool enable_v4 = true;
   uint32_t lease_seconds = 90;        // v4 lease (also the grace window)
   uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
+  uint32_t state_shards = 16;         // v4 state table shards (plan doc 10 §2.6)
   std::string ctl_socket;   // default: <state_dir>/ctl.sock; "" resolves at startup
   uint16_t metrics_port = 0;  // 0 = disabled
   // Metrics exposure (plan doc 10 §1.8): loopback by default; widening the bind and

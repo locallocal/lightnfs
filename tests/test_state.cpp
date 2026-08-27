@@ -727,3 +727,48 @@ TEST(StateMgr, ResourceCapsReturnResource) {
   });
   runtime.stop_and_join();
 }
+
+// Plan doc 10 §2.6: shard count is configurable; a single-shard table must serve the
+// full client/session lifecycle (also exercises the clientid index + per-slot waits
+// with everything hashed into one shard).
+TEST(StateMgr, SingleShardConfigLifecycle) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  state::StateMgr mgr({.boot_epoch = 7, .state_dir = dir.path, .shards = 1});
+
+  std::atomic<bool> done{false};
+  std::atomic<int> errors{0};
+  rt::spawn(
+      [](state::StateMgr* mgr, std::atomic<bool>* done,
+         std::atomic<int>* errors) -> rt::Task<void> {
+        nfsv4::Verifier verf{};
+        verf[0] = std::byte{0x11};
+        auto ex = co_await mgr->exchange_id("single-shard", verf, "sys/test/0", false);
+        if (ex.status != 0) ++*errors;
+        nfsv4::ChannelAttrs attrs;
+        attrs.max_requests = 4;
+        auto cs = co_await mgr->create_session(ex.clientid, ex.sequenceid, "sys/test/0",
+                                               attrs, attrs, 1);
+        if (cs.status != 0) ++*errors;
+        auto seq = co_await mgr->sequence_begin(cs.sessionid, 0, 1, 0, false, 1);
+        if (seq.status != 0 || seq.replay) ++*errors;
+        co_await mgr->sequence_complete(cs.sessionid, 0, 1, false, {});
+        // Replay of the completed slot classifies as replay, not misordered.
+        auto replay = co_await mgr->sequence_begin(cs.sessionid, 0, 1, 0, false, 1);
+        if (!replay.replay) ++*errors;
+        if ((co_await mgr->destroy_session(cs.sessionid, 1)) != 0) ++*errors;
+        if ((co_await mgr->destroy_clientid(ex.clientid)) != 0) ++*errors;
+        // The index must agree: the clientid is gone.
+        if ((co_await mgr->destroy_clientid(ex.clientid)) !=
+            static_cast<uint32_t>(nfsv4::Status::kStaleClientid))
+          ++*errors;
+        done->store(true);
+      }(&mgr, &done, &errors),
+      runtime.reactor(0));
+  while (!done.load()) std::this_thread::yield();
+  runtime.stop_and_join();
+  EXPECT_EQ(errors.load(), 0);
+  EXPECT_EQ(mgr.stats().clients, 0u);
+  EXPECT_EQ(mgr.stats().sessions, 0u);
+}

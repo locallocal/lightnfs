@@ -193,26 +193,31 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
   共用），local 后端 allocate/deallocate/clone/copy_range 标记 kHeavy——慢 fsync/
   fallocate 不再队头阻塞元数据操作。
 
-### 2.6 其余热点（中优先级）
+### 2.6 其余热点（中优先级） ✅ 已完成
 
-- 四个 listener + lease scanner 全部 spawn 在 reactor 0（`main.cpp:176、237-255`），
-  明确热点；配合 §2.3 的 REUSEPORT 方案分散。
-- metrics 原子量无 padding 无分片（`obs/metrics.hpp:13-33`），每请求 ≥2 次
-  fetch_add 打同一批 cache line——per-reactor 分片累加，导出时汇总。
-- `ObjLockRegistry::get` 用 `operator[]` + 命中也插条目 + 超 1024 全表清扫
-  （`core/obj_lock.cpp:5-21`）——`find` 快路径 + 摊销清理。
-- StateMgr：`clientid → ClientRec` 查找是全 16 分片顺序加锁扫描（插入按 owner 哈希
-  分片而 `client_shard()` 是死代码，`state_mgr.cpp:74-76、113-121`），CREATE_SESSION/
-  RECLAIM_COMPLETE 等都走它——加 clientid 索引；session 分片单 CondVar 惊群
-  （`state_mgr.cpp:557` notify_all 唤醒全分片等待者）——下沉 per-session/slot event；
-  `scan_leases` 每秒全表扫描（:1219-1271）——改到期时间堆；分片数 16 硬编码不可调。
-- attr 路径：`attr_reply` 里 `mounted_on_fileid` 触发每条目一次 `root()` + `getattr()`
-  （`nfsv4/engine.cpp:820-827`，Linux 客户端 READDIR 掩码几乎必含该属性）；
-  `limits()/caps()` 与 `supported_attrs` 编码结果均不变，可预计算缓存。
-- local 后端：`read()` 每次多一次 statx 求 eof（`local.cpp:591`）；readdir 每页
-  重新 open 目录 fd（:497）；DRC 淘汰链 `std::list<Key>` 每项一次节点分配。
-- epoll 回退路径：`socks_` 用 `std::map<int,·>`（fd 稠密应数组直索引，
-  `epoll_ring.hpp:68`）；ready 非空时跳过 epoll_wait 推迟事件发现（`epoll_ring.cpp:252`）。
+- ✅ listener 已随 §2.3 分散到每 reactor；lease scanner 移到最后一个 reactor，
+  ctl / metrics HTTP 分别移到 reactor 1/2（模 reactor 数）——reactor 0 不再是
+  辅助任务的聚集点。
+- ✅ metrics 改 `ShardedCounter`（8 个 per-thread slot、每 slot 独占 cache line，
+  fetch_add/fetch_sub/load 接口不变，导出时求和）。
+- ✅ `ObjLockRegistry::get`：`find` 命中快路径（不再每次命中插条目）；超水位后
+  每次插入只扫少量哈希桶（轮转游标摊销清理），全表清扫消除。
+- ✅ StateMgr：新增 `clientid → ClientRec` 专用索引（`client_idx_`，与 by_id 同步
+  维护），CREATE_SESSION/DESTROY_CLIENTID/RECLAIM_COMPLETE/expire 全部 O(1) 定位，
+  全分片扫描消除；SEQUENCE 重传等待下沉为 per-slot CondVar（会话销毁前逐 slot 唤
+  醒），分片级惊群消除；`scan_leases` 改为到期时间堆（懒惰重臂:续租仍是无锁原子
+  store,过期堆项弹出时按实际到期重新入堆,courtesy 复活时重臂新租约到期），
+  每秒全表扫描消除；分片数经 `Config::shards`（`[server] state_shards`）可调。
+- ✅ attr 路径：`mounted_on_fileid` 的导出根比较改用 per-fsid root oid 缓存
+  （`Engine::root_oid_of`），不再每次 `backend->root()`；`supported_attrs` 本就是
+  静态单例，limits/caps 为单次虚调用返回值，无需额外缓存层。
+- ✅ local 后端：`read()` 的 eof 由短读推断（读满时 eof=false,客户端在精确边界多
+  一次空读换掉每次 READ 的 statx；零长读保留 size 探测）；readdir 页复用 fd cache
+  的目录 fd（per-entry dents 互斥串行化共享的目录偏移），每页 open/close 消除；
+  DRC 淘汰链 `std::list` → `std::deque`。
+- ✅ epoll 回退路径：`socks_` 改 fd 直索引的稠密表
+  （`vector<unique_ptr<FdQ>>`）；ready 非空时以 0 超时轮询 epoll 而非跳过，
+  事件发现不再被推迟。
 
 ---
 
