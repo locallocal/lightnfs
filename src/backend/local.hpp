@@ -74,8 +74,8 @@ class LocalBackend final : public Backend {
   Result<int> open_oid(const ObjId& oid, int flags);
   Result<ObjPtr> object_from_fd(int fd, std::string relative, bool remember = true);
   Result<Attr> attr_from_fd(int fd) const;
-  Result<DirPage> readdir_sync(const LocalObject& dir, uint64_t cookie,
-                               uint32_t max_entries);
+  Result<DirPage> readdir_sync(const LocalObject& dir, int fd, std::mutex& dents_mu,
+                               uint64_t cookie, uint32_t max_entries);
   static bool valid_name(std::string_view name, bool allow_dotdot = false);
   // Applies requested ownership to a freshly created object; EPERM from an unprivileged
   // server process is tolerated (files stay owned by the process user; documented mode)

@@ -1,6 +1,11 @@
 #include <string>
 
 #include "mini_test.hpp"
+
+#include <thread>
+#include <vector>
+
+#include "obs/metrics.hpp"
 #include "obs/errlog.hpp"
 #include "util/flags.hpp"
 #include "util/result.hpp"
@@ -103,4 +108,22 @@ TEST(ErrLog, RingKeepsMostRecent) {
   EXPECT_TRUE(out.find("xid=0x9063") != std::string::npos);   // newest (i=99)
   EXPECT_TRUE(out.find("xid=0x9024") != std::string::npos);   // oldest kept (i=36)
   EXPECT_TRUE(out.find("xid=0x9023") == std::string::npos);   // evicted
+}
+
+// Sharded metric counters (plan doc 10 §2.6): concurrent bumps land in per-thread
+// slots; load() must still sum to the exact total, including negative net values.
+TEST(Metrics, ShardedCounterSumsAcrossThreads) {
+  obs::ShardedCounter<uint64_t> c;
+  obs::ShardedCounter<int64_t> net;
+  std::vector<std::thread> ts;
+  for (int t = 0; t < 8; ++t) {
+    ts.emplace_back([&] {
+      for (int i = 0; i < 10000; ++i) c.fetch_add(1, std::memory_order_relaxed);
+      for (int i = 0; i < 100; ++i) net.fetch_add(3, std::memory_order_relaxed);
+      for (int i = 0; i < 100; ++i) net.fetch_sub(2, std::memory_order_relaxed);
+    });
+  }
+  for (auto& t : ts) t.join();
+  EXPECT_EQ(c.load(std::memory_order_relaxed), 80000u);
+  EXPECT_EQ(net.load(std::memory_order_relaxed), 8 * 100);
 }

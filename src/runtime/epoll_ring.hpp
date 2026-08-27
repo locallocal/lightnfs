@@ -7,8 +7,8 @@
 #include <sys/epoll.h>
 
 #include <condition_variable>
+#include <memory>
 #include <deque>
-#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -64,9 +64,20 @@ class EpollRing final : public RingOps {
   void service_fd(int fd, uint32_t events);
   static int try_sock_op(SockOp& s, int fd);  // returns res or -EAGAIN
 
+  // Dense fd-indexed table (plan doc 10 §2.6): fds are small and dense, so direct
+  // indexing beats a std::map. null slot = no queued ops for that fd.
+  FdQ* fdq(int fd) {
+    return fd >= 0 && static_cast<size_t>(fd) < socks_.size() ? socks_[fd].get() : nullptr;
+  }
+  FdQ& fdq_make(int fd) {
+    if (static_cast<size_t>(fd) >= socks_.size()) socks_.resize(fd + 1);
+    if (!socks_[fd]) socks_[fd] = std::make_unique<FdQ>();
+    return *socks_[fd];
+  }
+
   int epfd_ = -1;
   int evfd_ = -1;
-  std::map<int, FdQ> socks_;
+  std::vector<std::unique_ptr<FdQ>> socks_;
   std::vector<Completion> ready_;  // reactor-thread completions
 
   std::mutex rmu_;

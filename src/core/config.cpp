@@ -211,6 +211,10 @@ Result<Config> parse_config(std::string_view text) {
         config.server.ring = r;
       } else if (key == "ring_sqpoll") {
         config.server.ring_sqpoll = LNFS_TRY(bool_value(value));
+      } else if (key == "state_shards") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n == 0 || n > 4096) return Err(errno_from(EINVAL));
+        config.server.state_shards = static_cast<uint32_t>(n);
       } else if (key == "port") {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n > UINT16_MAX) return Err(errno_from(EINVAL));

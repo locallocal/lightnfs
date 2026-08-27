@@ -827,8 +827,11 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
       }
     }
     if (wanted.test(attr::kMountedOnFileid)) {
-      auto root_obj = co_await resolved.exp->backend->root();
-      if (root_obj && (*root_obj)->id() == resolved.oid) {
+      // Cached root oid (plan doc 10 §2.6): Linux clients request this attribute on
+      // nearly every GETATTR/READDIR; the export-root comparison must not cost a
+      // backend->root() (fd dup + handle encode) each time.
+      auto root_oid = co_await root_oid_of(*resolved.exp);
+      if (root_oid && *root_oid == resolved.oid) {
         if (auto* crossing = pseudo_.for_export(resolved.exp->fsid))
           src.mounted_on_fileid = crossing->id;
       }
@@ -840,6 +843,20 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
   enc.u32(st(Status::kOk));
   encode_fattr(enc, wanted, src);
   co_return st(Status::kOk);
+}
+
+rt::Task<Result<backend::ObjId>> Engine::root_oid_of(core::ExportEntry& exp) {
+  {
+    std::lock_guard g(root_oid_mu_);
+    auto it = root_oids_.find(exp.fsid);
+    if (it != root_oids_.end()) co_return it->second;
+  }
+  auto root_obj = co_await exp.backend->root();
+  if (!root_obj) co_return Err(root_obj.error());
+  backend::ObjId oid = (*root_obj)->id();
+  std::lock_guard g(root_oid_mu_);
+  root_oids_.emplace(exp.fsid, oid);
+  co_return oid;
 }
 
 rt::Task<uint32_t> Engine::op_getattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {

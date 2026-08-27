@@ -15,7 +15,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <list>
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -78,7 +78,9 @@ class Drc {
     rt::AsyncMutex mu;
     rt::AsyncCondVar cv;
     std::unordered_map<Key, Entry, KeyHash> entries;
-    std::list<Key> completed;  // completion order: front = oldest (TTL + memory evict)
+    // Completion order: front = oldest (TTL + memory evict). A deque, not a list:
+    // no per-entry node allocation (plan doc 10 §2.6).
+    std::deque<Key> completed;
     size_t bytes = 0;
   };
 

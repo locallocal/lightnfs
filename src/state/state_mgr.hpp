@@ -15,7 +15,9 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -55,6 +57,10 @@ struct ClientRec {
   std::atomic<bool> courtesy{false};
   std::atomic<bool> expired{false};  // reclaim chain started: its state is dead
   int64_t courtesy_since = 0;
+  // Deadline of this client's live lease-heap entry, -1 = none. Guarded by the
+  // StateMgr lease heap mutex (plan doc 10 §2.6: the scanner walks an expiry heap
+  // instead of every client every second; renewals still never touch it).
+  int64_t lease_heap_deadline = -1;
   std::unordered_set<StateOther, OtherHash> states;  // owned stateids (client shard)
 };
 
@@ -63,13 +69,18 @@ struct Slot {
   bool in_flight = false;
   bool cached = false;
   std::vector<std::byte> reply;  // full RPC reply payload for replay
+  // Retransmission-of-in-flight waiters park here (plan doc 10 §2.6): completing one
+  // slot no longer wakes every waiter of the whole session shard.
+  rt::AsyncCondVar cv;
 };
 
 struct SessionRec {
   SessionId id{};
   std::shared_ptr<ClientRec> client;
   nfsv4::ChannelAttrs fore, back;
-  std::vector<Slot> slots;
+  // Fixed at creation; Slot owns a condvar and never moves.
+  std::unique_ptr<Slot[]> slots;
+  uint32_t slot_count = 0;
   std::unordered_set<uint64_t> bound_conns;  // CREATE/BIND/SEQUENCE bind; DESTROY checks
 };
 
@@ -131,6 +142,9 @@ class StateMgr {
     uint32_t max_clients = 4096;
     uint32_t max_states_per_client = 65536;      // open + lock stateids per client
     uint32_t max_lock_segments_per_owner = 1024; // per (lock-owner, file)
+    // Shard count for the client/session/state/file tables (plan doc 10 §2.6: was a
+    // hardcoded 16).  [server] state_shards.
+    uint32_t shards = 16;
   };
 
   explicit StateMgr(Config cfg);
@@ -299,7 +313,6 @@ class StateMgr {
   rt::Task<std::string> dump();
 
  private:
-  static constexpr size_t kShards = 16;
   struct OwnerSlot {
     std::shared_ptr<ClientRec> confirmed;
     std::shared_ptr<ClientRec> unconfirmed;
@@ -314,7 +327,6 @@ class StateMgr {
   };
   struct SessionShard {
     rt::AsyncMutex mu;
-    rt::AsyncCondVar cv;  // in-flight slot duplicate waiters
     std::unordered_map<SessionId, std::shared_ptr<SessionRec>, SessionIdHash> table;
   };
   struct StateShard {
@@ -326,7 +338,7 @@ class StateMgr {
     std::unordered_map<FileKey, FileStateRec, FileKeyHash> table;
   };
 
-  ClientShard& client_shard(uint64_t clientid);
+  ClientShard& owner_shard(std::string_view owner_id);  // clients live in the owner shard
   SessionShard& session_shard(const SessionId& id);
   StateShard& state_shard(const StateOther& other);
   FileShard& file_shard(const FileKey& key);
@@ -335,7 +347,17 @@ class StateMgr {
   void persist_client(const ClientRec& client);
   void unpersist_client(const ClientRec& client);
   void note_reclaimed(std::string_view owner_id);  // grace early-exit bookkeeping
+  // O(1) clientid lookup via the dedicated index (plan doc 10 §2.6: replaces the
+  // all-shards sequential locked scan). Sync; Task kept for call-site compatibility.
   rt::Task<std::shared_ptr<ClientRec>> find_client(uint64_t clientid);
+  std::shared_ptr<ClientRec> find_client_sync(uint64_t clientid);
+  // by_id companions: every by_id insert/erase mirrors into the clientid index.
+  void index_client(const std::shared_ptr<ClientRec>& rec);
+  void unindex_client(uint64_t clientid);
+  // Arms (or advances) the client's lease-heap entry; earliest deadline wins.
+  void arm_lease_check(ClientRec& client, int64_t when);
+  // Wakes every slot's retransmission waiters; used when a session is torn down.
+  static void wake_all_slots(SessionRec& session);
   StateOther new_other(StateType type);
   // Internal reclaim chain; `reason` selects the metric.
   rt::Task<uint32_t> expire_client_impl(uint64_t clientid, int reason);
@@ -356,10 +378,20 @@ class StateMgr {
   GatewayLockMgr locks_;
   std::mutex lock_owner_mu_;
   std::unordered_map<std::string, LockOwnerRec> lock_owners_;  // key: 24 id bytes
-  std::array<ClientShard, kShards> clients_;
-  std::array<SessionShard, kShards> sessions_;
-  std::array<StateShard, kShards> states_;
-  std::array<FileShard, kShards> files_;
+  size_t shard_count_;  // cfg_.shards, clamped >= 1
+  std::unique_ptr<ClientShard[]> clients_;
+  std::unique_ptr<SessionShard[]> sessions_;
+  std::unique_ptr<StateShard[]> states_;
+  std::unique_ptr<FileShard[]> files_;
+  // clientid -> record, maintained alongside every by_id mutation (plan doc 10 §2.6).
+  mutable std::mutex client_idx_mu_;
+  std::unordered_map<uint64_t, std::shared_ptr<ClientRec>> client_idx_;
+  // Lease expiry heap (plan doc 10 §2.6): (deadline, clientid), lazily re-armed; the
+  // SEQUENCE renewal fast path stays a lone atomic store.
+  std::mutex lease_heap_mu_;
+  std::priority_queue<std::pair<int64_t, uint64_t>,
+                      std::vector<std::pair<int64_t, uint64_t>>, std::greater<>>
+      lease_heap_;
   std::atomic<uint32_t> next_client_{1};
   std::atomic<uint64_t> next_state_{1};
   std::atomic<uint32_t> next_session_{1};

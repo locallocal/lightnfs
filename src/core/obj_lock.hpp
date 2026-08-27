@@ -28,6 +28,7 @@ class ObjLockRegistry {
   struct Shard {
     std::mutex mu;
     std::unordered_map<Key, std::weak_ptr<rt::AsyncSharedMutex>, Hash> locks;
+    size_t sweep_pos = 0;  // rotating bucket cursor for amortized cleanup
   };
   std::array<Shard, 64> shards_;
 };

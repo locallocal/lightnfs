@@ -153,7 +153,7 @@ int EpollRing::try_sock_op(SockOp& s, int fd) {
 }
 
 void EpollRing::enqueue_sock(int fd, SockOp op) {
-  FdQ& q = socks_[fd];
+  FdQ& q = fdq_make(fd);
   if (!q.nonblock_set) {
     int fl = fcntl(fd, F_GETFL);
     if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
@@ -192,9 +192,9 @@ void EpollRing::update_interest(int fd, FdQ& q) {
 }
 
 void EpollRing::service_fd(int fd, uint32_t events) {
-  auto it = socks_.find(fd);
-  if (it == socks_.end()) return;
-  FdQ& q = it->second;
+  FdQ* qp = fdq(fd);
+  if (!qp) return;
+  FdQ& q = *qp;
   bool err = events & (EPOLLERR | EPOLLHUP);
   if ((events & EPOLLIN) || err) {
     while (!q.in.empty()) {
@@ -212,12 +212,8 @@ void EpollRing::service_fd(int fd, uint32_t events) {
       q.out.pop_front();
     }
   }
-  if (q.in.empty() && q.out.empty()) {
-    update_interest(fd, q);
-    socks_.erase(it);
-  } else {
-    update_interest(fd, q);
-  }
+  update_interest(fd, q);
+  if (q.in.empty() && q.out.empty()) socks_[fd].reset();
 }
 
 void EpollRing::prep_recv(OpHandle* op, int fd, std::span<std::byte> buf) {
@@ -232,21 +228,19 @@ void EpollRing::prep_accept(OpHandle* op, int fd, sockaddr* addr, socklen_t* ale
 
 void EpollRing::prep_cancel_fd(OpHandle* op, int fd) {
   int32_t n = 0;
-  auto it = socks_.find(fd);
-  if (it != socks_.end()) {
-    FdQ& q = it->second;
-    for (auto& s : q.in) {
+  if (FdQ* q = fdq(fd)) {
+    for (auto& s : q->in) {
       ready_.push_back({s.op, -ECANCELED});
       ++n;
     }
-    for (auto& s : q.out) {
+    for (auto& s : q->out) {
       ready_.push_back({s.op, -ECANCELED});
       ++n;
     }
-    q.in.clear();
-    q.out.clear();
-    update_interest(fd, q);
-    socks_.erase(it);
+    q->in.clear();
+    q->out.clear();
+    update_interest(fd, *q);
+    socks_[fd].reset();
   }
   ready_.push_back({op, n == 0 ? -ENOENT : n});
 }
@@ -259,10 +253,12 @@ size_t EpollRing::wait(std::span<Completion> out,
     remote_ready_.clear();
   }
 
-  if (ready_.empty()) {
+  {
+    // Always poll for events; only block when nothing is ready yet (plan doc 10 §2.6:
+    // skipping epoll_wait while ready_ was non-empty deferred event discovery).
     int ms;
-    if (!timeout) ms = -1;
-    else if (timeout->count() == 0) ms = 0;
+    if (!ready_.empty() || (timeout && timeout->count() == 0)) ms = 0;
+    else if (!timeout) ms = -1;
     else ms = static_cast<int>((timeout->count() + 999999) / 1000000);
 
     epoll_event evs[64];

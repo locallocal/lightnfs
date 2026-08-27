@@ -10,7 +10,9 @@
 // minorversion 0 is permanently rejected (decision D5); unimplemented ops answer
 // NOTSUPP, opcodes beyond the minor version's table answer OP_ILLEGAL.
 
+#include <mutex>
 #include <optional>
+#include <unordered_map>
 
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
@@ -140,6 +142,9 @@ class Engine {
                                 xdr::XdrEnc&);  // GETATTR tail
   FhBytes pseudo_fh(const core::PseudoFs::Node& node) const;
   FhBytes export_fh(const core::ExportEntry& exp, const backend::ObjId& oid) const;
+  // Cached backend root oid per export (plan doc 10 §2.6): the mounted_on_fileid
+  // export-root check no longer costs a backend->root() round trip per GETATTR.
+  rt::Task<Result<backend::ObjId>> root_oid_of(core::ExportEntry& exp);
 
   core::ExportTable& exports_;
   core::FileHandleCodec& handles_;
@@ -148,6 +153,8 @@ class Engine {
   state::StateMgr& state_;
   core::WriteVerf write_verf_;
   std::string server_owner_, server_scope_;
+  std::mutex root_oid_mu_;
+  std::unordered_map<uint32_t, backend::ObjId> root_oids_;  // fsid -> root oid
 };
 
 }  // namespace lnfs::nfsv4
