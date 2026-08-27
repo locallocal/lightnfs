@@ -110,7 +110,7 @@ struct Server {
     auto l = Listener::create(0, TransportConfig{}, disp, rt);
     ASSERT_OK(l);
     listener = std::move(*l);
-    spawn(listener->run(), rt.reactor(0));
+    listener->start();
     rt.start();
   }
   ~Server() {

@@ -7,9 +7,11 @@
 
 #include <netinet/in.h>
 
-#include <map>
+#include <array>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "rpc/dispatch.hpp"
 #include "runtime/buffer.hpp"
@@ -27,12 +29,22 @@ struct TransportConfig {
   int per_peer_limit = 128;
 };
 
+// Binary per-peer key: the address without the port, v4 addresses v6-mapped so the two
+// families never alias (plan doc 10 §2.4 — replaces inet_ntop + string keys).
+struct IpKey {
+  std::array<uint8_t, 16> b{};
+  friend bool operator==(const IpKey&, const IpKey&) = default;
+};
+struct IpKeyHash {
+  size_t operator()(const IpKey& k) const noexcept;
+};
+
 struct Peer {
   sockaddr_storage addr{};
   socklen_t len = 0;
   std::string to_string() const;
   // Key for per-peer connection limits (address without port).
-  std::string ip_key() const;
+  IpKey ip_key() const;
 };
 
 class ConnTracker {  // global + per-peer connection counting (design 03 §3.1)
@@ -43,10 +55,18 @@ class ConnTracker {  // global + per-peer connection counting (design 03 §3.1)
   int count();
 
  private:
+  // Sharded by peer key so parallel accept loops (per-reactor listeners, plan §2.3)
+  // don't serialize on one lock; the global total is a lone atomic.
+  static constexpr size_t kShards = 8;
+  struct Shard {
+    std::mutex mu;
+    std::unordered_map<IpKey, int, IpKeyHash> per_peer;
+  };
+  Shard& shard_of(const IpKey& k) { return shards_[IpKeyHash{}(k) % kShards]; }
+
   const TransportConfig cfg_;
-  std::mutex mu_;
-  int total_ = 0;
-  std::map<std::string, int> per_peer_;
+  std::atomic<int> total_{0};
+  std::array<Shard, kShards> shards_;
 };
 
 struct ConnCtx {

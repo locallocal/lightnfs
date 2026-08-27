@@ -157,7 +157,11 @@ struct WriteArgs {
   uint64_t offset = 0;
   uint32_t count = 0;
   uint32_t stable = kFileSync;
-  std::span<const std::byte> data{};  // references the decoded record
+  // Zero-copy views into the decoded record, one per contiguous piece (plan doc 10
+  // §2.4: a payload spanning recv buffers is handed to the backend as segments, never
+  // flattened). data_len is their total size.
+  SmallVec<std::span<const std::byte>, 8> data;
+  uint32_t data_len = 0;
   static Result<WriteArgs> decode(xdr::XdrDec& dec);
 };
 

@@ -400,3 +400,55 @@ TEST(BackendWrite, V42SparseCopyClone) {
   }
   runtime.stop_and_join();
 }
+
+// Plan doc 10 §2.4: the scatter write hands the payload to the kernel as segments
+// (IORING_OP_WRITEV) — bytes must land exactly as if flattened, including the fsync
+// tail for stable writes.
+TEST(BackendWrite, ScatterWriteVectored) {
+  TmpTree tree;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  {
+    auto made = backend::LocalBackend::create({.path = tree.path, .fsid = 5});
+    ASSERT_TRUE(made.has_value());
+    auto& be = **made;
+    auto root = run_runtime(runtime, be.root());
+    ASSERT_TRUE(root.has_value());
+    auto cred = self_cred();
+    auto created =
+        run_runtime(runtime, (*root)->create(cred, "vfile", backend::SetAttr{}, nullptr));
+    ASSERT_TRUE(created.has_value());
+    backend::OpenCtx open{cred, nullptr};
+
+    const char a[] = "hello ";
+    const char b[] = "scatter ";
+    const char c[] = "world";
+    iovec iov[3] = {{const_cast<char*>(a), 6}, {const_cast<char*>(b), 8},
+                    {const_cast<char*>(c), 5}};
+    auto w = run_runtime(runtime,
+                         created->obj->write(open, 0, std::span<const iovec>(iov, 3),
+                                             backend::Stability::kFileSync));
+    ASSERT_TRUE(w.has_value());
+    EXPECT_EQ(*w, 19u);
+
+    std::string on_disk;
+    {
+      FILE* f = fopen((tree.path + "/vfile").c_str(), "r");
+      char buf[64] = {};
+      size_t n = fread(buf, 1, sizeof buf, f);
+      fclose(f);
+      on_disk.assign(buf, n);
+    }
+    EXPECT_STREQ(on_disk, "hello scatter world");
+
+    // Offset + empty segments: writev skips zero-length iovecs.
+    iovec iov2[3] = {{const_cast<char*>(a), 0}, {const_cast<char*>(c), 5},
+                     {const_cast<char*>(a), 0}};
+    auto w2 = run_runtime(runtime,
+                          created->obj->write(open, 19, std::span<const iovec>(iov2, 3),
+                                              backend::Stability::kUnstable));
+    ASSERT_TRUE(w2.has_value());
+    EXPECT_EQ(*w2, 5u);
+  }
+  runtime.stop_and_join();
+}

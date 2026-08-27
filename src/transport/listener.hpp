@@ -1,8 +1,12 @@
 #pragma once
-// Accept loop (design 03 §3.1): accepts on one reactor, assigns connections round-robin
-// across the runtime's reactors, enforces global/per-peer connection limits.
+// Accept path (design 03 §3.1, reworked per plan doc 10 §2.3): one SO_REUSEPORT
+// listening socket per reactor, each with its own accept loop pinned to that reactor.
+// The kernel load-balances incoming connections across the sockets, so there is no
+// single accept serialization point and no cross-reactor handoff — a connection is
+// served where it was accepted. Global/per-peer connection limits are shared.
 
 #include <memory>
+#include <vector>
 
 #include "runtime/runtime.hpp"
 #include "transport/connection.hpp"
@@ -11,7 +15,8 @@ namespace lnfs::transport {
 
 class Listener {
  public:
-  // Binds and listens; port 0 picks an ephemeral port (tests).
+  // Binds one socket per reactor; port 0 picks an ephemeral port (tests) which the
+  // remaining sockets then share via SO_REUSEPORT.
   static Result<std::unique_ptr<Listener>> create(uint16_t port, TransportConfig cfg,
                                                   rpc::Dispatcher& disp, rt::Runtime& rt);
   ~Listener();
@@ -19,24 +24,27 @@ class Listener {
   uint16_t port() const { return port_; }
   ConnTracker& tracker() { return tracker_; }
 
-  // The accept loop; spawn this on a reactor. Exits when request_stop() is called.
-  rt::Task<void> run();
-  // Thread-safe: cancels the in-flight accept on the reactor run() lives on.
+  // Spawns the accept loops (one per reactor). They exit when request_stop() is called.
+  void start();
+  // Thread-safe: cancels every in-flight accept on its owning reactor.
   void request_stop();
 
  private:
-  Listener(int fd, uint16_t port, TransportConfig cfg, rpc::Dispatcher& disp, rt::Runtime& rt)
-      : fd_(fd), port_(port), cfg_(cfg), disp_(disp), rt_(rt), tracker_(cfg) {}
+  Listener(std::vector<int> fds, uint16_t port, TransportConfig cfg, rpc::Dispatcher& disp,
+           rt::Runtime& rt)
+      : fds_(std::move(fds)), port_(port), cfg_(cfg), disp_(disp), rt_(rt), tracker_(cfg) {}
 
-  int fd_;
+  rt::Task<void> run_one(size_t idx);
+
+  std::vector<int> fds_;  // fds_[i] is accepted on rt_.reactor(i)
   uint16_t port_;
   TransportConfig cfg_;
   rpc::Dispatcher& disp_;
   rt::Runtime& rt_;
   ConnTracker tracker_;
   rt::CancelSource stop_;
-  std::atomic<rt::Reactor*> run_reactor_{nullptr};
-  // Each reactor needs its own pool eventually; one shared thread-safe pool for now.
+  // Each reactor needs its own pool eventually; one shared thread-safe pool for now
+  // (per-thread magazines make the sharing cheap, see runtime/buffer.hpp).
   rt::BufferPool pool_;
 };
 

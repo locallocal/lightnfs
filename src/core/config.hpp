@@ -31,6 +31,15 @@ class Cidr {
 struct ServerConfig {
   int reactors = 0;
   int offload_threads = 16;
+  // Offload pool shaping (plan doc 10 §2.5): threads reserved for heavy (fsync/
+  // fallocate/copy-grade) jobs — 0 = max(1, offload_threads/4) — and the per-class
+  // queued-job cap before admissions wait.
+  int offload_heavy_threads = 0;
+  uint32_t offload_queue_cap = 4096;
+  // Ring backend (plan doc 10 §2.3): "auto" probes io_uring and falls back to epoll;
+  // ring_sqpoll enables IORING_SETUP_SQPOLL kernel-thread submission (design 02 §2.63).
+  std::string ring = "auto";
+  bool ring_sqpoll = false;
   uint16_t port = 2049;
   uint16_t mount_port = 20048;
   bool rpcbind = true;

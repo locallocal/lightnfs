@@ -1,6 +1,29 @@
 #include "rpc/drc.hpp"
 
+#include <cstring>
+
 namespace lnfs::rpc {
+
+Drc::Key Drc::Key::make(const sockaddr_storage& peer, uint32_t xid, uint32_t prog,
+                        uint32_t vers, uint32_t proc, uint64_t args_hash) {
+  Key k;
+  if (peer.ss_family == AF_INET) {
+    auto* a = reinterpret_cast<const sockaddr_in*>(&peer);
+    k.peer_addr[10] = k.peer_addr[11] = 0xff;  // ::ffff:a.b.c.d
+    std::memcpy(k.peer_addr.data() + 12, &a->sin_addr, 4);
+    k.peer_port = ntohs(a->sin_port);
+  } else if (peer.ss_family == AF_INET6) {
+    auto* a = reinterpret_cast<const sockaddr_in6*>(&peer);
+    std::memcpy(k.peer_addr.data(), &a->sin6_addr, 16);
+    k.peer_port = ntohs(a->sin6_port);
+  }
+  k.xid = xid;
+  k.prog = prog;
+  k.vers = vers;
+  k.proc = proc;
+  k.args_hash = args_hash;
+  return k;
+}
 
 size_t Drc::KeyHash::operator()(const Key& k) const noexcept {
   uint64_t h = 1469598103934665603ull;
@@ -8,7 +31,8 @@ size_t Drc::KeyHash::operator()(const Key& k) const noexcept {
     h ^= v;
     h *= 1099511628211ull;
   };
-  for (char c : k.peer) mix(static_cast<uint8_t>(c));
+  for (uint8_t c : k.peer_addr) mix(c);
+  mix(k.peer_port);
   mix(k.xid);
   mix(k.prog);
   mix(k.vers);
@@ -29,7 +53,7 @@ void Drc::purge(Shard& sh) {
     bool expired = now - it->second.done_at >= cfg_.ttl;
     bool over_memory = sh.bytes > cfg_.max_memory / kShards;
     if (!expired && !over_memory) break;
-    sh.bytes -= it->second.reply.size();
+    sh.bytes -= it->second.reply ? it->second.reply->size() : 0;
     sh.entries.erase(it);
     sh.completed.pop_front();
     evictions_.fetch_add(1, std::memory_order_relaxed);
@@ -64,9 +88,9 @@ rt::Task<void> Drc::complete(const Key& key, std::vector<std::byte> reply) {
   auto it = sh.entries.find(key);
   if (it != sh.entries.end() && !it->second.done) {
     it->second.done = true;
-    it->second.reply = std::move(reply);
+    it->second.reply = std::make_shared<const std::vector<std::byte>>(std::move(reply));
     it->second.done_at = std::chrono::steady_clock::now();
-    sh.bytes += it->second.reply.size();
+    sh.bytes += it->second.reply->size();
     sh.completed.push_back(key);
     purge(sh);
   }

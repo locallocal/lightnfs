@@ -134,3 +134,123 @@ TEST(Xdr, FlatSpanMode) {
   EXPECT_EQ(*dec.u32(), 2u);
   EXPECT_FALSE(dec.u32().has_value());
 }
+
+// ---- speculative encoding (plan doc 10 §2.4) --------------------------------
+
+TEST(Xdr, MarkRollbackSameTail) {
+  rt::BufferPool pool;
+  XdrEnc enc(pool);
+  enc.u32(1);
+  auto m = enc.mark();
+  enc.u32(2);
+  enc.u32(3);
+  enc.rollback(m);
+  enc.u32(4);
+  auto chain = enc_to_chain(enc);
+  XdrDec dec(chain);
+  EXPECT_EQ(*dec.u32(), 1u);
+  EXPECT_EQ(*dec.u32(), 4u);
+  EXPECT_TRUE(dec.at_end());
+}
+
+TEST(Xdr, MarkRollbackAcrossTailClose) {
+  rt::BufferPool pool;
+  XdrEnc enc(pool);
+  enc.u32(7);
+  auto m = enc.mark();
+  // Overflow the 4K tail so it is closed into the chain and a fresh tail opens.
+  std::vector<std::byte> big(rt::BufferPool::kSmall + 100, std::byte{0x5a});
+  enc.opaque_fixed(big);
+  enc.u32(9);
+  enc.rollback(m);
+  enc.u32(8);
+  auto chain = enc_to_chain(enc);
+  EXPECT_EQ(chain.size(), 8u);
+  XdrDec dec(chain);
+  EXPECT_EQ(*dec.u32(), 7u);
+  EXPECT_EQ(*dec.u32(), 8u);
+}
+
+TEST(Xdr, MarkRollbackAcrossAttach) {
+  rt::BufferPool pool;
+  XdrEnc enc(pool);
+  enc.u32(1);
+  auto m = enc.mark();
+  auto data = pool.alloc(6);
+  std::memcpy(data.data(), "abcdef", 6);
+  enc.u32(6);
+  enc.attach(data, 0, 6);  // closes the tail, splices a segment, pads
+  enc.rollback(m);
+  enc.u32(2);
+  auto chain = enc_to_chain(enc);
+  EXPECT_EQ(chain.size(), 8u);
+  XdrDec dec(chain);
+  EXPECT_EQ(*dec.u32(), 1u);
+  EXPECT_EQ(*dec.u32(), 2u);
+}
+
+TEST(Xdr, MarkRollbackKeepsEarlierGapPatchable) {
+  rt::BufferPool pool;
+  XdrEnc enc(pool);
+  std::byte* gap = enc.raw_gap(4);
+  auto m = enc.mark();
+  enc.u32(0xdead);
+  enc.rollback(m);
+  enc.u32(0xbeef);
+  uint32_t v = to_be32(42);
+  std::memcpy(gap, &v, 4);  // gap pointer from before the mark stays valid
+  auto chain = enc_to_chain(enc);
+  XdrDec dec(chain);
+  EXPECT_EQ(*dec.u32(), 42u);
+  EXPECT_EQ(*dec.u32(), 0xbeefu);
+}
+
+TEST(Xdr, OpaqueSpansZeroCopyAcrossSegments) {
+  rt::BufferPool pool;
+  // opaque<9>: len=9, payload "abcdefghi", 3 pad bytes, then a trailing u32.
+  std::vector<std::byte> raw;
+  auto push32 = [&](uint32_t v) {
+    v = to_be32(v);
+    auto* p = reinterpret_cast<const std::byte*>(&v);
+    raw.insert(raw.end(), p, p + 4);
+  };
+  push32(9);
+  const char* payload = "abcdefghi";
+  raw.insert(raw.end(), reinterpret_cast<const std::byte*>(payload),
+             reinterpret_cast<const std::byte*>(payload) + 9);
+  raw.insert(raw.end(), 3, std::byte{0});
+  push32(0x77);
+  // Split inside the payload so it spans two chain segments.
+  auto chain = make_chain(pool, raw, 7);
+  XdrDec dec(chain);
+  lnfs::SmallVec<std::span<const std::byte>, 4> segs;
+  auto len = dec.opaque_spans(64, segs);
+  ASSERT_TRUE(len.has_value());
+  EXPECT_EQ(*len, 9u);
+  ASSERT_TRUE(segs.size() == 2);  // no gather: one span per chain segment
+  std::string got;
+  for (auto s : segs) got.append(reinterpret_cast<const char*>(s.data()), s.size());
+  EXPECT_STREQ(got, "abcdefghi");
+  EXPECT_EQ(*dec.u32(), 0x77u);  // padding was consumed
+  EXPECT_TRUE(dec.at_end());
+}
+
+TEST(Xdr, OpaqueSpansRejectsOverMaxAndTruncated) {
+  rt::BufferPool pool;
+  std::vector<std::byte> raw;
+  uint32_t v = to_be32(100);
+  auto* p = reinterpret_cast<const std::byte*>(&v);
+  raw.insert(raw.end(), p, p + 4);
+  raw.insert(raw.end(), 4, std::byte{0x11});  // only 4 payload bytes present
+  auto chain = make_chain(pool, raw, 3);
+  {
+    XdrDec dec(chain);
+    lnfs::SmallVec<std::span<const std::byte>, 4> segs;
+    EXPECT_FALSE(dec.opaque_spans(50, segs).has_value());  // len > max
+  }
+  {
+    XdrDec dec(chain);
+    lnfs::SmallVec<std::span<const std::byte>, 4> segs;
+    EXPECT_FALSE(dec.opaque_spans(200, segs).has_value());  // len > remaining
+  }
+}

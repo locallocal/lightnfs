@@ -86,7 +86,7 @@ int lnfs::bench::fullpath_main(int argc, char** argv) {
     fprintf(stderr, "listener failed\n");
     return 1;
   }
-  spawn((*l)->run(), rt.reactor(0));
+  (*l)->start();
   rt.start();
 
   // Resolve the target fh directly (bench, not protocol conformance).

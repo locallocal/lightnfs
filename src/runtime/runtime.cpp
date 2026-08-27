@@ -15,11 +15,16 @@ Runtime::Runtime(Config cfg) {
   if (cfg.ring == "auto") cfg.ring = "epoll";
 #endif
 
+  std::string uring_mode;
   for (int i = 0; i < n; ++i) {
     std::unique_ptr<RingOps> ring;
     if (cfg.ring == "uring" || cfg.ring == "auto") {
-      auto r = UringRing::create(cfg.ring_entries);
+      auto r = UringRing::create(UringRing::Setup{.sq_entries = cfg.ring_entries,
+                                                  .cq_entries = cfg.ring_cq_entries,
+                                                  .sqpoll = cfg.ring_sqpoll});
       if (r) {
+        if (uring_mode.empty())
+          uring_mode = (*r)->multishot_accept() ? "multishot-accept" : "single-accept";
         ring = std::move(*r);
         ring_kind_ = "uring";
       } else if (cfg.ring == "uring") {
@@ -34,13 +39,17 @@ Runtime::Runtime(Config cfg) {
     rings_.push_back(std::move(ring));
     reactors_.push_back(std::make_unique<Reactor>(*rings_.back()));
   }
-  offload_ = std::make_unique<OffloadPool>(cfg.offload_threads);
+  offload_ = std::make_unique<OffloadPool>(
+      OffloadPool::Config{.threads = cfg.offload_threads,
+                          .heavy_threads = cfg.offload_heavy_threads,
+                          .queue_cap = cfg.offload_queue_cap});
   for (auto& r : reactors_) r->set_offload_pool(offload_.get());
   LNFS_INFO("runtime: {} reactors, ring={}, offload_threads={}", reactors_.size(), ring_kind_,
             cfg.offload_threads);
   if (ring_kind_ == "uring")
     LNFS_INFO("uring probe: required opcodes supported "
-              "(read/write/writev/recv/accept/openat/close/fsync/statx/cancel)");
+              "(read/write/writev/recv/accept/openat/close/fsync/statx/cancel), {}",
+              uring_mode);
 }
 
 Runtime::~Runtime() { stop_and_join(); }

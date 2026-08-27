@@ -1266,6 +1266,51 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
   co_return static_cast<uint32_t>(done);
 }
 
+rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
+                                              std::span<const iovec> iov,
+                                              Stability stability) {
+  auto gate = co_await io_gate(ctx.cred, /*write=*/true);
+  if (!gate) co_return Err(gate.error());
+  auto ref = co_await backend_.fd_cache_->acquire(id(), true);
+  if (!ref) co_return Err(ref.error());
+  int fd = (*ref)->fd;
+  // Mutable copy for short-write continuation (an iovec is advanced in place).
+  SmallVec<iovec, 16> vec;
+  size_t total = 0;
+  for (const auto& v : iov) {
+    if (v.iov_len == 0) continue;
+    vec.push_back(v);
+    total += v.iov_len;
+  }
+  size_t done = 0;
+  size_t idx = 0;
+  while (done < total) {
+    int n = co_await rt::uring_writev(fd, vec.data() + idx,
+                                      static_cast<int>(vec.size() - idx), off + done);
+    if (n < 0) co_return Err(errno_from_neg(n));
+    if (n == 0) co_return Err(errno_from(EIO));
+    done += static_cast<size_t>(n);
+    size_t adv = static_cast<size_t>(n);
+    while (idx < vec.size() && adv >= vec[idx].iov_len) {
+      adv -= vec[idx].iov_len;
+      ++idx;
+    }
+    if (idx < vec.size() && adv > 0) {
+      vec[idx].iov_base = static_cast<char*>(vec[idx].iov_base) + adv;
+      vec[idx].iov_len -= adv;
+    }
+  }
+  if (stability != Stability::kUnstable) {
+    int rc = take_fsync_fault() ? -EIO
+                                : co_await rt::uring_fsync(fd, stability == Stability::kDataSync);
+    if (rc < 0) {
+      backend_.poison(id());
+      co_return Err(errno_from_neg(rc));
+    }
+  }
+  co_return static_cast<uint32_t>(done);
+}
+
 rt::Task<Result<void>> LocalObject::commit(OpenCtx, uint64_t, uint64_t) {
   if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
   // Sticky writeback-error contract (06 §6.2): once fsync failed, keep failing.
@@ -1323,7 +1368,7 @@ rt::Task<Result<void>> LocalObject::allocate(OpenCtx ctx, uint64_t off, uint64_t
     if (::fallocate(fd, 0, static_cast<off_t>(off), static_cast<off_t>(len)) < 0)
       return Err(errno_from(errno));
     return {};
-  });
+  }, rt::OffloadClass::kHeavy);
 }
 
 rt::Task<Result<void>> LocalObject::deallocate(OpenCtx ctx, uint64_t off, uint64_t len) {
@@ -1340,7 +1385,7 @@ rt::Task<Result<void>> LocalObject::deallocate(OpenCtx ctx, uint64_t off, uint64
                     static_cast<off_t>(len)) < 0)
       return Err(errno_from(errno));
     return {};
-  });
+  }, rt::OffloadClass::kHeavy);
 }
 
 rt::Task<Result<void>> LocalObject::clone(OpenCtx sctx, Object& dst, OpenCtx dctx,
@@ -1371,7 +1416,7 @@ rt::Task<Result<void>> LocalObject::clone(OpenCtx sctx, Object& dst, OpenCtx dct
       return Err(errno_from(errno == ENOTTY ? EOPNOTSUPP : errno));
     }
     return {};
-  });
+  }, rt::OffloadClass::kHeavy);
 }
 
 rt::Task<Result<uint64_t>> LocalObject::copy_range(OpenCtx sctx, Object& dst, OpenCtx dctx,
@@ -1433,7 +1478,7 @@ rt::Task<Result<uint64_t>> LocalObject::copy_range(OpenCtx sctx, Object& dst, Op
       done += static_cast<uint64_t>(n);
     }
     return done;
-  });
+  }, rt::OffloadClass::kHeavy);
 }
 
 namespace {

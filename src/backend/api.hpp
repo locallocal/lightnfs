@@ -2,6 +2,8 @@
 // Protocol-neutral storage boundary (design 05).  Backends speak filesystem objects,
 // attributes and POSIX errno only; NFS-specific types stay in core/engines.
 
+#include <sys/uio.h>
+
 #include <array>
 #include <compare>
 #include <cstddef>
@@ -202,6 +204,12 @@ class Object {
   virtual rt::Task<Result<OpenPtr>> open(const Cred&, OpenFlags);
   virtual rt::Task<Result<uint32_t>> read(OpenCtx, uint64_t, std::span<std::byte>, bool&);
   virtual rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t, std::span<const std::byte>,
+                                            Stability);
+  // Scatter write (plan doc 10 §2.4): the engines hand the WRITE payload down as the
+  // received segments so a payload spanning recv buffers is never flattened. Backends
+  // with a native vectored path (local: IORING_OP_WRITEV) override; the default calls
+  // the flat overload per segment with the same stability.
+  virtual rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t, std::span<const iovec>,
                                             Stability);
   virtual rt::Task<Result<void>> commit(OpenCtx, uint64_t, uint64_t);
   virtual rt::Task<Result<uint64_t>> seek(OpenCtx, uint64_t, SeekWhat);

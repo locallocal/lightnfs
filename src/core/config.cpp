@@ -197,6 +197,20 @@ Result<Config> parse_config(std::string_view text) {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n > INT_MAX) return Err(errno_from(EINVAL));
         config.server.offload_threads = static_cast<int>(n);
+      } else if (key == "offload_heavy_threads") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n > INT_MAX) return Err(errno_from(EINVAL));
+        config.server.offload_heavy_threads = static_cast<int>(n);
+      } else if (key == "offload_queue_cap") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n == 0 || n > UINT32_MAX) return Err(errno_from(EINVAL));
+        config.server.offload_queue_cap = static_cast<uint32_t>(n);
+      } else if (key == "ring") {
+        auto r = LNFS_TRY(string_value(value));
+        if (r != "auto" && r != "uring" && r != "epoll") return Err(errno_from(EINVAL));
+        config.server.ring = r;
+      } else if (key == "ring_sqpoll") {
+        config.server.ring_sqpoll = LNFS_TRY(bool_value(value));
       } else if (key == "port") {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n > UINT16_MAX) return Err(errno_from(EINVAL));

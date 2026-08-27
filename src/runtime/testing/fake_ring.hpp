@@ -18,6 +18,7 @@ class FakeRing final : public RingOps {
   enum class Kind {
     kRead,
     kWrite,
+    kWritev,
     kFsync,
     kRecv,
     kSendv,
@@ -90,6 +91,12 @@ class FakeRing final : public RingOps {
   }
   void prep_write(OpHandle* op, int fd, std::span<const std::byte> buf, uint64_t off) override {
     pending.push_back(Op{op, Kind::kWrite, fd, off, {}, buf});
+  }
+  void prep_writev(OpHandle* op, int fd, const iovec* iov, int iovcnt, uint64_t off) override {
+    Op o{op, Kind::kWritev, fd, off};
+    o.iov = iov;
+    o.iovcnt = iovcnt;
+    pending.push_back(o);
   }
   void prep_fsync(OpHandle* op, int fd, bool) override {
     pending.push_back(Op{op, Kind::kFsync, fd});

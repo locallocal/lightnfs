@@ -76,6 +76,10 @@ class SmallVec {
     ++size_;
     return *p;
   }
+  void pop_back() {
+    assert(size_ > 0);
+    data()[--size_].~T();
+  }
   void clear() {
     for (size_t i = 0; i < size_; ++i) data()[i].~T();
     size_ = 0;
