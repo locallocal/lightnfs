@@ -10,10 +10,13 @@
 // exceed the memory cap.  Keys include a checksum of the argument prefix so a colliding
 // xid from the same peer cannot replay a different call's reply.
 
+#include <netinet/in.h>
+
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <list>
-#include <string>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -30,16 +33,24 @@ class Drc {
   };
 
   struct Key {
-    std::string peer;  // ip:port
+    // Binary peer identity: 16-byte address (v4 addresses v6-mapped) + port. Replaces
+    // the per-request inet_ntop + string hash/compare (plan doc 10 §2.4).
+    std::array<uint8_t, 16> peer_addr{};
+    uint16_t peer_port = 0;
     uint32_t xid = 0;
     uint32_t prog = 0, vers = 0, proc = 0;
     uint64_t args_hash = 0;
     friend bool operator==(const Key&, const Key&) = default;
+
+    static Key make(const sockaddr_storage& peer, uint32_t xid, uint32_t prog,
+                    uint32_t vers, uint32_t proc, uint64_t args_hash);
   };
 
   struct Claim {
-    bool owner = false;              // true: execute, then complete() or abort()
-    std::vector<std::byte> cached{};  // owner==false: the reply to retransmit
+    bool owner = false;  // true: execute, then complete() or abort()
+    // owner==false: the reply to retransmit — shared with the cache entry, no
+    // under-lock value copy (plan doc 10 §2.4).
+    std::shared_ptr<const std::vector<std::byte>> cached{};
   };
 
   struct Stats {
@@ -60,7 +71,7 @@ class Drc {
   };
   struct Entry {
     bool done = false;
-    std::vector<std::byte> reply;
+    std::shared_ptr<const std::vector<std::byte>> reply;
     std::chrono::steady_clock::time_point done_at{};
   };
   struct Shard {

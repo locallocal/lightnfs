@@ -103,6 +103,25 @@ rt::Task<Result<uint32_t>> Object::write(OpenCtx, uint64_t, std::span<const std:
                                           Stability) {
   return unsupported<uint32_t>();
 }
+rt::Task<Result<uint32_t>> Object::write(OpenCtx ctx, uint64_t off,
+                                          std::span<const iovec> iov, Stability stability) {
+  // Default scatter path: one flat write per segment, same stability each time (a
+  // backend where stability costs a sync should override with a native vectored write).
+  uint32_t done = 0;
+  for (const auto& v : iov) {
+    auto n = co_await write(
+        ctx, off + done,
+        std::span<const std::byte>(static_cast<const std::byte*>(v.iov_base), v.iov_len),
+        stability);
+    if (!n) {
+      if (done > 0) co_return done;  // partial success: report what landed
+      co_return Err(n.error());
+    }
+    done += *n;
+    if (*n < v.iov_len) break;  // short write: stop at the backend's boundary
+  }
+  co_return done;
+}
 rt::Task<Result<void>> Object::commit(OpenCtx, uint64_t, uint64_t) {
   return unsupported<void>();
 }

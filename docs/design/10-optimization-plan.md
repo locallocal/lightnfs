@@ -142,54 +142,56 @@ Event 全部经由它）、每个 reply 的 `wmu_` 串行锁（`transport/record
 - 顺带修 `reactor.cpp:60-61`：`drain` 的 swap 把带容量的 vector 换出去析构，
   MpscQueue 容量每轮清零、每批 push 重新 malloc——把 drain 缓冲提为 Reactor 成员。
 
-### 2.3 io_uring 现代化
+### 2.3 io_uring 现代化 ✅ 已完成（registered buffers / send zerocopy 留二期）
 
 setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"一 reactor 一 ring
 一线程"是 `SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN` 的教科书场景：
 
 | 项 | 改动 | 备注 |
 |---|---|---|
-| `SINGLE_ISSUER + DEFER_TASKRUN + COOP_TASKRUN` | 一行 + 内核版本探测回退 | 收益直接，先做 |
-| `IORING_SETUP_CQSIZE` | CQ 深度与并发度对齐 | 现 SQ=1024/CQ=2048，与 4096 连接 × 64 inflight 脱钩（`runtime.hpp:24`、`connection.hpp:26-27`） |
-| multishot accept + 每 reactor `SO_REUSEPORT` listener | 改 `listener.cpp:19-83` | 同时消除 §2.6 的 accept 串行点 |
-| registered buffers / provided buffer ring | 依赖 §2.5 buffer pool 改造（需稳定内存区，现在 `std::malloc` 地址不稳定） | 二期 |
+| `SINGLE_ISSUER + DEFER_TASKRUN + COOP_TASKRUN` | ✅ setup 阶梯探测（DEFER→COOP→plain），SINGLE_ISSUER 经 `R_DISABLED` 创建、`bind_submitter()` 在 reactor 线程启用 | `uring_ring.cpp` create()/bind_submitter() |
+| `IORING_SETUP_CQSIZE` | ✅ CQ 默认 8×SQ，`Runtime::Config::ring_cq_entries` 可调 | |
+| multishot accept + 每 reactor `SO_REUSEPORT` listener | ✅ addr-less accept 走 multishot（每 listener 一个常驻 SQE，5.19+ 探测回退单发）；Listener 改为每 reactor 一个 REUSEPORT socket + 本 reactor accept 循环，连接就地服务 | 同时消除 §2.6 的 accept 串行点与跨 reactor 交接 |
+| registered buffers / provided buffer ring | 依赖稳定内存区（magazine 化后仍是 malloc 地址） | 二期 |
 | send zerocopy | 大 READ 应答收益 | 二期，需完成通知处理 |
-| SQPOLL | 设计 02 §2.63 声明"可配"但配置项与代码均不存在 | 补配置或修文档 |
+| SQPOLL | ✅ 配置项 `[server] ring_sqpoll`（含 `ring = auto\|uring\|epoll`），不可用时告警回退 | |
 
-### 2.4 内存与拷贝路径
+### 2.4 内存与拷贝路径 ✅ 已完成
 
-- **WRITE 整包拷贝（设计与实现不符）**：设计 02 声明大 opaque 不拷贝，实际
-  `xdr.hpp:102-128` 仅当字段落在单 segment 内才零拷贝，而接收缓冲固定 64KB
-  （`record_stream.cpp:13`），任何 >64KB 的 WRITE 必然跨段 → 每 1MB 写多一次 1MB
-  堆分配 + memcpy。根因是后端 API 只收扁平 span（`backend/api.hpp:204`）。
-  修复：后端加 `writev(iovec span)` 重载走 `IORING_OP_WRITEV`，把接收链直接递给内核。
-- **BufferPool**（`runtime/buffer.{hpp,cpp}`）：全局 `std::mutex` freelist +
-  原子引用计数，而 99% 分配是同 reactor 的——加 thread-local magazine；尺寸类
-  4K/64K/1M 跨度过大，128K/256K 的典型 rsize 落到 1M 类浪费 4~8 倍并击穿 64MB
-  水位（`buffer.cpp:33-38`）——补中间尺寸类；`alloc` 失败抛 `bad_alloc` 而协程
-  未捕获异常直接 `abort()`（`reactor.cpp:114-117`）——OOM 应转为出错降级。
-- **协程帧分配**：`TaskPromise` 未重载 `operator new`（`runtime/task.hpp:31-59`），
-  一次 GETATTR 的调用链 7~8 个协程帧全走全局堆。加 per-reactor freelist 分配器，
-  这是自研 runtime 本应兑现的优势。
-- **v4 编码 staging 双重拷贝**：COMPOUND 主循环对每个 op 先编进 staging `XdrEnc`
-  再 `to_bytes()` 再拷入主 buffer（`nfsv4/engine.cpp:349-361`），attrs 编码再叠一层
-  （`nfsv4/attrs.cpp:54-110`）；READDIRPLUS 每条目一次（`engine.cpp:1084-1110`，
-  千条目 ≈ 2000+ 次 vector 分配）。给 `XdrEnc` 加 `mark()/rollback()` 直接编码进
-  主 buffer、超预算回滚，两层 staging 都能去掉。
-- 小件：reply 的两个临时 `std::vector<iovec>` 改 `SmallVec`
-  （`record_stream.cpp:79-86`）；DRC `Claim.cached` 持锁值拷贝改共享引用
-  （`rpc/drc.cpp:52`）；DRC Key 去 `std::string peer` 化（`drc.hpp:33`，每请求
-  `inet_ntop` + 字符串哈希）；ConnTracker 的 `map<string,int>` + 全局锁改二进制
-  key + 分片（`connection.cpp:42-59`）。
+- **WRITE 整包拷贝（设计与实现不符）** ✅：`XdrDec::opaque_spans()` 把跨段 opaque
+  以零拷贝段视图交出（不再 gather）；后端加 `write(iovec span)` 重载，local 走
+  `IORING_OP_WRITEV`（短写续传），默认实现逐段透传；v3/v4 WRITE 均改走段路径。
+- **BufferPool** ✅：thread-local magazine（每线程每尺寸类 16 块，池亡/线程退出经
+  全局注册表安全回收）；尺寸类补 128K/256K（现 4K/64K/128K/256K/1M）；OOM 先清空
+  freelist 重试，仍失败在连接层降级为断连而非进程 abort（`handle_one` 兜底 +
+  `RecordStream::fill` 返回 ENOMEM）。
+- **协程帧分配** ✅：`runtime/frame_alloc.hpp` per-thread 64B 粒度 freelist
+  （≤4KB 帧，每 bin 上限 64），`TaskPromise`/spawn root promise 接入
+  `operator new/delete`；跨线程释放只是块在线程缓存间迁移，天然安全。
+- **v4 编码 staging 双重拷贝** ✅：`XdrEnc::mark()/rollback()`（可跨 tail 关闭与
+  attach 回滚，早于 mark 的 raw_gap 指针保持有效）；COMPOUND 逐 op、READDIR 逐条目
+  改为就地编码 + 超预算回滚；`encode_fattr` 改 attrmask 后留 4 字节 gap、值就地
+  编码、末尾 patch 长度，去掉 vals staging。
+- 小件 ✅：reply iovec 改 `SmallVec<iovec,8>`；DRC `Claim.cached` 改
+  `shared_ptr<const vector<byte>>`；DRC Key 改二进制（16B v6-mapped 地址 + 端口，
+  `Key::make(sockaddr_storage)`）；ConnTracker 改 16B 二进制 key + 8 分片 +
+  原子总数。
 
-### 2.5 offload pool 改造
+### 2.5 offload pool 改造 ✅ 已完成
 
 `runtime/offload_pool.{hpp,cpp}`：单把全局锁 + 无界 FIFO deque，`queue_depth()`
 是死代码。local 后端 20+ 处元数据操作全走它，每次 submit/完成回投都抢同一把锁。
 
-- 接入背压（队列深度上限 + 准入等待），`queue_depth` 导出为指标（设计 08 §8.3 本就要求）；
-- 分片队列或 per-reactor 队列 + work stealing，消除全局锁；
-- 轻重分级（statx/open vs fsync/fallocate），避免慢 fsync 队头阻塞元数据操作。
+- ✅ 背压：每类 `queue_cap`（默认 4096，`[server] offload_queue_cap`）之上进入
+  overflow 准入队列、随完成逐个放行；`deferred` 计数 + 队列深度经
+  `lightnfs_offload_*` 指标导出（`queue_depth()` 复活为指标源）。
+- ✅ 分片队列 + work stealing：每 worker 一个 shard（mutex+deque），类级
+  counting_semaphore 停车；空闲 worker 从自己的 shard 起扫全组（即 stealing），
+  全局锁消除。
+- ✅ 轻重分级：`OffloadClass::{kLight,kHeavy}`，heavy 独占预留线程
+  （默认 max(1, threads/4)，`[server] offload_heavy_threads` 可调；单线程池回落
+  共用），local 后端 allocate/deallocate/clone/copy_range 标记 kHeavy——慢 fsync/
+  fallocate 不再队头阻塞元数据操作。
 
 ### 2.6 其余热点（中优先级）
 

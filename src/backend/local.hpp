@@ -145,6 +145,10 @@ class LocalObject final : public Object {
                                   bool& eof) override;
   rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const std::byte> in,
                                    Stability) override;
+  // Scatter write via IORING_OP_WRITEV (plan doc 10 §2.4): the received WRITE payload
+  // goes to the kernel as-is, no flattening copy.
+  rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const iovec> iov,
+                                   Stability) override;
   rt::Task<Result<void>> commit(OpenCtx, uint64_t off, uint64_t len) override;
   // v4.2 sweets (design 06 §6.x mapping table): lseek(SEEK_DATA/HOLE), fallocate(0 /
   // PUNCH_HOLE|KEEP_SIZE), ioctl(FICLONERANGE), copy_file_range with a pread/pwrite

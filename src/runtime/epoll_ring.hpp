@@ -25,6 +25,7 @@ class EpollRing final : public RingOps {
 
   void prep_read(OpHandle* op, int fd, std::span<std::byte> buf, uint64_t off) override;
   void prep_write(OpHandle* op, int fd, std::span<const std::byte> buf, uint64_t off) override;
+  void prep_writev(OpHandle* op, int fd, const iovec* iov, int iovcnt, uint64_t off) override;
   void prep_fsync(OpHandle* op, int fd, bool datasync) override;
   void prep_recv(OpHandle* op, int fd, std::span<std::byte> buf) override;
   void prep_sendv(OpHandle* op, int fd, const iovec* iov, int iovcnt) override;

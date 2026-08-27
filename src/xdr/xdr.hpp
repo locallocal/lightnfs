@@ -76,6 +76,39 @@ class XdrDec {
     auto s = LNFS_TRY(opaque(max));
     return std::string_view(reinterpret_cast<const char*>(s.data()), s.size());
   }
+  // Variable-length opaque<max> as zero-copy segment views (WRITE payload path, plan
+  // doc 10 §2.4): no gather even when the field spans recv buffers.  The spans point
+  // into the underlying chain/flat memory, which the caller keeps alive.  Returns the
+  // total payload length; `out` receives one span per contiguous piece.
+  template <class Vec>
+  Result<uint32_t> opaque_spans(uint32_t max, Vec& out) {
+    uint32_t len = LNFS_TRY(u32());
+    if (len > max) return Err(Errno::kGarbage);
+    if (len > remaining_) return Err(Errno::kGarbage);
+    out.clear();
+    uint32_t need = len;
+    while (need > 0) {
+      if (!chain_) {  // flat mode: one span
+        out.push_back(std::span<const std::byte>(flat_.data() + off_, need));
+        off_ += need;
+        remaining_ -= need;
+        need = 0;
+        break;
+      }
+      while (seg_ < chain_->seg_count() && off_ == chain_->seg(seg_).len) {
+        ++seg_;
+        off_ = 0;
+      }
+      const auto& s = chain_->seg(seg_);
+      uint32_t k = std::min<uint32_t>(need, static_cast<uint32_t>(s.len - off_));
+      out.push_back(std::span<const std::byte>(s.buf.data() + s.off + off_, k));
+      off_ += k;
+      remaining_ -= k;
+      need -= k;
+    }
+    LNFS_TRY(skip(pad4(len)));
+    return len;
+  }
   Result<void> skip(size_t n) {
     if (n == 0) return {};
     LNFS_TRY(take(n));
@@ -192,6 +225,46 @@ class XdrEnc {
     out_.clear();
     size_ = 0;
     return r;
+  }
+
+  // ---- speculative encoding (plan doc 10 §2.4) ------------------------------
+  // mark() snapshots the write position; rollback(m) discards everything encoded
+  // since.  Replaces the stage-into-scratch-then-copy pattern (COMPOUND per-op
+  // budgets, READDIR entry budgets): encode directly into the reply, roll back on
+  // over-budget.  Marks are stack-like: rolling back invalidates marks taken after m.
+  // raw_gap pointers taken before the mark stay valid.
+  struct Mark {
+    size_t segs;
+    size_t size;
+    size_t tail_used;
+    const std::byte* tail_id;
+    bool overflow;
+  };
+  Mark mark() const {
+    return {out_.seg_count(), size_, tail_used_, tail_ ? tail_.data() : nullptr, overflow_};
+  }
+  void rollback(const Mark& m) {
+    if (tail_ && tail_.data() == m.tail_id) {
+      // The mark-time tail is still open: nothing was closed since, just move the
+      // cursor back.
+      tail_used_ = m.tail_used;
+    } else {
+      // Tail was closed (and possibly replaced): discard the current one, pop
+      // segments appended since the mark, and re-open the mark-time tail if it was
+      // closed into the chain meanwhile (it sits at segment index m.segs).
+      tail_ = rt::Buffer();
+      tail_used_ = 0;
+      while (out_.seg_count() > m.segs) {
+        auto seg = out_.pop_back();
+        if (out_.seg_count() == m.segs && m.tail_id && seg.buf.data() == m.tail_id &&
+            seg.off == 0) {
+          tail_ = std::move(seg.buf);
+          tail_used_ = m.tail_used;
+        }
+      }
+    }
+    size_ = m.size;
+    overflow_ = m.overflow;
   }
 
  private:

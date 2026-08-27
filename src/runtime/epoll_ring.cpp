@@ -91,6 +91,16 @@ void EpollRing::prep_write(OpHandle* op, int fd, std::span<const std::byte> buf,
     push_remote({op, static_cast<int32_t>(r < 0 ? -errno : r)});
   });
 }
+void EpollRing::prep_writev(OpHandle* op, int fd, const iovec* iov, int iovcnt,
+                            uint64_t off) {
+  submit_file([this, op, fd, iov, iovcnt, off] {
+    ssize_t r;
+    do {
+      r = pwritev(fd, iov, iovcnt, static_cast<off_t>(off));
+    } while (r < 0 && errno == EINTR);
+    push_remote({op, static_cast<int32_t>(r < 0 ? -errno : r)});
+  });
+}
 void EpollRing::prep_fsync(OpHandle* op, int fd, bool datasync) {
   submit_file([this, op, fd, datasync] {
     int r = datasync ? fdatasync(fd) : fsync(fd);

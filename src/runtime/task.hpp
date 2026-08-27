@@ -11,6 +11,8 @@
 #include <utility>
 #include <variant>
 
+#include "runtime/frame_alloc.hpp"
+
 namespace lnfs::rt {
 
 template <class T>
@@ -32,6 +34,10 @@ struct PromiseBase {
   std::coroutine_handle<> continuation;
   std::suspend_always initial_suspend() noexcept { return {}; }
   FinalAwaiter final_suspend() noexcept { return {}; }
+  // Coroutine frames come from the per-thread freelist allocator (plan doc 10 §2.4)
+  // instead of the global heap; inherited by every TaskPromise.
+  static void* operator new(size_t n) { return frame_alloc(n); }
+  static void operator delete(void* p, size_t n) noexcept { frame_free(p, n); }
 };
 
 template <class T>

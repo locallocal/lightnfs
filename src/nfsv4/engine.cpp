@@ -355,21 +355,21 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
         ++done;
         continue;
       }
-      // Everything else is encoded via a staging buffer so an over-budget reply can be
-      // replaced by REP_TOO_BIG(_TO_CACHE) for exactly this op (RFC 8881 §2.10.6.4).
-      xdr::XdrEnc staged(conn.pool);
-      status = co_await exec_op(ctx, *opcode, dec, staged);
-      auto bytes = staged.take().to_bytes();
-      if (enc.size() + bytes.size() + 16 > ctx.max_response) {
-        status = ctx.cachethis && enc.size() + bytes.size() + 16 <= seq.max_response
+      // Everything else encodes straight into the reply under a mark; an over-budget
+      // result is rolled back and replaced by REP_TOO_BIG(_TO_CACHE) for exactly this
+      // op (RFC 8881 §2.10.6.4). Replaces the stage-then-copy path (plan doc 10 §2.4).
+      auto op_mark = enc.mark();
+      status = co_await exec_op(ctx, *opcode, dec, enc);
+      if (enc.size() + 16 > ctx.max_response) {
+        status = ctx.cachethis && enc.size() + 16 <= seq.max_response
                      ? st(Status::kRepTooBigToCache)
                      : st(Status::kRepTooBig);
+        enc.rollback(op_mark);
         enc.u32(*opcode);
         enc.u32(status);
         ++done;
         break;
       }
-      enc.opaque_fixed(bytes);
       ++done;
     }
 
@@ -838,7 +838,7 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
   src.fh = ctx.cfh;
   src.lease_seconds = state_.config().lease_seconds;
   enc.u32(st(Status::kOk));
-  encode_fattr(enc, wanted, src, ctx.conn.pool);
+  encode_fattr(enc, wanted, src);
   co_return st(Status::kOk);
 }
 
@@ -1093,10 +1093,18 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
                   const backend::Attr& attr, const FhBytes& fh, uint64_t fsid_val,
                   uint64_t mounted_on, const backend::FsLimits* lim_ptr,
                   bool ent_link_sup, bool ent_symlink_sup) -> bool {
-    xdr::XdrEnc entry(ctx.conn.pool);
-    entry.boolean(true);
-    entry.u64(entry_cookie);
-    entry.string(name);
+    size_t name_part = 8 + 4 + ((name.size() + 3) & ~size_t(3));
+    if (used_dir + name_part > *dircount) {
+      truncated = true;
+      return false;
+    }
+    // Encode the entry in place under a mark; over-budget rolls it back (plan doc 10
+    // §2.4 — was one staging XdrEnc + flatten + copy per entry).
+    auto entry_mark = enc.mark();
+    const size_t entry_start = enc.size();
+    enc.boolean(true);
+    enc.u64(entry_cookie);
+    enc.string(name);
     AttrSource src;
     src.attr = &attr;
     src.fsid = fsid_val;
@@ -1106,15 +1114,14 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     src.link_support = ent_link_sup;
     src.symlink_support = ent_symlink_sup;
     src.lease_seconds = state_.config().lease_seconds;
-    encode_fattr(entry, *wanted, src, ctx.conn.pool);
-    auto bytes = entry.take().to_bytes();
-    size_t name_part = 8 + 4 + ((name.size() + 3) & ~size_t(3));
-    if (used + bytes.size() > budget || used_dir + name_part > *dircount) {
+    encode_fattr(enc, *wanted, src);
+    const size_t entry_size = enc.size() - entry_start;
+    if (used + entry_size > budget) {
+      enc.rollback(entry_mark);
       truncated = true;
       return false;
     }
-    enc.opaque_fixed(bytes);  // raw append: already XDR-formed
-    used += bytes.size();
+    used += entry_size;
     used_dir += name_part;
     return true;
   };
@@ -1623,8 +1630,11 @@ rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
   auto sid = Stateid::decode(dec);
   auto offset = dec.u64();
   auto stable = dec.u32();
-  auto data = dec.opaque(UINT32_MAX);
-  if (!sid || !offset || !stable || !data) {
+  // Zero-copy segment views of the payload (plan doc 10 §2.4): no gather-copy even
+  // when the opaque spans recv buffers.
+  SmallVec<std::span<const std::byte>, 8> data_segs;
+  auto data_len = dec.opaque_spans(UINT32_MAX, data_segs);
+  if (!sid || !offset || !stable || !data_len) {
     enc.u32(st(Status::kBadxdr));
     co_return st(Status::kBadxdr);
   }
@@ -1670,21 +1680,29 @@ rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     enc.u32(st(Status::kRofs));
     co_return st(Status::kRofs);
   }
-  if (*offset + data->size() < *offset) {  // offset+length overflow
+  if (*offset + *data_len < *offset) {  // offset+length overflow
     enc.u32(st(Status::kInval));
     co_return st(Status::kInval);
   }
   auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
   auto cred = mapped.view();
   uint32_t count = static_cast<uint32_t>(
-      std::min<size_t>(data->size(), resolved->exp->backend->limits().max_write));
+      std::min<size_t>(*data_len, resolved->exp->backend->limits().max_write));
+  SmallVec<iovec, 8> iov;
+  for (uint32_t left = count; const auto& seg : data_segs) {
+    if (left == 0) break;
+    uint32_t k = static_cast<uint32_t>(std::min<size_t>(left, seg.size()));
+    iov.push_back(iovec{const_cast<std::byte*>(seg.data()), k});
+    left -= k;
+  }
   backend::Stability stability = *stable == 0   ? backend::Stability::kUnstable
                                  : *stable == 1 ? backend::Stability::kDataSync
                                                 : backend::Stability::kFileSync;
   auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
   auto held = co_await lock->lock();
   backend::OpenCtx open{cred, check.bopen.get()};
-  auto written = co_await resolved->obj->write(open, *offset, data->first(count), stability);
+  auto written = co_await resolved->obj->write(
+      open, *offset, std::span<const iovec>(iov.data(), iov.size()), stability);
   if (!written) {
     uint32_t code = st(core::to_v4(written.error(), Op::kWrite));
     enc.u32(code);

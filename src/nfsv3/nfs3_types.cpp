@@ -152,7 +152,7 @@ Result<WriteArgs> WriteArgs::decode(xdr::XdrDec& dec) {
   out.count = LNFS_TRY(dec.u32());
   out.stable = LNFS_TRY(dec.u32());
   if (out.stable > kFileSync) return Err(Errno::kGarbage);
-  out.data = LNFS_TRY(dec.opaque(1u << 24));
+  out.data_len = LNFS_TRY(dec.opaque_spans(1u << 24, out.data));
   return out;
 }
 

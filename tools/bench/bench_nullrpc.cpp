@@ -68,7 +68,7 @@ int lnfs::bench::nullrpc_main(int argc, char** argv) {
     fprintf(stderr, "listener failed\n");
     return 1;
   }
-  spawn((*l)->run(), rt.reactor(0));
+  (*l)->start();
   rt.start();
 
   auto res = bench::run_load((*l)->port(), conns, per_conn, pipeline, build_null_call());

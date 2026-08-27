@@ -10,7 +10,11 @@ using namespace lnfs::rt;
 
 Task<Result<void>> RecordStream::fill() {
   if (!rbuf_ || rend_ == rbuf_.capacity()) {
-    rbuf_ = pool_.alloc(BufferPool::kMedium);
+    try {
+      rbuf_ = pool_.alloc(BufferPool::kMedium);
+    } catch (const std::bad_alloc&) {
+      co_return Err(errno_from(ENOMEM));  // OOM degrades to a connection error (§2.4)
+    }
     roff_ = rend_ = 0;
   }
   for (;;) {
@@ -75,15 +79,15 @@ Task<Result<void>> RecordStream::write_record(SendBuf buf) {
 
   // 4-byte record mark (single fragment; RPC replies are bounded by reply-size budgets).
   uint32_t marker = xdr::to_be32(0x80000000u | static_cast<uint32_t>(total));
-  std::vector<iovec> iov;
-  std::vector<iovec> body;
+  SmallVec<iovec, 8> iov;   // typical replies: marker + a few segments — no heap (§2.4)
+  SmallVec<iovec, 8> body;
   size_t sent = 0;
   while (sent < 4 + total) {
     iov.clear();
     if (sent < 4) {
       iov.push_back(iovec{reinterpret_cast<std::byte*>(&marker) + sent, 4 - sent});
       buf.to_iovecs(body, 0);
-      iov.insert(iov.end(), body.begin(), body.end());
+      for (const auto& v : body) iov.push_back(v);
     } else {
       buf.to_iovecs(iov, sent - 4);
     }

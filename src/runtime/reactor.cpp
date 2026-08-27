@@ -106,11 +106,15 @@ bool Reactor::pump(std::optional<std::chrono::nanoseconds> block_for) {
 
 bool Reactor::poll_once() {
   ReactorGuard g(this);
+  ring_.bind_submitter();
   return pump(std::chrono::nanoseconds(0));
 }
 
 void Reactor::run() {
   ReactorGuard g(this);
+  // First act on the reactor thread: claim the ring as its single issuer (io_uring
+  // SINGLE_ISSUER/DEFER_TASKRUN setup, plan doc 10 §2.3). No-op for other backends.
+  ring_.bind_submitter();
   for (;;) {
     // Non-blocking sweep until quiescent, then decide whether to exit or block.
     while (pump(std::chrono::nanoseconds(0))) {
@@ -141,6 +145,8 @@ struct SpawnRoot {
       std::fprintf(stderr, "lnfs: uncaught exception escaped a spawned task; aborting\n");
       std::abort();
     }
+    static void* operator new(size_t n) { return detail::frame_alloc(n); }
+    static void operator delete(void* p, size_t n) noexcept { detail::frame_free(p, n); }
   };
   std::coroutine_handle<promise_type> h;
 };

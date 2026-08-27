@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <linux/stat.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -102,6 +103,64 @@ void run_socket_scenario(RingOps& ring) {
   EXPECT_TRUE(ok);
 }
 
+// Multishot accept (plan doc 10 §2.3): the addr-less accept path keeps one standing
+// SQE per listener; several queued connections must each complete exactly one accept,
+// and cancel_fd must terminate the stream with -ECANCELED.
+void run_multishot_accept_scenario(UringRing& ring) {
+  Reactor r(ring);
+  int lfd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_TRUE(lfd >= 0);
+  int one = 1;
+  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in6 addr{};
+  addr.sin6_family = AF_INET6;
+  addr.sin6_addr = in6addr_loopback;
+  ASSERT_TRUE(bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+  ASSERT_TRUE(listen(lfd, 16) == 0);
+  socklen_t alen = sizeof(addr);
+  getsockname(lfd, reinterpret_cast<sockaddr*>(&addr), &alen);
+  const uint16_t port = ntohs(addr.sin6_port);
+
+  constexpr int kConns = 5;
+  std::thread clients([port] {
+    for (int i = 0; i < kConns; ++i) {
+      int fd = socket(AF_INET6, SOCK_STREAM, 0);
+      sockaddr_in6 dst{};
+      dst.sin6_family = AF_INET6;
+      dst.sin6_addr = in6addr_loopback;
+      dst.sin6_port = htons(port);
+      if (connect(fd, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) != 0) {
+        close(fd);
+        return;
+      }
+      close(fd);
+    }
+  });
+
+  int accepted = 0;
+  bool cancelled_ok = false;
+  spawn(
+      [](int lfd, int* accepted, bool* cok, Reactor* rr) -> Task<void> {
+        for (int i = 0; i < kConns; ++i) {
+          int cfd = co_await uring_accept(lfd, nullptr, nullptr);
+          if (cfd < 0) break;
+          ++*accepted;
+          close(cfd);
+        }
+        // Cancel the standing multishot op; the next accept must see -ECANCELED.
+        spawn([](int fd) -> Task<void> { co_await uring_cancel_fd(fd); }(lfd), *rr);
+        int e = co_await uring_accept(lfd, nullptr, nullptr);
+        *cok = (e == -ECANCELED);
+        rr->stop();
+      }(lfd, &accepted, &cancelled_ok, &r),
+      r);
+  r.run();
+  clients.join();
+  close(lfd);
+  EXPECT_EQ(accepted, kConns);
+  EXPECT_TRUE(cancelled_ok);
+}
+
 bool uring_available(std::unique_ptr<UringRing>& out) {
   auto r = UringRing::create(64);
   if (!r) {
@@ -130,6 +189,16 @@ TEST(UringSmoke, SocketPair) {
 // lose ops. A 4-entry ring gets 256 immediate /dev/null writes prepped back-to-back
 // with no intervening wait(): get_sqe() has to recycle SQ slots by flushing, ride out
 // -EBUSY by parking ready completions, and every op must still complete exactly once.
+TEST(UringSmoke, MultishotAccept) {
+  std::unique_ptr<UringRing> ring;
+  if (!uring_available(ring)) return;
+  if (!ring->multishot_accept()) {
+    std::printf("  (kernel lacks multishot accept — skipped)\n");
+    return;
+  }
+  run_multishot_accept_scenario(*ring);
+}
+
 TEST(UringSmoke, SqExhaustionAndCqOverflow) {
   auto made = UringRing::create(4);
   if (!made) {

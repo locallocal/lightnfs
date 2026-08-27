@@ -243,8 +243,8 @@ std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
     return std::nullopt;
   }
   Frontend fe{std::move(*nfs_listener), std::move(*mount_listener), nullptr, nullptr};
-  lnfs::rt::spawn(fe.nfs->run(), runtime.reactor(0));
-  lnfs::rt::spawn(fe.mount->run(), runtime.reactor(0));
+  fe.nfs->start();    // per-reactor REUSEPORT accept loops (plan doc 10 §2.3)
+  fe.mount->start();
 
   std::string ctl_path =
       cfg.ctl_socket.empty() ? cfg.state_dir + "/ctl.sock" : cfg.ctl_socket;
@@ -324,7 +324,11 @@ int run_server(const std::string& config_path, bool check_only) {
   lnfs::init_async_logging();
 
   lnfs::rt::Runtime runtime({.reactors = server_cfg.reactors,
-                             .offload_threads = server_cfg.offload_threads});
+                             .offload_threads = server_cfg.offload_threads,
+                             .offload_heavy_threads = server_cfg.offload_heavy_threads,
+                             .offload_queue_cap = server_cfg.offload_queue_cap,
+                             .ring = server_cfg.ring,
+                             .ring_sqpoll = server_cfg.ring_sqpoll});
   runtime.start();
   if (!start_backends(runtime, *core->exports)) {
     runtime.stop_and_join();
@@ -334,6 +338,21 @@ int run_server(const std::string& config_path, bool check_only) {
   ProtocolStack stack(server_cfg, *core);
   if (server_cfg.enable_v4) stack.enable_v4(server_cfg, *core, runtime);
   register_metrics_providers(stack);
+  // Runtime-layer metrics (plan doc 10 §2.5 / design 08 §8.3): offload queue depth and
+  // per-class throughput.
+  lnfs::obs::register_text_provider([&runtime](std::string& out) {
+    auto s = runtime.offload().stats();
+    static constexpr const char* kCls[] = {"light", "heavy"};
+    for (int c = 0; c < lnfs::rt::kOffloadClasses; ++c) {
+      out += std::format(
+          "lightnfs_offload_queue_depth{{class=\"{}\"}} {}\n"
+          "lightnfs_offload_submitted_total{{class=\"{}\"}} {}\n"
+          "lightnfs_offload_completed_total{{class=\"{}\"}} {}\n"
+          "lightnfs_offload_admission_deferred_total{{class=\"{}\"}} {}\n",
+          kCls[c], s.depth[c], kCls[c], s.submitted[c], kCls[c], s.completed[c],
+          kCls[c], s.deferred[c]);
+    }
+  });
 
   auto frontend = start_frontend(server_cfg, runtime, stack, *core);
   if (!frontend) {

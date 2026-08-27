@@ -458,3 +458,68 @@ TEST(WritePath, ErrmapWhitelistForWriteProcs) {
   EXPECT_EQ((uint32_t)core::to_v3(errno_from(ENOTEMPTY), P::kCommit), (uint32_t)S::kIo);
   EXPECT_EQ((uint32_t)core::to_v3(errno_from(EEXIST), P::kWrite), (uint32_t)S::kIo);
 }
+
+// Plan doc 10 §2.4: a WRITE payload that spans recv-buffer segments reaches the
+// backend as segment views (no flatten). Split the record mid-payload and verify the
+// bytes land intact end-to-end.
+TEST(WritePath, WritePayloadSpanningSegments) {
+  WriteFixture f;
+  auto file = f.lookup_fh(f.root_fh, "hello");
+  ASSERT_TRUE(!file.data.empty());
+
+  std::string payload(100, '\0');
+  for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>('a' + i % 26);
+  xdr::XdrEnc wenc(f.pool);
+  file.encode(wenc);
+  wenc.u64(0);
+  wenc.u32(static_cast<uint32_t>(payload.size()));
+  wenc.u32(nfsv3::kFileSync);
+  wenc.opaque(std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(payload.data()), payload.size()));
+  auto record = f.call(0x77, static_cast<uint32_t>(nfsv3::Proc::kWrite), wenc.take());
+
+  // Re-slice the record into three segments with both cuts inside the payload.
+  auto flat = record.to_bytes();
+  auto buf = f.pool.alloc(flat.size());
+  std::memcpy(buf.data(), flat.data(), flat.size());
+  rt::BufferChain split;
+  const uint32_t total = static_cast<uint32_t>(flat.size());
+  const uint32_t cut1 = total - 80, cut2 = total - 30;
+  split.append(buf, 0, cut1);
+  split.append(buf, cut1, cut2 - cut1);
+  split.append(buf, cut2, total - cut2);
+
+  auto parsed = rpc::parse_call(split);
+  ASSERT_TRUE(parsed.has_value());
+  rpc::Cred root_cred;
+  root_cred.uid = 0;
+  root_cred.gid = 0;
+  rt::spawn(f.engine.dispatch(f.ctx, *parsed, root_cred), f.reactor);
+  while (!f.ring.has_pending(rt::testing::FakeRing::Kind::kSendv)) f.reactor.poll_once();
+  auto op = f.ring.take(rt::testing::FakeRing::Kind::kSendv, 5);
+  std::vector<std::byte> wire;
+  for (int i = 0; i < op.iovcnt; ++i) {
+    auto* p = static_cast<std::byte*>(op.iov[i].iov_base);
+    wire.insert(wire.end(), p, p + op.iov[i].iov_len);
+  }
+  f.ring.complete(op, static_cast<int32_t>(wire.size()));
+  while (f.reactor.poll_once()) {}
+  auto dec = WriteFixture::result(wire);
+  EXPECT_EQ(*dec.u32(), 0u);  // NFS3_OK
+  WriteFixture::skip_wcc(dec);
+  EXPECT_EQ(*dec.u32(), payload.size());  // full count written
+
+  // READ back and compare.
+  xdr::XdrEnc renc(f.pool);
+  nfsv3::ReadArgs{file, 0, 200}.encode(renc);
+  auto reply = f.request(nfsv3::Proc::kRead, renc.take());
+  auto rdec = WriteFixture::result(reply);
+  EXPECT_EQ(*rdec.u32(), 0u);
+  ASSERT_TRUE(*rdec.boolean());
+  WriteFixture::skip_fattr(rdec);
+  EXPECT_EQ(*rdec.u32(), payload.size());
+  (void)rdec.boolean();  // eof
+  auto got = *rdec.opaque(256);
+  EXPECT_STREQ(std::string(reinterpret_cast<const char*>(got.data()), got.size()),
+               payload);
+}

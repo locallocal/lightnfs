@@ -40,8 +40,17 @@ class RingOps {
  public:
   virtual ~RingOps() = default;
 
+  // Optional hook: the first call made from the thread that will drive wait() from now
+  // on. io_uring uses it for SINGLE_ISSUER/DEFER_TASKRUN (the ring is created disabled
+  // on the setup thread, then enabled here); other backends need nothing.
+  virtual void bind_submitter() {}
+
   virtual void prep_read(OpHandle* op, int fd, std::span<std::byte> buf, uint64_t off) = 0;
   virtual void prep_write(OpHandle* op, int fd, std::span<const std::byte> buf, uint64_t off) = 0;
+  // Positioned scatter write (file WRITE path, plan doc 10 §2.4); iov must stay alive
+  // until completion.
+  virtual void prep_writev(OpHandle* op, int fd, const iovec* iov, int iovcnt,
+                           uint64_t off) = 0;
   virtual void prep_fsync(OpHandle* op, int fd, bool datasync) = 0;
   virtual void prep_recv(OpHandle* op, int fd, std::span<std::byte> buf) = 0;
   virtual void prep_sendv(OpHandle* op, int fd, const iovec* iov, int iovcnt) = 0;

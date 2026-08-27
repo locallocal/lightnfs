@@ -47,6 +47,10 @@ inline auto uring_write(int fd, std::span<const std::byte> buf, uint64_t off) {
   return detail::IoAwaiter{
       [=](RingOps& ring, OpHandle* op) { ring.prep_write(op, fd, buf, off); }};
 }
+inline auto uring_writev(int fd, const iovec* iov, int iovcnt, uint64_t off) {
+  return detail::IoAwaiter{
+      [=](RingOps& ring, OpHandle* op) { ring.prep_writev(op, fd, iov, iovcnt, off); }};
+}
 inline auto uring_fsync(int fd, bool datasync) {
   return detail::IoAwaiter{
       [=](RingOps& ring, OpHandle* op) { ring.prep_fsync(op, fd, datasync); }};

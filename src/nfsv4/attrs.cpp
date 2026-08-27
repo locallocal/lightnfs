@@ -1,5 +1,6 @@
 #include "nfsv4/attrs.hpp"
 
+#include <cstring>
 #include <string>
 
 namespace lnfs::nfsv4 {
@@ -32,8 +33,14 @@ bool wants_stats(const Bitmap& wanted) {
   return false;
 }
 
-void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src,
-                  rt::BufferPool& pool) {
+namespace {
+void patch_be32(std::byte* gap, uint32_t v) {
+  v = xdr::to_be32(v);
+  std::memcpy(gap, &v, 4);
+}
+}  // namespace
+
+void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src) {
   Bitmap actual;
   const Bitmap& sup = supported_attrs();
   for (uint32_t w = 0; w < 3; ++w) {
@@ -51,7 +58,13 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src,
   backend::FsStats zero_stats;
   const backend::FsStats& st = src.stats ? *src.stats : zero_stats;
 
-  xdr::XdrEnc vals(pool);  // attrlist4 body, ascending attribute order
+  // attrlist4 body, ascending attribute order, encoded in place: the opaque length is
+  // a 4-byte gap patched once the values are down (every value is 4-aligned, so the
+  // opaque needs no tail padding).
+  actual.encode(enc);
+  std::byte* len_gap = enc.raw_gap(4);
+  const size_t vals_start = enc.size();
+  xdr::XdrEnc& vals = enc;
   auto ok = [&](uint32_t id) { return actual.test(id); };
 
   if (ok(kSupportedAttrs)) supported_attrs().encode(vals);
@@ -105,9 +118,7 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src,
     vals.u64(src.mounted_on_fileid ? src.mounted_on_fileid : a.fileid);
   if (ok(kSuppattrExclCreat)) settable_attrs().encode(vals);
 
-  actual.encode(enc);
-  auto bytes = vals.take().to_bytes();
-  enc.opaque(bytes);
+  patch_be32(len_gap, static_cast<uint32_t>(enc.size() - vals_start));
 }
 
 const Bitmap& settable_attrs() {

@@ -128,12 +128,12 @@ rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rp
   }
 
   if (drc_ && drc_cached(proc)) {
-    rpc::Drc::Key key{ctx.peer.to_string(), call.xid, call.prog, call.vers, call.proc,
-                      call.args_hash};
+    auto key = rpc::Drc::Key::make(ctx.peer.addr, call.xid, call.prog, call.vers,
+                                   call.proc, call.args_hash);
     auto claim = co_await drc_->begin(key);
     if (!claim.owner) {  // retransmission: replay the cached reply bytes verbatim
       xdr::XdrEnc enc(ctx.pool);
-      enc.opaque_fixed(claim.cached);
+      enc.opaque_fixed(*claim.cached);
       co_await ctx.send(enc.take());
       co_return;
     }
@@ -603,11 +603,19 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
   auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
   auto cred = mapped.view();
   uint32_t count = std::min<uint32_t>(
-      std::min<uint64_t>(args->count, args->data.size()),
+      std::min<uint64_t>(args->count, args->data_len),
       resolved->exp->backend->limits().max_write);
+  // Hand the payload down as the received segments, truncated to `count` (§2.4).
+  SmallVec<iovec, 8> iov;
+  for (uint32_t left = count; const auto& seg : args->data) {
+    if (left == 0) break;
+    uint32_t k = static_cast<uint32_t>(std::min<size_t>(left, seg.size()));
+    iov.push_back(iovec{const_cast<std::byte*>(seg.data()), k});
+    left -= k;
+  }
   backend::OpenCtx open{cred, nullptr};
   auto written = co_await resolved->obj->write(open, args->offset,
-                                               args->data.first(count),
+                                               std::span<const iovec>(iov.data(), iov.size()),
                                                stability_from_wire(args->stable));
   auto after = co_await sample(resolved->obj);
   if (!written) {

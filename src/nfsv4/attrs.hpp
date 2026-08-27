@@ -51,8 +51,8 @@ const Bitmap& settable_attrs();
 // True if the mask requests attrs that need a statfs() prefetch.
 bool wants_stats(const Bitmap& wanted);
 
-// Encodes fattr4 {attrmask, attr_vals} for wanted ∩ supported into enc.
-void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src,
-                  rt::BufferPool& pool);
+// Encodes fattr4 {attrmask, attr_vals} for wanted ∩ supported into enc. Values are
+// encoded in place behind a patched length gap — no staging buffer (plan doc 10 §2.4).
+void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src);
 
 }  // namespace lnfs::nfsv4

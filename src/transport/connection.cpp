@@ -5,6 +5,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#include <cstring>
+
 #include "runtime/io.hpp"
 #include "util/log.hpp"
 
@@ -27,41 +29,62 @@ std::string Peer::to_string() const {
   return std::string(buf) + ":" + std::to_string(port);
 }
 
-std::string Peer::ip_key() const {
-  char buf[INET6_ADDRSTRLEN] = "?";
+IpKey Peer::ip_key() const {
+  IpKey k;
   if (addr.ss_family == AF_INET) {
     auto* a = reinterpret_cast<const sockaddr_in*>(&addr);
-    inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf));
+    k.b[10] = k.b[11] = 0xff;  // ::ffff:a.b.c.d
+    std::memcpy(k.b.data() + 12, &a->sin_addr, 4);
   } else if (addr.ss_family == AF_INET6) {
     auto* a = reinterpret_cast<const sockaddr_in6*>(&addr);
-    inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof(buf));
+    std::memcpy(k.b.data(), &a->sin6_addr, 16);
   }
-  return buf;
+  return k;
+}
+
+size_t IpKeyHash::operator()(const IpKey& k) const noexcept {
+  uint64_t h = 1469598103934665603ull;
+  for (uint8_t c : k.b) {
+    h ^= c;
+    h *= 1099511628211ull;
+  }
+  return static_cast<size_t>(h);
 }
 
 bool ConnTracker::try_add(const Peer& p) {
-  std::lock_guard lk(mu_);
-  if (total_ >= cfg_.max_connections) return false;
-  int& c = per_peer_[p.ip_key()];
-  if (c >= cfg_.per_peer_limit) return false;
-  ++c;
-  ++total_;
+  if (total_.fetch_add(1, std::memory_order_relaxed) >= cfg_.max_connections) {
+    total_.fetch_sub(1, std::memory_order_relaxed);
+    return false;
+  }
+  IpKey key = p.ip_key();
+  Shard& sh = shard_of(key);
+  {
+    std::lock_guard lk(sh.mu);
+    int& c = sh.per_peer[key];
+    if (c >= cfg_.per_peer_limit) {
+      if (c == 0) sh.per_peer.erase(key);
+      total_.fetch_sub(1, std::memory_order_relaxed);
+      return false;
+    }
+    ++c;
+  }
   obs::Metrics::instance().conns_active.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
 void ConnTracker::remove(const Peer& p) {
-  std::lock_guard lk(mu_);
-  auto it = per_peer_.find(p.ip_key());
-  if (it != per_peer_.end() && --it->second == 0) per_peer_.erase(it);
-  --total_;
+  IpKey key = p.ip_key();
+  Shard& sh = shard_of(key);
+  {
+    std::lock_guard lk(sh.mu);
+    auto it = sh.per_peer.find(key);
+    if (it != sh.per_peer.end() && --it->second == 0) sh.per_peer.erase(it);
+  }
+  total_.fetch_sub(1, std::memory_order_relaxed);
   obs::Metrics::instance().conns_active.fetch_sub(1, std::memory_order_relaxed);
 }
 
-int ConnTracker::count() {
-  std::lock_guard lk(mu_);
-  return total_;
-}
+int ConnTracker::count() { return total_.load(std::memory_order_relaxed); }
 
 Task<void> ConnCtx::send(rt::SendBuf buf) {
   auto r = co_await rs.write_record(std::move(buf));
@@ -75,7 +98,19 @@ Task<void> ConnCtx::send(rt::SendBuf buf) {
 
 namespace {
 Task<void> handle_one(ConnCtx* c, rpc::Dispatcher* d, BufferChain rec) {
-  co_await d->handle_request(*c, std::move(rec));
+  // Failure isolation (plan doc 10 §2.4): an exception that escapes the dispatcher's
+  // own error handling (e.g. bad_alloc while encoding the error reply) costs this
+  // connection, not the process.
+  try {
+    co_await d->handle_request(*c, std::move(rec));
+  } catch (const std::exception& e) {
+    LNFS_ERROR("conn {}: unrecoverable handler error ({}), tearing down",
+               c->peer.to_string(), e.what());
+    c->cancel.request();
+  } catch (...) {
+    LNFS_ERROR("conn {}: unrecoverable handler error, tearing down", c->peer.to_string());
+    c->cancel.request();
+  }
   c->inflight.release();
   if (--c->live == 0) c->drained.set();
 }

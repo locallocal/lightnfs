@@ -1,5 +1,7 @@
 #include "mini_test.hpp"
 #include "runtime/buffer.hpp"
+#include <thread>
+#include <vector>
 
 using namespace lnfs::rt;
 
@@ -9,13 +11,18 @@ TEST(BufferPool, SizeClassesAndReuse) {
   EXPECT_EQ(b1.capacity(), BufferPool::kSmall);
   auto b2 = pool.alloc(5000);
   EXPECT_EQ(b2.capacity(), BufferPool::kMedium);
+  // Intermediate classes (plan doc 10 §2.4): typical rsize allocations no longer round
+  // all the way to the 1M class.
   auto b3 = pool.alloc(70000);
-  EXPECT_EQ(b3.capacity(), BufferPool::kLarge);
+  EXPECT_EQ(b3.capacity(), 128u * 1024);
+  auto b3b = pool.alloc(200000);
+  EXPECT_EQ(b3b.capacity(), 256u * 1024);
+  auto b3c = pool.alloc(300000);
+  EXPECT_EQ(b3c.capacity(), BufferPool::kLarge);
   std::byte* p1 = b1.data();
-  b1 = Buffer();  // release -> freelist
-  EXPECT_TRUE(pool.free_bytes() >= BufferPool::kSmall);
+  b1 = Buffer();  // release -> this thread's magazine
   auto b4 = pool.alloc(50);
-  EXPECT_TRUE(b4.data() == p1);  // reused
+  EXPECT_TRUE(b4.data() == p1);  // reused without touching the global freelist
 }
 
 TEST(BufferPool, OversizeUnpooled) {
@@ -26,12 +33,30 @@ TEST(BufferPool, OversizeUnpooled) {
   EXPECT_EQ(pool.free_bytes(), 0u);  // not cached
 }
 
+TEST(BufferPool, MagazineOverflowSpillsToGlobal) {
+  BufferPool pool;
+  // Fill this thread's magazine past its cap; the overflow lands on the freelist.
+  std::vector<Buffer> held;
+  for (uint32_t i = 0; i < BufferPool::kMagazineCap + 3; ++i) held.push_back(pool.alloc(10));
+  held.clear();
+  EXPECT_EQ(pool.free_bytes(), 3u * BufferPool::kSmall);
+}
+
 TEST(BufferPool, Watermark) {
   BufferPool pool(BufferPool::Config{.max_free_bytes = BufferPool::kSmall});
-  auto a = pool.alloc(10);
+  // Overflow the magazine so releases reach the global freelist, which caps at one
+  // small block; the excess is freed outright.
+  std::vector<Buffer> held;
+  for (uint32_t i = 0; i < BufferPool::kMagazineCap + 4; ++i) held.push_back(pool.alloc(10));
+  held.clear();
+  EXPECT_EQ(pool.free_bytes(), BufferPool::kSmall);
+}
+
+TEST(BufferPool, CrossThreadRecycle) {
+  BufferPool pool;
   auto b = pool.alloc(10);
-  a = Buffer();
-  b = Buffer();  // second free exceeds watermark -> freed, not cached
+  std::thread t([moved = std::move(b)]() mutable { moved = Buffer(); });
+  t.join();  // freed on the other thread; its magazine flushed back at thread exit
   EXPECT_EQ(pool.free_bytes(), BufferPool::kSmall);
 }
 
