@@ -40,6 +40,8 @@ log_level = "info"  # debug | info | warn | error; debug adds a per-request summ
 [protocol]
 v3 = true
 v4 = true
+# delegations = true  # v4.1 read delegations (granted only to sessions that bound a
+#                     # backchannel); set false to disable granting entirely
 lease = "90s"            # v4.1 lease
 # grace = "auto"         # reclaim window after restart; "auto" = lease. Operators
                          # often set grace < lease for faster restart recovery.

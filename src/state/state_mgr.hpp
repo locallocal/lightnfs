@@ -24,10 +24,12 @@
 #include <vector>
 
 #include "backend/api.hpp"
+#include "nfsv4/callback.hpp"
 #include "nfsv4/nfs4_types.hpp"
 #include "runtime/sync.hpp"
 #include "runtime/task.hpp"
 #include "state/lock_mgr.hpp"
+#include "transport/backchannel.hpp"
 
 namespace lnfs::state {
 
@@ -61,6 +63,8 @@ struct ClientRec {
   // StateMgr lease heap mutex (plan doc 10 §2.6: the scanner walks an expiry heap
   // instead of every client every second; renewals still never touch it).
   int64_t lease_heap_deadline = -1;
+  // Read delegations held (plan doc 10 §5.2); drives SEQ4_STATUS_CB_PATH_DOWN.
+  std::atomic<uint32_t> delegs{0};
   std::unordered_set<StateOther, OtherHash> states;  // owned stateids (client shard)
 };
 
@@ -82,9 +86,23 @@ struct SessionRec {
   std::unique_ptr<Slot[]> slots;
   uint32_t slot_count = 0;
   std::unordered_set<uint64_t> bound_conns;  // CREATE/BIND/SEQUENCE bind; DESTROY checks
+
+  // Backchannel send side (plan doc 10 §5.2): one cb slot (the back channel is
+  // clamped to 1 request), bound at CREATE_SESSION (CONN_BACK_CHAN flag) or
+  // BIND_CONN_TO_SESSION(BACK/BOTH).  cb_mu guards all of it and is never held
+  // across IO — a call marks the slot busy, sends, then clears it; a slot stuck
+  // longer than a lease means the client stopped answering and the path is down.
+  std::mutex cb_mu;
+  std::shared_ptr<transport::CbChannel> cb_chan;
+  uint32_t cb_program = 0;
+  nfsv4::cb::Cred cb_cred;
+  uint32_t cb_seq = 0;
+  bool cb_inflight = false;
+  int64_t cb_inflight_since = 0;
+  std::atomic<bool> cb_down{false};
 };
 
-enum class StateType : uint8_t { kOpen = 1, kLock = 2 };
+enum class StateType : uint8_t { kOpen = 1, kLock = 2, kDeleg = 3 };
 
 // share_access / share_deny bit values (RFC 8881 §18.16).
 inline constexpr uint32_t kShareRead = 1, kShareWrite = 2, kShareBoth = 3;
@@ -109,12 +127,18 @@ struct StateRec {  // other = {boot_epoch(4B)|type(1B)|counter(7B)}
   // handle itself is released outside every lock.
   backend::OpenPtr bopen;
   bool closed = false;  // set under the state shard when removed from the index
+  // kDeleg (plan doc 10 §5.2): the filehandle for CB_RECALL, the recall state and
+  // the revocation deadline (coarse seconds; 0 = not recalled).
+  std::vector<std::byte> fh;
+  std::atomic<bool> recalled{false};
+  std::atomic<int64_t> recall_deadline{0};
 };
 using StateRef = std::shared_ptr<StateRec>;
 
 struct FileStateRec {  // conflict arbitration entry: share reservations + lock owners
   std::vector<StateRef> opens;
   std::vector<StateRef> locks;  // one lock stateid per (lock-owner, file)
+  std::vector<StateRef> delegs;  // read delegations (plan doc 10 §5.2)
 };
 
 // Compatibility view for callers that only need the identity of an open state.
@@ -148,6 +172,8 @@ class StateMgr {
     // Shard count for the client/session/state/file tables (plan doc 10 §2.6: was a
     // hardcoded 16).  [server] state_shards.
     uint32_t shards = 16;
+    // Read delegations (plan doc 10 §5.2); [protocol] delegations kill switch.
+    bool delegations = true;
   };
 
   explicit StateMgr(Config cfg);
@@ -184,11 +210,14 @@ class StateMgr {
     nfsv4::ChannelAttrs fore, back;
     uint32_t sequence = 0;
   };
-  rt::Task<CreateSessionResult> create_session(uint64_t clientid, uint32_t sequence,
-                                               std::string principal,
-                                               const nfsv4::ChannelAttrs& fore_req,
-                                               const nfsv4::ChannelAttrs& back_req,
-                                               uint64_t conn_id);
+  // cb_chan non-null = the client set CONN_BACK_CHAN: this connection carries the
+  // backchannel.  cb_program/cb_cred are remembered either way (a later
+  // BIND_CONN_TO_SESSION may attach a connection).
+  rt::Task<CreateSessionResult> create_session(
+      uint64_t clientid, uint32_t sequence, std::string principal,
+      const nfsv4::ChannelAttrs& fore_req, const nfsv4::ChannelAttrs& back_req,
+      uint64_t conn_id, std::shared_ptr<transport::CbChannel> cb_chan = nullptr,
+      uint32_t cb_program = 0, nfsv4::cb::Cred cb_cred = {});
   // Called after the engine encoded the successful reply op body: persists the client
   // to the stable list and caches the reply for sequence-based replay.
   rt::Task<void> confirm_create_session(uint64_t clientid, std::vector<std::byte> reply);
@@ -196,6 +225,9 @@ class StateMgr {
   rt::Task<uint32_t> destroy_session(const SessionId& id, uint64_t conn_id);
   rt::Task<uint32_t> destroy_clientid(uint64_t clientid);
   rt::Task<uint32_t> bind_conn(const SessionId& id, uint64_t conn_id);
+  // BIND_CONN_TO_SESSION with a BACK direction: attach this connection's channel.
+  rt::Task<uint32_t> bind_backchannel(const SessionId& id,
+                                      std::shared_ptr<transport::CbChannel> chan);
 
   // ---- SEQUENCE ----
   struct SeqResult {
@@ -205,6 +237,7 @@ class StateMgr {
     // negotiated context for the executing compound:
     uint32_t max_ops = 0, max_request = 0, max_response = 0, max_response_cached = 0;
     uint32_t highest_slot = 0;
+    uint32_t status_flags = 0;  // sr_status_flags: SEQ4_STATUS_CB_PATH_DOWN etc.
   };
   rt::Task<SeqResult> sequence_begin(const SessionId& id, uint32_t slotid, uint32_t seqid,
                                      uint32_t highest, bool cachethis, uint64_t conn_id);
@@ -224,6 +257,9 @@ class StateMgr {
     std::string owner;
     uint32_t access = 0, deny = 0;
     bool reclaim = false;  // CLAIM_PREVIOUS: stable-list gated, allowed during grace
+    // CLAIM_DELEG_CUR_FH (plan doc 10 §5.2): the open reclaims state under a
+    // delegation being recalled — it must not itself trigger the recall gate.
+    bool deleg_claim = false;
   };
   struct OpenResult {
     uint32_t status = 0;  // OK / SHARE_DENIED / GRACE / NO_GRACE / RECLAIM_BAD / ...
@@ -236,6 +272,34 @@ class StateMgr {
   // engine already obtained (may be null for backends without open state).
   rt::Task<OpenResult> open(OpenArgs args, backend::OpenPtr bopen);
   rt::Task<Stateid> open_read(uint64_t clientid, uint32_t fsid, const backend::ObjId& oid);
+
+  // ---- read delegations (plan doc 10 §5.2) ----
+  struct DelegGrant {
+    bool granted = false;
+    Stateid stateid{};
+  };
+  // Grant policy: delegations enabled, not in grace, no reclaim, the session has a
+  // live backchannel, the open is read-only, no other client holds a write open, and
+  // this client holds no delegation on the file yet.  `fh` is kept for CB_RECALL.
+  rt::Task<DelegGrant> maybe_grant_read_deleg(const SessionId& sessionid, uint64_t clientid,
+                                              uint32_t fsid, const backend::ObjId& oid,
+                                              std::vector<std::byte> fh, uint32_t access,
+                                              bool reclaim);
+  rt::Task<uint32_t> delegreturn(const Stateid& sid, uint64_t clientid, uint32_t fsid,
+                                 const backend::ObjId& oid);
+  // Mutation gate: when the file carries read delegations, initiate CB_RECALLs and
+  // return NFS4ERR_DELAY (the client retries; DELEGRETURN or the revocation deadline
+  // clears the way).  Returns 0 when the file is delegation-free.
+  rt::Task<uint32_t> deleg_conflict(uint32_t fsid, const backend::ObjId& oid);
+  // CLAIM_DELEG_CUR_FH: the stateid must be this client's delegation on this file.
+  rt::Task<uint32_t> check_deleg_claim(const Stateid& sid, uint64_t clientid,
+                                       uint32_t fsid, const backend::ObjId& oid);
+
+  // ---- CB_NOTIFY_LOCK (plan doc 10 §5.2) ----
+  // Registers a blocked LOCK waiter; when a lock on the file is released the client
+  // gets CB_NOTIFY_LOCK and retries.  Best effort, capped and lease-bounded.
+  void register_lock_waiter(uint32_t fsid, const backend::ObjId& oid, uint64_t clientid,
+                            std::string owner, std::vector<std::byte> fh);
 
   // IO-path stateid check (07 §6.1 order: special → table → OPENMODE).  `need` is the
   // share_access bit the op requires (kShareRead / kShareWrite).
@@ -312,6 +376,10 @@ class StateMgr {
     uint64_t share_denied = 0, open_merges = 0;
     size_t lock_states = 0, lock_segments = 0, lock_owners = 0;
     uint64_t lock_denied = 0;
+    // Delegations + backchannel (plan doc 10 §5.2).
+    size_t delegs = 0;
+    uint64_t deleg_grants = 0, deleg_recalls = 0, deleg_returns = 0, deleg_revokes = 0;
+    uint64_t cb_lock_notifies = 0;
     bool grace = false;
     int64_t grace_remaining = 0;
   };
@@ -417,6 +485,39 @@ class StateMgr {
       reclaim_timeout_{0}, reclaim_forced_{0}, share_denied_{0}, open_merges_{0},
       lock_denied_{0};
   std::atomic<int64_t> lock_count_{0};
+
+  // ---- read delegations + backchannel (plan doc 10 §5.2) ----
+  // Starts a recall for one delegation (marks it, arms the revocation deadline,
+  // spawns the CB_RECALL sender on the current reactor).  Never called under a lock.
+  void start_recall(const StateRef& deleg);
+  rt::Task<void> recall_task(StateRef deleg);
+  // One serialized CB_COMPOUND on the client's first live backchannel session;
+  // build(target) produces the record.  False = no usable backchannel / send failed.
+  rt::Task<bool> send_cb(std::shared_ptr<ClientRec> client,
+                         std::vector<std::byte> (*build)(const nfsv4::cb::Target&,
+                                                         const void*),
+                         const void* args);
+  // Sweeps recalled delegations whose deadline passed (called by scan_leases).
+  rt::Task<void> sweep_recalls();
+  void notify_lock_waiters(const FileKey& key);
+  rt::Task<void> notify_task(uint64_t clientid, std::string owner,
+                             std::vector<std::byte> fh);
+
+  std::mutex recall_mu_;
+  std::vector<StateRef> recall_watch_;  // recalled delegations awaiting return/revoke
+
+  struct LockWaiter {
+    uint64_t clientid = 0;
+    std::string owner;
+    std::vector<std::byte> fh;
+    int64_t expires = 0;
+  };
+  std::mutex lock_waiters_mu_;
+  std::unordered_map<FileKey, std::vector<LockWaiter>, FileKeyHash> lock_waiters_;
+
+  std::atomic<int64_t> deleg_count_{0};
+  std::atomic<uint64_t> deleg_grants_{0}, deleg_recalls_{0}, deleg_returns_{0},
+      deleg_revokes_{0}, cb_lock_notifies_{0};
 };
 
 }  // namespace lnfs::state

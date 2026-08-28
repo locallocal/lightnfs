@@ -171,7 +171,8 @@ struct ProtocolStack {
                .grace_seconds = cfg.grace_seconds,
                .courtesy_multiplier = cfg.courtesy_multiplier,
                .max_io = cfg.max_request_size,
-               .shards = cfg.state_shards}) {
+               .shards = cfg.state_shards,
+               .delegations = cfg.delegations}) {
     nfs3.set_write_verifier(lnfs::core::verifier_from_epoch(core.epoch));
     nfs3.set_drc(&drc);
     nfs3.register_with(dispatcher);
@@ -225,12 +226,17 @@ void register_metrics_providers(ProtocolStack& stack, lnfs::core::ExportTable& e
         "lightnfs_v4_share_denied_total {}\nlightnfs_v4_open_merges_total {}\n"
         // Lock-state gauges promised by deployment.md (plan doc 10 §3.4).
         "lightnfs_v4_lock_states {}\nlightnfs_v4_lock_segments {}\n"
-        "lightnfs_v4_lock_owners {}\nlightnfs_v4_lock_denied_total {}\n",
+        "lightnfs_v4_lock_owners {}\nlightnfs_v4_lock_denied_total {}\n"
+        // Delegations + backchannel (plan doc 10 §5.2).
+        "lightnfs_v4_delegations {}\nlightnfs_v4_deleg_grants_total {}\n"
+        "lightnfs_v4_deleg_recalls_total {}\nlightnfs_v4_deleg_returns_total {}\n"
+        "lightnfs_v4_deleg_revokes_total {}\nlightnfs_v4_cb_lock_notifies_total {}\n",
         s.clients, s.sessions, s.opens, s.seq_new, s.seq_replay, s.seq_misordered,
         s.seq_waits, s.grace ? 1 : 0, s.grace_remaining, s.files, s.courtesy,
         s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout, s.reclaim_forced,
         s.share_denied, s.open_merges, s.lock_states, s.lock_segments, s.lock_owners,
-        s.lock_denied);
+        s.lock_denied, s.delegs, s.deleg_grants, s.deleg_recalls, s.deleg_returns,
+        s.deleg_revokes, s.cb_lock_notifies);
   });
   lnfs::obs::register_text_provider([&exports](std::string& out) {
     for (const auto& entry : exports.entries()) {

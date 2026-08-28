@@ -28,6 +28,7 @@ enum class Op : uint32_t {
   kClose = 4,
   kCommit = 5,
   kCreate = 6,
+  kDelegreturn = 8,
   kGetattr = 9,
   kGetfh = 10,
   kLink = 11,

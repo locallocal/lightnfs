@@ -81,6 +81,7 @@ const char* op_name(uint32_t op) {
     case Op::kClose: return "CLOSE";
     case Op::kCommit: return "COMMIT";
     case Op::kCreate: return "CREATE";
+    case Op::kDelegreturn: return "DELEGRETURN";
     case Op::kGetattr: return "GETATTR";
     case Op::kGetfh: return "GETFH";
     case Op::kLink: return "LINK";

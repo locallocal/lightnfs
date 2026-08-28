@@ -79,6 +79,11 @@ struct V4Fixture {
     engine.emplace(exports, handles, locks, *pseudo, *state);
   }
   ~V4Fixture() {
+    // Release any callback sender parked on an unanswered CB call (plan doc 10 §5.2)
+    // so no coroutine frame outlives the reactor.
+    if (ctx.cb) ctx.cb->detach();
+    while (reactor.poll_once()) {
+    }
     std::error_code ec;
     std::filesystem::remove_all(state_dir, ec);
   }
@@ -104,17 +109,68 @@ struct V4Fixture {
     cred.uid = 0;
     cred.gid = 0;
     rt::spawn(engine->dispatch(ctx, *parsed, cred), reactor);
-    while (!ring.has_pending(rt::testing::FakeRing::Kind::kSendv)) reactor.poll_once();
-    auto op = ring.take(rt::testing::FakeRing::Kind::kSendv, 5);
-    std::vector<std::byte> wire;
-    for (int i = 0; i < op.iovcnt; ++i) {
-      auto* p = static_cast<std::byte*>(op.iov[i].iov_base);
-      wire.insert(wire.end(), p, p + op.iov[i].iov_len);
+    // A backchannel CALL (CB_RECALL / CB_NOTIFY_LOCK) may hit the wire before the
+    // compound reply: stash CALL records and return the first REPLY (plan doc 10 §5.2).
+    for (;;) {
+      while (!ring.has_pending(rt::testing::FakeRing::Kind::kSendv)) reactor.poll_once();
+      auto op = ring.take(rt::testing::FakeRing::Kind::kSendv, 5);
+      std::vector<std::byte> wire;
+      for (int i = 0; i < op.iovcnt; ++i) {
+        auto* p = static_cast<std::byte*>(op.iov[i].iov_base);
+        wire.insert(wire.end(), p, p + op.iov[i].iov_len);
+      }
+      ring.complete(op, static_cast<int32_t>(wire.size()));
+      while (reactor.poll_once()) {}
+      std::vector<std::byte> payload(wire.begin() + 4, wire.end());
+      // msg_type is the second u32: 0 = a callback CALL from the server.
+      if (payload.size() >= 8 && payload[7] == std::byte{0}) {
+        cb_records.push_back(std::move(payload));
+        continue;
+      }
+      return payload;
     }
-    ring.complete(op, static_cast<int32_t>(wire.size()));
-    while (reactor.poll_once()) {}
-    return {wire.begin() + 4, wire.end()};
   }
+
+  // Pulls one pending backchannel CALL off the fake wire (already-stashed first).
+  std::vector<std::byte> take_cb_record() {
+    if (cb_records.empty()) {
+      while (!ring.has_pending(rt::testing::FakeRing::Kind::kSendv)) reactor.poll_once();
+      auto op = ring.take(rt::testing::FakeRing::Kind::kSendv, 5);
+      std::vector<std::byte> wire;
+      for (int i = 0; i < op.iovcnt; ++i) {
+        auto* p = static_cast<std::byte*>(op.iov[i].iov_base);
+        wire.insert(wire.end(), p, p + op.iov[i].iov_len);
+      }
+      ring.complete(op, static_cast<int32_t>(wire.size()));
+      while (reactor.poll_once()) {}
+      cb_records.emplace_back(wire.begin() + 4, wire.end());
+    }
+    auto out = std::move(cb_records.front());
+    cb_records.erase(cb_records.begin());
+    return out;
+  }
+
+  // Feeds an RPC reply for a callback back into the connection (the read loop's job
+  // in production) and pumps the reactor so the sender completes.
+  void answer_cb(const std::vector<std::byte>& cb_record, uint32_t nfs_status = 0) {
+    uint32_t xid_be;
+    std::memcpy(&xid_be, cb_record.data(), 4);
+    xdr::XdrEnc r(pool);
+    r.u32(xdr::to_be32(xid_be));  // wire order in -> host for the encoder -> wire out
+    r.u32(1);                     // REPLY
+    r.u32(0);                     // MSG_ACCEPTED
+    r.u32(0);                     // verf AUTH_NONE
+    r.u32(0);
+    r.u32(0);  // SUCCESS
+    r.u32(nfs_status);  // CB_COMPOUND status
+    r.u32(0);           // tag
+    r.u32(0);           // no results (status is all the sender reads)
+    ctx.route_cb_reply(r.take());
+    while (reactor.poll_once()) {
+    }
+  }
+
+  std::vector<std::vector<std::byte>> cb_records;
 
   // Parses reply through the compound header; returns {status, ops_count, dec}.
   struct Reply {
@@ -155,7 +211,8 @@ struct V4Fixture {
   std::array<uint32_t, 64> slot_seq{};  // next seq per slot
 
   void establish_session(bool reclaim_complete = true,
-                         std::string_view owner = "lnfs-test-client") {
+                         std::string_view owner = "lnfs-test-client",
+                         bool back_chan = false) {
     xdr::XdrEnc body(pool);
     body.u32(0);  // tag len
     body.u32(minor);
@@ -180,7 +237,7 @@ struct V4Fixture {
     cs.u32(static_cast<uint32_t>(Op::kCreateSession));
     cs.u64(clientid);
     cs.u32(eir_seq);
-    cs.u32(0);  // flags
+    cs.u32(back_chan ? 0x2u : 0u);  // CREATE_SESSION4_FLAG_CONN_BACK_CHAN
     nfsv4::ChannelAttrs fore;
     fore.max_requests = 8;
     fore.encode(cs);
@@ -578,6 +635,8 @@ struct OpenRes {
   nfsv4::Stateid stateid{};
   std::vector<std::byte> fh;
   nfsv4::Bitmap attrset;
+  uint32_t deleg_type = 0;  // 0 NONE / 1 READ / 3 NONE_EXT
+  nfsv4::Stateid deleg_stateid{};
 };
 
 // {PUTFH dir, OPEN(...), GETFH}: parses the open result.
@@ -585,7 +644,7 @@ OpenRes do_open(V4Fixture& f, const std::vector<std::byte>& dir_fh, std::string_
                 uint32_t access, uint32_t deny, std::string_view owner,
                 std::optional<uint32_t> create_mode = std::nullopt,
                 const std::function<void(xdr::XdrEnc&)>& create_args = {},
-                uint32_t claim = 0) {
+                uint32_t claim = 0, const nfsv4::Stateid* claim_sid = nullptr) {
   xdr::XdrEnc ops(f.pool);
   ops.u32(static_cast<uint32_t>(Op::kPutfh));
   ops.opaque(dir_fh);
@@ -605,6 +664,7 @@ OpenRes do_open(V4Fixture& f, const std::vector<std::byte>& dir_fh, std::string_
   ops.u32(claim);
   if (claim == 0) ops.string(name);
   else if (claim == 1) ops.u32(0);  // delegate_type NONE
+  else if (claim == 5 && claim_sid) claim_sid->encode(ops);  // CLAIM_DELEG_CUR_FH
   ops.u32(static_cast<uint32_t>(Op::kGetfh));
   auto reply = f.parse(f.compound_raw(f.session_body(3, ops.take())));
   OpenRes out;
@@ -620,7 +680,17 @@ OpenRes do_open(V4Fixture& f, const std::vector<std::byte>& dir_fh, std::string_
   (void)reply.dec.u64();
   (void)reply.dec.u32();
   out.attrset = *nfsv4::Bitmap::decode(reply.dec);
-  (void)reply.dec.u32();
+  out.deleg_type = *reply.dec.u32();
+  if (out.deleg_type == 1) {  // OPEN_DELEGATE_READ (plan doc 10 §5.2)
+    out.deleg_stateid = *nfsv4::Stateid::decode(reply.dec);
+    (void)reply.dec.boolean();  // recall
+    (void)reply.dec.u32();      // ace type
+    (void)reply.dec.u32();      // ace flag
+    (void)reply.dec.u32();      // ace mask
+    (void)reply.dec.string(64); // who
+  } else if (out.deleg_type == 3) {  // NONE_EXT
+    if (*reply.dec.u32() == 2) (void)reply.dec.boolean();
+  }
   V4Fixture::expect_op(reply.dec, Op::kGetfh, 0);
   auto fh = *reply.dec.opaque(128);
   out.fh.assign(fh.begin(), fh.end());
@@ -1750,16 +1820,16 @@ TEST(Nfs4, PseudoIdsStableAcrossReconfig) {
   EXPECT_EQ(b.attr_of(*nb).change, 8u);
 }
 
-// Plan doc 10 §1.7: BIND_CONN_TO_SESSION grants FORE only (no backchannel exists, so
-// granting CDFS4_BACK would contradict CREATE_SESSION's flags), and EXCHANGE_ID
-// presents the configured server identity instead of a hardcoded literal.
+// BIND_CONN_TO_SESSION honors the requested direction now that the backchannel send
+// side exists (plan doc 10 §5.2): CDFC4_BACK binds this connection and is granted
+// CDFS4_BACK.  EXCHANGE_ID presents the configured server identity (plan doc 10 §1.7).
 TEST(Nfs4, BindConnGrantsForeOnlyAndConfiguredIdentity) {
   V4Fixture fx;
   fx.engine.emplace(fx.exports, fx.handles, fx.locks, *fx.pseudo, *fx.state, "nodeA",
                     "scopeX");
   fx.establish_session();
 
-  // BIND_CONN_TO_SESSION asking for CDFC4_BACK: the grant must still be CDFS4_FORE.
+  // BIND_CONN_TO_SESSION asking for CDFC4_BACK: granted, connection now carries CB.
   xdr::XdrEnc body(fx.pool);
   body.u32(0);  // tag
   body.u32(fx.minor);
@@ -1772,7 +1842,7 @@ TEST(Nfs4, BindConnGrantsForeOnlyAndConfiguredIdentity) {
   ASSERT_TRUE(reply.status == 0);
   V4Fixture::expect_op(reply.dec, Op::kBindConnToSession, 0);
   (void)reply.dec.opaque_fixed(16);
-  EXPECT_EQ(*reply.dec.u32(), 1u);  // CDFS4_FORE
+  EXPECT_EQ(*reply.dec.u32(), 2u);  // CDFS4_BACK (plan doc 10 §5.2)
 
   // EXCHANGE_ID reply carries the configured owner/scope.
   xdr::XdrEnc ex(fx.pool);
@@ -1982,4 +2052,203 @@ TEST(Nfs4, ReaddirCookieVerifierDetectsChange) {
   EXPECT_FALSE(verf2 == verf);
   list_page(last_cookie, verf2, &status, &ignore_cookie, &verf);
   EXPECT_EQ(status, 0u);
+}
+
+// ---- plan doc 10 §5.2: read delegations + backchannel send side --------------------
+
+namespace {
+
+uint32_t rd_be32(const std::vector<std::byte>& b, size_t off) {
+  uint32_t v = 0;
+  for (int i = 0; i < 4; ++i) v = (v << 8) | static_cast<uint32_t>(b[off + i]);
+  return v;
+}
+
+uint32_t do_delegreturn(V4Fixture& f, const std::vector<std::byte>& fh,
+                        const nfsv4::Stateid& sid) {
+  xdr::XdrEnc ops(f.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(fh);
+  ops.u32(static_cast<uint32_t>(Op::kDelegreturn));
+  sid.encode(ops);
+  return f.parse(f.compound_raw(f.session_body(2, ops.take()))).status;
+}
+
+}  // namespace
+
+// CREATE_SESSION with CONN_BACK_CHAN binds the channel; a read-only OPEN then earns a
+// read delegation whose stateid serves READ; DELEGRETURN hands it back.
+TEST(Nfs4, ReadDelegationGrantAndReturn) {
+  V4Fixture f;
+  f.establish_session(true, "lnfs-test-client", /*back_chan=*/true);
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "hello", 1, 0, "owner-d");  // read-only
+  ASSERT_TRUE(o.status == 0);
+  EXPECT_EQ(o.deleg_type, 1u);  // OPEN_DELEGATE_READ
+  EXPECT_EQ(f.state->stats().delegs, 1u);
+  EXPECT_EQ(f.state->stats().deleg_grants, 1u);
+
+  // The delegation stateid is a first-class read stateid.
+  uint32_t status = 1;
+  EXPECT_STREQ(do_read(f, o.fh, o.deleg_stateid, 0, 64, &status), "hello v4 world");
+  EXPECT_EQ(status, 0u);
+
+  EXPECT_EQ(do_delegreturn(f, o.fh, o.deleg_stateid), 0u);
+  EXPECT_EQ(f.state->stats().delegs, 0u);
+  EXPECT_EQ(f.state->stats().deleg_returns, 1u);
+
+  // A write open never gets a delegation; without a backchannel none is granted.
+  auto w = do_open(f, dir_fh, "hello", 3, 0, "owner-w");
+  ASSERT_TRUE(w.status == 0);
+  EXPECT_TRUE(w.deleg_type != 1u);
+}
+
+// A conflicting write open triggers CB_RECALL on the wire and answers DELAY; the
+// client responds with CLAIM_DELEG_CUR_FH + DELEGRETURN, then the retry succeeds.
+TEST(Nfs4, DelegationRecallOnWriteOpenConflict) {
+  V4Fixture f;
+  f.establish_session(true, "lnfs-test-client", /*back_chan=*/true);
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "hello", 1, 0, "owner-r");
+  ASSERT_TRUE(o.status == 0);
+  ASSERT_TRUE(o.deleg_type == 1u);
+
+  auto conflict = do_open(f, dir_fh, "hello", 3, 0, "owner-w");
+  EXPECT_EQ(conflict.status, stv(Status::kDelay));
+  EXPECT_EQ(f.state->stats().deleg_recalls, 1u);
+
+  // The CB_COMPOUND that went out: CB program, CB_SEQUENCE on our session, CB_RECALL.
+  auto rec = f.take_cb_record();
+  EXPECT_EQ(rd_be32(rec, 4), 0u);            // CALL
+  EXPECT_EQ(rd_be32(rec, 12), 0x40000000u);  // cb_program from CREATE_SESSION
+  EXPECT_EQ(rd_be32(rec, 20), 1u);           // CB_COMPOUND
+  EXPECT_EQ(rd_be32(rec, 52), 2u);           // numops
+  EXPECT_EQ(rd_be32(rec, 56), 11u);          // CB_SEQUENCE
+  EXPECT_TRUE(std::equal(f.sessionid.begin(), f.sessionid.end(), rec.begin() + 60));
+  EXPECT_EQ(rd_be32(rec, 96), 4u);           // CB_RECALL
+  f.answer_cb(rec);  // the client acknowledged the recall
+
+  // Repeated conflicting opens keep getting DELAY but do not re-recall.
+  auto again = do_open(f, dir_fh, "hello", 3, 0, "owner-w");
+  EXPECT_EQ(again.status, stv(Status::kDelay));
+  EXPECT_EQ(f.state->stats().deleg_recalls, 1u);
+
+  // Recall response: reclaim the open under the delegation, then return it.
+  auto claimed = do_open(f, o.fh, "", 1, 0, "owner-r2", std::nullopt, {}, 5,
+                         &o.deleg_stateid);
+  ASSERT_TRUE(claimed.status == 0);
+  EXPECT_TRUE(claimed.deleg_type != 1u);  // no fresh delegation mid-recall
+  EXPECT_EQ(do_delegreturn(f, o.fh, o.deleg_stateid), 0u);
+
+  auto retry = do_open(f, dir_fh, "hello", 3, 0, "owner-w");
+  EXPECT_EQ(retry.status, 0u);
+}
+
+// A blocked LOCK registers a waiter; releasing the range emits CB_NOTIFY_LOCK with
+// the waiter's lock owner so the client retries instead of blind-polling.
+TEST(Nfs4, CbNotifyLockOnRelease) {
+  V4Fixture f;
+  f.establish_session(true, "lnfs-test-client", /*back_chan=*/true);
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "hello", 3, 0, "owner-nl");
+  ASSERT_TRUE(o.status == 0);
+  if (o.deleg_type == 1u) (void)do_delegreturn(f, o.fh, o.deleg_stateid);
+
+  auto lock_op = [&](uint32_t type, uint64_t off, uint64_t len, bool new_owner,
+                     const nfsv4::Stateid& sid, std::string_view owner) {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(o.fh);
+    ops.u32(static_cast<uint32_t>(Op::kLock));
+    ops.u32(type);
+    ops.boolean(false);
+    ops.u64(off);
+    ops.u64(len);
+    ops.boolean(new_owner);
+    if (new_owner) {
+      ops.u32(0);
+      sid.encode(ops);
+      ops.u32(0);
+      ops.u64(f.clientid);
+      ops.string(owner);
+    } else {
+      sid.encode(ops);
+      ops.u32(0);
+    }
+    return f.parse(f.compound_raw(f.session_body(2, ops.take())));
+  };
+  auto r1 = lock_op(2, 0, 100, true, o.stateid, "holder");
+  ASSERT_TRUE(r1.status == 0);
+  V4Fixture::expect_op(r1.dec, Op::kSequence, 0);
+  (void)r1.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(r1.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(r1.dec, Op::kLock, 0);
+  auto lsid = *nfsv4::Stateid::decode(r1.dec);
+  auto denied = lock_op(2, 10, 5, true, o.stateid, "blocked");
+  EXPECT_EQ(denied.status, stv(Status::kDenied));
+
+  // LOCKU by the holder frees the range: the blocked owner gets CB_NOTIFY_LOCK.
+  xdr::XdrEnc lu(f.pool);
+  lu.u32(static_cast<uint32_t>(Op::kPutfh));
+  lu.opaque(o.fh);
+  lu.u32(static_cast<uint32_t>(Op::kLocku));
+  lu.u32(2);
+  lu.u32(0);
+  lsid.encode(lu);
+  lu.u64(0);
+  lu.u64(100);
+  auto lur = f.parse(f.compound_raw(f.session_body(2, lu.take())));
+  EXPECT_EQ(lur.status, 0u);
+  auto rec = f.take_cb_record();
+  EXPECT_EQ(rd_be32(rec, 56), 11u);  // CB_SEQUENCE
+  EXPECT_EQ(rd_be32(rec, 96), 14u);  // CB_NOTIFY_LOCK
+  f.answer_cb(rec);
+  EXPECT_EQ(f.state->stats().cb_lock_notifies, 1u);
+}
+
+// Chunked COPY (plan doc 10 §5.2): a copy spanning several 8MiB chunks lands intact
+// and no longer holds the object locks for the whole transfer.
+TEST(Nfs4, CopyChunksLargeFiles) {
+  V4Fixture f;
+  f.minor = 2;
+  std::string big(20u << 20, '\0');
+  for (size_t i = 0; i < big.size(); i += 4096) big[i] = static_cast<char>('a' + (i / 4096) % 23);
+  ASSERT_TRUE(f.memory->add_file("/big", big).has_value());
+  ASSERT_TRUE(f.memory->add_file("/bigcopy", "").has_value());
+  f.establish_session();
+  auto src_fh = f.path_fh({"export", "data", "big"});
+  auto dst_fh = f.path_fh({"export", "data", "bigcopy"});
+
+  nfsv4::Stateid anon{};
+  xdr::XdrEnc ops(f.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(src_fh);
+  ops.u32(static_cast<uint32_t>(Op::kSavefh));
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(dst_fh);
+  ops.u32(static_cast<uint32_t>(Op::kCopy));
+  anon.encode(ops);
+  anon.encode(ops);
+  ops.u64(0);
+  ops.u64(0);
+  ops.u64(0);  // ca_count 0: to source EOF -> 3 chunks
+  ops.boolean(true);
+  ops.boolean(true);
+  ops.u32(0);
+  auto reply = f.parse(f.compound_raw(f.session_body(4, ops.take())));
+  ASSERT_TRUE(reply.status == 0);
+  V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+  (void)reply.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kSavefh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kCopy, 0);
+  (void)reply.dec.u32();  // no callback stateid
+  EXPECT_EQ(*reply.dec.u64(), big.size());
+  EXPECT_EQ(file_size(f, dst_fh), big.size());
+  // Spot-check bytes on both sides of a chunk boundary.
+  uint32_t status = 1;
+  auto at_boundary = do_read(f, dst_fh, anon, (8u << 20) - 2, 4, &status);
+  EXPECT_EQ(status, 0u);
+  EXPECT_STREQ(at_boundary, big.substr((8u << 20) - 2, 4));
 }

@@ -300,25 +300,38 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 | v4 READDIR 批量按预算 ✅ | 每页后端批量 = clamp(dircount/24, 16, 4096)，对齐 v3 |
 | LocalObject `open()` ✅ | `LocalOpenState` 持每 OPEN 独立 fd（写开 O_RDWR）；read/write/seek 优先用它——open 时定权限的 POSIX 语义（OPEN 后 chmod 不再断读写）、免 fd 缓存往返；打开失败降级 EOPNOTSUPP 保持旧行为；合并升级后不可写句柄自动回落 fd 缓存路径。share deny 仍由状态层唯一执行（fs 层本无对应语义，维持设计 07 口径） |
 
-### 5.2 中期（v2 主题：委托与回传通道）
+### 5.2 中期（v2 主题：委托与回传通道） ✅ 已完成（2026-08-28；异步 COPY 取分片方案，见末段）
 
-**读委托 + callback channel 发送侧**是 09 册 M8 的 demand-gated 项，建议作为 v2
-的主线：它同时解锁三件事——
+**读委托 + callback channel 发送侧**已落地：
 
-- 读委托本身（客户端缓存一致性、GETATTR 风暴削减）；
-- `CB_NOTIFY_LOCK`：现在锁冲突只能 DENIED + 客户端盲轮询（`state/lock_mgr.hpp:6-7`），
-  高竞争延迟不可控；
-- 为将来目录委托/pNFS 铺路。
+- **回传通道发送侧**：`transport::CbChannel`（每连接一个发送句柄，状态层持
+  shared_ptr 跨连接生命周期；发送任务投递回连接自己的 reactor 并计入 drain 计数，
+  teardown 先 detach——排队未跑的发送观测到 detach 跳过、在途的被 drain 等待，
+  悬空 fd/UAF 不可能）；连接读循环按 msg_type 把 RPC REPLY 记录路由给挂起的回调
+  （`route_cb_reply`）。CREATE_SESSION 的 CONN_BACK_CHAN 与
+  BIND_CONN_TO_SESSION(BACK/BOTH) 真正绑定通道并如实应答（back channel 属性
+  clamp 到 1 slot / 2 ops）；回调凭据取客户端 sec_parms 的首个 AUTH_SYS（否则
+  AUTH_NONE）。CB_COMPOUND（CB_SEQUENCE 前缀）由 `nfsv4/callback.cpp` 手工编码，
+  单 slot 串行；slot 卡死超过一个租约即判通道 down（不依赖定时器）。
+  SEQUENCE 的 sr_status_flags 现会报 CB_PATH_DOWN。
+- **读委托**：`StateType::kDeleg`；授予策略（开关 `[protocol] delegations`、非
+  grace/非 reclaim、只读 OPEN、会话有活回传通道、无他端写打开、每客户端每文件一
+  张）在授予与发布同一把文件分片锁下完成，与并发写打开互斥。冲突（写 OPEN 含持有
+  者自身、SETATTR、REMOVE/RENAME 被替换目标、匿名写）→ 标记 recalled、发
+  CB_RECALL、回 DELAY，客户端 CLAIM_DELEG_CUR_FH 转正打开 + DELEGRETURN 后重试；
+  租约期内不归还由租约扫描器吊销。DELEGRETURN/CLAIM_DELEG_CUR_FH 已实现；
+  客户端过期/换代走既有 unlink 链自动回收。指标：delegs/grants/recalls/returns/
+  revokes 进 Prometheus 与 `ctl state`。
+- **CB_NOTIFY_LOCK**：LOCK DENIED 时登记等待者（每文件上限 16、租约期失效、按
+  owner 去重）；LOCKU 或锁状态随 CLOSE/过期释放时通知等待客户端重试，替代盲轮询。
+- **边界（文档明示）**：v3 侧写不触发召回（与 v3/v4 锁边界同口径）；无写委托/
+  目录委托；CLAIM_DELEGATE_PREV（重启后委托 reclaim）不支持——委托随重启消亡，
+  普通打开经 CLAIM_PREVIOUS 恢复。
 
-前置工作已知：StateMgr 增加 delegation 状态类型（现 `StateType` 只有 kOpen/kLock，
-`state_mgr.hpp:76`）、CREATE_SESSION 的 backchannel 协商真正启用
-（现 "accepted verbatim; never used"，`state_mgr.cpp:351`）、召回超时与
-CB_RECALL 失败的降级路径。
-
-同期可做：**异步 COPY**（OFFLOAD_STATUS/OFFLOAD_CANCEL/CB_OFFLOAD）。现在 COPY
-无条件同步（`engine.cpp:2745`），且**持源和目标两把独占 ObjLock 同步跑完全量拷贝**
-（`engine.cpp:2711-2725`，`ca_count==0` 时长度无上限）——大文件 COPY 会把该文件上
-所有请求阻塞任意久。即使不做完整异步，也应先做分片拷贝 + 中途放锁。
+**异步 COPY**：取计划许可的分片方案——COPY 改为 8MiB 分片、片间释放两把 ObjLock
+（`ca_count==0` 的全文件拷贝不再把源/目标上的所有请求阻塞任意久）；完整异步
+（OFFLOAD_STATUS/OFFLOAD_CANCEL/CB_OFFLOAD）留待有真实需求时基于现有回传通道
+实现（发送侧已具备）。
 
 ### 5.3 中期（另一条线：第二后端）
 

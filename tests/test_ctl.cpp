@@ -196,6 +196,12 @@ TEST(Ctl, OpsConfigKeys) {
   ASSERT_TRUE(auto_grace.has_value());
   EXPECT_EQ(auto_grace->server.grace_seconds, 0u);
 
+  // Delegation kill switch (plan doc 10 §5.2), default on.
+  EXPECT_TRUE(auto_grace->server.delegations);
+  auto no_deleg = core::parse_config("[protocol]\ndelegations = false\n");
+  ASSERT_TRUE(no_deleg.has_value());
+  EXPECT_FALSE(no_deleg->server.delegations);
+
   // A listener bind must be an address literal (validated with a full config).
   std::string valid =
       "[[export]]\npath = \"/tmp\"\nfsid = 1\nclients = [\"127.0.0.0/8\"]\n";

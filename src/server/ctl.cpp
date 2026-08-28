@@ -285,11 +285,13 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
         "clients={} sessions={} opens={} files={} courtesy={} grace={} grace_remaining={}s "
         "lease_expirations={} reclaim_conflict={} reclaim_timeout={} reclaim_forced={} "
         "share_denied={} open_merges={} lock_states={} lock_segments={} lock_owners={} "
-        "lock_denied={}\n",
+        "lock_denied={} delegs={} deleg_grants={} deleg_recalls={} deleg_returns={} "
+        "deleg_revokes={} cb_lock_notifies={}\n",
         s.clients, s.sessions, s.opens, s.files, s.courtesy, s.grace ? 1 : 0,
         s.grace_remaining, s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout,
         s.reclaim_forced, s.share_denied, s.open_merges, s.lock_states, s.lock_segments,
-        s.lock_owners, s.lock_denied);
+        s.lock_owners, s.lock_denied, s.delegs, s.deleg_grants, s.deleg_recalls,
+        s.deleg_returns, s.deleg_revokes, s.cb_lock_notifies);
     out += co_await deps.state->dump();
     co_return out;
   }

@@ -368,7 +368,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
     enc.u32(*sl);
     enc.u32(seq.highest_slot);
     enc.u32(seq.highest_slot);
-    enc.u32(0);  // sr_status_flags
+    enc.u32(seq.status_flags);  // e.g. SEQ4_STATUS_CB_PATH_DOWN (plan doc 10 §5.2)
     status = st(Status::kOk);
     done = 1;
     bool saw_destroy_session = false;
@@ -562,6 +562,10 @@ rt::Task<uint32_t> Engine::exec_op_impl(Ctx& ctx, uint32_t opcode, xdr::XdrDec& 
     case Op::kOpenDowngrade: {
       enc.u32(opcode);
       co_return co_await op_open_downgrade(ctx, dec, enc);
+    }
+    case Op::kDelegreturn: {
+      enc.u32(opcode);
+      co_return co_await op_delegreturn(ctx, dec, enc);
     }
     case Op::kWrite: {
       enc.u32(opcode);
@@ -1525,6 +1529,8 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     co_return st(Status::kBadxdr);
   }
   std::string name;
+  bool deleg_claim = false;
+  Stateid deleg_claim_sid{};
   switch (*claim) {
     case kClaimNull: {
       auto n = dec.string(kMaxName + 1);
@@ -1544,11 +1550,22 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       break;
     }
     case kClaimFh: break;
+    case kClaimDelegCurFh: {
+      // Recall response (plan doc 10 §5.2): the client converts opens it holds under
+      // a delegation being recalled into real open stateids before DELEGRETURN.
+      auto dsid = Stateid::decode(dec);
+      if (!dsid) {
+        enc.u32(st(Status::kBadxdr));
+        co_return st(Status::kBadxdr);
+      }
+      deleg_claim_sid = *dsid;
+      deleg_claim = true;
+      break;
+    }
     case kClaimDelegateCur:
     case kClaimDelegatePrev:
-    case kClaimDelegCurFh:
     case kClaimDelegPrevFh: {
-      enc.u32(st(Status::kNotsupp));  // delegation claims (roadmap M8)
+      enc.u32(st(Status::kNotsupp));  // 4.0-style / reboot delegation claims
       co_return st(Status::kNotsupp);
     }
     default: {
@@ -1707,12 +1724,21 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       }
       file = std::move(made->obj);
     }
-  } else {  // CLAIM_FH / CLAIM_PREVIOUS: CFH is the file itself
+  } else {  // CLAIM_FH / CLAIM_PREVIOUS / CLAIM_DELEG_CUR_FH: CFH is the file itself
     if (dir->pseudo()) {
       enc.u32(st(Status::kIsdir));
       co_return st(Status::kIsdir);
     }
     file = dir->obj;
+  }
+  if (deleg_claim) {
+    // The claimed stateid must be this client's delegation on this very file.
+    uint32_t code = co_await state_.check_deleg_claim(deleg_claim_sid, ctx.clientid,
+                                                      exp->fsid, file->id());
+    if (code != 0) {
+      enc.u32(code);
+      co_return code;
+    }
   }
 
   if (file->type() == backend::FType::kDir) {
@@ -1773,7 +1799,9 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   args.owner = std::move(owner_bytes);
   args.access = access;
   args.deny = deny;
-  args.reclaim = *claim == kClaimPrevious;
+  const bool is_reclaim = *claim == kClaimPrevious;
+  args.reclaim = is_reclaim;
+  args.deleg_claim = deleg_claim;
   auto opened = co_await state_.open(std::move(args), std::move(bopen));
   if (opened.status != 0) {
     enc.u32(opened.status);
@@ -1782,18 +1810,33 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   ctx.cfh = export_fh(*exp, file->id());
   ctx.current_sid = opened.stateid;
   ctx.current_valid = true;
+  // Read delegation grant (plan doc 10 §5.2): policy lives in the state manager; a
+  // WANT_NO_DELEG / WANT_CANCEL request and the recall-response claim never grant.
+  uint32_t want = *share_access & 0xFF00;
+  state::StateMgr::DelegGrant grant;
+  if (!deleg_claim && want != 0x0400 && want != 0x0500) {
+    grant = co_await state_.maybe_grant_read_deleg(ctx.sessionid, ctx.clientid,
+                                                   exp->fsid, file->id(), ctx.cfh,
+                                                   access, is_reclaim);
+  }
   enc.u32(st(Status::kOk));
   opened.stateid.encode(enc);
   encode_change_info(enc, atomic, change_before, change_after);
   enc.u32(kOpenResultLocktypePosix);
   attrset.encode(enc);
-  // open_delegation4: no delegations are granted (M8).  A client that stated a want
-  // gets OPEN_DELEGATE_NONE_EXT with the reason (RFC 8881 §18.16.3).
-  uint32_t want = *share_access & 0xFF00;
-  if (want == 0) {
+  if (grant.granted) {
+    enc.u32(1);  // OPEN_DELEGATE_READ
+    grant.stateid.encode(enc);
+    enc.boolean(false);  // recall
+    // nfsace4: a null everyone-ACE — no extra permissions ride the delegation.
+    enc.u32(0);  // ACCESS_ALLOWED_ACE_TYPE
+    enc.u32(0);  // flags
+    enc.u32(0);  // access mask
+    enc.string("EVERYONE@");
+  } else if (want == 0) {
     enc.u32(0);  // OPEN_DELEGATE_NONE
   } else {
-    enc.u32(3);  // OPEN_DELEGATE_NONE_EXT
+    enc.u32(3);  // OPEN_DELEGATE_NONE_EXT (RFC 8881 §18.16.3)
     if (want == 0x0400 || want == 0x0500) {
       enc.u32(0);  // WND4_NOT_WANTED (WANT_NO_DELEG / WANT_CANCEL)
     } else {
@@ -1802,6 +1845,34 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     }
   }
   co_return st(Status::kOk);
+}
+
+// DELEGRETURN (RFC 8881 §18.6, plan doc 10 §5.2): the client hands a delegation
+// back — voluntarily or as its answer to CB_RECALL.
+rt::Task<uint32_t> Engine::op_delegreturn(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto sid = Stateid::decode(dec);
+  if (!sid) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  auto resolved = co_await resolve(ctx, ctx.cfh);
+  if (!resolved) {
+    uint32_t code = st(core::to_v4(resolved.error(), Op::kDelegreturn));
+    enc.u32(code);
+    co_return code;
+  }
+  if (resolved->pseudo()) {
+    enc.u32(st(Status::kBadStateid));
+    co_return st(Status::kBadStateid);
+  }
+  uint32_t code = co_await state_.delegreturn(*sid, ctx.clientid, resolved->exp->fsid,
+                                              resolved->oid);
+  enc.u32(code);
+  co_return code;
 }
 
 rt::Task<uint32_t> Engine::op_close(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
@@ -2041,6 +2112,10 @@ rt::Task<uint32_t> Engine::op_setattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     if (check.status != 0) co_return fail(check.status);
   }
   if (resolved->exp->readonly) co_return fail(st(Status::kRofs));
+  // Attribute changes invalidate read delegations (plan doc 10 §5.2): recall + DELAY.
+  if (uint32_t dc = co_await state_.deleg_conflict(resolved->exp->fsid, resolved->oid);
+      dc != 0)
+    co_return fail(dc);
   auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
   auto cred = mapped.view();
   auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
@@ -2273,6 +2348,13 @@ rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(code);
     co_return code;
   }
+  // Deleting a delegated file recalls its read delegations first (plan doc 10 §5.2).
+  if (uint32_t dc =
+          co_await state_.deleg_conflict(dir->exp->fsid, (*target)->id());
+      dc != 0) {
+    enc.u32(dc);
+    co_return dc;
+  }
   Result<void> removed = (*target)->type() == backend::FType::kDir
                              ? co_await dir->obj->rmdir(cred, *name)
                              : co_await dir->obj->unlink(cred, *name);
@@ -2353,6 +2435,17 @@ rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
 
   auto mapped = exports_.squash_cred(ctx.cred, *from->exp);
   auto cred = mapped.view();
+  // A rename that replaces an existing target deletes it: recall the target's read
+  // delegations first (plan doc 10 §5.2).  The source only changes name; its oid —
+  // and therefore its delegations — stay coherent.
+  if (auto victim = co_await to->obj->lookup(cred, *newname); victim) {
+    if (uint32_t dc =
+            co_await state_.deleg_conflict(to->exp->fsid, (*victim)->id());
+        dc != 0) {
+      enc.u32(dc);
+      co_return dc;
+    }
+  }
   auto before_from = co_await from->obj->getattr();
   auto before_to = same ? before_from : co_await to->obj->getattr();
   auto renamed = co_await from->obj->rename(cred, *oldname, *to->obj, *newname);
@@ -2641,9 +2734,16 @@ rt::Task<uint32_t> Engine::op_lock(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   args.reclaim = *reclaim;
   args.offset = *offset;
   args.length = *length;
+  const bool waiter_known = args.new_owner;  // first attempts carry the owner bytes
+  std::string waiter_owner = args.owner;
   auto result = co_await state_.lock(std::move(args));
   enc.u32(result.status);
   if (result.status == st(Status::kDenied)) {
+    // CB_NOTIFY_LOCK (plan doc 10 §5.2): remember the blocked owner; when a lock on
+    // this file is released the client is poked to retry instead of blind-polling.
+    if (ctx.session && waiter_known)
+      state_.register_lock_waiter(target->exp->fsid, target->oid, ctx.clientid,
+                                  std::move(waiter_owner), ctx.cfh);
     encode_lock_denied(enc, result.denied);
   } else if (result.status == 0) {
     ctx.current_sid = result.stateid;
@@ -2980,30 +3080,51 @@ rt::Task<uint32_t> Engine::op_copy(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   }
   auto mapped = exports_.squash_cred(ctx.cred, *dst->exp);
   auto cred = mapped.view();
-  // Deterministic lock order across the two objects (same object: one exclusive hold).
+  backend::OpenCtx sopen{cred, scheck.bopen.get()};
+  backend::OpenCtx dopen{cred, dcheck.bopen.get()};
+  // Chunked copy with the locks released between chunks (plan doc 10 §5.2): the old
+  // whole-range hold blocked every request on both files for the entire copy —
+  // unbounded with ca_count == 0.  Each chunk is copied under the deterministic
+  // two-object lock, then the locks drop so readers/writers interleave; the total is
+  // not atomic, which POSIX-mapped COPY never promised (the reply stays UNSTABLE +
+  // verifier, like WRITE).
+  constexpr uint64_t kCopyChunk = 8u << 20;
   bool same = src->oid == dst->oid;
   auto first = locks_.get(dst->exp->fsid, same || src->oid < dst->oid ? src->oid : dst->oid);
   auto second = same ? nullptr
                      : locks_.get(dst->exp->fsid, src->oid < dst->oid ? dst->oid : src->oid);
-  auto held1 = co_await first->lock();
-  std::optional<decltype(held1)> held2;
-  if (second) held2.emplace(co_await second->lock());
-  backend::OpenCtx sopen{cred, scheck.bopen.get()};
-  backend::OpenCtx dopen{cred, dcheck.bopen.get()};
   uint64_t length = *count;
-  if (length == 0) {  // ca_count 0: through the source EOF (RFC 7862 §15.2.3)
-    auto attr = co_await src->obj->getattr();
-    if (!attr) {
-      uint32_t code = st(core::to_v4(attr.error(), Op::kCopy));
-      enc.u32(code);
-      co_return code;
+  {
+    auto held1 = co_await first->lock();
+    std::optional<decltype(held1)> held2;
+    if (second) held2.emplace(co_await second->lock());
+    if (length == 0) {  // ca_count 0: through the source EOF (RFC 7862 §15.2.3)
+      auto attr = co_await src->obj->getattr();
+      if (!attr) {
+        uint32_t code = st(core::to_v4(attr.error(), Op::kCopy));
+        enc.u32(code);
+        co_return code;
+      }
+      length = attr->size > *src_off ? attr->size - *src_off : 0;
     }
-    length = attr->size > *src_off ? attr->size - *src_off : 0;
   }
-  Result<uint64_t> copied = length == 0 ? Result<uint64_t>{0}
-                                        : co_await src->obj->copy_range(
-                                              sopen, *dst->obj, dopen, *src_off, *dst_off,
-                                              length);
+  Result<uint64_t> copied = 0;
+  uint64_t done = 0;
+  while (done < length) {
+    uint64_t chunk = std::min(kCopyChunk, length - done);
+    auto held1 = co_await first->lock();
+    std::optional<decltype(held1)> held2;
+    if (second) held2.emplace(co_await second->lock());
+    auto part = co_await src->obj->copy_range(sopen, *dst->obj, dopen, *src_off + done,
+                                              *dst_off + done, chunk);
+    if (!part) {
+      copied = Err(part.error());
+      break;
+    }
+    done += *part;
+    copied = done;
+    if (*part < chunk) break;  // source EOF inside the chunk
+  }
   if (!copied) {
     uint32_t code = st(core::to_v4(copied.error(), Op::kCopy));
     enc.u32(code);
@@ -3189,6 +3310,7 @@ rt::Task<uint32_t> Engine::op_create_session(Ctx& ctx, xdr::XdrDec& dec,
     enc.u32(st(Status::kBadxdr));
     co_return st(Status::kBadxdr);
   }
+  cb::Cred cb_cred;  // first AUTH_SYS wins; else callbacks go out AUTH_NONE (§2.10.8.2)
   for (uint32_t i = 0; i < *sec_count; ++i) {
     auto flavor = dec.u32();
     if (!flavor) {
@@ -3210,6 +3332,12 @@ rt::Task<uint32_t> Engine::op_create_session(Ctx& ctx, xdr::XdrDec& dec,
           enc.u32(st(Status::kBadxdr));
           co_return st(Status::kBadxdr);
         }
+      if (!cb_cred.auth_sys) {
+        cb_cred.auth_sys = true;
+        cb_cred.uid = *uid;
+        cb_cred.gid = *gid;
+        cb_cred.machine = std::string(*machine);
+      }
     } else if (*flavor == 6) {  // RPCSEC_GSS cb parms: parsed, never used (7.7)
       auto service = dec.u32();
       auto h1 = dec.opaque(1024);
@@ -3234,9 +3362,11 @@ rt::Task<uint32_t> Engine::op_create_session(Ctx& ctx, xdr::XdrDec& dec,
     enc.u32(st(Status::kToosmall));
     co_return st(Status::kToosmall);
   }
-  auto result = co_await state_.create_session(*clientid, *sequence,
-                                               ctx.cred.principal(), *fore, *back,
-                                               conn_id_of(ctx.conn));
+  // CONN_BACK_CHAN (0x2): this connection carries the backchannel (plan doc 10 §5.2).
+  const bool want_back = (*flags & 0x2u) != 0;
+  auto result = co_await state_.create_session(
+      *clientid, *sequence, ctx.cred.principal(), *fore, *back, conn_id_of(ctx.conn),
+      want_back ? ctx.conn.cb_channel() : nullptr, *cb_program, std::move(cb_cred));
   if (result.status != 0) {
     enc.u32(result.status);
     co_return result.status;
@@ -3250,7 +3380,7 @@ rt::Task<uint32_t> Engine::op_create_session(Ctx& ctx, xdr::XdrDec& dec,
   body.u32(st(Status::kOk));
   body.opaque_fixed(result.sessionid);
   body.u32(result.sequence);
-  body.u32(0);  // flags: no persist, no backchannel service
+  body.u32(want_back ? 0x2u : 0u);  // echo CONN_BACK_CHAN when the channel is bound
   result.fore.encode(body);
   result.back.encode(body);
   auto bytes = body.take().to_bytes();
@@ -3300,12 +3430,19 @@ rt::Task<uint32_t> Engine::op_bind_conn(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc&
     enc.u32(code);
     co_return code;
   }
+  // Backchannel directions (plan doc 10 §5.2): CDFC4_BACK(0x2)/FORE_OR_BOTH(0x3)/
+  // BACK_OR_BOTH(0x7) attach this connection's channel to the session.
+  bool back = (*dir & 0x2u) != 0 || *dir == 0x7u;
+  if (back) {
+    uint32_t bound = co_await state_.bind_backchannel(id, ctx.conn.cb_channel());
+    if (bound != 0) {
+      enc.u32(bound);
+      co_return bound;
+    }
+  }
   enc.u32(st(Status::kOk));
   enc.opaque_fixed(id);
-  // No backchannel is implemented (CREATE_SESSION flags are always 0), so granting
-  // CDFS4_BACK would contradict the session's own declaration (plan doc 10 §1.7):
-  // grant FORE unconditionally until a backchannel exists.
-  enc.u32(1);  // CDFS4_FORE
+  enc.u32(back ? (*dir == 0x2u ? 0x2u : 0x3u) : 0x1u);  // CDFS4_BACK / BOTH / FORE
   enc.boolean(false);
   co_return st(Status::kOk);
 }

@@ -122,6 +122,13 @@ state_dir/
 
 v1 不发委托 → 回传通道仅在 CREATE_SESSION 协商中应答（接受客户端参数、SEQ4_STATUS 不置 CB_PATH_DOWN、永不发 CB_COMPOUND）。`SessionRec.back` 与 `bound_conns` 的结构已按可用设计，委托阶段（路线图 M8）只加发送侧。
 
+**实现更新（2026-08-28，plan doc 10 §5.2）**：发送侧已落地——CREATE_SESSION 的
+CONN_BACK_CHAN / BIND_CONN_TO_SESSION(BACK/BOTH) 绑定连接为回传通道
+（`transport::CbChannel`），服务器经其发 CB_COMPOUND{CB_SEQUENCE, CB_RECALL /
+CB_NOTIFY_LOCK}（单 cb slot 串行、卡死一个租约判通道 down）；SEQ4_STATUS 在持有
+可召回状态且无活通道时置 CB_PATH_DOWN。读委托为 `StateType::kDeleg`：授予/冲突
+召回/DELEGRETURN/超时吊销见 plan doc 10 §5.2 的落地说明。
+
 ## 7.8 观测点
 
 每张表导出指标：clients/sessions/opens/locks 计数、courtesy 数、grace 剩余、槽重放命中率、DRC 命中率、租约回收事件——是排"客户端挂死/状态泄漏"问题的第一现场（08 分册）。

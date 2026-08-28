@@ -298,6 +298,7 @@ Result<Config> parse_config(std::string_view text) {
     } else if (section == Section::kProtocol) {
       if (key == "v3") LNFS_TRY(bool_value(value));
       else if (key == "v4") config.server.enable_v4 = LNFS_TRY(bool_value(value));
+      else if (key == "delegations") config.server.delegations = LNFS_TRY(bool_value(value));
       else if (key == "lease" || key == "grace") {
         // Seconds, with optional "s" suffix ("90s").  grace defaults to the lease but
         // is decoupled (plan doc 10 §4.4): "auto" (or omission) = lease; operators
