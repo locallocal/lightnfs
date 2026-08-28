@@ -78,11 +78,17 @@ enum class Op : uint32_t {
   kSeek = 69,
   kWriteSame = 70,
   kClone = 71,
+  // RFC 8276 xattr ops close the 4.2 table: unimplemented, but inside the known range
+  // they answer NOTSUPP instead of OP_ILLEGAL (plan doc 10 §5.1).
+  kGetXattr = 72,
+  kSetXattr = 73,
+  kListXattrs = 74,
+  kRemoveXattr = 75,
   kIllegal = 10044,
 };
 inline constexpr uint32_t kFirstOp = 3;
 inline constexpr uint32_t kLastOp41 = 58;     // 4.1 ceiling; beyond -> ILLEGAL at minor 1
-inline constexpr uint32_t kLastKnownOp = 71;  // 4.2 ceiling; beyond -> ILLEGAL
+inline constexpr uint32_t kLastKnownOp = 75;  // 4.2 ceiling (RFC 8276); beyond -> ILLEGAL
 // Minor versions served: 1 and 2 (decision D5 keeps 0 rejected).  4.2 adds ops only;
 // sessions, state and stateids are shared verbatim (RFC 7862 §1.4).
 inline bool minor_supported(uint32_t minor) { return minor == 1 || minor == 2; }

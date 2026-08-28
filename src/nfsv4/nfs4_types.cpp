@@ -129,6 +129,10 @@ const char* op_name(uint32_t op) {
     case Op::kSeek: return "SEEK";
     case Op::kWriteSame: return "WRITE_SAME";
     case Op::kClone: return "CLONE";
+    case Op::kGetXattr: return "GETXATTR";
+    case Op::kSetXattr: return "SETXATTR";
+    case Op::kListXattrs: return "LISTXATTRS";
+    case Op::kRemoveXattr: return "REMOVEXATTR";
     case Op::kReclaimComplete: return "RECLAIM_COMPLETE";
     default: return "?";
   }

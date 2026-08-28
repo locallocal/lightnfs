@@ -355,6 +355,31 @@ class LocalBackend::PathCache {
   std::atomic<uint64_t> hits_{0}, misses_{0};
 };
 
+// Per-OPEN data fd (design 05 §5.5, plan doc 10 §5.1): returned by
+// LocalObject::open, held by the v4 state layer for the life of the open state, and
+// handed back per IO via OpenCtx.open.  Only the local backend ever produces a
+// non-null OpenState (memory stays EOPNOTSUPP), so the static_cast at the IO sites
+// cannot cross backends.
+class LocalOpenState final : public OpenState {
+ public:
+  LocalOpenState(int fd, bool writable) : fd_(fd), writable_(writable) {}
+  ~LocalOpenState() override {
+    if (fd_ >= 0) ::close(fd_);
+  }
+  int fd() const { return fd_; }
+  bool writable() const { return writable_; }
+
+ private:
+  int fd_;
+  bool writable_;
+};
+
+namespace {
+LocalOpenState* open_state(const OpenCtx& ctx) {
+  return static_cast<LocalOpenState*>(ctx.open);
+}
+}  // namespace
+
 LocalBackend::FdCacheStats LocalBackend::fd_cache_stats() const {
   auto out = fd_cache_->stats();
   out.path_hits = path_cache_->hits();
@@ -819,21 +844,43 @@ rt::Task<Result<std::string>> LocalObject::readlink() {
   });
 }
 
+rt::Task<Result<OpenPtr>> LocalObject::open(const Cred&, OpenFlags flags) {
+  if (type() != FType::kReg) co_return Err(errno_from(EOPNOTSUPP));
+  bool writable = flags.has(OpenFlag::kWrite);
+  auto opened = co_await rt::offload(
+      [this, writable] { return backend_.open_oid(id(), writable ? O_RDWR : O_RDONLY); });
+  // Degrade rather than fail: EOPNOTSUPP means "no backend open state" to the engine,
+  // so IO keeps going through the fd cache and reports errors at IO time as before —
+  // the OPEN itself must not start failing where it used to succeed.
+  if (!opened) co_return Err(errno_from(EOPNOTSUPP));
+  co_return OpenPtr(std::make_shared<LocalOpenState>(*opened, writable));
+}
+
 rt::Task<Result<uint32_t>> LocalObject::read(OpenCtx ctx, uint64_t off,
                                              std::span<std::byte> out, bool& eof) {
   if (type() == FType::kDir) co_return Err(errno_from(EISDIR));
   if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
-  auto allowed = co_await access(ctx.cred, Access::kRead);
-  if (!allowed) co_return Err(allowed.error());
-  // Owner relaxation follows the v3 open-less convention documented in nfsv3/04.
-  if (!allowed->has(Access::kRead)) {
-    auto attr = co_await getattr();
-    if (!attr) co_return Err(attr.error());
-    if (ctx.cred.uid != attr->uid) co_return Err(errno_from(EACCES));
+  int fd = -1;
+  LocalBackend::FdCache::Ref ref;  // pins the cache entry while fd is in use
+  if (auto* os = open_state(ctx)) {
+    // The open's own fd (design 05 §5.5): permission was settled at OPEN time — POSIX
+    // open semantics, and a mode change after OPEN no longer breaks reads.
+    fd = os->fd();
+  } else {
+    auto allowed = co_await access(ctx.cred, Access::kRead);
+    if (!allowed) co_return Err(allowed.error());
+    // Owner relaxation follows the v3 open-less convention documented in nfsv3/04.
+    if (!allowed->has(Access::kRead)) {
+      auto attr = co_await getattr();
+      if (!attr) co_return Err(attr.error());
+      if (ctx.cred.uid != attr->uid) co_return Err(errno_from(EACCES));
+    }
+    auto got = co_await backend_.fd_cache_->acquire(id(), false);
+    if (!got) co_return Err(got.error());
+    ref = std::move(*got);
+    fd = ref->fd;
   }
-  auto ref = co_await backend_.fd_cache_->acquire(id(), false);
-  if (!ref) co_return Err(ref.error());
-  int n = co_await rt::uring_read((*ref)->fd, out, off);
+  int n = co_await rt::uring_read(fd, out, off);
   if (n < 0) co_return Err(errno_from_neg(n));
   if (out.empty()) {  // zero-length read: only a size probe can answer eof
     auto attr = co_await getattr();
@@ -1279,19 +1326,28 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
                                               Stability stability) {
   if (type() == FType::kDir) co_return Err(errno_from(EISDIR));
   if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
-  if (backend_.cfg_.identity != LocalBackend::Identity::kSetFsuid) {
-    auto allowed = co_await access(ctx.cred, Access::kModify);
-    if (!allowed) co_return Err(allowed.error());
-    if (!allowed->has(Access::kModify)) {
-      // v3 open-less owner relaxation, mirroring read (nfsv3/04 §6).
-      auto attr = co_await getattr();
-      if (!attr) co_return Err(attr.error());
-      if (ctx.cred.uid != attr->uid) co_return Err(errno_from(EACCES));
+  int fd = -1;
+  LocalBackend::FdCache::Ref ref;
+  if (auto* os = open_state(ctx); os && os->writable()) {
+    fd = os->fd();  // the open's own fd (design 05 §5.5); checked at OPEN time
+  } else {
+    // Anonymous IO, or a same-owner merge upgraded a read-only open (the state layer
+    // keeps the original handle): the fd-cache path with its per-IO checks.
+    if (backend_.cfg_.identity != LocalBackend::Identity::kSetFsuid) {
+      auto allowed = co_await access(ctx.cred, Access::kModify);
+      if (!allowed) co_return Err(allowed.error());
+      if (!allowed->has(Access::kModify)) {
+        // v3 open-less owner relaxation, mirroring read (nfsv3/04 §6).
+        auto attr = co_await getattr();
+        if (!attr) co_return Err(attr.error());
+        if (ctx.cred.uid != attr->uid) co_return Err(errno_from(EACCES));
+      }
     }
+    auto got = co_await backend_.fd_cache_->acquire(id(), true);
+    if (!got) co_return Err(got.error());
+    ref = std::move(*got);
+    fd = ref->fd;
   }
-  auto ref = co_await backend_.fd_cache_->acquire(id(), true);
-  if (!ref) co_return Err(ref.error());
-  int fd = (*ref)->fd;
   size_t done = 0;
   while (done < in.size()) {
     int n = co_await rt::uring_write(fd, in.subspan(done), off + done);
@@ -1313,11 +1369,18 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
 rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
                                               std::span<const iovec> iov,
                                               Stability stability) {
-  auto gate = co_await io_gate(ctx.cred, /*write=*/true);
-  if (!gate) co_return Err(gate.error());
-  auto ref = co_await backend_.fd_cache_->acquire(id(), true);
-  if (!ref) co_return Err(ref.error());
-  int fd = (*ref)->fd;
+  int fd = -1;
+  LocalBackend::FdCache::Ref ref;
+  if (auto* os = open_state(ctx); os && os->writable()) {
+    fd = os->fd();  // the open's own fd (design 05 §5.5); checked at OPEN time
+  } else {
+    auto gate = co_await io_gate(ctx.cred, /*write=*/true);
+    if (!gate) co_return Err(gate.error());
+    auto got = co_await backend_.fd_cache_->acquire(id(), true);
+    if (!got) co_return Err(got.error());
+    ref = std::move(*got);
+    fd = ref->fd;
+  }
   // Mutable copy for short-write continuation (an iovec is advanced in place).
   SmallVec<iovec, 16> vec;
   size_t total = 0;
@@ -1387,11 +1450,18 @@ rt::Task<Result<void>> LocalObject::io_gate(const Cred& cred, bool write) {
 // ---- v4.2 sweets -------------------------------------------------------------
 
 rt::Task<Result<uint64_t>> LocalObject::seek(OpenCtx ctx, uint64_t off, SeekWhat what) {
-  auto gate = co_await io_gate(ctx.cred, false);
-  if (!gate) co_return Err(gate.error());
-  auto ref = co_await backend_.fd_cache_->acquire(id(), false);
-  if (!ref) co_return Err(ref.error());
-  int fd = (*ref)->fd;
+  int fd = -1;
+  LocalBackend::FdCache::Ref ref;
+  if (auto* os = open_state(ctx)) {
+    fd = os->fd();  // the open's own fd (design 05 §5.5)
+  } else {
+    auto gate = co_await io_gate(ctx.cred, false);
+    if (!gate) co_return Err(gate.error());
+    auto got = co_await backend_.fd_cache_->acquire(id(), false);
+    if (!got) co_return Err(got.error());
+    ref = std::move(*got);
+    fd = ref->fd;
+  }
   co_return co_await rt::offload([fd, off, what]() -> Result<uint64_t> {
     off_t r = ::lseek(fd, static_cast<off_t>(off), what == SeekWhat::kData ? SEEK_DATA : SEEK_HOLE);
     if (r < 0) return Err(errno_from(errno));  // ENXIO past EOF / no data

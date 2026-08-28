@@ -449,3 +449,83 @@ TEST(Backend, LocalResolvePathCache) {
   std::error_code ec;
   std::filesystem::remove_all(path, ec);
 }
+
+// Per-open data fd (design 05 §5.5, plan doc 10 §5.1): open() hands back a handle
+// whose fd serves IO for that open — POSIX open-time permission semantics.  A handle
+// without write access falls back to the anonymous fd-cache path (its per-IO checks
+// included), which is what a same-owner merge upgrade relies on.
+TEST(Backend, LocalOpenStateFdSemantics) {
+  char path_template[] = "/tmp/lightnfs-open-XXXXXX";
+  char* path = mkdtemp(path_template);
+  ASSERT_TRUE(path != nullptr);
+  std::string file_path = std::string(path) + "/f";
+  int seed_fd = open(file_path.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+  ASSERT_TRUE(seed_fd >= 0);
+  ASSERT_TRUE(write(seed_fd, "0123456789", 10) == 10);
+  close(seed_fd);
+
+  backend::LocalBackend::Config cfg{.path = path,
+                                     .fsid = 32,
+                                     .fd_cache = 8,
+                                     .handles = backend::LocalBackend::HandleMode::kFallback};
+  auto made = backend::LocalBackend::create(cfg);
+  ASSERT_TRUE(made.has_value());
+  auto backend = std::move(*made);
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2, .ring = "epoll"});
+  runtime.start();
+  backend::Cred owner{geteuid(), getegid(), {}};
+  backend::Cred stranger{owner.uid + 12345, owner.gid + 12345, {}};
+
+  auto root = run_runtime(runtime, backend->root());
+  ASSERT_TRUE(root.has_value());
+  auto file = run_runtime(runtime, (*root)->lookup(owner, "f"));
+  ASSERT_TRUE(file.has_value());
+
+  backend::OpenFlags rw;
+  rw.set(backend::OpenFlag::kRead).set(backend::OpenFlag::kWrite);
+  auto opened = run_runtime(runtime, (*file)->open(owner, rw));
+  ASSERT_TRUE(opened.has_value());
+  ASSERT_TRUE(*opened != nullptr);
+
+  // Write through the open's own fd, then read it back.
+  auto data = std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>("ABC"), 3);
+  auto wrote = run_runtime(runtime, (*file)->write(backend::OpenCtx{owner, opened->get()},
+                                                   0, data, backend::Stability::kUnstable));
+  ASSERT_TRUE(wrote.has_value());
+  EXPECT_EQ(*wrote, 3u);
+
+  // 0600 file: a stranger's anonymous read is refused, but the same stranger reading
+  // through the established open succeeds — permission was settled at OPEN time.
+  std::array<std::byte, 16> buf{};
+  bool eof = false;
+  auto anon = run_runtime(runtime,
+                          (*file)->read(backend::OpenCtx{stranger}, 0, buf, eof));
+  EXPECT_FALSE(anon.has_value());
+  EXPECT_EQ(raw(anon.error()), EACCES);
+  auto via_open = run_runtime(
+      runtime, (*file)->read(backend::OpenCtx{stranger, opened->get()}, 0, buf, eof));
+  ASSERT_TRUE(via_open.has_value());
+  EXPECT_EQ(*via_open, 10u);
+  EXPECT_EQ(static_cast<char>(buf[0]), 'A');
+  EXPECT_EQ(static_cast<char>(buf[3]), '3');
+
+  // A read-only open handle used for WRITE falls back to the anonymous path: the
+  // owner passes its checks, the stranger does not.
+  backend::OpenFlags ro;
+  ro.set(backend::OpenFlag::kRead);
+  auto ro_open = run_runtime(runtime, (*file)->open(owner, ro));
+  ASSERT_TRUE(ro_open.has_value());
+  auto owner_wr = run_runtime(
+      runtime, (*file)->write(backend::OpenCtx{owner, ro_open->get()}, 3,
+                              data, backend::Stability::kUnstable));
+  EXPECT_TRUE(owner_wr.has_value());
+  auto stranger_wr = run_runtime(
+      runtime, (*file)->write(backend::OpenCtx{stranger, ro_open->get()}, 3,
+                              data, backend::Stability::kUnstable));
+  EXPECT_FALSE(stranger_wr.has_value());
+
+  runtime.stop_and_join();
+  std::error_code ec;
+  std::filesystem::remove_all(path, ec);
+}

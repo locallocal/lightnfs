@@ -496,13 +496,15 @@ TEST(Nfs4, ReaddirPaginatesWithinBudget) {
   uint64_t cookie = 0;
   bool eof = false;
   int pages = 0;
+  // Page 1 (cookie 0) ignores the verifier; later pages must echo the one the server
+  // returned (semantic cookieverf, plan doc 10 §5.1).
+  std::array<std::byte, 8> verf{};
   while (!eof && pages < 50) {
     xdr::XdrEnc ops(f.pool);
     ops.u32(static_cast<uint32_t>(Op::kPutfh));
     ops.opaque(dir_fh);
     ops.u32(static_cast<uint32_t>(Op::kReaddir));
     ops.u64(cookie);
-    std::array<std::byte, 8> verf{};
     ops.opaque_fixed(verf);
     ops.u32(1u << 20);  // dircount
     ops.u32(600);       // small maxcount forces pagination
@@ -515,7 +517,8 @@ TEST(Nfs4, ReaddirPaginatesWithinBudget) {
     (void)reply.dec.skip(16 + 5 * 4);
     V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(reply.dec, Op::kReaddir, 0);
-    (void)reply.dec.opaque_fixed(8);
+    auto got_verf = *reply.dec.opaque_fixed(8);
+    std::copy(got_verf.begin(), got_verf.end(), verf.begin());
     while (*reply.dec.boolean()) {
       cookie = *reply.dec.u64();
       auto name = *reply.dec.string(255);
@@ -1490,7 +1493,8 @@ TEST(Nfs4, MinorversionTwoOpcodeTable) {
     V4Fixture::expect_op(reply.dec, Op::kIllegal, stv(Status::kOpIllegal));
   }
   // The same session serves minorversion 2 (state is shared, RFC 7862 §1.4): SEEK works,
-  // an unimplemented 4.2 op (IO_ADVISE) is NOTSUPP, 72+ stays ILLEGAL.
+  // an unimplemented 4.2 op (IO_ADVISE) is NOTSUPP; the RFC 8276 xattr ops 72-75 are
+  // in-table and answer NOTSUPP too (plan doc 10 §5.1), 76+ stays ILLEGAL.
   f.minor = 2;
   auto s = do_seek(f, fh, anon, 0, nfsv4::kContentData);
   EXPECT_EQ(s.status, 0u);
@@ -1504,11 +1508,19 @@ TEST(Nfs4, MinorversionTwoOpcodeTable) {
     auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
     EXPECT_EQ(reply.status, stv(Status::kNotsupp));
   }
+  for (uint32_t op : {72u, 73u, 74u, 75u}) {  // GETXATTR..REMOVEXATTR
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(fh);
+    ops.u32(op);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    EXPECT_EQ(reply.status, stv(Status::kNotsupp));
+  }
   {
     xdr::XdrEnc ops(f.pool);
     ops.u32(static_cast<uint32_t>(Op::kPutfh));
     ops.opaque(fh);
-    ops.u32(72);
+    ops.u32(76);
     auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
     EXPECT_EQ(reply.status, stv(Status::kOpIllegal));
   }
@@ -1816,4 +1828,158 @@ TEST(Nfs4, CompoundResolvesSameFhOnce) {
   V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
   // Three GETATTRs on one CFH: exactly one backend resolve for the whole compound.
   EXPECT_EQ(fx.memory->resolve_calls() - before, 1u);
+}
+
+// ---- plan doc 10 §5.1: READ_PLUS, semantic cookieverf, xattr table --------------
+
+namespace {
+
+struct RpSeg {
+  uint32_t type = 0;
+  uint64_t off = 0;
+  std::string data;
+  uint64_t hole = 0;
+};
+struct RpRes {
+  uint32_t status = 0;
+  bool eof = false;
+  std::vector<RpSeg> segs;
+};
+
+RpRes do_read_plus(V4Fixture& f, const std::vector<std::byte>& fh,
+                   const nfsv4::Stateid& sid, uint64_t offset, uint32_t count) {
+  xdr::XdrEnc ops(f.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(fh);
+  ops.u32(static_cast<uint32_t>(Op::kReadPlus));
+  sid.encode(ops);
+  ops.u64(offset);
+  ops.u32(count);
+  auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+  RpRes out;
+  out.status = reply.status;
+  if (reply.status != 0) return out;
+  V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+  (void)reply.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kReadPlus, 0);
+  out.eof = *reply.dec.boolean();
+  uint32_t n = *reply.dec.u32();
+  for (uint32_t i = 0; i < n; ++i) {
+    RpSeg s;
+    s.type = *reply.dec.u32();
+    s.off = *reply.dec.u64();
+    if (s.type == nfsv4::kContentData) {
+      auto d = *reply.dec.opaque(1 << 20);
+      s.data.assign(reinterpret_cast<const char*>(d.data()), d.size());
+    } else {
+      s.hole = *reply.dec.u64();
+    }
+    out.segs.push_back(std::move(s));
+  }
+  return out;
+}
+
+}  // namespace
+
+// READ_PLUS (RFC 7862 §15.10): DATA segments carry offset + bytes, the reply past EOF
+// is zero segments with eof, and minorversion 1 answers OP_ILLEGAL (op 68 > 58).
+TEST(Nfs4, ReadPlusSegmentsAndEof) {
+  V4Fixture f;
+  f.minor = 2;
+  f.establish_session();
+  auto fh = f.path_fh({"export", "data", "hello"});  // "hello v4 world" (14 bytes)
+  nfsv4::Stateid anon{};
+
+  auto whole = do_read_plus(f, fh, anon, 0, 64);
+  ASSERT_TRUE(whole.status == 0);
+  EXPECT_TRUE(whole.eof);
+  ASSERT_TRUE(whole.segs.size() == 1);
+  EXPECT_EQ(whole.segs[0].type, nfsv4::kContentData);
+  EXPECT_EQ(whole.segs[0].off, 0u);
+  EXPECT_STREQ(whole.segs[0].data, "hello v4 world");
+
+  auto middle = do_read_plus(f, fh, anon, 6, 2);
+  ASSERT_TRUE(middle.status == 0);
+  EXPECT_FALSE(middle.eof);
+  ASSERT_TRUE(middle.segs.size() == 1);
+  EXPECT_EQ(middle.segs[0].off, 6u);
+  EXPECT_STREQ(middle.segs[0].data, "v4");
+
+  auto past = do_read_plus(f, fh, anon, 14, 8);
+  ASSERT_TRUE(past.status == 0);
+  EXPECT_TRUE(past.eof);
+  EXPECT_EQ(past.segs.size(), 0u);
+
+  // Directories are not READ_PLUS-able; minorversion 1 rejects the opcode outright.
+  auto dir = do_read_plus(f, f.path_fh({"export", "data"}), anon, 0, 8);
+  EXPECT_EQ(dir.status, stv(Status::kIsdir));
+  f.minor = 1;
+  auto v41 = do_read_plus(f, fh, anon, 0, 8);
+  EXPECT_EQ(v41.status, stv(Status::kOpIllegal));
+}
+
+// Semantic cookie verifier (plan doc 10 §5.1): a directory change between pages turns
+// the stale {cookie, verifier} pair into NOT_SAME; restarting from cookie 0 recovers.
+TEST(Nfs4, ReaddirCookieVerifierDetectsChange) {
+  V4Fixture f;
+  f.establish_session();
+  auto dir_fh = f.path_fh({"export", "data"});
+
+  auto list_page = [&](uint64_t cookie, std::array<std::byte, 8> verf, uint32_t* status,
+                       uint64_t* last_cookie, std::array<std::byte, 8>* out_verf) {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(dir_fh);
+    ops.u32(static_cast<uint32_t>(Op::kReaddir));
+    ops.u64(cookie);
+    ops.opaque_fixed(verf);
+    ops.u32(1u << 20);
+    ops.u32(1u << 20);
+    nfsv4::Bitmap want;
+    want.set(nfsv4::attr::kFileid);
+    want.encode(ops);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    *status = reply.status;
+    if (reply.status != 0) return;
+    V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+    (void)reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(reply.dec, Op::kReaddir, 0);
+    auto got = *reply.dec.opaque_fixed(8);
+    std::copy(got.begin(), got.end(), out_verf->begin());
+    while (*reply.dec.boolean()) {
+      *last_cookie = *reply.dec.u64();
+      (void)reply.dec.string(255);
+      (void)nfsv4::Bitmap::decode(reply.dec);
+      auto vals = *reply.dec.u32();
+      (void)reply.dec.skip((vals + 3) & ~3u);
+    }
+  };
+
+  uint32_t status = 1;
+  uint64_t last_cookie = 0;
+  std::array<std::byte, 8> verf{};
+  list_page(0, {}, &status, &last_cookie, &verf);
+  ASSERT_TRUE(status == 0);
+  ASSERT_TRUE(last_cookie > 2);
+
+  // Same verifier, unchanged directory: the cookie is honored.
+  uint64_t ignore_cookie = 0;
+  std::array<std::byte, 8> verf2{};
+  list_page(last_cookie, verf, &status, &ignore_cookie, &verf2);
+  EXPECT_EQ(status, 0u);
+  EXPECT_TRUE(verf2 == verf);
+
+  // Modify the directory: the old {cookie, verifier} pair is now NOT_SAME.
+  ASSERT_TRUE(f.memory->add_file("/added-mid-listing", "x").has_value());
+  list_page(last_cookie, verf, &status, &ignore_cookie, &verf2);
+  EXPECT_EQ(status, stv(Status::kNotSame));
+
+  // Restart from cookie 0: a fresh verifier arrives and paging works again.
+  list_page(0, {}, &status, &last_cookie, &verf2);
+  EXPECT_EQ(status, 0u);
+  EXPECT_FALSE(verf2 == verf);
+  list_page(last_cookie, verf2, &status, &ignore_cookie, &verf);
+  EXPECT_EQ(status, 0u);
 }

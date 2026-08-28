@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <limits>
 
 #include <chrono>
@@ -351,7 +352,7 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
     FileHandle dir_fh;
     uint64_t cookie = 0;
     uint32_t dircount = 0, maxcount = 0;
-    bool bad_verifier = false;
+    std::array<std::byte, 8> client_verf{};
     if (plus) {
       auto args = ReaddirPlusArgs::decode(call.args);
       if (!args || !call.args.at_end()) {
@@ -360,9 +361,7 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
       }
       dir_fh = std::move(args->dir);
       cookie = args->cookie;
-      bad_verifier = cookie != 0 &&
-                     std::any_of(args->cookieverf.begin(), args->cookieverf.end(),
-                                 [](std::byte value) { return value != std::byte{0}; });
+      client_verf = args->cookieverf;
       dircount = args->dircount;
       maxcount = args->maxcount;
     } else {
@@ -373,9 +372,7 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
       }
       dir_fh = std::move(args->dir);
       cookie = args->cookie;
-      bad_verifier = cookie != 0 &&
-                     std::any_of(args->cookieverf.begin(), args->cookieverf.end(),
-                                 [](std::byte value) { return value != std::byte{0}; });
+      client_verf = args->cookieverf;
       dircount = maxcount = args->count;
     }
     auto resolved = co_await resolve(dir_fh, ctx.peer.addr);
@@ -391,7 +388,14 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
     auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
     auto held = co_await lock->lock_shared();
     auto attr = co_await resolved->obj->getattr();
-    if (bad_verifier) {
+    // Semantic cookie verifier (plan doc 10 §5.1): the directory change attribute.
+    // A directory modified between pages makes the verifier mismatch; BAD_COOKIE
+    // sends the client back to cookie 0 for a consistent restart instead of a
+    // silently duplicated/holey listing.
+    std::array<std::byte, 8> dir_verf{};
+    uint64_t dir_change = attr ? attr->change : 0;
+    std::memcpy(dir_verf.data(), &dir_change, sizeof(dir_change));
+    if (cookie != 0 && client_verf != dir_verf) {
       begin_result(enc, ctx, call, Status::kBadCookie);
       encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
       co_await send(ctx, enc);
@@ -417,8 +421,7 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
     }
     begin_result(enc, ctx, call, Status::kOk);
     encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-    std::array<std::byte, 8> zero_verf{};
-    enc.opaque_fixed(zero_verf);
+    enc.opaque_fixed(dir_verf);
     size_t used_total = kFixedReply;
     size_t used_dir = 0;
     bool truncated = false;

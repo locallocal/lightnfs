@@ -179,6 +179,12 @@ struct OpenCtx {                       // IO 调用的第一参数
 契约：
 
 - `open == nullptr`（v3 路径 / v4 特殊 stateid）时后端**必须**仍能完成 IO——本地后端用内部 fd 缓存按需开（06 分册 6.3），gluster 用匿名 fd（`glfs_h_anonymous_open`语义）。
+
+**实现（2026-08-28，plan doc 10 §5.1）**：`LocalObject::open` 已实现——每 OPEN 一个
+独立数据 fd（读 O_RDONLY / 写 O_RDWR），read/write/seek 优先走它（open 时定权限的
+POSIX 语义，免 fd 缓存往返）；打不开时降级返回 EOPNOTSUPP，引擎继续走匿名路径，
+行为与之前一致。同 owner 合并升级（读→读写）时状态层保留原句柄，写路径检测到句柄
+不可写自动回落 fd 缓存。memory 后端维持 EOPNOTSUPP。
 - v4 引擎把 OPEN→`open()` 的 OpenPtr 存入状态表，CLOSE 时释放（shared_ptr 归零 → 后端资源回收）；同一文件多次 OPEN 合并由状态层负责，后端只见 open/close 配对。
 - `OpenFlags`：read/write/create(3 模式)/truncate；EXCLUSIVE 创建的 verifier 由 `create(..., ExclVerf*)` 传入，后端负责持久化到 atime/mtime 并在重放时比对（语义 nfsv3/04 §8——两版协议共用此实现）。
 
