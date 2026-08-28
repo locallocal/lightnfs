@@ -527,11 +527,17 @@ Result<ObjId> MemoryBackend::add_node(std::string_view path, FType type, uint32_
   node->attr.fileid = node->id;
   node->attr.size = type == FType::kLnk ? link.size() : data.size();
   node->attr.used = data.size();
+  node->attr.atime = node->attr.mtime = node->attr.ctime = now();
+  node->attr.change = static_cast<uint64_t>(node->attr.ctime.sec);
   node->data.assign(data.begin(), data.end());
   node->link = link;
   node->parent = parent;
   uint64_t cookie = next_cookie_++;
   parent->children.emplace(name, Node::Child{node, cookie});
+  // Keep the seeding path honest about directory change semantics (plan doc 10 §5.1:
+  // cookie verifiers derive from it) — protocol-driven creates already do this.
+  parent->attr.mtime = parent->attr.ctime = now();
+  parent->attr.change = static_cast<uint64_t>(parent->attr.ctime.sec);
   parent->cookie_order.emplace(cookie, name);
   objects_[id_for(node->id)] = node;
   return id_for(node->id);

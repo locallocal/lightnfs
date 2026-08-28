@@ -391,7 +391,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
         break;
       }
       if (op == Op::kDestroySession) saw_destroy_session = true;
-      if (op == Op::kRead || op == Op::kReaddir) {
+      if (op == Op::kRead || op == Op::kReaddir || op == Op::kReadPlus) {
         // These budget themselves against ctx.max_response (clamp / truncate).
         status = co_await exec_op(ctx, *opcode, dec, enc);
         ++done;
@@ -660,7 +660,8 @@ rt::Task<uint32_t> Engine::exec_op_impl(Ctx& ctx, uint32_t opcode, xdr::XdrDec& 
     case Op::kAllocate:
     case Op::kDeallocate:
     case Op::kCopy:
-    case Op::kClone: {
+    case Op::kClone:
+    case Op::kReadPlus: {
       if (ctx.minor < 2) break;  // 4.1 table ends at 58 -> OP_ILLEGAL below
       enc.u32(opcode);
       switch (static_cast<Op>(opcode)) {
@@ -668,6 +669,7 @@ rt::Task<uint32_t> Engine::exec_op_impl(Ctx& ctx, uint32_t opcode, xdr::XdrDec& 
         case Op::kAllocate: co_return co_await op_allocate(ctx, dec, enc, false);
         case Op::kDeallocate: co_return co_await op_allocate(ctx, dec, enc, true);
         case Op::kCopy: co_return co_await op_copy(ctx, dec, enc);
+        case Op::kReadPlus: co_return co_await op_read_plus(ctx, dec, enc);
         default: co_return co_await op_clone(ctx, dec, enc);
       }
     }
@@ -1106,6 +1108,133 @@ rt::Task<uint32_t> Engine::op_read(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   co_return st(Status::kOk);
 }
 
+// READ_PLUS (RFC 7862 §15.10, plan doc 10 §5.1): sparse-aware READ — the reply is a
+// list of DATA/HOLE segments.  This implementation returns at most one segment per
+// call: the hole the offset sits in (clamped to the request and EOF), or one data
+// extent read the normal way and clamped to the next hole.  Short replies are the
+// protocol's norm; the client continues from wherever the last segment ended.
+// Backends without kSparseOps degrade to a single DATA segment (plain READ shape).
+rt::Task<uint32_t> Engine::op_read_plus(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
+  auto sid = Stateid::decode(dec);
+  auto offset = dec.u64();
+  auto count = dec.u32();
+  if (!sid || !offset || !count) {
+    enc.u32(st(Status::kBadxdr));
+    co_return st(Status::kBadxdr);
+  }
+  if (ctx.cfh.empty()) {
+    enc.u32(st(Status::kNofilehandle));
+    co_return st(Status::kNofilehandle);
+  }
+  auto resolved = co_await resolve(ctx, ctx.cfh);
+  if (!resolved) {
+    uint32_t code = st(core::to_v4(resolved.error(), Op::kReadPlus));
+    enc.u32(code);
+    co_return code;
+  }
+  if (resolved->pseudo() || resolved->obj->type() == backend::FType::kDir) {
+    enc.u32(st(Status::kIsdir));
+    co_return st(Status::kIsdir);
+  }
+  if (resolved->obj->type() != backend::FType::kReg) {
+    enc.u32(st(Status::kWrongType));
+    co_return st(Status::kWrongType);
+  }
+  if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
+    enc.u32(cur);
+    co_return cur;
+  }
+  auto check = co_await state_.check_io(*sid, ctx.clientid, resolved->exp->fsid,
+                                        resolved->oid, state::kShareRead);
+  if (check.status != 0) {
+    enc.u32(check.status);
+    co_return check.status;
+  }
+  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
+  auto cred = mapped.view();
+  size_t slack = 256;  // op headers + eof/segment framing
+  size_t budget = ctx.max_response > enc.size() + slack
+                      ? ctx.max_response - enc.size() - slack
+                      : 0;
+  uint32_t len = std::min<uint32_t>(
+      {*count, resolved->exp->backend->limits().max_read,
+       static_cast<uint32_t>(std::min<size_t>(budget, UINT32_MAX))});
+  co_await resolved->exp->qos.throttle(false, len);
+  if (auto* cq = client_qos(ctx.clientid)) {
+    co_await cq->ops.acquire(1);
+    co_await cq->read_bytes.acquire(len);
+  }
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock_shared();
+  backend::OpenCtx open{cred, check.bopen.get()};
+
+  auto attr = co_await resolved->obj->getattr();
+  if (!attr) {
+    uint32_t code = st(core::to_v4(attr.error(), Op::kReadPlus));
+    enc.u32(code);
+    co_return code;
+  }
+  if (*offset >= attr->size || len == 0) {  // nothing at/after the offset
+    enc.u32(st(Status::kOk));
+    enc.boolean(*offset >= attr->size);
+    enc.u32(0);
+    co_return st(Status::kOk);
+  }
+
+  // Where does data begin at/after the offset?  ENXIO = a hole runs to EOF.
+  uint64_t data_at = *offset;
+  bool sparse = resolved->exp->backend->caps().has(backend::Cap::kSparseOps);
+  if (sparse) {
+    auto found = co_await resolved->obj->seek(open, *offset, backend::SeekWhat::kData);
+    if (found) data_at = std::max(*found, *offset);
+    else if (found.error() == errno_from(ENXIO)) data_at = attr->size;
+    else sparse = false;  // sparse probe unavailable: serve everything as data
+  }
+  if (data_at > *offset) {  // the offset sits in a hole
+    uint64_t hole_end = std::min<uint64_t>({data_at, *offset + *count, attr->size});
+    enc.u32(st(Status::kOk));
+    enc.boolean(hole_end >= attr->size);
+    enc.u32(1);
+    enc.u32(kContentHole);
+    enc.u64(*offset);
+    enc.u64(hole_end - *offset);
+    co_return st(Status::kOk);
+  }
+
+  // Data at the offset: clamp the read to the next hole so the segment stays pure.
+  if (sparse) {
+    auto hole = co_await resolved->obj->seek(open, *offset, backend::SeekWhat::kHole);
+    if (hole && *hole > *offset)
+      len = static_cast<uint32_t>(std::min<uint64_t>(len, *hole - *offset));
+  }
+  auto data = ctx.conn.pool.alloc(std::max<uint32_t>(len, 1));
+  bool eof = false;
+  auto n = co_await resolved->obj->read(open, *offset,
+                                        std::span<std::byte>(data.data(), len), eof);
+  if (!n) {
+    uint32_t code = st(core::to_v4(n.error(), Op::kReadPlus));
+    enc.u32(code);
+    co_return code;
+  }
+  obs::Metrics::instance().read_bytes.fetch_add(*n, std::memory_order_relaxed);
+  resolved->exp->metrics.read_bytes.fetch_add(*n, std::memory_order_relaxed);
+  resolved->exp->metrics.read_ops.fetch_add(1, std::memory_order_relaxed);
+  // A data segment ending at a mid-file hole is not EOF even if the read came short.
+  bool at_eof = *offset + *n >= attr->size;
+  enc.u32(st(Status::kOk));
+  enc.boolean(eof && at_eof);
+  if (*n == 0) {
+    enc.u32(0);
+    co_return st(Status::kOk);
+  }
+  enc.u32(1);
+  enc.u32(kContentData);
+  enc.u64(*offset);
+  enc.u32(*n);
+  enc.attach(std::move(data), 0, *n);
+  co_return st(Status::kOk);
+}
+
 rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
   auto cookie = dec.u64();
   auto verf = dec.opaque_fixed(8);
@@ -1131,6 +1260,30 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     co_return code;
   }
 
+  // Semantic cookie verifier (plan doc 10 §5.1): derived from the directory change
+  // attribute.  A directory modified between pages flips the verifier; the client
+  // gets NOT_SAME and restarts the listing instead of silently duplicating or
+  // missing entries against stale cookies.
+  uint64_t dir_change = 0;
+  if (resolved->pseudo()) {
+    dir_change = pseudo_.attr_of(*resolved->node).change;
+  } else {
+    auto dattr = co_await resolved->obj->getattr();
+    if (!dattr) {
+      uint32_t code = st(core::to_v4(dattr.error(), Op::kReaddir));
+      enc.u32(code);
+      co_return code;
+    }
+    dir_change = dattr->change;
+  }
+  std::array<std::byte, 8> dir_verf{};
+  std::memcpy(dir_verf.data(), &dir_change, sizeof(dir_change));
+  if (*cookie != 0 &&
+      !std::equal(verf->begin(), verf->end(), dir_verf.begin(), dir_verf.end())) {
+    enc.u32(st(Status::kNotSame));
+    co_return st(Status::kNotSame);
+  }
+
   size_t slack = 256;
   size_t budget = ctx.max_response > enc.size() + slack
                       ? std::min<size_t>(*maxcount, ctx.max_response - enc.size() - slack)
@@ -1139,6 +1292,10 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     enc.u32(st(Status::kToosmall));
     co_return st(Status::kToosmall);
   }
+  // Per-page backend batch sized from the client's dircount budget like the v3 path
+  // (plan doc 10 §5.1) — the hardcoded 128 made big-directory listings pay dozens of
+  // extra backend round-trips per reply.
+  uint32_t batch = std::min<uint32_t>(4096, std::max<uint32_t>(16, *dircount / 24));
 
   // Export side: fetch the first page before committing to an OK status, so cursor
   // errors (BAD_COOKIE) can still be reported cleanly.
@@ -1157,7 +1314,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     symlink_sup = caps.has(backend::Cap::kSymlink);
     lock = locks_.get(resolved->exp->fsid, resolved->oid);
     auto held = co_await lock->lock_shared();
-    auto page = co_await core::readdir_page(resolved->obj, cred, *cookie, 128);
+    auto page = co_await core::readdir_page(resolved->obj, cred, *cookie, batch);
     if (!page) {
       uint32_t code = *cookie != 0 && page.error() == errno_from(EINVAL)
                           ? st(Status::kBadCookie)
@@ -1169,8 +1326,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
   }
 
   enc.u32(st(Status::kOk));
-  std::array<std::byte, 8> zero_verf{};
-  enc.opaque_fixed(zero_verf);
+  enc.opaque_fixed(dir_verf);
   size_t used = 32;       // verifier + list/eof framing
   size_t used_dir = 0;    // dircount budget: cookie+name portions
   bool truncated = false;
@@ -1275,7 +1431,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
         eof = true;
         break;
       }
-      auto next = co_await core::readdir_page(resolved->obj, cred, next_cookie, 128);
+      auto next = co_await core::readdir_page(resolved->obj, cred, next_cookie, batch);
       if (!next) break;  // mid-stream error: return what we have, eof=false
       page = std::move(*next);
     }

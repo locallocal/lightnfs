@@ -122,8 +122,13 @@ sudo systemctl enable --now lightnfs
   v3 写不受 v4 的 share deny / 字节锁约束**（v3 侧本无锁语义，文档明示的边界）。
 - **v4.2 按 op 宣告**：启动时对每个导出探测 `kSparseOps`/`kCopyRange`/`kCloneRange` 并写
   日志（`export <path> v4.2 capabilities: …`）；无能力位的 op 回 NOTSUPP，Linux 客户端自动
-  降级（`cp --reflink=auto` 退到 COPY 再退到读写）。不做异步/跨服 COPY、READ_PLUS、xattr、
-  sec_label。CLONE 仅在 XFS(reflink=1)/Btrfs 导出上可用。
+  降级（`cp --reflink=auto` 退到 COPY 再退到读写）。READ_PLUS 已支持（稀疏感知，
+  每应答一个 DATA/HOLE 段，客户端自续传；无稀疏能力的后端退化为单 DATA 段）。
+  不做异步/跨服 COPY、xattr（op 72-75 回 NOTSUPP）、sec_label。CLONE 仅在
+  XFS(reflink=1)/Btrfs 导出上可用。
+- **READDIR cookie 校验**：cookieverf 取目录 change 属性——分页期间目录被改，客户端
+  收到 BAD_COOKIE（v3）/NOT_SAME（v4）并自动从头重新列目录，不再静默漏项/重复。
+  高频变更的大目录列举可能因此重启多次（正确性换代价，Linux 客户端自动处理）。
 - **无委托、无 pNFS、无 SECINFO(带名之外) 的多 flavor**：SECINFO/SECINFO_NO_NAME 恒返回
   `[AUTH_SYS]`（AUTH_SYS-only 服务器的合规简化，永不发 WRONGSEC）。
 - **句柄稳定性**：`handles="auto"` 在无 `CAP_DAC_READ_SEARCH` 且文件系统无 STATX_BTIME

@@ -141,6 +141,7 @@ class Engine {
   // two-file ops), stateid-checked like READ/WRITE, capability-gated (NOTSUPP when the
   // backend lacks the bit).
   rt::Task<uint32_t> op_seek(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
+  rt::Task<uint32_t> op_read_plus(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_allocate(Ctx&, xdr::XdrDec&, xdr::XdrEnc&, bool deallocate);
   rt::Task<uint32_t> op_copy(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_clone(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);

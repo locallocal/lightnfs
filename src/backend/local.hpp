@@ -145,6 +145,11 @@ class LocalObject final : public Object {
   rt::Task<Result<DirPage>> readdir(const Cred&, uint64_t cookie,
                                      uint32_t max_entries) override;
   rt::Task<Result<std::string>> readlink() override;
+  // v4 open state (design 05 §5.5, plan doc 10 §5.1): the OPEN gets its own data fd
+  // with the requested access mode; IO through that stateid uses it directly —
+  // POSIX open-time permission semantics, no fd-cache round trip.  Failure to open
+  // degrades to EOPNOTSUPP so the engine falls back to today's anonymous-fd path.
+  rt::Task<Result<OpenPtr>> open(const Cred&, OpenFlags) override;
   rt::Task<Result<uint32_t>> read(OpenCtx, uint64_t off, std::span<std::byte> out,
                                   bool& eof) override;
   rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const std::byte> in,

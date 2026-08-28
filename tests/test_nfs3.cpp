@@ -208,7 +208,7 @@ TEST(Nfs3, ErrorWhitelistFiltersInvalidMappings) {
 TEST(Nfs3, ReaddirRejectsMismatchedCookieVerifier) {
   NfsFixture f;
   std::array<std::byte, 8> verifier{};
-  verifier[0] = std::byte{1};
+  verifier[7] = std::byte{0xFF};  // cannot collide with a logical-clock change attr
   xdr::XdrEnc args(f.pool);
   nfsv3::ReaddirArgs{f.root_fh, 3, verifier, 4096}.encode(args);
   auto reply = f.request((uint32_t)nfsv3::Proc::kReaddir, args.take());
@@ -264,4 +264,48 @@ TEST(Nfs3, ErrorWhitelistMatchesResearchTable) {
     EXPECT_TRUE(core::v3_error_allowed(proc, Status::kBadhandle));
   }
   EXPECT_FALSE(core::v3_error_allowed(Proc::kNull, Status::kStale));
+}
+
+// Semantic cookie verifier (plan doc 10 §5.1): the reply verifier round-trips while
+// the directory is unchanged; a modification invalidates the old pair (BAD_COOKIE)
+// and the client restarts from cookie 0.
+TEST(Nfs3, ReaddirVerifierRoundTripAndChangeDetection) {
+  NfsFixture f;
+  auto list = [&](uint64_t cookie, std::array<std::byte, 8> verf, uint32_t* status,
+                  uint64_t* last_cookie, std::array<std::byte, 8>* out_verf) {
+    xdr::XdrEnc args(f.pool);
+    nfsv3::ReaddirArgs{f.root_fh, cookie, verf, 8192}.encode(args);
+    auto reply = f.request((uint32_t)nfsv3::Proc::kReaddir, args.take());
+    auto result = f.result(reply);
+    *status = *result.u32();
+    if (*status != 0) return;
+    if (*result.boolean()) (void)result.skip(84);  // post_op_attr
+    auto got = *result.opaque_fixed(8);
+    std::copy(got.begin(), got.end(), out_verf->begin());
+    while (*result.boolean()) {
+      (void)result.u64();  // fileid
+      (void)result.string(255);
+      *last_cookie = *result.u64();
+    }
+  };
+
+  uint32_t status = 1;
+  uint64_t last_cookie = 0;
+  std::array<std::byte, 8> verf{};
+  list(0, {}, &status, &last_cookie, &verf);
+  ASSERT_TRUE(status == 0);
+  ASSERT_TRUE(last_cookie != 0);
+
+  uint64_t ignore = 0;
+  std::array<std::byte, 8> verf2{};
+  list(last_cookie, verf, &status, &ignore, &verf2);
+  EXPECT_EQ(status, 0u);  // unchanged directory: pair accepted
+
+  ASSERT_TRUE(f.memory->add_file("/added-mid-listing", "x").has_value());
+  list(last_cookie, verf, &status, &ignore, &verf2);
+  EXPECT_EQ(status, (uint32_t)nfsv3::Status::kBadCookie);
+
+  list(0, {}, &status, &last_cookie, &verf2);  // restart recovers with a fresh verifier
+  EXPECT_EQ(status, 0u);
+  EXPECT_FALSE(verf2 == verf);
 }

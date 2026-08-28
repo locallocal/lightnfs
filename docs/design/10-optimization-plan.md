@@ -290,15 +290,15 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 
 按"价值 / 实现成本"排序，并给出建议的接受条件：
 
-### 5.1 短期（v1.x，低成本高价值）
+### 5.1 短期（v1.x，低成本高价值） ✅ 已完成（2026-08-28）
 
-| 特性 | 理由 | 现状锚点 |
-|---|---|---|
-| **READ_PLUS**（RFC 7862） | 稀疏能力已具备（SEEK/ALLOCATE/DEALLOCATE 都实现了），READ_PLUS 是最低垂的果实；稀疏文件读放大直接受益 | 现返回 NOTSUPP（`nfsv4/engine.cpp:606-615`） |
-| **cookieverf 语义化** | 现恒为 0 且不校验（v3 `nfsv3/engine.cpp:363-365`、v4 解出即忽略 `nfsv4/engine.cpp:1016`），分页期间目录被改时客户端静默拿到重复/漏条目。用目录 change attr 生成 verifier | readdir 一致性红线 |
-| **xattr 支持**（RFC 8276，op 72-75） | 现在这四个 op 超出 `kLastKnownOp=71` 回 OP_ILLEGAL 而非 NOTSUPP（`nfs4_types.hpp:84-85`），先把表尾提到 75 修正应答语义（半小时），再评估完整实现 | 属性表也缺 `xattr_support` bit 82 |
-| v4 READDIR 每页后端批量从硬编码 128 提到按预算计算 | v3 已按 dircount 算到 4096（`nfsv3/engine.cpp:395`），v4 大目录多付数十倍后端往返 | `nfsv4/engine.cpp:1067` |
-| LocalObject 实现 `open()` | 设计 05 §5.5 要求 v4 OpenState 持独立 fd，现落到基类 EOPNOTSUPP（`api.hpp` 基类、`nfsv4/engine.cpp:1502-1508` 显式容忍），share deny 在 fs 层无对应语义 | `local.hpp:98-135` |
+| 特性 | 落地方式 |
+|---|---|
+| **READ_PLUS**（RFC 7862） ✅ | `op_read_plus`：每应答一个段——offset 落在洞里返回 HOLE 段（clamp 到请求与 EOF），落在数据上先 SEEK_HOLE 截到洞边界再按 READ 路径返回 DATA 段；客户端从段尾自续传（RFC 允许的短应答范式）。无 kSparseOps 的后端退化为单 DATA 段；stateid/budget/QoS 检查与 READ 完全一致。minor 1 仍 OP_ILLEGAL（表到 58）。内部洞的段编码由 SEEK 语义单测 + 后续 pynfs 4.2 验收覆盖（memory 后端无内部洞，引擎单测覆盖 DATA/EOF/空段路径） |
+| **cookieverf 语义化** ✅ | v3/v4 verifier = 目录 change 属性（8 字节）；cookie≠0 时校验，不匹配回 BAD_COOKIE（v3）/NOT_SAME（v4），客户端从 cookie 0 重启获得一致列举。cookie==0 忽略 verifier（RFC 语义）。顺带修正 memory 测试后端播种路径不打目录 change 的保真缺口 |
+| **xattr 应答语义**（RFC 8276） ✅ | 表尾 `kLastKnownOp` 提到 75，op 72-75（GETXATTR/SETXATTR/LISTXATTRS/REMOVEXATTR）在 minor 2 回 NOTSUPP、minor 1 仍 ILLEGAL；op_name/指标数组同步。`xattr_support` bit 82 未加：不宣告该属性与宣告 false 对客户端等效（Linux 客户端按属性缺失判定无 xattr），留给完整实现一并做 |
+| v4 READDIR 批量按预算 ✅ | 每页后端批量 = clamp(dircount/24, 16, 4096)，对齐 v3 |
+| LocalObject `open()` ✅ | `LocalOpenState` 持每 OPEN 独立 fd（写开 O_RDWR）；read/write/seek 优先用它——open 时定权限的 POSIX 语义（OPEN 后 chmod 不再断读写）、免 fd 缓存往返；打开失败降级 EOPNOTSUPP 保持旧行为；合并升级后不可写句柄自动回落 fd 缓存路径。share deny 仍由状态层唯一执行（fs 层本无对应语义，维持设计 07 口径） |
 
 ### 5.2 中期（v2 主题：委托与回传通道）
 

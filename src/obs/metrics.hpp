@@ -118,9 +118,9 @@ struct Metrics {
   ShardedCounter<uint64_t> mount_calls{};
 
   // v4 engine (plan doc 10 §3.1): per-op calls/errors/latency indexed by opcode
-  // (3..71 = nfsv4 kLastKnownOp; slot 0 collects out-of-table opcodes) plus a
+  // (3..75 = nfsv4 kLastKnownOp; slot 0 collects out-of-table opcodes) plus a
   // whole-COMPOUND latency histogram (count == compounds served).
-  static constexpr size_t kV4Ops = 72;
+  static constexpr size_t kV4Ops = 76;
   ShardedCounter<uint64_t> v4_op_calls[kV4Ops]{};
   ShardedCounter<uint64_t> v4_op_errors[kV4Ops]{};
   LatencyHistogram v4_op_duration[kV4Ops]{};
