@@ -341,7 +341,8 @@ rt::Task<StateMgr::ExchangeResult> StateMgr::exchange_id(std::string owner_id,
 rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(
     uint64_t clientid, uint32_t sequence, std::string principal,
     const nfsv4::ChannelAttrs& fore_req, const nfsv4::ChannelAttrs& back_req,
-    uint64_t conn_id) {
+    uint64_t conn_id, std::shared_ptr<transport::CbChannel> cb_chan, uint32_t cb_program,
+    nfsv4::cb::Cred cb_cred) {
   CreateSessionResult out;
   auto client = co_await find_client(clientid);
   if (!client) {
@@ -404,7 +405,14 @@ rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(
         std::min(fore_req.max_response_cached, cfg_.max_cached_reply);
     session->fore.max_ops = std::min(fore_req.max_ops, cfg_.max_ops);
     session->fore.max_requests = std::clamp(fore_req.max_requests, 1u, cfg_.max_slots);
-    session->back = back_req;  // accepted verbatim; the backchannel is never used (7.7)
+    // Backchannel (plan doc 10 §5.2): clamp to the one slot we serialize callbacks
+    // on; the channel itself attaches here (CONN_BACK_CHAN) or via BIND_CONN.
+    session->back = back_req;
+    session->back.max_requests = 1;
+    session->back.max_ops = 2;  // CB_SEQUENCE + one op is all we ever send
+    session->cb_chan = std::move(cb_chan);
+    session->cb_program = cb_program;
+    session->cb_cred = std::move(cb_cred);
     session->slot_count = session->fore.max_requests;
     session->slots = std::make_unique<Slot[]>(session->slot_count);
     session->bound_conns.insert(conn_id);
@@ -535,6 +543,22 @@ rt::Task<uint32_t> StateMgr::bind_conn(const SessionId& id, uint64_t conn_id) {
   co_return 0;
 }
 
+rt::Task<uint32_t> StateMgr::bind_backchannel(const SessionId& id,
+                                              std::shared_ptr<transport::CbChannel> chan) {
+  SessionShard& shard = session_shard(id);
+  auto lock = co_await shard.mu.lock();
+  auto it = shard.table.find(id);
+  if (it == shard.table.end()) co_return as_u32(Status::kBadsession);
+  SessionRec& session = *it->second;
+  {
+    std::lock_guard cb(session.cb_mu);
+    session.cb_chan = std::move(chan);
+    session.cb_inflight = false;
+  }
+  session.cb_down.store(false, std::memory_order_relaxed);  // fresh path, fresh chance
+  co_return 0;
+}
+
 // ---- SEQUENCE --------------------------------------------------------------
 
 rt::Task<StateMgr::SeqResult> StateMgr::sequence_begin(const SessionId& id,
@@ -583,6 +607,14 @@ rt::Task<StateMgr::SeqResult> StateMgr::sequence_begin(const SessionId& id,
       out.max_response = session.fore.max_response;
       out.max_response_cached = session.fore.max_response_cached;
       out.highest_slot = session.slot_count - 1;
+      // SEQ4_STATUS_CB_PATH_DOWN (plan doc 10 §5.2): the client holds recallable
+      // state but this session has no usable backchannel — it should re-bind one.
+      if (session.client->delegs.load(std::memory_order_relaxed) > 0) {
+        std::lock_guard cb(session.cb_mu);
+        bool cb_alive = session.cb_chan && session.cb_chan->alive() &&
+                        !session.cb_down.load(std::memory_order_relaxed);
+        if (!cb_alive) out.status_flags |= 0x1;
+      }
       seq_new_.fetch_add(1, std::memory_order_relaxed);
       co_return out;
     }
@@ -672,11 +704,14 @@ rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from
         opens.erase(std::remove(opens.begin(), opens.end(), rec), opens.end());
         for (const auto& l : file.locks)
           if (l->parent_open == rec) dependents.push_back(l);
-      } else {
+      } else if (rec->type == StateType::kLock) {
         auto& locks = file.locks;
         locks.erase(std::remove(locks.begin(), locks.end(), rec), locks.end());
+      } else {
+        auto& delegs = file.delegs;
+        delegs.erase(std::remove(delegs.begin(), delegs.end(), rec), delegs.end());
       }
-      if (file.opens.empty() && file.locks.empty()) {
+      if (file.opens.empty() && file.locks.empty() && file.delegs.empty()) {
         shard.table.erase(it);
         file_count_.fetch_sub(1, std::memory_order_relaxed);
       }
@@ -685,6 +720,12 @@ rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from
   if (rec->type == StateType::kLock) {
     locks_.release_owner(key, rec->lowner);  // plain mutex table: no shard lock held
     lock_count_.fetch_sub(1, std::memory_order_relaxed);
+    // The freed ranges may unblock waiters (plan doc 10 §5.2): CB_NOTIFY_LOCK them.
+    notify_lock_waiters(key);
+  }
+  if (rec->type == StateType::kDeleg) {
+    deleg_count_.fetch_sub(1, std::memory_order_relaxed);
+    rec->client->delegs.fetch_sub(1, std::memory_order_relaxed);
   }
   // CLOSE releases the byte-range locks held through this open (RFC 8881 §18.2.4).
   for (const auto& l : dependents) (void)co_await unlink_state(l, from_client);
@@ -747,6 +788,7 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
   FileKey key{args.fsid, args.oid};
   StateRef rec;
   backend::OpenPtr released;
+  std::vector<StateRef> deleg_recalls;  // write open vs. read delegations (§5.2)
   for (int attempt = 0;; ++attempt) {
     uint64_t courtesy_conflict = 0;
     {
@@ -771,9 +813,21 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
           break;
         }
       }
-      if (courtesy_conflict == 0) {
+      // A write open invalidates every read delegation on the file, the opener's own
+      // included (plan doc 10 §5.2): recall them and let the client retry (DELAY).
+      // A DELEG_CUR_FH claim is the recall response itself and passes through.
+      if (courtesy_conflict == 0 && !denied && (args.access & kShareWrite) &&
+          !args.deleg_claim) {
+        for (const auto& d : file.delegs)
+          if (!d->closed && !d->client->expired.load(std::memory_order_relaxed))
+            deleg_recalls.push_back(d);
+      }
+      if (!deleg_recalls.empty()) {
+        // Nothing created; fall out of the lock scope to start the recalls.
+      } else if (courtesy_conflict == 0) {
         if (denied) {
-          if (file.opens.empty()) shard.table.erase(key);
+          if (file.opens.empty() && file.locks.empty() && file.delegs.empty())
+            shard.table.erase(key);
           share_denied_.fetch_add(1, std::memory_order_relaxed);
           out.status = as_u32(Status::kShareDenied);
           co_return out;
@@ -802,6 +856,11 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
       } else if (file.opens.empty()) {
         shard.table.erase(key);
       }
+    }
+    if (!deleg_recalls.empty()) {
+      for (const auto& d : deleg_recalls) start_recall(d);
+      out.status = as_u32(Status::kDelay);
+      co_return out;
     }
     if (courtesy_conflict == 0) break;
     if (attempt >= 8) {  // pathological: keep the invariant rather than spin
@@ -849,6 +908,335 @@ rt::Task<Stateid> StateMgr::open_read(uint64_t clientid, uint32_t fsid,
   co_return result.stateid;
 }
 
+// ---- read delegations + backchannel (plan doc 10 §5.2) ---------------------
+
+rt::Task<StateMgr::DelegGrant> StateMgr::maybe_grant_read_deleg(
+    const SessionId& sessionid, uint64_t clientid, uint32_t fsid,
+    const backend::ObjId& oid, std::vector<std::byte> fh, uint32_t access,
+    bool reclaim) {
+  DelegGrant out;
+  if (!cfg_.delegations || reclaim || access != kShareRead || in_grace()) co_return out;
+  // The granting session must have a live backchannel: without one a recall could
+  // never reach the client.
+  {
+    SessionShard& shard = session_shard(sessionid);
+    auto lock = co_await shard.mu.lock();
+    auto it = shard.table.find(sessionid);
+    if (it == shard.table.end()) co_return out;
+    SessionRec& session = *it->second;
+    std::lock_guard cb(session.cb_mu);
+    if (!session.cb_chan || !session.cb_chan->alive() ||
+        session.cb_down.load(std::memory_order_relaxed))
+      co_return out;
+  }
+  auto client = co_await find_client(clientid);
+  if (!client || client->expired.load(std::memory_order_relaxed)) co_return out;
+  {
+    ClientShard& shard = owner_shard(client->owner_id);
+    auto lock = co_await shard.mu.lock();
+    if (cfg_.max_states_per_client != 0 &&
+        client->states.size() >= cfg_.max_states_per_client)
+      co_return out;
+  }
+  auto rec = std::make_shared<StateRec>();
+  rec->other = new_other(StateType::kDeleg);
+  rec->type = StateType::kDeleg;
+  rec->client = client;
+  rec->fsid = fsid;
+  rec->oid = oid;
+  rec->owner = "\x01" "deleg";
+  rec->access = kShareRead;
+  rec->fh = std::move(fh);
+  FileKey key{fsid, oid};
+  {
+    // One file-shard scope for the checks and the publication, so a racing write
+    // open either sees this delegation (and recalls it) or blocks the grant here.
+    // The caller's own open is already in file.opens: the entry exists.
+    FileShard& shard = file_shard(key);
+    auto lock = co_await shard.mu.lock();
+    auto& file = shard.table[key];
+    for (const auto& o : file.opens) {
+      if (o->closed || o->client->expired.load(std::memory_order_relaxed)) continue;
+      if (o->client != client &&
+          (o->access.load(std::memory_order_relaxed) & kShareWrite))
+        co_return out;  // live write open elsewhere: not coherent to delegate
+    }
+    for (const auto& d : file.delegs) {
+      if (d->closed) continue;
+      if (d->client == client || d->recalled.load(std::memory_order_relaxed))
+        co_return out;  // one per client; nothing new while a recall is running
+    }
+    file.delegs.push_back(rec);
+  }
+  {
+    StateShard& shard = state_shard(rec->other);
+    auto lock = co_await shard.mu.lock();
+    shard.table[rec->other] = rec;
+  }
+  bool dead;
+  {
+    ClientShard& shard = owner_shard(client->owner_id);
+    auto lock = co_await shard.mu.lock();
+    dead = client->expired.load(std::memory_order_relaxed);
+    if (!dead) client->states.insert(rec->other);
+  }
+  client->delegs.fetch_add(1, std::memory_order_relaxed);
+  deleg_count_.fetch_add(1, std::memory_order_relaxed);
+  if (dead) {  // reclaim chain ran mid-grant: retract
+    (void)co_await unlink_state(rec, false);
+    co_return out;
+  }
+  deleg_grants_.fetch_add(1, std::memory_order_relaxed);
+  out.granted = true;
+  out.stateid.seqid = rec->seqid.load(std::memory_order_relaxed);
+  out.stateid.other = rec->other;
+  co_return out;
+}
+
+rt::Task<uint32_t> StateMgr::delegreturn(const Stateid& sid, uint64_t clientid,
+                                         uint32_t fsid, const backend::ObjId& oid) {
+  if (epoch_of(sid.other) != static_cast<uint32_t>(cfg_.boot_epoch))
+    co_return as_u32(Status::kStaleStateid);
+  StateRef rec;
+  {
+    StateShard& shard = state_shard(sid.other);
+    auto lock = co_await shard.mu.lock();
+    auto it = shard.table.find(sid.other);
+    if (it == shard.table.end()) co_return as_u32(Status::kBadStateid);
+    rec = it->second;
+  }
+  if (rec->type != StateType::kDeleg || rec->client->clientid != clientid ||
+      rec->fsid != fsid || !(rec->oid == oid))
+    co_return as_u32(Status::kBadStateid);
+  (void)co_await unlink_state(rec, true);
+  deleg_returns_.fetch_add(1, std::memory_order_relaxed);
+  co_return 0;
+}
+
+rt::Task<uint32_t> StateMgr::deleg_conflict(uint32_t fsid, const backend::ObjId& oid) {
+  if (deleg_count_.load(std::memory_order_relaxed) == 0) co_return 0;  // fast path
+  std::vector<StateRef> recalls;
+  FileKey key{fsid, oid};
+  {
+    FileShard& shard = file_shard(key);
+    auto lock = co_await shard.mu.lock();
+    auto it = shard.table.find(key);
+    if (it != shard.table.end()) {
+      for (const auto& d : it->second.delegs)
+        if (!d->closed && !d->client->expired.load(std::memory_order_relaxed))
+          recalls.push_back(d);
+    }
+  }
+  if (recalls.empty()) co_return 0;
+  for (const auto& d : recalls) start_recall(d);
+  co_return as_u32(Status::kDelay);
+}
+
+rt::Task<uint32_t> StateMgr::check_deleg_claim(const Stateid& sid, uint64_t clientid,
+                                               uint32_t fsid, const backend::ObjId& oid) {
+  if (epoch_of(sid.other) != static_cast<uint32_t>(cfg_.boot_epoch))
+    co_return as_u32(Status::kStaleStateid);
+  StateRef rec;
+  {
+    StateShard& shard = state_shard(sid.other);
+    auto lock = co_await shard.mu.lock();
+    auto it = shard.table.find(sid.other);
+    if (it == shard.table.end()) co_return as_u32(Status::kBadStateid);
+    rec = it->second;
+  }
+  if (rec->type != StateType::kDeleg || rec->client->clientid != clientid ||
+      rec->fsid != fsid || !(rec->oid == oid))
+    co_return as_u32(Status::kBadStateid);
+  co_return 0;
+}
+
+void StateMgr::start_recall(const StateRef& deleg) {
+  if (deleg->recalled.exchange(true, std::memory_order_relaxed)) return;  // once only
+  deleg->recall_deadline.store(now_coarse() + cfg_.lease_seconds,
+                               std::memory_order_relaxed);
+  {
+    std::lock_guard lock(recall_mu_);
+    recall_watch_.push_back(deleg);
+  }
+  deleg_recalls_.fetch_add(1, std::memory_order_relaxed);
+  rt::spawn(recall_task(deleg), rt::current_reactor());
+}
+
+rt::Task<void> StateMgr::recall_task(StateRef deleg) {
+  Stateid sid;
+  sid.seqid = deleg->seqid.load(std::memory_order_relaxed);
+  sid.other = deleg->other;
+  struct Args {
+    Stateid sid;
+    const std::vector<std::byte>* fh;
+  } args{sid, &deleg->fh};
+  bool sent = co_await send_cb(
+      deleg->client,
+      [](const nfsv4::cb::Target& t, const void* p) {
+        auto* a = static_cast<const Args*>(p);
+        return nfsv4::cb::build_cb_recall(t, a->sid, *a->fh);
+      },
+      &args);
+  if (!sent)
+    LNFS_WARN("CB_RECALL undeliverable (client {:#x}): delegation will be revoked at "
+              "the deadline",
+              deleg->client->clientid);
+}
+
+rt::Task<bool> StateMgr::send_cb(std::shared_ptr<ClientRec> client,
+                                 std::vector<std::byte> (*build)(const nfsv4::cb::Target&,
+                                                                 const void*),
+                                 const void* args) {
+  std::vector<SessionId> session_ids;
+  {
+    ClientShard& shard = owner_shard(client->owner_id);
+    auto lock = co_await shard.mu.lock();
+    session_ids = client->sessions;
+  }
+  std::shared_ptr<SessionRec> session;
+  for (const auto& id : session_ids) {
+    SessionShard& shard = session_shard(id);
+    auto lock = co_await shard.mu.lock();
+    auto it = shard.table.find(id);
+    if (it == shard.table.end()) continue;
+    std::lock_guard cb(it->second->cb_mu);
+    if (it->second->cb_chan && it->second->cb_chan->alive() &&
+        !it->second->cb_down.load(std::memory_order_relaxed)) {
+      session = it->second;
+      break;
+    }
+  }
+  if (!session) co_return false;
+  nfsv4::cb::Target target;
+  std::shared_ptr<transport::CbChannel> chan;
+  {
+    std::lock_guard cb(session->cb_mu);
+    if (!session->cb_chan || !session->cb_chan->alive() ||
+        session->cb_down.load(std::memory_order_relaxed))
+      co_return false;
+    int64_t now = now_coarse();
+    if (session->cb_inflight) {
+      // One slot, one call at a time.  A slot stuck past a lease means the client
+      // stopped answering: mark the path down instead of queueing behind it.
+      if (now - session->cb_inflight_since >
+          static_cast<int64_t>(cfg_.lease_seconds))
+        session->cb_down.store(true, std::memory_order_relaxed);
+      co_return false;
+    }
+    session->cb_inflight = true;
+    session->cb_inflight_since = now;
+    chan = session->cb_chan;
+    target.program = session->cb_program;
+    target.cred = session->cb_cred;
+    target.sessionid = session->id;
+    target.slot_seq = ++session->cb_seq;
+    target.xid = chan->next_xid();
+  }
+  auto record = build(target, args);
+  auto reply = co_await chan->call(target.xid, std::move(record));
+  bool ok = false;
+  {
+    std::lock_guard cb(session->cb_mu);
+    session->cb_inflight = false;
+    if (!reply) {
+      session->cb_down.store(true, std::memory_order_relaxed);
+    } else {
+      auto rs = nfsv4::cb::parse_cb_reply(*reply);
+      ok = rs.rpc_ok;  // any well-formed RPC answer proves the path is alive
+      if (!ok) session->cb_down.store(true, std::memory_order_relaxed);
+    }
+  }
+  co_return ok;
+}
+
+rt::Task<void> StateMgr::sweep_recalls() {
+  std::vector<StateRef> due;
+  int64_t now = now_coarse();
+  {
+    std::lock_guard lock(recall_mu_);
+    for (size_t i = 0; i < recall_watch_.size();) {
+      StateRef& rec = recall_watch_[i];
+      if (rec->closed) {  // DELEGRETURN / client expiry beat the deadline
+        rec = recall_watch_.back();
+        recall_watch_.pop_back();
+        continue;
+      }
+      if (rec->recall_deadline.load(std::memory_order_relaxed) <= now) {
+        due.push_back(rec);
+        rec = recall_watch_.back();
+        recall_watch_.pop_back();
+        continue;
+      }
+      ++i;
+    }
+  }
+  for (auto& rec : due) {
+    LNFS_WARN("delegation recall deadline passed: revoking (client {:#x})",
+              rec->client->clientid);
+    (void)co_await unlink_state(rec, true);
+    deleg_revokes_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+// ---- CB_NOTIFY_LOCK (plan doc 10 §5.2) -------------------------------------
+
+void StateMgr::register_lock_waiter(uint32_t fsid, const backend::ObjId& oid,
+                                    uint64_t clientid, std::string owner,
+                                    std::vector<std::byte> fh) {
+  FileKey key{fsid, oid};
+  int64_t expires = now_coarse() + cfg_.lease_seconds;
+  std::lock_guard lock(lock_waiters_mu_);
+  auto& waiters = lock_waiters_[key];
+  for (auto& w : waiters) {
+    if (w.clientid == clientid && w.owner == owner) {
+      w.expires = expires;  // re-armed by the retry
+      return;
+    }
+  }
+  if (waiters.size() >= 16) return;  // bounded, best effort
+  waiters.push_back({clientid, std::move(owner), std::move(fh), expires});
+}
+
+void StateMgr::notify_lock_waiters(const FileKey& key) {
+  std::vector<LockWaiter> waiters;
+  {
+    std::lock_guard lock(lock_waiters_mu_);
+    auto it = lock_waiters_.find(key);
+    if (it == lock_waiters_.end()) return;
+    waiters = std::move(it->second);
+    lock_waiters_.erase(it);
+  }
+  int64_t now = now_coarse();
+  for (auto& w : waiters) {
+    if (w.expires < now) continue;  // the waiter gave up a lease ago
+    rt::spawn(notify_task(w.clientid, std::move(w.owner), std::move(w.fh)),
+              rt::current_reactor());
+  }
+}
+
+rt::Task<void> StateMgr::notify_task(uint64_t clientid, std::string owner,
+                                     std::vector<std::byte> fh) {
+  auto client = co_await find_client(clientid);
+  if (!client || client->expired.load(std::memory_order_relaxed)) co_return;
+  struct Args {
+    const std::vector<std::byte>* fh;
+    uint64_t clientid;
+    const std::string* owner;
+  } args{&fh, clientid, &owner};
+  bool ok = co_await send_cb(
+      client,
+      [](const nfsv4::cb::Target& t, const void* p) {
+        auto* a = static_cast<const Args*>(p);
+        return nfsv4::cb::build_cb_notify_lock(
+            t, *a->fh, a->clientid,
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(a->owner->data()),
+                a->owner->size()));
+      },
+      &args);
+  if (ok) cb_lock_notifies_.fetch_add(1, std::memory_order_relaxed);
+}
+
 rt::Task<StateMgr::IoCheck> StateMgr::check_io(const Stateid& sid, uint64_t clientid,
                                                uint32_t fsid, const backend::ObjId& oid,
                                                uint32_t need) {
@@ -860,19 +1248,33 @@ rt::Task<StateMgr::IoCheck> StateMgr::check_io(const Stateid& sid, uint64_t clie
       co_return out;
     }
     if (sid.is_all_one()) co_return out;  // READ bypass: ignores share deny
-    // Anonymous stateid IO is subject to share reservations (RFC 8881 §9.1.2).
+    // Anonymous stateid IO is subject to share reservations (RFC 8881 §9.1.2), and an
+    // anonymous WRITE invalidates read delegations like any other mutation (§5.2).
     FileKey key{fsid, oid};
-    FileShard& shard = file_shard(key);
-    auto lock = co_await shard.mu.lock();
-    auto it = shard.table.find(key);
-    if (it != shard.table.end()) {
-      for (const auto& rec : it->second.opens) {
-        if (rec->closed || rec->client->expired.load(std::memory_order_relaxed)) continue;
-        if (rec->deny & need) {
-          out.status = as_u32(Status::kLocked);
-          break;
+    std::vector<StateRef> deleg_recalls;
+    {
+      FileShard& shard = file_shard(key);
+      auto lock = co_await shard.mu.lock();
+      auto it = shard.table.find(key);
+      if (it != shard.table.end()) {
+        for (const auto& rec : it->second.opens) {
+          if (rec->closed || rec->client->expired.load(std::memory_order_relaxed))
+            continue;
+          if (rec->deny & need) {
+            out.status = as_u32(Status::kLocked);
+            break;
+          }
+        }
+        if (out.status == 0 && need == kShareWrite) {
+          for (const auto& d : it->second.delegs)
+            if (!d->closed && !d->client->expired.load(std::memory_order_relaxed))
+              deleg_recalls.push_back(d);
         }
       }
+    }
+    if (!deleg_recalls.empty()) {
+      for (const auto& d : deleg_recalls) start_recall(d);
+      out.status = as_u32(Status::kDelay);
     }
     co_return out;
   }
@@ -1318,6 +1720,8 @@ rt::Task<uint32_t> StateMgr::locku(const Stateid& sid, uint64_t clientid, uint64
     out->other = sid.other;
     out->seqid = rec->seqid;
   }
+  // The released range may unblock waiters (plan doc 10 §5.2): CB_NOTIFY_LOCK them.
+  notify_lock_waiters(FileKey{rec->fsid, rec->oid});
   co_return 0;
 }
 
@@ -1398,6 +1802,8 @@ rt::Task<void> StateMgr::scan_leases() {
     arm_lease_check(c, now + courtesy_window);
   }
   for (uint64_t id : timed_out) (void)co_await expire_client_impl(id, kReasonTimeout);
+  // Recalled delegations past their deadline are revoked here (plan doc 10 §5.2).
+  co_await sweep_recalls();
 }
 
 rt::Task<void> StateMgr::run_lease_scanner(std::atomic<bool>* stop) {
@@ -1521,6 +1927,12 @@ StateMgr::Stats StateMgr::stats() const {
     out.lock_owners = lock_owners_.size();
   }
   out.lock_denied = lock_denied_.load(std::memory_order_relaxed);
+  out.delegs = nonneg(deleg_count_);
+  out.deleg_grants = deleg_grants_.load(std::memory_order_relaxed);
+  out.deleg_recalls = deleg_recalls_.load(std::memory_order_relaxed);
+  out.deleg_returns = deleg_returns_.load(std::memory_order_relaxed);
+  out.deleg_revokes = deleg_revokes_.load(std::memory_order_relaxed);
+  out.cb_lock_notifies = cb_lock_notifies_.load(std::memory_order_relaxed);
   out.grace = in_grace();
   out.grace_remaining = grace_remaining_seconds();
   return out;

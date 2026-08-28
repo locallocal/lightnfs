@@ -19,6 +19,7 @@
 #include "runtime/buffer.hpp"
 #include "runtime/cancel.hpp"
 #include "runtime/sync.hpp"
+#include "transport/backchannel.hpp"
 #include "transport/record_stream.hpp"
 
 namespace lnfs::transport {
@@ -91,6 +92,16 @@ struct ConnCtx {
 
   // Serialized reply send; on failure marks the connection for teardown.
   rt::Task<void> send(rt::SendBuf buf);
+
+  // Backchannel send handle (plan doc 10 §5.2), created lazily on the connection's
+  // reactor (CREATE_SESSION / BIND_CONN run as handlers here).  The v4 state layer
+  // shares ownership; connection teardown detaches it.
+  std::shared_ptr<CbChannel> cb_channel();
+  // Read-loop upcall for an RPC REPLY record (a callback answer).  Public so tests
+  // without a live read loop can inject replies.
+  void route_cb_reply(rt::BufferChain rec);
+
+  std::shared_ptr<CbChannel> cb;  // null until first cb_channel()
 };
 
 // Live-connection registry for `lightnfs-ctl conns` / `kill-conn` (plan doc 10 §4.2).

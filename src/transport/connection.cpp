@@ -142,6 +142,22 @@ Task<void> ConnCtx::send(rt::SendBuf buf) {
   }
 }
 
+std::shared_ptr<CbChannel> ConnCtx::cb_channel() {
+  if (!cb) cb = CbChannel::create(this, rt::current_reactor_or_null());
+  return cb;
+}
+
+void ConnCtx::route_cb_reply(rt::BufferChain rec) {
+  auto bytes = rec.to_bytes();
+  if (bytes.size() < 8 || !cb) return;  // no channel: nothing ever called out
+  uint32_t xid = 0;
+  std::memcpy(&xid, bytes.data(), 4);
+  xid = xdr::to_be32(xid);  // symmetric byte swap
+  if (!cb->route_reply(xid, std::move(bytes)))
+    LNFS_DEBUG("conn {}: unmatched callback reply xid={:#x}, dropped", peer.to_string(),
+               xid);
+}
+
 namespace {
 Task<void> handle_one(ConnCtx* c, rpc::Dispatcher* d, BufferChain rec) {
   // Failure isolation (plan doc 10 §2.4): an exception that escapes the dispatcher's
@@ -177,6 +193,17 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp,
     }
     if (rec->empty()) continue;  // empty record: ignore
     if (c->cancel.cancel_requested()) break;
+    {
+      // RPC REPLY records answer our backchannel calls (plan doc 10 §5.2): routed by
+      // xid to the pending callback, never dispatched as requests.
+      xdr::XdrDec peek(*rec);
+      (void)peek.u32();  // xid
+      auto mtype = peek.u32();
+      if (mtype && *mtype == rpc::kReply) {
+        c->route_cb_reply(std::move(*rec));
+        continue;
+      }
+    }
       if (c->inflight.available() <= 0)
       obs::Metrics::instance().backpressure_waits.fetch_add(1, std::memory_order_relaxed);
     co_await c->inflight.acquire();  // backpressure (design 01 §1.5)
@@ -184,7 +211,11 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp,
     spawn(handle_one(c, &disp, std::move(*rec)), current_reactor());
   }
 
-  // Teardown (design 02 §2.6): cancel, then drain in-flight handlers.
+  // Teardown (design 02 §2.6): cancel, then drain in-flight handlers.  The backchannel
+  // detaches first (same reactor): pending callback waiters fail, a queued-but-unrun
+  // callback send observes the detach and skips, and an in-flight one is counted in
+  // `live` so the drain below waits for it.
+  if (c->cb) c->cb->detach();
   c->cancel.request();
   co_await uring_cancel_fd(c->fd);
   while (c->live > 0) {

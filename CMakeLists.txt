@@ -82,6 +82,8 @@ add_library(lnfs_core STATIC
   src/transport/record_stream.cpp
   src/transport/listener.cpp
   src/transport/connection.cpp
+  src/transport/backchannel.cpp
+  src/nfsv4/callback.cpp
   src/rpc/rpc_msg.cpp
   src/rpc/auth.cpp
   src/rpc/drc.cpp

@@ -58,6 +58,9 @@ struct ServerConfig {
   uint64_t drc_ttl_ms = 120000;
   uint64_t drc_mem = 64u << 20;
   bool enable_v4 = true;
+  // Read delegations (plan doc 10 §5.2): granted only to sessions with a live
+  // backchannel; this is the operator kill switch.
+  bool delegations = true;
   uint32_t lease_seconds = 90;   // v4 lease
   // Grace window after restart, decoupled from the lease (plan doc 10 §4.4):
   // 0 = "auto" = lease; operators often want grace < lease for faster recovery.

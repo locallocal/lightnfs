@@ -129,7 +129,16 @@ sudo systemctl enable --now lightnfs
 - **READDIR cookie 校验**：cookieverf 取目录 change 属性——分页期间目录被改，客户端
   收到 BAD_COOKIE（v3）/NOT_SAME（v4）并自动从头重新列目录，不再静默漏项/重复。
   高频变更的大目录列举可能因此重启多次（正确性换代价，Linux 客户端自动处理）。
-- **无委托、无 pNFS、无 SECINFO(带名之外) 的多 flavor**：SECINFO/SECINFO_NO_NAME 恒返回
+- **读委托 + 回传通道**（plan doc 10 §5.2）：会话绑定回传通道（CREATE_SESSION 的
+  CONN_BACK_CHAN 或 BIND_CONN_TO_SESSION BACK/BOTH）后，只读 OPEN 可获读委托——
+  客户端本地缓存/打开不再逐次询问服务器，GETATTR 风暴显著削减。写打开、SETATTR、
+  REMOVE/RENAME、匿名写等冲突操作触发 CB_RECALL 并回 DELAY，客户端 DELEGRETURN
+  （或 CLAIM_DELEG_CUR_FH 先转正打开）后重试；一个租约期内不归还则吊销
+  （`lightnfs_v4_deleg_revokes_total`）。`[protocol] delegations = false` 可整体关闭。
+  锁竞争方也会在持有者解锁时收到 CB_NOTIFY_LOCK 提示重试，替代盲轮询。
+  **边界**：与 v3 锁一致，v3 侧的写不触发 v4 委托召回——v3/v4 混挂同一导出时委托
+  一致性只覆盖 v4 客户端（文档明示的既有边界）。无写委托/目录委托，无 pNFS。
+- **SECINFO 多 flavor**：SECINFO/SECINFO_NO_NAME 恒返回
   `[AUTH_SYS]`（AUTH_SYS-only 服务器的合规简化，永不发 WRONGSEC）。
 - **句柄稳定性**：`handles="auto"` 在无 `CAP_DAC_READ_SEARCH` 且文件系统无 STATX_BTIME
   （如 tmpfs）时，句柄不跨重启稳定——生产用 `CAP_DAC_READ_SEARCH` + 内核句柄，或
