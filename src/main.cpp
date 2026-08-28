@@ -3,6 +3,7 @@
 
 #include <ccmd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -15,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "backend/local.hpp"
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
@@ -24,6 +26,7 @@
 #include "nfsv3/engine.hpp"
 #include "nfsv4/engine.hpp"
 #include "state/state_mgr.hpp"
+#include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
 #include "runtime/runtime.hpp"
@@ -190,8 +193,9 @@ struct ProtocolStack {
   }
 };
 
-// Prometheus text groups for the DRC and the v4 state tables (design 08 §8.3).
-void register_metrics_providers(ProtocolStack& stack) {
+// Prometheus text groups for the DRC, the v4 state tables, per-export data-path
+// counters, and the local-backend fd caches (design 08 §8.3, plan doc 10 §3).
+void register_metrics_providers(ProtocolStack& stack, lnfs::core::ExportTable& exports) {
   lnfs::obs::register_text_provider([&drc = stack.drc](std::string& out) {
     auto s = drc.stats();
     out += std::format(
@@ -212,11 +216,45 @@ void register_metrics_providers(ProtocolStack& stack) {
         "lightnfs_v4_reclaims_total{{reason=\"conflict\"}} {}\n"
         "lightnfs_v4_reclaims_total{{reason=\"timeout\"}} {}\n"
         "lightnfs_v4_reclaims_total{{reason=\"forced\"}} {}\n"
-        "lightnfs_v4_share_denied_total {}\nlightnfs_v4_open_merges_total {}\n",
+        "lightnfs_v4_share_denied_total {}\nlightnfs_v4_open_merges_total {}\n"
+        // Lock-state gauges promised by deployment.md (plan doc 10 §3.4).
+        "lightnfs_v4_lock_states {}\nlightnfs_v4_lock_segments {}\n"
+        "lightnfs_v4_lock_owners {}\nlightnfs_v4_lock_denied_total {}\n",
         s.clients, s.sessions, s.opens, s.seq_new, s.seq_replay, s.seq_misordered,
         s.seq_waits, s.grace ? 1 : 0, s.grace_remaining, s.files, s.courtesy,
         s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout, s.reclaim_forced,
-        s.share_denied, s.open_merges);
+        s.share_denied, s.open_merges, s.lock_states, s.lock_segments, s.lock_owners,
+        s.lock_denied);
+  });
+  lnfs::obs::register_text_provider([&exports](std::string& out) {
+    for (const auto& entry : exports.entries()) {
+      std::string labels =
+          std::format("export=\"{}\",fsid=\"{}\"", entry->path, entry->fsid);
+      const auto& em = entry->metrics;
+      out += std::format(
+          "lightnfs_export_read_bytes_total{{{0}}} {1}\n"
+          "lightnfs_export_write_bytes_total{{{0}}} {2}\n"
+          "lightnfs_export_read_ops_total{{{0}}} {3}\n"
+          "lightnfs_export_write_ops_total{{{0}}} {4}\n",
+          labels, em.read_bytes.load(), em.write_bytes.load(), em.read_ops.load(),
+          em.write_ops.load());
+      // Local-backend fd/resolve cache counters (previously ctl text only, §3.5).
+      auto* local = dynamic_cast<lnfs::backend::LocalBackend*>(entry->backend.get());
+      if (!local) continue;
+      auto s = local->fd_cache_stats();
+      out += std::format(
+          "lightnfs_fdcache_hits_total{{{0}}} {1}\n"
+          "lightnfs_fdcache_misses_total{{{0}}} {2}\n"
+          "lightnfs_fdcache_upgrades_total{{{0}}} {3}\n"
+          "lightnfs_fdcache_evictions_total{{{0}}} {4}\n"
+          "lightnfs_fdcache_overflows_total{{{0}}} {5}\n"
+          "lightnfs_fdcache_entries{{{0}}} {6}\n"
+          "lightnfs_fdcache_path_hits_total{{{0}}} {7}\n"
+          "lightnfs_fdcache_path_misses_total{{{0}}} {8}\n"
+          "lightnfs_fdcache_path_entries{{{0}}} {9}\n",
+          labels, s.hits, s.misses, s.upgrades, s.evictions, s.overflows, s.entries,
+          s.path_hits, s.path_misses, s.path_entries);
+    }
   });
 }
 
@@ -249,6 +287,15 @@ std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
   Frontend fe{std::move(*nfs_listener), std::move(*mount_listener), nullptr, nullptr};
   fe.nfs->start();    // per-reactor REUSEPORT accept loops (plan doc 10 §2.3)
   fe.mount->start();
+  // Buffer-pool watermark (plan doc 10 §3.5); the listeners are heap-allocated and
+  // outlive every metrics scrape (frontend stops before run_server returns).
+  lnfs::obs::register_text_provider(
+      [nfs = fe.nfs.get(), mount = fe.mount.get()](std::string& out) {
+        out += std::format(
+            "lightnfs_buffer_pool_free_bytes{{listener=\"nfs\"}} {}\n"
+            "lightnfs_buffer_pool_free_bytes{{listener=\"mount\"}} {}\n",
+            nfs->pool().free_bytes(), mount->pool().free_bytes());
+      });
 
   std::string ctl_path =
       cfg.ctl_socket.empty() ? cfg.state_dir + "/ctl.sock" : cfg.ctl_socket;
@@ -341,9 +388,13 @@ int run_server(const std::string& config_path, bool check_only) {
 
   ProtocolStack stack(server_cfg, *core);
   if (server_cfg.enable_v4) stack.enable_v4(server_cfg, *core, runtime);
-  register_metrics_providers(stack);
-  // Runtime-layer metrics (plan doc 10 §2.5 / design 08 §8.3): offload queue depth and
-  // per-class throughput.
+  register_metrics_providers(stack, *core->exports);
+  // Slow-request log + error-sampling ring sizing (plan doc 10 §3.6/§3.7).
+  lnfs::obs::set_slow_request_threshold_us(
+      static_cast<uint64_t>(server_cfg.slow_request_ms) * 1000);
+  lnfs::obs::set_error_ring_capacity(server_cfg.error_ring);
+  // Runtime-layer metrics (plan doc 10 §2.5/§3.5, design 08 §8.3): offload queue depth,
+  // per-class throughput, and the reactor loop busy-period histogram.
   lnfs::obs::register_text_provider([&runtime](std::string& out) {
     auto s = runtime.offload().stats();
     static constexpr const char* kCls[] = {"light", "heavy"};
@@ -356,6 +407,16 @@ int run_server(const std::string& config_path, bool check_only) {
           kCls[c], s.depth[c], kCls[c], s.submitted[c], kCls[c], s.completed[c],
           kCls[c], s.deferred[c]);
     }
+    std::array<uint64_t, lnfs::rt::Reactor::kLoopBuckets> agg{};
+    uint64_t sum_us = 0;
+    for (size_t i = 0; i < runtime.reactor_count(); ++i) {
+      auto ls = runtime.reactor(i).loop_stats();
+      for (size_t b = 0; b < agg.size(); ++b) agg[b] += ls.buckets[b];
+      sum_us += ls.sum_us;
+    }
+    out += "# TYPE lightnfs_reactor_loop_duration_seconds histogram\n";
+    lnfs::obs::append_histogram(out, "lightnfs_reactor_loop_duration_seconds", "",
+                                lnfs::rt::Reactor::kLoopBoundsUs, agg, sum_us);
   });
 
   auto frontend = start_frontend(server_cfg, runtime, stack, *core);

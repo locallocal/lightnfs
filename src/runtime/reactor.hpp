@@ -93,10 +93,37 @@ class Reactor {
   // Test helper: process what is ready without blocking; returns true if progress was made.
   bool poll_once();
 
+  // Loop busy-period stats (plan doc 10 §3.5): each run() sweep that made progress
+  // records how long the reactor was busy — the delay newly arriving work experiences.
+  // Written relaxed from the reactor thread only; readable from any thread (metrics).
+  static constexpr uint64_t kLoopBoundsUs[] = {10,   50,    100,   500,
+                                               1000, 5000,  10000, 50000};
+  static constexpr size_t kLoopBuckets = std::size(kLoopBoundsUs) + 1;
+  struct LoopStats {
+    uint64_t buckets[kLoopBuckets]{};
+    uint64_t sum_us = 0;
+    uint64_t count = 0;
+  };
+  LoopStats loop_stats() const {
+    LoopStats out;
+    for (size_t b = 0; b < kLoopBuckets; ++b) {
+      out.buckets[b] = loop_buckets_[b].load(std::memory_order_relaxed);
+      out.count += out.buckets[b];
+    }
+    out.sum_us = loop_sum_us_.load(std::memory_order_relaxed);
+    return out;
+  }
+
  private:
   bool pump(std::optional<std::chrono::nanoseconds> block_for);
   std::optional<std::chrono::nanoseconds> next_timer_delay();
   void run_expired_timers();
+  void observe_loop(uint64_t us) {
+    size_t b = 0;
+    while (b < kLoopBuckets - 1 && us > kLoopBoundsUs[b]) ++b;
+    loop_buckets_[b].fetch_add(1, std::memory_order_relaxed);
+    loop_sum_us_.fetch_add(us, std::memory_order_relaxed);
+  }
 
   RingOps& ring_;
   Options opts_;
@@ -121,6 +148,8 @@ class Reactor {
   std::atomic<bool> stop_{false};
   std::atomic<int64_t> live_tasks_{0};
   int64_t pending_ops_ = 0;
+  std::atomic<uint64_t> loop_buckets_[kLoopBuckets]{};
+  std::atomic<uint64_t> loop_sum_us_{0};
 };
 
 // TLS accessor (design 02 §2.2). Aborts if called off-reactor.

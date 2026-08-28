@@ -75,8 +75,18 @@ sudo systemctl enable --now lightnfs
   自起进程内栈压测，不经 ctl 套接字、不涉运行中的服务。
 - **Prometheus**：`[server] metrics_port` 开一个 HTTP 文本端点；关键指标包括
   `lightnfs_v4_{clients,sessions,opens,files_with_state,courtesy_clients,in_grace,
-  grace_remaining_seconds,lock_states,lock_segments}`、`lightnfs_v4_reclaims_total{reason}`、
-  `lightnfs_v4_lock_denied_total`、`lightnfs_drc_*`、连接/背压计数。
+  grace_remaining_seconds,lock_states,lock_segments,lock_owners}`、
+  `lightnfs_v4_reclaims_total{reason}`、`lightnfs_v4_lock_denied_total`、
+  `lightnfs_drc_*`、连接/背压计数。时延类指标为固定桶直方图（可算 p99）：
+  `lightnfs_v3_duration_seconds{proc}`、`lightnfs_v4_op_duration_seconds{op}`
+  （另有 `lightnfs_v4_op_{calls,errors}_total{op}`）、
+  `lightnfs_v4_compound_duration_seconds`、`lightnfs_reactor_loop_duration_seconds`。
+  多导出定位用带 `{export,fsid}` 标签的
+  `lightnfs_export_{read,write}_{bytes,ops}_total` 与 `lightnfs_fdcache_*`；
+  runtime 层另有 `lightnfs_offload_*` 与 `lightnfs_buffer_pool_free_bytes{listener}`。
+- **慢请求日志**：超过 `[server] slow_request_ms`（默认 1000，0 关闭）的请求落一条
+  warn 日志；v4 附 COMPOUND 内逐 op 耗时分解（`ops=[PUTFH=12us,READ=890000us]`），
+  现网定位的第一工具。`dump-errors` 采样环大小由 `[server] error_ring`（默认 64）控制。
 - **重启恢复**：进程重启后 boot_epoch +1，读 `state_dir/clients/` 名单进入 grace
   （时长 = lease），仅名单内客户端可 reclaim；名单内全部 RECLAIM_COMPLETE 则提前结束。
   普通操作在 grace 内收 GRACE 重试。**不要清空 state_dir**，否则客户端无法 reclaim、

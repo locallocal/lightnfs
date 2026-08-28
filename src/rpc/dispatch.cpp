@@ -74,7 +74,7 @@ Task<void> Dispatcher::handle_request(transport::ConnCtx& ctx, rt::BufferChain r
 
   bool failed = false;
   try {
-    co_await prog->handler(ctx, *call, *cred);
+    co_await prog->handler(prog->self, ctx, *call, *cred);
   } catch (const std::exception& e) {
     LNFS_ERROR("conn {}: handler exception for prog={} proc={}: {}", ctx.peer.to_string(),
                call->prog, call->proc, e.what());

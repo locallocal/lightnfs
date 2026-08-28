@@ -57,7 +57,8 @@ int lnfs::bench::nullrpc_main(int argc, char** argv) {
   set_log_level(LogLevel::kWarn);
   Runtime rt(Runtime::Config{.reactors = reactors, .offload_threads = 2});
   Dispatcher disp;
-  disp.add({kProg, 3, 3, [](ConnCtx& c, RpcCall& call, const Cred&) -> Task<void> {
+  disp.add({kProg, 3, 3, nullptr,
+            [](void*, ConnCtx& c, RpcCall& call, const Cred&) -> Task<void> {
               xdr::XdrEnc enc(c.pool);
               encode_reply_success(enc, call.xid);
               co_await c.send(enc.take());

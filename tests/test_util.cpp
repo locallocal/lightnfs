@@ -110,6 +110,22 @@ TEST(ErrLog, RingKeepsMostRecent) {
   EXPECT_TRUE(out.find("xid=0x9023") == std::string::npos);   // evicted
 }
 
+// Ring capacity is configurable (plan doc 10 §3.7) and the `what` field holds the
+// longest v4 op name without truncation (the old 20-byte field cut it short).
+TEST(ErrLog, CapacityAndLongOpNames) {
+  obs::set_error_ring_capacity(4);
+  obs::record_error_reply("peer", "BIND_CONN_TO_SESSION", 0xa000, 1);
+  for (uint32_t i = 1; i < 4; ++i)
+    obs::record_error_reply("peer", "SEQUENCE", 0xa000 + i, 1);
+  auto out = obs::dump_error_replies();
+  EXPECT_TRUE(out.find("proc=BIND_CONN_TO_SESSION") != std::string::npos);
+  obs::record_error_reply("peer", "SEQUENCE", 0xa004, 1);  // evicts the oldest of 4
+  out = obs::dump_error_replies();
+  EXPECT_TRUE(out.find("xid=0xa000 ") == std::string::npos);
+  EXPECT_TRUE(out.find("xid=0xa004") != std::string::npos);
+  obs::set_error_ring_capacity(64);  // restore the default for later tests
+}
+
 // Sharded metric counters (plan doc 10 §2.6): concurrent bumps land in per-thread
 // slots; load() must still sum to the exact total, including negative net values.
 TEST(Metrics, ShardedCounterSumsAcrossThreads) {
@@ -126,4 +142,57 @@ TEST(Metrics, ShardedCounterSumsAcrossThreads) {
   for (auto& t : ts) t.join();
   EXPECT_EQ(c.load(std::memory_order_relaxed), 80000u);
   EXPECT_EQ(net.load(std::memory_order_relaxed), 8 * 100);
+}
+
+// Latency histogram (plan doc 10 §3.2): observations land in the right bucket and the
+// Prometheus rendering is cumulative with _sum/_count, so p99 is computable.
+TEST(Metrics, HistogramBucketsAndExposition) {
+  obs::LatencyHistogram h;
+  h.observe_us(50);        // <= 100µs -> bucket 0
+  h.observe_us(100);       // boundary is inclusive -> bucket 0
+  h.observe_us(300);       // -> le=0.0005
+  h.observe_us(9'000'000); // beyond the last bound -> +Inf only
+  auto snap = h.snapshot();
+  EXPECT_EQ(snap.count, 4u);
+  EXPECT_EQ(snap.sum_us, 50u + 100 + 300 + 9'000'000);
+  EXPECT_EQ(snap.buckets[0], 2u);
+  EXPECT_EQ(snap.buckets[2], 1u);
+  EXPECT_EQ(snap.buckets[obs::LatencyHistogram::kBuckets - 1], 1u);
+  std::string out;
+  obs::append_histogram(out, "t_seconds", "op=\"X\"", snap);
+  EXPECT_TRUE(out.find("t_seconds_bucket{op=\"X\",le=\"0.0001\"} 2\n") != std::string::npos);
+  EXPECT_TRUE(out.find("t_seconds_bucket{op=\"X\",le=\"0.0005\"} 3\n") != std::string::npos);
+  EXPECT_TRUE(out.find("t_seconds_bucket{op=\"X\",le=\"5\"} 3\n") != std::string::npos);
+  EXPECT_TRUE(out.find("t_seconds_bucket{op=\"X\",le=\"+Inf\"} 4\n") != std::string::npos);
+  EXPECT_TRUE(out.find("t_seconds_count{op=\"X\"} 4\n") != std::string::npos);
+}
+
+// v4 per-op counters (plan doc 10 §3.1) surface in the exposition with op labels; the
+// label text is stored at bump time so obs stays independent of the nfsv4 op table.
+TEST(Metrics, V4OpSeriesInPrometheusText) {
+  auto& m = obs::Metrics::instance();
+  size_t idx = obs::v4_op_index(9);  // GETATTR
+  m.v4_op_names[idx].store("GETATTR", std::memory_order_relaxed);
+  m.v4_op_calls[idx].fetch_add(3, std::memory_order_relaxed);
+  m.v4_op_errors[idx].fetch_add(1, std::memory_order_relaxed);
+  m.v4_op_duration[idx].observe_us(120);
+  m.v4_compound_duration.observe_us(500);
+  auto text = obs::prometheus_text();
+  EXPECT_TRUE(text.find("lightnfs_v4_op_calls_total{op=\"GETATTR\"} 3") !=
+              std::string::npos);
+  EXPECT_TRUE(text.find("lightnfs_v4_op_errors_total{op=\"GETATTR\"} 1") !=
+              std::string::npos);
+  EXPECT_TRUE(text.find("lightnfs_v4_op_duration_seconds_bucket{op=\"GETATTR\"") !=
+              std::string::npos);
+  EXPECT_TRUE(text.find("lightnfs_v4_compound_duration_seconds_count") !=
+              std::string::npos);
+  // Out-of-table opcodes collapse into slot 0 instead of indexing out of bounds.
+  EXPECT_EQ(obs::v4_op_index(10044), 0u);
+}
+
+TEST(Metrics, SlowRequestThreshold) {
+  EXPECT_EQ(obs::slow_request_threshold_us(), 0u);  // default off until configured
+  obs::set_slow_request_threshold_us(250000);
+  EXPECT_EQ(obs::slow_request_threshold_us(), 250000u);
+  obs::set_slow_request_threshold_us(0);
 }

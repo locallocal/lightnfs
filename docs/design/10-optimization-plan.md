@@ -221,28 +221,32 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 
 ---
 
-## 3. 可观测性补齐
+## 3. 可观测性补齐 ✅ 已完成（2026-08-28）
 
 现状与设计 08 §8.3/8.4 的差距是系统性的，建议作为一个独立里程碑：
 
-1. **v4 指标为零**：只有 v3 的 per-proc calls/errors/duration 数组
-   （`obs/metrics.hpp:16-31`），v4 无任何 per-op 调用数/错误数/时延——想知道 v4
-   GETATTR QPS 都做不到。补 per-op 计数 + COMPOUND 时延。
-2. **无延迟直方图**：现在只有 duration 累计和，算不出设计 SLI 要求的 p99。
-   引入固定 bucket 直方图（Prometheus histogram 语义）。
-3. **无 per-export 维度**：全部指标进程全局，多导出无法定位。加 `fsid`/`export` 标签。
-4. **文档承诺未兑现**：deployment.md 宣称的 `lightnfs_v4_lock_states /
-   lock_segments / lock_denied_total`，`StateMgr::Stats` 字段存在
-   （`state_mgr.hpp:287-288`）但 provider（`main.cpp:190-205`）与 `ctl state`
-   （`ctl.cpp:70-76`）都没输出。
-5. **runtime 层指标全缺**：offload 队列深度、buffer 池水位、reactor 循环延迟、
-   fd cache 命中率（现仅 ctl 文本）——全部接入 Prometheus。
-6. **慢请求日志与进程内 span**（设计 08 §8.4 要求）：超阈值请求自动落带耗时分解的
-   日志，是现网定位的第一工具。
-7. errlog 强化：环 64 条硬编码、秒级时间戳、`what[20]` 截断长 op 名
-   （`obs/errlog.cpp:16-33`）。
-8. `Dispatcher` 的 `std::function` 间接层与 metrics 的 racy `stats()`
-   （`drc.cpp:90-93`，TSAN 意义上的 data race）顺带清理。
+1. **v4 指标为零** ✅：`exec_op` 包装层按 opcode 记 per-op calls/errors/时延直方图
+   （`lightnfs_v4_op_*{op=...}`，op 名在 bump 时存入 obs，obs 不依赖 nfsv4 表），
+   另有整 COMPOUND 直方图 `lightnfs_v4_compound_duration_seconds`。
+2. **无延迟直方图** ✅：`obs::LatencyHistogram`（固定桶 100µs–5s，Prometheus
+   histogram 语义，per-thread slot 无争用）；v3 per-proc、v4 per-op/COMPOUND、
+   reactor 循环均接入，p99 可从 exposition 算出。
+3. **无 per-export 维度** ✅：`ExportEntry` 持 `obs::ExportMetrics`，READ/WRITE/COPY
+   路径 bump；导出为带 `{export,fsid}` 标签的
+   `lightnfs_export_{read,write}_{bytes,ops}_total`。
+4. **文档承诺未兑现** ✅：provider 输出 `lightnfs_v4_lock_states / lock_segments /
+   lock_owners / lock_denied_total`；`ctl state` 首行同步补齐。
+5. **runtime 层指标全缺** ✅：offload 组（§2.5 已有）之外补 reactor 循环忙时直方图
+   （`Reactor::loop_stats()`，reactor 线程 relaxed 写）、
+   `lightnfs_buffer_pool_free_bytes{listener}`、带标签的 `lightnfs_fdcache_*`。
+6. **慢请求日志与进程内 span** ✅：`[server] slow_request_ms`（默认 1000，0 关）；
+   v4 在 Ctx 内零分配记录前 32 个 op 的耗时，超阈值 warn 日志附
+   `ops=[PUTFH=12us,...]` 分解；v3 落单过程慢日志。
+7. errlog 强化 ✅：环大小 `[server] error_ring` 可配（默认 64）、毫秒时间戳、
+   `what[32]` 容纳最长 v4 op 名（BIND_CONN_TO_SESSION）。
+8. `Dispatcher`/`Drc` 清理 ✅：Handler 改函数指针 + self（去 `std::function`
+   型别擦除间接层）；DRC 分片 `bytes`/条目数改原子，`stats()` 不再有 TSAN 意义
+   上的 data race。
 
 ---
 

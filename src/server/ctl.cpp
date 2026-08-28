@@ -91,10 +91,12 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
     std::string out = std::format(
         "clients={} sessions={} opens={} files={} courtesy={} grace={} grace_remaining={}s "
         "lease_expirations={} reclaim_conflict={} reclaim_timeout={} reclaim_forced={} "
-        "share_denied={} open_merges={}\n",
+        "share_denied={} open_merges={} lock_states={} lock_segments={} lock_owners={} "
+        "lock_denied={}\n",
         s.clients, s.sessions, s.opens, s.files, s.courtesy, s.grace ? 1 : 0,
         s.grace_remaining, s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout,
-        s.reclaim_forced, s.share_denied, s.open_merges);
+        s.reclaim_forced, s.share_denied, s.open_merges, s.lock_states, s.lock_segments,
+        s.lock_owners, s.lock_denied);
     out += co_await deps.state->dump();
     co_return out;
   }

@@ -51,10 +51,12 @@ void Drc::purge(Shard& sh) {
       continue;
     }
     bool expired = now - it->second.done_at >= cfg_.ttl;
-    bool over_memory = sh.bytes > cfg_.max_memory / kShards;
+    bool over_memory = sh.bytes.load(std::memory_order_relaxed) > cfg_.max_memory / kShards;
     if (!expired && !over_memory) break;
-    sh.bytes -= it->second.reply ? it->second.reply->size() : 0;
+    sh.bytes.fetch_sub(it->second.reply ? it->second.reply->size() : 0,
+                       std::memory_order_relaxed);
     sh.entries.erase(it);
+    sh.count.store(sh.entries.size(), std::memory_order_relaxed);
     sh.completed.pop_front();
     evictions_.fetch_add(1, std::memory_order_relaxed);
   }
@@ -68,6 +70,7 @@ rt::Task<Drc::Claim> Drc::begin(const Key& key) {
     auto it = sh.entries.find(key);
     if (it == sh.entries.end()) {
       sh.entries.emplace(key, Entry{});
+      sh.count.store(sh.entries.size(), std::memory_order_relaxed);
       inserts_.fetch_add(1, std::memory_order_relaxed);
       co_return Claim{.owner = true};
     }
@@ -90,7 +93,7 @@ rt::Task<void> Drc::complete(const Key& key, std::vector<std::byte> reply) {
     it->second.done = true;
     it->second.reply = std::make_shared<const std::vector<std::byte>>(std::move(reply));
     it->second.done_at = std::chrono::steady_clock::now();
-    sh.bytes += it->second.reply->size();
+    sh.bytes.fetch_add(it->second.reply->size(), std::memory_order_relaxed);
     sh.completed.push_back(key);
     purge(sh);
   }
@@ -101,7 +104,10 @@ rt::Task<void> Drc::abort(const Key& key) {
   Shard& sh = shard_of(key);
   auto lk = co_await sh.mu.lock();
   auto it = sh.entries.find(key);
-  if (it != sh.entries.end() && !it->second.done) sh.entries.erase(it);
+  if (it != sh.entries.end() && !it->second.done) {
+    sh.entries.erase(it);
+    sh.count.store(sh.entries.size(), std::memory_order_relaxed);
+  }
   sh.cv.notify_all();
 }
 
@@ -112,8 +118,8 @@ Drc::Stats Drc::stats() const {
   out.waits = waits_.load(std::memory_order_relaxed);
   out.evictions = evictions_.load(std::memory_order_relaxed);
   for (const auto& sh : shards_) {
-    out.entries += sh.entries.size();  // racy reads: stats are advisory
-    out.bytes += sh.bytes;
+    out.entries += sh.count.load(std::memory_order_relaxed);
+    out.bytes += sh.bytes.load(std::memory_order_relaxed);
   }
   return out;
 }

@@ -24,8 +24,8 @@ namespace {
 constexpr uint32_t kProg = 200001;
 
 void add_test_program(Dispatcher& disp) {
-  disp.add({kProg, 1, 1,
-            [](ConnCtx& c, RpcCall& call, const Cred&) -> Task<void> {
+  disp.add({kProg, 1, 1, nullptr,
+            [](void*, ConnCtx& c, RpcCall& call, const Cred&) -> Task<void> {
               xdr::XdrEnc enc(c.pool);
               encode_reply_success(enc, call.xid);
               if (call.proc == 1) {  // echo

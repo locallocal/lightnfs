@@ -45,18 +45,26 @@ void begin_result(xdr::XdrEnc& enc, ConnCtx& ctx, const RpcCall& call, Status st
 }
 
 // Aggregate per-procedure latency; destructor fires when the handler frame completes,
-// exception paths included.
+// exception paths included.  Requests over the slow threshold (plan doc 10 §3.6) leave
+// a warn line — v3 procedures are single ops, so there is no further breakdown.
 struct ProcTimer {
-  explicit ProcTimer(uint32_t p) : proc(p % obs::Metrics::kV3Procs) {}
+  ProcTimer(uint32_t p, const ConnCtx& c, uint32_t x)
+      : proc(p % obs::Metrics::kV3Procs), ctx(&c), xid(x) {}
   ~ProcTimer() {
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0)
-                  .count();
+    auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - t0)
+                                        .count());
     auto& m = obs::Metrics::instance();
     m.v3_calls[proc].fetch_add(1, std::memory_order_relaxed);
-    m.v3_duration_us[proc].fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+    m.v3_duration_us[proc].fetch_add(us, std::memory_order_relaxed);
+    m.v3_duration[proc].observe_us(us);
+    if (auto thr = obs::slow_request_threshold_us(); thr != 0 && us >= thr)
+      LNFS_WARN("v3 slow request proc={} xid={:#x} peer={} dur={}us",
+                obs::v3_proc_name(proc), xid, ctx->peer.to_string(), us);
   }
   uint32_t proc;
+  const ConnCtx* ctx;
+  uint32_t xid;
   std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 };
 
@@ -96,9 +104,9 @@ std::optional<backend::Attr> attr_value(const Result<backend::Attr>& result) {
 }  // namespace
 
 void Engine::register_with(rpc::Dispatcher& dispatcher) {
-  dispatcher.add({kProgram, kVersion, kVersion,
-                  [this](ConnCtx& ctx, RpcCall& call, const rpc::Cred& cred) {
-                    return dispatch(ctx, call, cred);
+  dispatcher.add({kProgram, kVersion, kVersion, this,
+                  [](void* self, ConnCtx& ctx, RpcCall& call, const rpc::Cred& cred) {
+                    return static_cast<Engine*>(self)->dispatch(ctx, call, cred);
                   }});
 }
 
@@ -112,7 +120,7 @@ rt::Task<Result<Engine::Resolved>> Engine::resolve(const FileHandle& fh,
 }
 
 rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred) {
-  ProcTimer timer(call.proc);
+  ProcTimer timer(call.proc, ctx, call.xid);
   if (call.proc > static_cast<uint32_t>(Proc::kCommit)) {
     xdr::XdrEnc enc(ctx.pool);
     rpc::encode_reply_accepted_err(enc, call.xid, rpc::kProcUnavail);
@@ -325,6 +333,8 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
       begin_result(enc, ctx, call, Status::kOk);
       encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
       obs::Metrics::instance().read_bytes.fetch_add(*read, std::memory_order_relaxed);
+      resolved->exp->metrics.read_bytes.fetch_add(*read, std::memory_order_relaxed);
+      resolved->exp->metrics.read_ops.fetch_add(1, std::memory_order_relaxed);
       enc.u32(*read);
       enc.boolean(eof);
       enc.u32(*read);
@@ -625,6 +635,8 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     begin_result(enc, ctx, call, Status::kOk);
     encode_wcc(enc, wcc_pre(before), after, resolved->exp->fsid);
     obs::Metrics::instance().write_bytes.fetch_add(*written, std::memory_order_relaxed);
+    resolved->exp->metrics.write_bytes.fetch_add(*written, std::memory_order_relaxed);
+    resolved->exp->metrics.write_ops.fetch_add(1, std::memory_order_relaxed);
     enc.u32(*written);
     enc.u32(args->stable);  // the backend honored the requested stability exactly
     enc.opaque_fixed(verf_);

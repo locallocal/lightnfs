@@ -258,6 +258,14 @@ Result<Config> parse_config(std::string_view text) {
         if (lv != "debug" && lv != "info" && lv != "warn" && lv != "error")
           return Err(errno_from(EINVAL));
         config.server.log_level = lv;
+      } else if (key == "slow_request_ms") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n > 3600000) return Err(errno_from(EINVAL));  // 0 disables the slow log
+        config.server.slow_request_ms = static_cast<uint32_t>(n);
+      } else if (key == "error_ring") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n == 0 || n > 65536) return Err(errno_from(EINVAL));
+        config.server.error_ring = static_cast<uint32_t>(n);
       }
     } else if (section == Section::kLimits) {
       if (key == "inflight_per_conn") {

@@ -81,7 +81,10 @@ class Drc {
     // Completion order: front = oldest (TTL + memory evict). A deque, not a list:
     // no per-entry node allocation (plan doc 10 §2.6).
     std::deque<Key> completed;
-    size_t bytes = 0;
+    // Written under mu only; atomic so stats() can read without taking every shard
+    // lock (plan doc 10 §3.8 — the plain reads were a TSAN-level data race).
+    std::atomic<size_t> bytes{0};
+    std::atomic<size_t> count{0};  // == entries.size()
   };
 
   Shard& shard_of(const Key& key) { return shards_[KeyHash{}(key) % kShards]; }

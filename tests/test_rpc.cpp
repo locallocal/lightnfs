@@ -28,8 +28,8 @@ struct Fixture {
   Dispatcher disp;
 
   Fixture() {
-    disp.add({kTestProg, 2, 3,
-              [](ConnCtx& c, RpcCall& call, const Cred& cred) -> Task<void> {
+    disp.add({kTestProg, 2, 3, nullptr,
+              [](void*, ConnCtx& c, RpcCall& call, const Cred& cred) -> Task<void> {
                 if (call.proc == 0) {  // NULL
                   xdr::XdrEnc enc(c.pool);
                   encode_reply_success(enc, call.xid);
