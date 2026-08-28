@@ -1,10 +1,15 @@
 #pragma once
-// Management endpoints (design 08 §8.3/8.6, minimal phase-2 versions):
+// Management endpoints (design 08 §8.3/8.6):
 //  - CtlServer: line-oriented unix-socket admin interface for lightnfs-ctl
-//    (ping / metrics / dump-errors / fdcache / drc / clear-poison / state /
-//    expire-client <id>); owner-only socket, SO_PEERCRED-gated
+//    (ping / version / status / metrics / dump-errors / fdcache [flush] / drc [flush] /
+//    clear-poison / state / expire-client <id> / conns / kill-conn <id> / loglevel /
+//    reload / drain / grace-end, every command with an optional --json rendering);
+//    owner-only socket, SO_PEERCRED-gated
 //  - MetricsHttp: one-shot HTTP responder serving the Prometheus text exposition
 
+#include <atomic>
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,6 +31,11 @@ struct CtlDeps {
   core::ExportTable* exports = nullptr;
   rpc::Drc* drc = nullptr;
   state::StateMgr* state = nullptr;  // v4 state table dump / forced client reclaim
+  // Ops hooks (plan doc 10 §4.1/§4.2); a null hook reports the feature unavailable.
+  std::function<std::string()> reload;  // re-apply reloadable config, returns report
+  std::function<std::string()> drain;   // stop accepting new connections
+  std::atomic<bool>* draining = nullptr;
+  std::chrono::steady_clock::time_point started{};
 };
 
 class CtlServer {

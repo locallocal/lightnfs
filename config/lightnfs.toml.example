@@ -7,6 +7,8 @@ offload_threads = 16
 # ring = "auto"               # auto | uring | epoll (auto probes io_uring, falls back)
 # ring_sqpoll = false         # io_uring SQPOLL kernel-thread submission
 # state_shards = 16           # v4 client/session/state table shard count
+# bind = ""                   # listen address literal (v4 or v6); empty = all
+                              # interfaces, dual-stack
 port = 2049
 mount_port = 20048
 rpcbind = true
@@ -27,11 +29,20 @@ log_level = "info"  # debug | info | warn | error; debug adds a per-request summ
 # slow_request_ms = 1000  # requests slower than this warn-log a per-op time breakdown;
 #                         # 0 disables the slow-request log
 # error_ring = 64         # entries kept in the `lightnfs-ctl dump-errors` sampling ring
+# log_file = ""                    # empty = stderr; otherwise a size-rotated file
+# log_rotate_size = "50MiB"        # rotate when the log file reaches this size
+# log_rotate_keep = 5              # rotated files kept (file.1 .. file.N)
+#
+# Hot reload (SIGHUP or `lightnfs-ctl reload`): log_level, slow_request_ms,
+# error_ring, per-export clients + QoS, and [limits] client_* apply live; every other
+# key needs a restart (the reload report says which).
 
 [protocol]
 v3 = true
 v4 = true
-lease = "90s"            # v4.1 lease; also the grace window after a restart
+lease = "90s"            # v4.1 lease
+# grace = "auto"         # reclaim window after restart; "auto" = lease. Operators
+                         # often set grace < lease for faster restart recovery.
 courtesy_multiplier = 24 # expired clients are kept (courtesy) up to 24 × lease
                          # unless a conflicting OPEN reclaims them first
 drc_ttl = "120s"    # duplicate request cache entry lifetime
@@ -39,6 +50,10 @@ drc_mem = "64MiB"   # duplicate request cache memory cap
 
 [limits]
 inflight_per_conn = 64
+# Per-client (v4 clientid) token buckets; 0 / omitted = unlimited. Hot-reloadable.
+# client_read_bps = "0"    # e.g. "50MiB"
+# client_write_bps = "0"
+# client_iops = 0
 
 [[export]]
 path = "/tmp" # replace with the directory to export
@@ -47,6 +62,11 @@ fsid = 1
 clients = ["192.168.0.0/24", "127.0.0.0/8"]
 squash = "root"
 readonly = true     # phase 2: set false for read-write exports
+# Per-export token buckets (READ/WRITE data path); 0 / omitted = unlimited.
+# Hot-reloadable via SIGHUP / `lightnfs-ctl reload`.
+# read_bps = "0"     # e.g. "200MiB"
+# write_bps = "0"
+# iops = 0
 
 [export.local]
 handles = "auto"

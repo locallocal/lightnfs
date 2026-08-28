@@ -32,6 +32,12 @@ lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面�
   的 strace 生成，运行时若变更需复核；v4.2 用到的 `lseek`/`fallocate`/`copy_file_range`/
   `ioctl(FICLONERANGE)` 与探测用 `openat(O_TMPFILE)` 均在 `@system-service` 内，无需额外放行）。
 
+打包安装（plan doc 10 §4.5）：`packaging/make_tarball.sh` 产出
+`packaging/dist/lightnfs-<ver>-linux-<arch>.tar.gz`（/usr/local 布局）、
+`packaging/make_deb.sh` 产出 .deb（dpkg-deb，装到 /usr 与 /etc/lightnfs）、
+`packaging/make_rpm.sh` 产出 .rpm（需 rpmbuild）。三者共享同一 CMake install
+文件集（bin、config 示例、systemd 单元、部署文档）。手工安装等价步骤：
+
 ```bash
 sudo useradd --system --home /var/lib/lightnfs --shell /usr/sbin/nologin lightnfs
 sudo install -m755 build-rel/lightnfsd /usr/local/bin/lightnfsd
@@ -59,7 +65,11 @@ sudo systemctl enable --now lightnfs
 | 来源白名单 | `[[export]] clients` | CIDR 列表，收敛到受信网段 |
 | 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none` |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
-| 租约/宽限 | `[protocol] lease` | v4.1 租约，也是重启后 grace 时长（默认 90s） |
+| 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |
+| 租约 | `[protocol] lease` | v4.1 租约（默认 90s） |
+| 宽限 | `[protocol] grace` | 重启后 reclaim 窗口；`auto`（默认）= lease，可设更短加快恢复 |
+| 日志文件 | `[server] log_file` / `log_rotate_*` | 空 = stderr；否则按大小轮转的文件 |
+| 限速 | `[[export]] read_bps/write_bps/iops`、`[limits] client_*` | 令牌桶；0 = 不限，热重载 |
 | courtesy | `[protocol] courtesy_multiplier` | 过期客户端保留 `N×lease`（默认 24），冲突则立即回收 |
 | 资源上限 | `[server]`/`[limits]` 各键 | 连接/在途/请求大小/DRC/fd 缓存均有默认且可配 |
 
@@ -68,11 +78,24 @@ sudo systemctl enable --now lightnfs
 ## 4. 运维与可观测性
 
 - **ctl 套接字**（`state_dir/ctl.sock`，或 `[server] ctl_socket`）：
-  `lightnfs-ctl <cmd>`——`ping`、`metrics`（Prometheus 文本）、`dump-errors`、`drc`、
-  `fdcache`、`state`（v4 状态表：clients/sessions/opens/locks 计数 + 三表 dump）、
-  `expire-client <clientid>`（强制回收某客户端全部状态，排查挂死/泄漏）。另有本地
-  子命令 `lightnfs-ctl bench <echo|nullrpc|fullpath>`——三层基准（02 分册 §2.8），
-  自起进程内栈压测，不经 ctl 套接字、不涉运行中的服务。
+  `lightnfs-ctl <cmd>`——`ping`、`version`、`status`（版本/uptime/连接数/drain/grace）、
+  `metrics`（Prometheus 文本）、`dump-errors`、`drc [flush]`、`fdcache [flush]`、
+  `clear-poison`、`state`（v4 状态表：clients/sessions/opens/locks 计数 + 三表 dump）、
+  `expire-client <clientid>`（强制回收某客户端全部状态，排查挂死/泄漏）、
+  `conns` / `kill-conn <id>`（连接列表与强制断开）、`loglevel <lv>`、`reload`
+  （热重载，见下）、`drain`（停止接受新连接、存量继续服务——从 LB 优雅摘流，重启前
+  不可逆）、`grace-end`（提前结束 grace）。所有命令加 `--json` 输出机器可读 JSON。
+  另有本地子命令 `lightnfs-ctl bench <echo|nullrpc|fullpath>`——三层基准（02 分册
+  §2.8），自起进程内栈压测，不经 ctl 套接字、不涉运行中的服务。
+- **热重载**（SIGHUP 或 `lightnfs-ctl reload`，plan doc 10 §4.1 第一步）：重新解析
+  配置文件并应用非拓扑子集——日志级别、slow_request_ms、error_ring、每导出 clients
+  白名单与 QoS 速率、[limits] client_*。导出增删、监听地址/端口、线程拓扑、
+  state_dir/lease 等改动会在 reload 报告中标注 restart required，不会带病生效。
+  systemd 单元的 `ExecReload`（`systemctl reload lightnfs`）即发 SIGHUP。
+- **限速 / QoS**：per-export（`[[export]] read_bps/write_bps/iops`）与 per-client
+  （v4 clientid 级，`[limits] client_read_bps/client_write_bps/client_iops`）令牌桶，
+  接在引擎 READ/WRITE 入口、对象锁之前；超配额的请求被延迟（debt 模式：大于突发
+  容量的单笔请求放行并透支，由后续请求偿还），不会报错。速率全部热重载。
 - **Prometheus**：`[server] metrics_port` 开一个 HTTP 文本端点；关键指标包括
   `lightnfs_v4_{clients,sessions,opens,files_with_state,courtesy_clients,in_grace,
   grace_remaining_seconds,lock_states,lock_segments,lock_owners}`、

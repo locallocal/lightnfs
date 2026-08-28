@@ -111,6 +111,20 @@ rt::Task<void> Drc::abort(const Key& key) {
   sh.cv.notify_all();
 }
 
+rt::Task<size_t> Drc::flush() {
+  size_t dropped = 0;
+  for (auto& sh : shards_) {
+    auto lk = co_await sh.mu.lock();
+    dropped += sh.entries.size();
+    sh.entries.clear();
+    sh.completed.clear();
+    sh.bytes.store(0, std::memory_order_relaxed);
+    sh.count.store(0, std::memory_order_relaxed);
+    sh.cv.notify_all();  // waiting retransmits re-check, find no entry, re-execute
+  }
+  co_return dropped;
+}
+
 Drc::Stats Drc::stats() const {
   Stats out;
   out.inserts = inserts_.load(std::memory_order_relaxed);

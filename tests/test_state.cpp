@@ -772,3 +772,25 @@ TEST(StateMgr, SingleShardConfigLifecycle) {
   EXPECT_EQ(mgr.stats().clients, 0u);
   EXPECT_EQ(mgr.stats().sessions, 0u);
 }
+
+// Decoupled grace window ([protocol] grace, plan doc 10 §4.4) and the operator's
+// `grace-end` override (plan doc 10 §4.2).
+TEST(StateMgr, GraceDecoupledFromLeaseAndOperatorEnd) {
+  TmpDir dir;
+  std::filesystem::create_directories(dir.path + "/clients");
+  if (FILE* f = fopen((dir.path + "/clients/c1").c_str(), "wb")) {
+    fputs("ownerX", f);
+    fclose(f);
+  }
+  state::StateMgr mgr({.boot_epoch = 2,
+                       .state_dir = dir.path,
+                       .lease_seconds = 90,
+                       .grace_seconds = 5});
+  mgr.load_grace_list();
+  EXPECT_TRUE(mgr.in_grace());
+  // The window follows grace_seconds (5), not the 90s lease.
+  EXPECT_TRUE(mgr.grace_remaining_seconds() <= 5);
+  EXPECT_TRUE(mgr.end_grace());
+  EXPECT_FALSE(mgr.in_grace());
+  EXPECT_FALSE(mgr.end_grace());  // second call: nothing left to end
+}

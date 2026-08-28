@@ -40,10 +40,11 @@ std::string default_socket() {
   return env ? env : "/tmp/lightnfs-state/ctl.sock";
 }
 
-// Root options do not propagate down in ccmd, so --socket is registered per leaf.
+// Root options do not propagate down in ccmd, so --socket/--json are registered per leaf.
 void add_socket_flag(const Cmd& cmd) {
   cmd->varp<std::string>("socket", "s", default_socket(),
                          "Path to the server ctl socket (default: $LIGHTNFS_CTL)");
+  cmd->varp<bool>("json", "j", false, "JSON output (machine-readable)");
 }
 
 // Sends one text line over the ctl socket and streams the reply to stdout.
@@ -79,6 +80,7 @@ int send_ctl(const std::string& path, const std::string& line) {
 void run_socket_cmd(const Cmd& c) {
   std::string line = c->name();
   for (const auto& a : c->args()) line += " " + a;
+  if (c->var<bool>("json")) line += " --json";
   line += '\n';
   g_exit = send_ctl(c->var<std::string>("socket"), line);
 }
@@ -141,7 +143,8 @@ Cmd make_bench() {
 }
 
 // Folds `--socket PATH`/`-s PATH` into --socket=PATH (the only form cflag takes) and
-// moves a pre-subcommand --socket to the end so the leaf that owns the flag sees it.
+// moves a pre-subcommand --socket/--json to the end so the leaf that owns the flag
+// sees it.
 std::vector<std::string> normalize_argv(int argc, char** argv) {
   std::vector<std::string> out, deferred;
   out.reserve(static_cast<size_t>(argc));
@@ -151,7 +154,7 @@ std::vector<std::string> normalize_argv(int argc, char** argv) {
     std::string a = argv[i];
     if ((a == "--socket" || a == "-s") && i + 1 < argc)
       a = "--socket=" + std::string(argv[++i]);
-    if (!seen_cmd && a.rfind("--socket=", 0) == 0) {
+    if (!seen_cmd && (a.rfind("--socket=", 0) == 0 || a == "--json" || a == "-j")) {
       deferred.push_back(std::move(a));
       continue;
     }
@@ -187,13 +190,14 @@ int main(int argc, char** argv) {
       "Most recent non-OK replies from the sampling ring (ts/peer/proc/xid/status) — "
       "production triage without debug logging.",
       "recent error replies"));
-  root->add_subcommand(make_socket_leaf("drc", "lightnfs-ctl drc", "lightnfs-ctl drc",
-                                        "Duplicate request cache statistics.",
-                                        "DRC statistics"));
-  root->add_subcommand(make_socket_leaf("fdcache", "lightnfs-ctl fdcache",
-                                        "lightnfs-ctl fdcache",
-                                        "Per-export fd cache statistics.",
-                                        "fd cache statistics"));
+  root->add_subcommand(make_socket_leaf(
+      "drc", "lightnfs-ctl drc", "lightnfs-ctl drc [flush]",
+      "Duplicate request cache statistics; `drc flush` drops every cached entry.",
+      "DRC statistics / flush"));
+  root->add_subcommand(make_socket_leaf(
+      "fdcache", "lightnfs-ctl fdcache", "lightnfs-ctl fdcache [flush]",
+      "Per-export fd cache statistics; `fdcache flush` drops every unpinned entry.",
+      "fd cache statistics / flush"));
   root->add_subcommand(make_socket_leaf(
       "clear-poison", "lightnfs-ctl clear-poison", "lightnfs-ctl clear-poison",
       "Clear sticky fsync-EIO marks on every local export so COMMIT can succeed "
@@ -209,6 +213,43 @@ int main(int argc, char** argv) {
       "Forcibly reclaim every piece of state a client holds (triage for hung or "
       "leaked clients).",
       "force client expiry"));
+  root->add_subcommand(make_socket_leaf("version", "lightnfs-ctl version",
+                                        "lightnfs-ctl version",
+                                        "Server version string.", "server version"));
+  root->add_subcommand(make_socket_leaf(
+      "status", "lightnfs-ctl status", "lightnfs-ctl status",
+      "One-line server summary: version, uptime, connections, drain state, exports, "
+      "grace.",
+      "server status summary"));
+  root->add_subcommand(make_socket_leaf(
+      "loglevel", "lightnfs-ctl loglevel debug",
+      "lightnfs-ctl loglevel <debug|info|warn|error>",
+      "Change the log level of the running server (also reloadable via `reload`).",
+      "set log level"));
+  root->add_subcommand(make_socket_leaf(
+      "reload", "lightnfs-ctl reload", "lightnfs-ctl reload",
+      "Re-read the config file and apply the hot-reloadable subset: log level, "
+      "slow-request threshold, error ring, per-export client allowlists and QoS, "
+      "per-client QoS. Topology changes are reported as restart-required.",
+      "hot-reload configuration"));
+  root->add_subcommand(make_socket_leaf(
+      "conns", "lightnfs-ctl conns", "lightnfs-ctl conns",
+      "List live connections (id, peer, age).", "list connections"));
+  root->add_subcommand(make_socket_leaf(
+      "kill-conn", "lightnfs-ctl kill-conn 42", "lightnfs-ctl kill-conn <id>",
+      "Shut down one connection by id (see `conns`); the client sees a TCP reset "
+      "and reconnects.",
+      "kill one connection"));
+  root->add_subcommand(make_socket_leaf(
+      "drain", "lightnfs-ctl drain", "lightnfs-ctl drain",
+      "Stop accepting new connections while continuing to serve existing ones — "
+      "graceful removal from a load balancer. Irreversible until restart.",
+      "stop accepting connections"));
+  root->add_subcommand(make_socket_leaf(
+      "grace-end", "lightnfs-ctl grace-end", "lightnfs-ctl grace-end",
+      "End the post-restart grace period immediately (clients that have not "
+      "reclaimed yet lose their claim window).",
+      "end grace early"));
   root->add_subcommand(make_bench());
 
   try {

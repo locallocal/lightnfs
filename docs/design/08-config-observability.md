@@ -4,6 +4,11 @@
 
 单一 TOML 文件（`/etc/lightnfs/lightnfs.toml`），启动读取；v1 不做热重载（SIGHUP 仅 reopen 日志），导出表变更需重启——文档明示。
 
+**实现更新（2026-08-28，plan doc 10 §4.1 第一步）**：SIGHUP / `lightnfs-ctl reload`
+现在热重载非拓扑子集——日志级别、slow_request_ms、error_ring、每导出 clients CIDR
+与 QoS 速率、per-client QoS。导出增删（拓扑）仍需重启，前置条件（PseudoFs 可重建、
+导出表并发保护）见 plan doc 10 §4.1 第二步。`grace` 已与 `lease` 解绑（`auto` = lease）。
+
 ```toml
 [server]
 reactors        = 0          # 0 = 物理核数

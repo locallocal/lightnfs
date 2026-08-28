@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -211,6 +212,8 @@ Result<Config> parse_config(std::string_view text) {
         config.server.ring = r;
       } else if (key == "ring_sqpoll") {
         config.server.ring_sqpoll = LNFS_TRY(bool_value(value));
+      } else if (key == "bind") {
+        config.server.bind = LNFS_TRY(string_value(value));
       } else if (key == "state_shards") {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n == 0 || n > 4096) return Err(errno_from(EINVAL));
@@ -266,20 +269,44 @@ Result<Config> parse_config(std::string_view text) {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n == 0 || n > 65536) return Err(errno_from(EINVAL));
         config.server.error_ring = static_cast<uint32_t>(n);
+      } else if (key == "log_file") {
+        config.server.log_file = LNFS_TRY(string_value(value));
+      } else if (key == "log_rotate_size") {
+        uint64_t n = LNFS_TRY(size_value(value));
+        if (n < (1u << 16)) return Err(errno_from(EINVAL));  // < 64K rotates constantly
+        config.server.log_rotate_size = n;
+      } else if (key == "log_rotate_keep") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n == 0 || n > 1000) return Err(errno_from(EINVAL));
+        config.server.log_rotate_keep = static_cast<uint32_t>(n);
       }
     } else if (section == Section::kLimits) {
       if (key == "inflight_per_conn") {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n > INT_MAX) return Err(errno_from(EINVAL));
         config.server.inflight_per_conn = static_cast<int>(n);
+      } else if (key == "client_read_bps") {
+        config.server.client_read_bps = LNFS_TRY(size_value(value));
+      } else if (key == "client_write_bps") {
+        config.server.client_write_bps = LNFS_TRY(size_value(value));
+      } else if (key == "client_iops") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n > UINT32_MAX) return Err(errno_from(EINVAL));
+        config.server.client_iops = static_cast<uint32_t>(n);
       }
       // rtmax/wtmax/dtpref are backend limits in phase 1; unknown limit keys are accepted.
     } else if (section == Section::kProtocol) {
       if (key == "v3") LNFS_TRY(bool_value(value));
       else if (key == "v4") config.server.enable_v4 = LNFS_TRY(bool_value(value));
       else if (key == "lease" || key == "grace") {
-        // Seconds, with optional "s" suffix ("90s").  grace == lease by design (07 §7.5).
+        // Seconds, with optional "s" suffix ("90s").  grace defaults to the lease but
+        // is decoupled (plan doc 10 §4.4): "auto" (or omission) = lease; operators
+        // often want grace < lease for faster restart recovery.
         std::string s = LNFS_TRY(string_value(value));
+        if (key == "grace" && s == "auto") {
+          config.server.grace_seconds = 0;
+          continue;
+        }
         uint64_t n = 0;
         size_t digits = 0;
         while (digits < s.size() && std::isdigit(static_cast<unsigned char>(s[digits])))
@@ -287,7 +314,8 @@ Result<Config> parse_config(std::string_view text) {
         std::string_view suffix = std::string_view(s).substr(digits);
         if (digits == 0 || !(suffix.empty() || suffix == "s") || n == 0 || n > 3600)
           return Err(errno_from(EINVAL));
-        config.server.lease_seconds = static_cast<uint32_t>(n);
+        if (key == "lease") config.server.lease_seconds = static_cast<uint32_t>(n);
+        else config.server.grace_seconds = static_cast<uint32_t>(n);
       } else if (key == "courtesy_multiplier") {
         uint64_t n = LNFS_TRY(uint_value(value));
         if (n == 0 || n > 1000) return Err(errno_from(EINVAL));
@@ -335,6 +363,13 @@ Result<Config> parse_config(std::string_view text) {
         else if (s == "all") exp->squash = Squash::kAll;
         else return Err(errno_from(EINVAL));
       }
+      else if (key == "read_bps") exp->read_bps = LNFS_TRY(size_value(value));
+      else if (key == "write_bps") exp->write_bps = LNFS_TRY(size_value(value));
+      else if (key == "iops") {
+        uint64_t n = LNFS_TRY(uint_value(value));
+        if (n > UINT32_MAX) return Err(errno_from(EINVAL));
+        exp->iops = static_cast<uint32_t>(n);
+      }
     } else if (section == Section::kExportBackend && exp) {
       if (!value.empty() && value.front() == '"') exp->backend_config.values[key] = LNFS_TRY(string_value(value));
       else if (value == "true" || value == "false") exp->backend_config.values[key] = value;
@@ -361,6 +396,13 @@ Result<void> validate_config(const Config& config) {
     return Err(errno_from(EINVAL));
   for (const auto& cidr : config.server.metrics_allow)
     if (!Cidr::parse(cidr)) return Err(errno_from(EINVAL));
+  if (!config.server.bind.empty()) {  // listener bind must be an address literal
+    in6_addr a6;
+    in_addr a4;
+    if (inet_pton(AF_INET, config.server.bind.c_str(), &a4) != 1 &&
+        inet_pton(AF_INET6, config.server.bind.c_str(), &a6) != 1)
+      return Err(errno_from(EINVAL));
+  }
   std::set<uint32_t> fsids;
   std::set<std::string> paths;
   for (const auto& exp : config.exports) {
@@ -403,7 +445,12 @@ Result<void> ExportTable::add(ExportConfig cfg, std::unique_ptr<backend::Backend
   entry->anon_gid = cfg.anon_gid;
   entry->readonly = cfg.readonly;
   entry->backend = std::move(backend);
-  for (const auto& client : cfg.clients) entry->clients.push_back(LNFS_TRY(Cidr::parse(client)));
+  std::vector<Cidr> clients;
+  for (const auto& client : cfg.clients) clients.push_back(LNFS_TRY(Cidr::parse(client)));
+  entry->set_clients(std::move(clients));
+  entry->qos.read_bytes.configure(cfg.read_bps);
+  entry->qos.write_bytes.configure(cfg.write_bps);
+  entry->qos.ops.configure(cfg.iops);
   entries_.push_back(std::move(entry));
   return {};
 }
@@ -436,8 +483,46 @@ ExportEntry* ExportTable::for_mount_path(std::string_view raw, std::string& rela
 }
 
 bool ExportTable::check_client(const sockaddr_storage& peer, const ExportEntry& entry) const {
-  return std::any_of(entry.clients.begin(), entry.clients.end(),
+  const auto& clients = entry.client_list();
+  return std::any_of(clients.begin(), clients.end(),
                      [&](const Cidr& cidr) { return cidr.contains(peer); });
+}
+
+std::string ExportTable::reload_dynamic(const Config& fresh) {
+  std::string report;
+  std::set<uint32_t> seen;
+  for (const auto& cfg : fresh.exports) {
+    seen.insert(cfg.fsid);
+    ExportEntry* entry = by_fsid(cfg.fsid);
+    if (!entry) {
+      report += std::format("export fsid={} ({}): new export, restart required\n",
+                            cfg.fsid, cfg.path);
+      continue;
+    }
+    if (normalize_path(cfg.path) != entry->path || cfg.squash != entry->squash ||
+        cfg.readonly != entry->readonly || cfg.anon_uid != entry->anon_uid ||
+        cfg.anon_gid != entry->anon_gid) {
+      report += std::format(
+          "export fsid={}: path/squash/readonly/anon changed, restart required "
+          "(clients/qos still applied)\n",
+          cfg.fsid);
+    }
+    std::vector<Cidr> clients;
+    for (const auto& client : cfg.clients)
+      clients.push_back(*Cidr::parse(client));  // fresh passed validate_config
+    entry->set_clients(std::move(clients));
+    entry->qos.read_bytes.configure(cfg.read_bps);
+    entry->qos.write_bytes.configure(cfg.write_bps);
+    entry->qos.ops.configure(cfg.iops);
+    report += std::format("export fsid={}: clients ({}) and qos applied\n", cfg.fsid,
+                          cfg.clients.size());
+  }
+  for (const auto& entry : entries_)
+    if (!seen.contains(entry->fsid))
+      report += std::format("export fsid={} ({}): removed from config, restart required "
+                            "(still being served)\n",
+                            entry->fsid, entry->path);
+  return report;
 }
 
 MappedCred ExportTable::squash_cred(const rpc::Cred& cred, const ExportEntry& entry) const {

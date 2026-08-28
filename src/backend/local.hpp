@@ -53,6 +53,10 @@ class LocalBackend final : public Backend {
     size_t path_entries = 0;
   };
   FdCacheStats fd_cache_stats() const;
+  // Operator flush (`lightnfs-ctl fdcache flush`, plan doc 10 §4.2): drops every
+  // entry not pinned by in-flight IO from both the data-fd and the O_PATH resolve
+  // cache; returns how many were dropped.
+  size_t flush_fd_cache();
 
   // fsync/fdatasync EIO is sticky per design 06 §6.2: after any sync failure on a file,
   // every later commit on it keeps failing instead of silently dropping writeback errors.

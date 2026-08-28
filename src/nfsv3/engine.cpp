@@ -318,6 +318,8 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
     auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
     auto cred = mapped.view();
     uint32_t count = std::min(args->count, resolved->exp->backend->limits().max_read);
+    // Per-export QoS (plan doc 10 §4.3), before the shared object lock.
+    co_await resolved->exp->qos.throttle(false, count);
     auto data = ctx.pool.alloc(std::max<uint32_t>(count, 1));
     bool eof = false;
     auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
@@ -601,6 +603,11 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     co_await send(ctx, enc);
     co_return;
   }
+  uint32_t count = std::min<uint32_t>(
+      std::min<uint64_t>(args->count, args->data_len),
+      resolved->exp->backend->limits().max_write);
+  // Per-export QoS (plan doc 10 §4.3), before the exclusive object lock.
+  co_await resolved->exp->qos.throttle(true, count);
   auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
   auto held = co_await lock->lock();
   auto before = co_await sample(resolved->obj);
@@ -612,9 +619,6 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
   }
   auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
   auto cred = mapped.view();
-  uint32_t count = std::min<uint32_t>(
-      std::min<uint64_t>(args->count, args->data_len),
-      resolved->exp->backend->limits().max_write);
   // Hand the payload down as the received segments, truncated to `count` (§2.4).
   SmallVec<iovec, 8> iov;
   for (uint32_t left = count; const auto& seg : args->data) {

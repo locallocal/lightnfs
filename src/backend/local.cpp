@@ -158,6 +158,24 @@ class LocalBackend::FdCache {
     return out;
   }
 
+  // Operator flush (plan doc 10 §4.2): drops every entry not pinned by in-flight IO.
+  size_t flush() {
+    size_t dropped = 0;
+    for (auto& shard : shards_) {
+      std::lock_guard lock(shard.mu);
+      for (auto it = shard.entries.begin(); it != shard.entries.end();) {
+        if (it->second.use_count() == 1) {
+          unlink(shard, it->second.get());
+          it = shard.entries.erase(it);
+          ++dropped;
+        } else {
+          ++it;
+        }
+      }
+    }
+    return dropped;
+  }
+
  private:
   static constexpr size_t kShards = 16;
   struct Shard {
@@ -278,6 +296,23 @@ class LocalBackend::PathCache {
     return value;
   }
 
+  size_t flush() {  // same semantics as FdCache::flush
+    size_t dropped = 0;
+    for (auto& shard : shards_) {
+      std::lock_guard lock(shard.mu);
+      for (auto it = shard.entries.begin(); it != shard.entries.end();) {
+        if (it->second.use_count() == 1) {
+          unlink(shard, it->second.get());
+          it = shard.entries.erase(it);
+          ++dropped;
+        } else {
+          ++it;
+        }
+      }
+    }
+    return dropped;
+  }
+
   uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
   uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
   size_t entries() const {
@@ -326,6 +361,10 @@ LocalBackend::FdCacheStats LocalBackend::fd_cache_stats() const {
   out.path_misses = path_cache_->misses();
   out.path_entries = path_cache_->entries();
   return out;
+}
+
+size_t LocalBackend::flush_fd_cache() {
+  return fd_cache_->flush() + path_cache_->flush();
 }
 
 void LocalBackend::poison(const ObjId& oid) {

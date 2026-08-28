@@ -16,9 +16,11 @@ namespace lnfs::transport {
 class Listener {
  public:
   // Binds one socket per reactor; port 0 picks an ephemeral port (tests) which the
-  // remaining sockets then share via SO_REUSEPORT.
+  // remaining sockets then share via SO_REUSEPORT.  bind_addr: IPv4/IPv6 literal;
+  // empty = all interfaces, dual-stack (plan doc 10 §4.4).
   static Result<std::unique_ptr<Listener>> create(uint16_t port, TransportConfig cfg,
-                                                  rpc::Dispatcher& disp, rt::Runtime& rt);
+                                                  rpc::Dispatcher& disp, rt::Runtime& rt,
+                                                  const std::string& bind_addr = "");
   ~Listener();
 
   uint16_t port() const { return port_; }

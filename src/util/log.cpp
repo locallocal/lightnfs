@@ -1,6 +1,7 @@
 #include "util/log.hpp"
 
 #include <spdlog/async.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_sinks.h>  // also provides stderr_sink_mt
 
 #include <memory>
@@ -35,11 +36,19 @@ spdlog::logger* logger() {
 
 }  // namespace detail
 
-void init_async_logging() {
+void init_async_logging(const LogSinkConfig& cfg) {
   auto level = detail::logger()->level();  // keep what set_log_level configured
   spdlog::init_thread_pool(8192, 1);
+  spdlog::sink_ptr sink;
+  if (cfg.file.empty()) {
+    sink = std::make_shared<spdlog::sinks::stderr_sink_mt>();
+  } else {
+    // Size-based rotation (plan doc 10 §4.4): file, file.1 .. file.<keep>.
+    sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+        cfg.file, cfg.rotate_size, cfg.rotate_keep);
+  }
   auto lg = std::make_shared<spdlog::async_logger>(
-      "lnfs", std::make_shared<spdlog::sinks::stderr_sink_mt>(), spdlog::thread_pool(),
+      "lnfs", std::move(sink), spdlog::thread_pool(),
       spdlog::async_overflow_policy::discard_new);
   lg->set_pattern(detail::kPattern);
   lg->set_level(level);

@@ -92,7 +92,7 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call,
     for (const auto& exp : exports_.entries()) {
       enc.boolean(true);
       enc.string(exp->path);
-      for (const auto& client : exp->clients) {
+      for (const auto& client : exp->client_list()) {
         enc.boolean(true);
         enc.string(client.text());
       }

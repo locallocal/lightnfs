@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(lightnfs CXX)
+project(lightnfs VERSION 1.3.0 LANGUAGES CXX)
 
 find_package(Threads REQUIRED)
 
@@ -90,6 +90,7 @@ add_library(lnfs_core STATIC
 target_include_directories(lnfs_core PUBLIC src ${LIBURING_INCLUDE_DIR})
 target_link_libraries(lnfs_core PUBLIC ${LIBURING_LIBRARY} Threads::Threads
   spdlog::spdlog)
+target_compile_definitions(lnfs_core PUBLIC LIGHTNFS_VERSION="${PROJECT_VERSION}")
 if(LNFS_RING STREQUAL "epoll")
   target_compile_definitions(lnfs_core PUBLIC LNFS_DEFAULT_RING_EPOLL=1)
 endif()
@@ -161,3 +162,14 @@ else()
   target_link_libraries(fuzz_regress PRIVATE lnfs_core)
   add_test(NAME fuzz_regress COMMAND fuzz_regress)
 endif()
+
+# ---- install (packaging scripts stage via `cmake --install` + DESTDIR, plan doc 10 §4.5) ----
+include(GNUInstallDirs)
+install(TARGETS lightnfsd lightnfs-ctl lightnfs-fh
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES config/lightnfs.toml.example
+        DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/lightnfs)
+install(FILES packaging/systemd/lightnfs.service
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
+install(FILES README.md docs/deployment.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
