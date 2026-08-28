@@ -37,7 +37,7 @@ namespace {
 constexpr uint32_t kFuzzProg = 300000;
 
 // A handler that exercises the decoder shapes engines will use.
-Task<void> fuzz_handler(ConnCtx& c, RpcCall& call, const Cred&) {
+Task<void> fuzz_handler(void*, ConnCtx& c, RpcCall& call, const Cred&) {
   auto u = call.args.u32();
   auto o = call.args.opaque(64 << 10);
   auto s = call.args.string(4096);
@@ -69,7 +69,7 @@ extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
   peer.len = sizeof(*addr);
   ConnCtx ctx(3, peer, pool, cfg);
   Dispatcher disp;
-  disp.add({kFuzzProg, 1, 1, fuzz_handler});
+  disp.add({kFuzzProg, 1, 1, nullptr, fuzz_handler});
   core::ExportTable exports;
   core::ExportConfig export_cfg;
   export_cfg.path = "/fuzz";

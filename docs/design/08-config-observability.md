@@ -60,9 +60,18 @@ clients = ["192.168.0.0/24"]; squash = "root"; readonly = false
 
 SLI 建议：READ/WRITE p99、GETATTR p99、错误率、grace 时长。
 
+**实现（2026-08-28，plan doc 10 §3）**：时延直方图为固定桶（100µs–5s，Prometheus
+histogram 语义）；v4 按 op 展开 calls/errors/duration，另有整 COMPOUND 直方图；
+per-export 维度落地为带 `{export,fsid}` 标签的数据面计数（read/write bytes+ops、
+fd 缓存）；runtime 组含 offload 队列深度、buffer 池水位、reactor 循环忙时直方图。
+
 ## 8.4 追踪
 
 `OpCtx.trace`（04 分册）贯穿：请求 → core → 后端调用逐段打点；v1 实现为进程内 span 记录 + 慢请求（>阈值）自动落日志；OTLP 导出留接口不实现。
+
+**实现（2026-08-28）**：span 粒度为 v4 COMPOUND 内逐 op（前 32 个 op 的耗时记录在
+请求上下文里，零分配）、v3 为单过程；超过 `[server] slow_request_ms`（默认 1000ms，
+0 关闭）时 warn 日志附耗时分解。后端级逐段打点与 OTLP 仍留待后续。
 
 ## 8.5 安全加固清单（实现验收项）
 

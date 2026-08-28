@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "backend/api.hpp"
+#include "obs/metrics.hpp"
 #include "rpc/auth.hpp"
 
 namespace lnfs::core {
@@ -68,6 +69,10 @@ struct ServerConfig {
   std::string server_owner;
   std::string server_scope;
   std::string log_level = "info";  // debug enables the per-request summary line (08 §8.2)
+  // Observability knobs (plan doc 10 §3.6/§3.7): requests slower than this warn-log a
+  // per-op time breakdown (0 disables); error_ring sizes the dump-errors sampling ring.
+  uint32_t slow_request_ms = 1000;
+  uint32_t error_ring = 64;
 };
 
 struct ExportConfig {
@@ -100,6 +105,8 @@ struct ExportEntry {
   uint32_t anon_gid = 65534;
   bool readonly = false;
   std::unique_ptr<backend::Backend> backend;
+  // Per-export data-path counters (plan doc 10 §3.3), exported with export/fsid labels.
+  obs::ExportMetrics metrics;
 };
 
 struct MappedCred {

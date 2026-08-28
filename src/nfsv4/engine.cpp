@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <format>
 #include <string>
 
 #include "core/boot_epoch.hpp"
@@ -104,9 +105,9 @@ uint32_t Engine::resolve_current(const Ctx& ctx, Stateid& sid) {
 }
 
 void Engine::register_with(rpc::Dispatcher& dispatcher) {
-  dispatcher.add({kProgram, kVersion, kVersion,
-                  [this](ConnCtx& ctx, RpcCall& call, const rpc::Cred& cred) {
-                    return dispatch(ctx, call, cred);
+  dispatcher.add({kProgram, kVersion, kVersion, this,
+                  [](void* self, ConnCtx& ctx, RpcCall& call, const rpc::Cred& cred) {
+                    return static_cast<Engine*>(self)->dispatch(ctx, call, cred);
                   }});
 }
 
@@ -178,6 +179,9 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
   std::vector<std::byte> tag_bytes(tag->begin(), tag->end());
   bool tag_ok = valid_utf8(tag_bytes);
 
+  Ctx ctx{.conn = conn, .cred = cred};
+  ctx.minor = *minor;
+
   // Per-request summary line (design 08 §8.2): op names are only collected when debug
   // logging is on; the error-reply sampling ring records non-OK compounds regardless.
   const bool dbg = log_enabled(LogLevel::kDebug);
@@ -191,10 +195,11 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
     }
   };
   auto log_summary = [&](uint32_t status, uint32_t ops_done) {
+    auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - t0)
+                                        .count());
+    obs::Metrics::instance().v4_compound_duration.observe_us(us);
     if (dbg) {
-      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - t0)
-                    .count();
       LNFS_DEBUG("v4 xid={:#x} peer={} tag=\"{}\" minor={} ops={}/[{}] st={} dur={}us",
                  call.xid, conn.peer.to_string(),
                  std::string_view(reinterpret_cast<const char*>(tag_bytes.data()),
@@ -204,6 +209,17 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
     if (status != 0)
       obs::record_error_reply(conn.peer.to_string(),
                               fail_op ? op_name(fail_op) : "COMPOUND", call.xid, status);
+    // Slow-request log (plan doc 10 §3.6, design 08 §8.4): the per-op breakdown from
+    // ctx.spans is the first triage tool — it names the op that ate the time.
+    if (auto thr = obs::slow_request_threshold_us(); thr != 0 && us >= thr) {
+      std::string spans;
+      for (uint32_t i = 0; i < ctx.span_count; ++i) {
+        if (!spans.empty()) spans += ',';
+        spans += std::format("{}={}us", op_name(ctx.spans[i].op), ctx.spans[i].us);
+      }
+      LNFS_WARN("v4 slow compound xid={:#x} peer={} dur={}us st={} ops={}/[{}]", call.xid,
+                conn.peer.to_string(), us, status, ops_done, spans);
+    }
   };
 
   xdr::XdrEnc enc(conn.pool);
@@ -239,8 +255,6 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
   }
 
   note_op(*first_op);
-  Ctx ctx{.conn = conn, .cred = cred};
-  ctx.minor = *minor;
   uint32_t status;
   uint32_t done = 0;
 
@@ -420,6 +434,25 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
 
 rt::Task<uint32_t> Engine::exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
                                    xdr::XdrEnc& enc) {
+  auto t0 = std::chrono::steady_clock::now();
+  uint32_t status = co_await exec_op_impl(ctx, opcode, dec, enc);
+  auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - t0)
+                                      .count());
+  auto& m = obs::Metrics::instance();
+  size_t idx = obs::v4_op_index(opcode);
+  m.v4_op_names[idx].store(op_name(opcode), std::memory_order_relaxed);
+  m.v4_op_calls[idx].fetch_add(1, std::memory_order_relaxed);
+  if (status != 0) m.v4_op_errors[idx].fetch_add(1, std::memory_order_relaxed);
+  m.v4_op_duration[idx].observe_us(us);
+  if (ctx.span_count < Ctx::kMaxSpans)
+    ctx.spans[ctx.span_count++] = {
+        opcode, static_cast<uint32_t>(std::min<uint64_t>(us, UINT32_MAX))};
+  co_return status;
+}
+
+rt::Task<uint32_t> Engine::exec_op_impl(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
+                                        xdr::XdrEnc& enc) {
   switch (static_cast<Op>(opcode)) {
     case Op::kPutrootfh:
     case Op::kPutpubfh: {
@@ -1029,6 +1062,8 @@ rt::Task<uint32_t> Engine::op_read(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     co_return code;
   }
   obs::Metrics::instance().read_bytes.fetch_add(*n, std::memory_order_relaxed);
+  resolved->exp->metrics.read_bytes.fetch_add(*n, std::memory_order_relaxed);
+  resolved->exp->metrics.read_ops.fetch_add(1, std::memory_order_relaxed);
   enc.u32(st(Status::kOk));
   enc.boolean(eof);
   enc.u32(*n);
@@ -1726,6 +1761,8 @@ rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     co_return code;
   }
   obs::Metrics::instance().write_bytes.fetch_add(*written, std::memory_order_relaxed);
+  resolved->exp->metrics.write_bytes.fetch_add(*written, std::memory_order_relaxed);
+  resolved->exp->metrics.write_ops.fetch_add(1, std::memory_order_relaxed);
   enc.u32(st(Status::kOk));
   enc.u32(*written);
   enc.u32(*stable);  // the backend honored the requested stability exactly
@@ -2776,6 +2813,8 @@ rt::Task<uint32_t> Engine::op_copy(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     co_return code;
   }
   obs::Metrics::instance().write_bytes.fetch_add(*copied, std::memory_order_relaxed);
+  dst->exp->metrics.write_bytes.fetch_add(*copied, std::memory_order_relaxed);
+  dst->exp->metrics.write_ops.fetch_add(1, std::memory_order_relaxed);
   enc.u32(st(Status::kOk));
   // write_response4: no callback stateid (synchronous), count, UNSTABLE + verifier —
   // the client COMMITs like after WRITE (RFC 7862 §15.2.3).

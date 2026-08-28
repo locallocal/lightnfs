@@ -48,10 +48,11 @@ bool valid_path_component(std::string_view part) {
 }  // namespace
 
 void Mount3::register_with(rpc::Dispatcher& dispatcher) {
-  dispatcher.add({kProgram, kVersion, kVersion,
-                  [this](transport::ConnCtx& ctx, rpc::RpcCall& call, const rpc::Cred& cred) {
-                    return dispatch(ctx, call, cred);
-                  }});
+  dispatcher.add(
+      {kProgram, kVersion, kVersion, this,
+       [](void* self, transport::ConnCtx& ctx, rpc::RpcCall& call, const rpc::Cred& cred) {
+         return static_cast<Mount3*>(self)->dispatch(ctx, call, cred);
+       }});
 }
 
 rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call,

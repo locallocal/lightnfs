@@ -117,8 +117,14 @@ void Reactor::run() {
   ring_.bind_submitter();
   for (;;) {
     // Non-blocking sweep until quiescent, then decide whether to exit or block.
-    while (pump(std::chrono::nanoseconds(0))) {
-    }
+    // The sweep duration is the loop busy period (plan doc 10 §3.5).
+    auto t0 = Clock::now();
+    bool busy = false;
+    while (pump(std::chrono::nanoseconds(0))) busy = true;
+    if (busy)
+      observe_loop(static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0)
+              .count()));
     if (stop_.load(std::memory_order_acquire) && live_tasks() == 0 && pending_ops_ == 0 &&
         remote_.empty() && local_ready_.empty()) {
       break;

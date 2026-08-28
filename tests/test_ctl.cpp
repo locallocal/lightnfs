@@ -131,3 +131,23 @@ TEST(Ctl, MetricsAndIdentityConfigKeys) {
   EXPECT_STREQ(parsed->server.server_owner, "nodeA");
   EXPECT_STREQ(parsed->server.server_scope, "clusterX");
 }
+
+// Observability knobs (plan doc 10 §3.6/§3.7): slow-request threshold and error-ring
+// size parse, defaults hold, and invalid values are rejected at load time.
+TEST(Ctl, ObservabilityConfigKeys) {
+  auto defaults = core::parse_config("[server]\n");
+  ASSERT_TRUE(defaults.has_value());
+  EXPECT_EQ(defaults->server.slow_request_ms, 1000u);
+  EXPECT_EQ(defaults->server.error_ring, 64u);
+
+  auto parsed = core::parse_config(
+      "[server]\n"
+      "slow_request_ms = 0\n"
+      "error_ring = 512\n");
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(parsed->server.slow_request_ms, 0u);
+  EXPECT_EQ(parsed->server.error_ring, 512u);
+
+  EXPECT_FALSE(core::parse_config("[server]\nerror_ring = 0\n").has_value());
+  EXPECT_FALSE(core::parse_config("[server]\nslow_request_ms = 9999999999\n").has_value());
+}

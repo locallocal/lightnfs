@@ -76,6 +76,15 @@ class Engine {
     // its result, so op chains touching the same CFH resolve it once per compound.
     FhBytes resolved_fh{};
     std::optional<Resolved> resolved{};
+    // Slow-request span breakdown (plan doc 10 §3.6): per-op durations for the first
+    // kMaxSpans ops, logged with the warn line when the compound crosses the threshold.
+    static constexpr uint32_t kMaxSpans = 32;
+    struct OpSpan {
+      uint32_t op;
+      uint32_t us;
+    };
+    OpSpan spans[kMaxSpans]{};
+    uint32_t span_count = 0;
   };
   // Substitutes the current stateid for its placeholder; BAD_STATEID if none is set.
   static uint32_t resolve_current(const Ctx& ctx, Stateid& sid);
@@ -84,8 +93,12 @@ class Engine {
   rt::Task<Result<Resolved>> resolve(Ctx& ctx, const FhBytes& fh);
 
   // Each op encodes {opcode, status, body} into enc and returns the status.
+  // exec_op wraps exec_op_impl (the op switch) with per-op metrics + span recording
+  // (plan doc 10 §3.1/§3.6).
   rt::Task<uint32_t> exec_op(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
                              xdr::XdrEnc& enc);
+  rt::Task<uint32_t> exec_op_impl(Ctx& ctx, uint32_t opcode, xdr::XdrDec& dec,
+                                  xdr::XdrEnc& enc);
 
   rt::Task<uint32_t> op_putrootfh(Ctx&, xdr::XdrEnc&);
   rt::Task<uint32_t> op_putfh(Ctx&, xdr::XdrDec&, xdr::XdrEnc&);

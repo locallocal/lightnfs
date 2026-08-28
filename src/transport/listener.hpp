@@ -23,6 +23,7 @@ class Listener {
 
   uint16_t port() const { return port_; }
   ConnTracker& tracker() { return tracker_; }
+  rt::BufferPool& pool() { return pool_; }  // watermark metrics (plan doc 10 §3.5)
 
   // Spawns the accept loops (one per reactor). They exit when request_stop() is called.
   void start();

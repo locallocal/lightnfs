@@ -3,7 +3,6 @@
 // handle_request enforces the layered error discipline and auth, then hands the call to the
 // engine, which decodes args and sends its own reply through ConnCtx.
 
-#include <functional>
 #include <vector>
 
 #include "rpc/auth.hpp"
@@ -19,17 +18,21 @@ namespace lnfs::rpc {
 class Dispatcher {
  public:
   // The handler owns arg decoding and reply sending. Throwing out of it maps to SYSTEM_ERR.
-  using Handler =
-      std::function<rt::Task<void>(transport::ConnCtx&, RpcCall&, const Cred&)>;
+  // A plain function pointer + self (plan doc 10 §3.8): every request went through a
+  // std::function's type-erased indirection; engines now register a captureless lambda
+  // that downcasts `self`.
+  using Handler = rt::Task<void> (*)(void* self, transport::ConnCtx&, RpcCall&,
+                                     const Cred&);
 
   struct Program {
     uint32_t prog;
     uint32_t vers_lo, vers_hi;
+    void* self;
     Handler handler;
   };
 
   explicit Dispatcher(AuthRegistry& auth = AuthRegistry::default_registry()) : auth_(auth) {}
-  void add(Program p) { programs_.push_back(std::move(p)); }
+  void add(Program p) { programs_.push_back(p); }
 
   rt::Task<void> handle_request(transport::ConnCtx& ctx, rt::BufferChain rec);
 

@@ -24,6 +24,9 @@ metrics_port = 0                          # Prometheus text endpoint; 0 = disabl
 log_level = "info"  # debug | info | warn | error; debug adds a per-request summary line
                     # (with it off, recent error replies stay visible via
                     # `lightnfs-ctl dump-errors`)
+# slow_request_ms = 1000  # requests slower than this warn-log a per-op time breakdown;
+#                         # 0 disables the slow-request log
+# error_ring = 64         # entries kept in the `lightnfs-ctl dump-errors` sampling ring
 
 [protocol]
 v3 = true
