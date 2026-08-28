@@ -127,6 +127,34 @@ rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& cr
   co_await compound(ctx, call, cred);
 }
 
+void Engine::configure_client_qos(uint64_t read_bps, uint64_t write_bps, uint32_t iops) {
+  std::lock_guard lock(cq_mu_);
+  cq_read_bps_.store(read_bps, std::memory_order_relaxed);
+  cq_write_bps_.store(write_bps, std::memory_order_relaxed);
+  cq_iops_.store(iops, std::memory_order_relaxed);
+  for (auto& [id, qos] : cq_map_) {
+    qos->read_bytes.configure(read_bps);
+    qos->write_bytes.configure(write_bps);
+    qos->ops.configure(iops);
+  }
+}
+
+Engine::ClientQos* Engine::client_qos(uint64_t clientid) {
+  if (cq_read_bps_.load(std::memory_order_relaxed) == 0 &&
+      cq_write_bps_.load(std::memory_order_relaxed) == 0 &&
+      cq_iops_.load(std::memory_order_relaxed) == 0)
+    return nullptr;  // unconfigured: zero cost on the IO path
+  std::lock_guard lock(cq_mu_);
+  auto& slot = cq_map_[clientid];
+  if (!slot) {
+    slot = std::make_unique<ClientQos>();
+    slot->read_bytes.configure(cq_read_bps_.load(std::memory_order_relaxed));
+    slot->write_bytes.configure(cq_write_bps_.load(std::memory_order_relaxed));
+    slot->ops.configure(cq_iops_.load(std::memory_order_relaxed));
+  }
+  return slot.get();
+}
+
 Engine::FhBytes Engine::pseudo_fh(const core::PseudoFs::Node& node) const {
   return handles_.encode_raw(0, core::PseudoFs::oid_of(node));
 }
@@ -1049,6 +1077,13 @@ rt::Task<uint32_t> Engine::op_read(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   uint32_t len = std::min<uint32_t>(
       {*count, resolved->exp->backend->limits().max_read,
        static_cast<uint32_t>(std::min<size_t>(budget, UINT32_MAX))});
+  // QoS (plan doc 10 §4.3): throttle before the object lock so a shaped client parks
+  // on its own bucket, not on the file everyone else needs.
+  co_await resolved->exp->qos.throttle(false, len);
+  if (auto* cq = client_qos(ctx.clientid)) {
+    co_await cq->ops.acquire(1);
+    co_await cq->read_bytes.acquire(len);
+  }
   auto data = ctx.conn.pool.alloc(std::max<uint32_t>(len, 1));
   bool eof = false;
   auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
@@ -1750,6 +1785,12 @@ rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
   backend::Stability stability = *stable == 0   ? backend::Stability::kUnstable
                                  : *stable == 1 ? backend::Stability::kDataSync
                                                 : backend::Stability::kFileSync;
+  // QoS (plan doc 10 §4.3): throttle before the exclusive object lock.
+  co_await resolved->exp->qos.throttle(true, count);
+  if (auto* cq = client_qos(ctx.clientid)) {
+    co_await cq->ops.acquire(1);
+    co_await cq->write_bytes.acquire(count);
+  }
   auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
   auto held = co_await lock->lock();
   backend::OpenCtx open{cred, check.bopen.get()};

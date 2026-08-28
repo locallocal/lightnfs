@@ -9,9 +9,11 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "rpc/dispatch.hpp"
 #include "runtime/buffer.hpp"
@@ -89,6 +91,39 @@ struct ConnCtx {
 
   // Serialized reply send; on failure marks the connection for teardown.
   rt::Task<void> send(rt::SendBuf buf);
+};
+
+// Live-connection registry for `lightnfs-ctl conns` / `kill-conn` (plan doc 10 §4.2).
+// connection_main registers on entry and removes before closing the fd, so kill() —
+// which shuts the socket down under the registry mutex — can never touch a reused fd:
+// the entry's presence proves the fd is still owned by that connection.
+class ConnRegistry {
+ public:
+  static ConnRegistry& instance();
+
+  uint64_t add(int fd, const Peer& peer);
+  void remove(uint64_t id);
+
+  struct Info {
+    uint64_t id;
+    std::string peer;
+    int64_t age_s;
+  };
+  std::vector<Info> list();
+  size_t count();
+  // shutdown(SHUT_RDWR) wakes the connection's read loop; teardown then runs the
+  // normal drain path.  Returns false when the id is gone already.
+  bool kill(uint64_t id);
+
+ private:
+  struct Ent {
+    int fd;
+    Peer peer;
+    std::chrono::steady_clock::time_point since;
+  };
+  std::mutex mu_;
+  uint64_t next_id_ = 1;
+  std::unordered_map<uint64_t, Ent> conns_;
 };
 
 // Owns the ConnCtx; runs until EOF/error, then drains and closes the fd.

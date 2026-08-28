@@ -132,6 +132,9 @@ class StateMgr {
     uint64_t boot_epoch = 1;
     std::string state_dir;
     uint32_t lease_seconds = nfsv4::kLeaseSeconds;
+    // Grace window after restart (plan doc 10 §4.4): 0 = lease_seconds. Decoupled so
+    // operators can shorten recovery (grace < lease) without touching the lease.
+    uint32_t grace_seconds = 0;
     uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
     uint32_t max_slots = 32;
     uint32_t max_cached_reply = 8u << 10;
@@ -152,6 +155,10 @@ class StateMgr {
 
   // ---- grace (7.5) ----
   void load_grace_list();  // reads state_dir/clients/, arms the grace deadline
+  // Operator override (`lightnfs-ctl grace-end`, plan doc 10 §4.2): ends the grace
+  // period immediately.  Clients that had not reclaimed yet lose their claim window.
+  // Returns whether grace was active.
+  bool end_grace();
   bool in_grace() const;
   bool in_stable_list(std::string_view owner_id) const;
   int64_t grace_remaining_seconds() const;

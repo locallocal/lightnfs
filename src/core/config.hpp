@@ -2,6 +2,7 @@
 
 #include <netinet/in.h>
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
@@ -11,6 +12,7 @@
 #include "backend/api.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/auth.hpp"
+#include "runtime/token_bucket.hpp"
 
 namespace lnfs::core {
 
@@ -41,6 +43,9 @@ struct ServerConfig {
   // ring_sqpoll enables IORING_SETUP_SQPOLL kernel-thread submission (design 02 §2.63).
   std::string ring = "auto";
   bool ring_sqpoll = false;
+  // Listen address for the NFS/MOUNT listeners (plan doc 10 §4.4): IPv4/IPv6 literal;
+  // empty = all interfaces (dual-stack).
+  std::string bind;
   uint16_t port = 2049;
   uint16_t mount_port = 20048;
   bool rpcbind = true;
@@ -53,7 +58,10 @@ struct ServerConfig {
   uint64_t drc_ttl_ms = 120000;
   uint64_t drc_mem = 64u << 20;
   bool enable_v4 = true;
-  uint32_t lease_seconds = 90;        // v4 lease (also the grace window)
+  uint32_t lease_seconds = 90;   // v4 lease
+  // Grace window after restart, decoupled from the lease (plan doc 10 §4.4):
+  // 0 = "auto" = lease; operators often want grace < lease for faster recovery.
+  uint32_t grace_seconds = 0;
   uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
   uint32_t state_shards = 16;         // v4 state table shards (plan doc 10 §2.6)
   std::string ctl_socket;   // default: <state_dir>/ctl.sock; "" resolves at startup
@@ -73,6 +81,15 @@ struct ServerConfig {
   // per-op time breakdown (0 disables); error_ring sizes the dump-errors sampling ring.
   uint32_t slow_request_ms = 1000;
   uint32_t error_ring = 64;
+  // Log sink (plan doc 10 §4.4): empty = stderr; otherwise a rotating file.
+  std::string log_file;
+  uint64_t log_rotate_size = 50u << 20;
+  uint32_t log_rotate_keep = 5;
+  // Per-client (v4 clientid) token-bucket defaults, [limits] section (plan doc 10
+  // §4.3).  0 = unlimited.  Hot-reloadable.
+  uint64_t client_read_bps = 0;
+  uint64_t client_write_bps = 0;
+  uint32_t client_iops = 0;
 };
 
 struct ExportConfig {
@@ -84,6 +101,11 @@ struct ExportConfig {
   uint32_t anon_uid = 65534;
   uint32_t anon_gid = 65534;
   bool readonly = false;
+  // Per-export token buckets (plan doc 10 §4.3): bytes/s for READ and WRITE plus an
+  // IO ops/s cap.  0 = unlimited.  Hot-reloadable.
+  uint64_t read_bps = 0;
+  uint64_t write_bps = 0;
+  uint32_t iops = 0;
   backend::BackendConfig backend_config;
 };
 
@@ -99,7 +121,6 @@ Result<void> validate_config(const Config& config);
 struct ExportEntry {
   std::string path;
   uint32_t fsid = 0;
-  std::vector<Cidr> clients;
   Squash squash = Squash::kRoot;
   uint32_t anon_uid = 65534;
   uint32_t anon_gid = 65534;
@@ -107,6 +128,32 @@ struct ExportEntry {
   std::unique_ptr<backend::Backend> backend;
   // Per-export data-path counters (plan doc 10 §3.3), exported with export/fsid labels.
   obs::ExportMetrics metrics;
+
+  // Client allowlist, hot-reloadable (plan doc 10 §4.1): readers load one atomic
+  // pointer; set_clients publishes a fresh list and retires the old one until the
+  // entry dies (reloads are rare and serialized, so the retirement list stays tiny).
+  const std::vector<Cidr>& client_list() const {
+    return *clients_.load(std::memory_order_acquire);
+  }
+  void set_clients(std::vector<Cidr> list) {
+    auto owned = std::make_unique<const std::vector<Cidr>>(std::move(list));
+    clients_.store(owned.get(), std::memory_order_release);
+    retired_clients_.push_back(std::move(owned));
+  }
+
+  // Per-export QoS buckets (plan doc 10 §4.3), enforced at the engine entry for
+  // READ/WRITE before any object lock is taken.
+  struct Qos {
+    rt::TokenBucket read_bytes, write_bytes, ops;
+    rt::Task<void> throttle(bool write, uint64_t bytes) {
+      co_await ops.acquire(1);
+      co_await (write ? write_bytes : read_bytes).acquire(bytes);
+    }
+  } qos;
+
+ private:
+  std::atomic<const std::vector<Cidr>*> clients_{nullptr};
+  std::vector<std::unique_ptr<const std::vector<Cidr>>> retired_clients_;
 };
 
 struct MappedCred {
@@ -128,6 +175,13 @@ class ExportTable {
   bool check_client(const sockaddr_storage& peer, const ExportEntry& entry) const;
   MappedCred squash_cred(const rpc::Cred& cred, const ExportEntry& entry) const;
   const std::vector<std::unique_ptr<ExportEntry>>& entries() const { return entries_; }
+
+  // Hot reload, step 1 (plan doc 10 §4.1): re-applies the non-topology per-export
+  // settings (client CIDR allowlist, QoS rates) from a freshly validated config,
+  // matching entries by fsid.  Topology changes (exports added/removed, path/backend/
+  // squash changed) are reported as restart-required, never applied.  Returns the
+  // human-readable report.  Must not run concurrently with itself.
+  std::string reload_dynamic(const Config& fresh);
 
  private:
   std::vector<std::unique_ptr<ExportEntry>> entries_;

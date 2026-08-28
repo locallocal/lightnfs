@@ -250,29 +250,39 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 
 ---
 
-## 4. 运维能力规划
+## 4. 运维能力规划 ✅ 已完成（2026-08-28；4.1 第二步除外，见说明）
 
 按运维价值排序：
 
-1. **SIGHUP / `ctl reload` 热重载**（最痛）。现在只注册 SIGINT/SIGTERM
-   （`main.cpp:283-285`），改任何配置都要重启 → bump boot epoch → 全体客户端
-   进 90s grace。分两步走：
-   - 第一步（低风险）：热重载不动拓扑的配置——CIDR 白名单、日志级别、限流参数；
-   - 第二步：导出动态增删。前置条件是 `PseudoFs` 可重建（现构造后完全不可变，
-     `pseudofs.cpp:7-30`）、`ExportTable::entries_` 加并发保护、伪 fs 句柄稳定性
-     （§1.6）先修。
-2. **ctl 命令面扩展**：`reload`、`loglevel`、`conns`（连接列表）/`kill-conn`、
-   `fdcache flush`、`clear-poison`（§1.5 的中毒标记）、`drc flush`、`grace-end`
-   （提前结束 grace）、`drain`（优雅摘流）、`version`/`status`、全部命令 `--json`
-   输出（脚本现在靠 grep 文本）。协议改为长度前缀 + 循环读（§1.8）。
-3. **限速 / QoS**：目前只有并发计数（max_connections / per_peer_limit /
-   inflight_per_conn），无任何带宽/IOPS 限制。规划 per-export 与 per-client
-   （clientid 级）令牌桶，接在引擎入口。
-4. **配置项补齐**：监听 bind 地址（现在只有端口）；`lease` 与 `grace` 解绑
-   （`config.cpp:246-247` 强制相等，运维常需 grace < lease 加快恢复）；日志文件/
-   轮转/per-module 级别（spdlog 能力已具备未暴露）；状态资源上限（§1.5）；
-   状态表分片数可调（§2.6）。
-5. **打包**：`packaging/` 现在只有 systemd unit，补 tarball/deb/rpm 构建脚本。
+1. **SIGHUP / `ctl reload` 热重载**（最痛）。分两步走：
+   - 第一步 ✅：SIGHUP（主线程 wait 循环应用）与 `ctl reload` 共用一个 handler，
+     重解析并校验配置后应用非拓扑子集——日志级别、slow_request_ms、error_ring、
+     每导出 clients CIDR（`ExportEntry::set_clients`，原子指针发布 + 退休链，读侧
+     零锁）与 QoS 速率、per-client QoS；拓扑/线程/监听/state_dir 改动在报告中标注
+     restart required。systemd `ExecReload` 已接 SIGHUP。
+   - 第二步（导出动态增删）**仍未做**：前置条件不变——`PseudoFs` 可重建、
+     `ExportTable::entries_` 并发保护（伪 fs 句柄稳定性 §1.6 已修）。列入 v2 前置。
+2. **ctl 命令面扩展** ✅：`reload`、`loglevel`、`conns`/`kill-conn`（进程级
+   `ConnRegistry`，注册表存在性证明 fd 未复用、kill 走 shutdown）、`fdcache flush`
+   （淘汰全部未 pin 条目）、`drc flush`、`grace-end`（`StateMgr::end_grace`）、
+   `drain`（停 accept 循环、存量继续服务）、`version`/`status`，全部命令支持
+   `--json`。协议维持"换行终止 + 循环读"（§1.8 已修的分包问题即其动机；单命令单
+   连接下与长度前缀等价，不再改）。
+3. **限速 / QoS** ✅：`rt::TokenBucket`（异步、debt 模式放行超突发请求、未配置时
+   一次 relaxed load 即返回、refill 时钟取自 reactor 便于 fake-clock 测试）；
+   per-export（`[[export]] read_bps/write_bps/iops`，挂 `ExportEntry::qos`）与
+   per-client（v4 clientid，`[limits] client_*`，engine 内懒建桶表）都接在引擎
+   READ/WRITE 入口、对象锁之前；速率热重载。
+4. **配置项补齐** ✅：`[server] bind` 监听地址（listener 支持 v4/v6 字面量，空 =
+   双栈全接口）；`grace` 与 `lease` 解绑（`auto` = lease）；`log_file` +
+   `log_rotate_size/keep`（spdlog rotating sink）；状态资源上限（§1.5 已有）与
+   分片数（§2.6 已有）。per-module 日志级别**未暴露**：门面是单 logger，按模块拆
+   logger 需逐调用点带模块标签，收益不抵改动面，搁置。
+5. **打包** ✅：`packaging/make_tarball.sh`（/usr/local 布局 tar.gz）、
+   `make_deb.sh`（dpkg-deb）、`make_rpm.sh` + `lightnfs.spec`（rpmbuild），三者
+   共享 CMake install 文件集（`GNUInstallDirs` + `cmake --install` DESTDIR 分阶段）；
+   版本号来自 `project(lightnfs VERSION …)`，二进制与 ctl `version` 同源
+   （`LIGHTNFS_VERSION`）。
 
 ---
 

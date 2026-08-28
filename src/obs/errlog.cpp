@@ -64,4 +64,19 @@ std::string dump_error_replies() {
   return out;
 }
 
+std::string dump_error_replies_json() {
+  std::lock_guard lock(g_mu);
+  std::string out = std::format("{{\"total_errors\":{},\"entries\":[", g_total);
+  size_t emitted = 0;
+  for (size_t i = 0; i < g_ring.size(); ++i) {
+    const Entry& e = g_ring[(g_next + i) % g_ring.size()];  // oldest first
+    if (e.when_ms == 0) continue;
+    out += std::format(
+        "{}{{\"ts_ms\":{},\"peer\":\"{}\",\"proc\":\"{}\",\"xid\":{},\"status\":{}}}",
+        emitted++ ? "," : "", e.when_ms, e.peer, e.what, e.xid, e.status);
+  }
+  out += "]}\n";
+  return out;
+}
+
 }  // namespace lnfs::obs

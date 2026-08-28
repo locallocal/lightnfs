@@ -38,7 +38,14 @@ void log(LogLevel lv, spdlog::format_string_t<A...> fmt, A&&... a) {
 }
 
 // Switch the sink to the async logger (production main); keeps the current level.
-void init_async_logging();
+// An empty `file` logs to stderr as before; otherwise a size-rotated file sink
+// ([server] log_file / log_rotate_*, plan doc 10 §4.4).
+struct LogSinkConfig {
+  std::string file;
+  size_t rotate_size = 50u << 20;
+  size_t rotate_keep = 5;
+};
+void init_async_logging(const LogSinkConfig& cfg = {});
 void shutdown_async_logging();
 
 #define LNFS_DEBUG(...) ::lnfs::log(::lnfs::LogLevel::kDebug, __VA_ARGS__)

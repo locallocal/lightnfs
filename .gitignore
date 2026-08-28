@@ -3,3 +3,5 @@ build-*/
 compile_commands.json
 .cache/
 fuzz/corpus/
+packaging/dist/
+build-pkg/

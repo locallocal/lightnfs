@@ -3,10 +3,12 @@
 
 #include <ccmd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <functional>
 #include <condition_variable>
 #include <cstdio>
 #include <format>
@@ -39,6 +41,9 @@ namespace {
 
 volatile std::sig_atomic_t stopping = 0;
 void on_signal(int) { stopping = 1; }
+// SIGHUP = hot reload (plan doc 10 §4.1); applied on the main thread's wait loop.
+volatile std::sig_atomic_t reload_requested = 0;
+void on_sighup(int) { reload_requested = 1; }
 
 lnfs::Result<void> run_backend_hook(lnfs::rt::Reactor& reactor,
                                     lnfs::rt::Task<lnfs::Result<void>> task) {
@@ -163,6 +168,7 @@ struct ProtocolStack {
         state({.boot_epoch = core.epoch,
                .state_dir = cfg.state_dir,
                .lease_seconds = cfg.lease_seconds,
+               .grace_seconds = cfg.grace_seconds,
                .courtesy_multiplier = cfg.courtesy_multiplier,
                .max_io = cfg.max_request_size,
                .shards = cfg.state_shards}) {
@@ -264,20 +270,24 @@ struct Frontend {
   std::unique_ptr<lnfs::transport::Listener> nfs, mount;
   std::unique_ptr<lnfs::server::CtlServer> ctl;        // null when unavailable
   std::unique_ptr<lnfs::server::MetricsHttp> metrics;  // null when disabled/unavailable
+  // `ctl drain` state (plan doc 10 §4.2): heap-owned so Frontend stays movable while
+  // CtlDeps keeps a stable pointer.
+  std::shared_ptr<std::atomic<bool>> draining = std::make_shared<std::atomic<bool>>(false);
 };
 
 std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
                                        lnfs::rt::Runtime& runtime, ProtocolStack& stack,
-                                       CoreState& core) {
+                                       CoreState& core,
+                                       std::function<std::string()> reload) {
   lnfs::transport::TransportConfig transport_cfg;
   transport_cfg.max_request_size = cfg.max_request_size;
   transport_cfg.max_inflight_per_conn = cfg.inflight_per_conn;
   transport_cfg.max_connections = cfg.max_connections;
   transport_cfg.per_peer_limit = cfg.per_peer_limit;
-  auto nfs_listener =
-      lnfs::transport::Listener::create(cfg.port, transport_cfg, stack.dispatcher, runtime);
-  auto mount_listener = lnfs::transport::Listener::create(cfg.mount_port, transport_cfg,
-                                                          stack.dispatcher, runtime);
+  auto nfs_listener = lnfs::transport::Listener::create(cfg.port, transport_cfg,
+                                                        stack.dispatcher, runtime, cfg.bind);
+  auto mount_listener = lnfs::transport::Listener::create(
+      cfg.mount_port, transport_cfg, stack.dispatcher, runtime, cfg.bind);
   if (!nfs_listener || !mount_listener) {
     LNFS_ERROR("cannot create listeners: nfs={} mount={}",
                nfs_listener ? "ok" : lnfs::errno_name(nfs_listener.error()),
@@ -299,8 +309,25 @@ std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
 
   std::string ctl_path =
       cfg.ctl_socket.empty() ? cfg.state_dir + "/ctl.sock" : cfg.ctl_socket;
+  // `drain` stops the accept loops but keeps serving established connections — the
+  // graceful way off a load balancer (plan doc 10 §4.2).  Irreversible until restart.
+  auto drain = [nfs = fe.nfs.get(), mount = fe.mount.get(),
+                draining = fe.draining]() -> std::string {
+    if (draining->exchange(true, std::memory_order_relaxed))
+      return "already draining\n";
+    nfs->request_stop();
+    mount->request_stop();
+    LNFS_INFO("draining: accept loops stopped, serving existing connections only");
+    return "draining: no new connections will be accepted\n";
+  };
   auto ctl = lnfs::server::CtlServer::create(
-      ctl_path, {.exports = core.exports.get(), .drc = &stack.drc, .state = &stack.state});
+      ctl_path, {.exports = core.exports.get(),
+                 .drc = &stack.drc,
+                 .state = &stack.state,
+                 .reload = std::move(reload),
+                 .drain = std::move(drain),
+                 .draining = fe.draining.get(),
+                 .started = std::chrono::steady_clock::now()});
   if (ctl) {
     fe.ctl = std::move(*ctl);
     lnfs::rt::spawn(fe.ctl->run(), runtime.reactor(1 % runtime.reactor_count()));
@@ -346,10 +373,17 @@ void stop_frontend(const lnfs::core::ServerConfig& cfg, Frontend& fe) {
   }
 }
 
-void wait_for_shutdown_signal() {
+void wait_for_shutdown_signal(const std::function<void()>& on_reload) {
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
-  while (!stopping) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::signal(SIGHUP, on_sighup);  // hot reload (plan doc 10 §4.1)
+  while (!stopping) {
+    if (reload_requested) {
+      reload_requested = 0;
+      on_reload();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
 }
 
 int run_server(const std::string& config_path, bool check_only) {
@@ -372,7 +406,9 @@ int run_server(const std::string& config_path, bool check_only) {
   auto core = build_core_state(std::move(*config));
   if (!core) return 1;
 
-  lnfs::init_async_logging();
+  lnfs::init_async_logging({.file = server_cfg.log_file,
+                            .rotate_size = server_cfg.log_rotate_size,
+                            .rotate_keep = server_cfg.log_rotate_keep});
 
   lnfs::rt::Runtime runtime({.reactors = server_cfg.reactors,
                              .offload_threads = server_cfg.offload_threads,
@@ -419,15 +455,65 @@ int run_server(const std::string& config_path, bool check_only) {
                                 lnfs::rt::Reactor::kLoopBoundsUs, agg, sum_us);
   });
 
-  auto frontend = start_frontend(server_cfg, runtime, stack, *core);
+  if (server_cfg.enable_v4 && stack.nfs4)
+    stack.nfs4->configure_client_qos(server_cfg.client_read_bps,
+                                     server_cfg.client_write_bps, server_cfg.client_iops);
+
+  // Hot reload, step 1 (plan doc 10 §4.1): SIGHUP and `ctl reload` re-parse the config
+  // file and apply the non-topology subset — log level, slow-request threshold, error
+  // ring, per-export client allowlists + QoS, per-client QoS.  Everything else is
+  // reported as restart-required.  Serialized: SIGHUP applies on the main wait loop,
+  // ctl reload on the ctl reactor; both paths funnel through this one handler, and
+  // concurrent invocations are harmless (last writer wins on independent knobs).
+  auto do_reload = [config_path, server_cfg, &core, &stack]() -> std::string {
+    auto fresh = load_validated_config(config_path);
+    if (!fresh) return "reload failed: config invalid (details in the log)\n";
+    std::string report;
+    const auto& sc = fresh->server;
+    if (sc.log_level != server_cfg.log_level) {
+      apply_log_level(sc);
+      report += std::format("log_level -> {}\n", sc.log_level);
+    }
+    lnfs::obs::set_slow_request_threshold_us(static_cast<uint64_t>(sc.slow_request_ms) *
+                                             1000);
+    lnfs::obs::set_error_ring_capacity(sc.error_ring);
+    if (stack.nfs4)
+      stack.nfs4->configure_client_qos(sc.client_read_bps, sc.client_write_bps,
+                                       sc.client_iops);
+    report += core->exports->reload_dynamic(*fresh);
+    // Topology/runtime keys stay fixed until restart; call out what was ignored.
+    if (sc.port != server_cfg.port || sc.mount_port != server_cfg.mount_port ||
+        sc.bind != server_cfg.bind)
+      report += "listen address/ports changed: restart required\n";
+    if (sc.reactors != server_cfg.reactors ||
+        sc.offload_threads != server_cfg.offload_threads)
+      report += "thread topology changed: restart required\n";
+    if (sc.state_dir != server_cfg.state_dir || sc.enable_v4 != server_cfg.enable_v4 ||
+        sc.lease_seconds != server_cfg.lease_seconds ||
+        sc.state_shards != server_cfg.state_shards)
+      report += "state_dir/v4/lease/shards changed: restart required\n";
+    if (sc.metrics_port != server_cfg.metrics_port ||
+        sc.metrics_bind != server_cfg.metrics_bind)
+      report += "metrics endpoint changed: restart required\n";
+    LNFS_INFO("configuration reloaded from {}", config_path);
+    return report.empty() ? "nothing to apply\n" : report;
+  };
+
+  auto frontend = start_frontend(server_cfg, runtime, stack, *core, do_reload);
   if (!frontend) {
     runtime.stop_and_join();
     return 1;
   }
-  LNFS_INFO("lightnfs ready: nfs_port={} mount_port={} exports={}", frontend->nfs->port(),
-            frontend->mount->port(), core->exports->entries().size());
+  LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={}", LIGHTNFS_VERSION,
+            frontend->nfs->port(), frontend->mount->port(),
+            core->exports->entries().size());
 
-  wait_for_shutdown_signal();
+  wait_for_shutdown_signal([&] {
+    std::string report = do_reload();
+    while (!report.empty() && report.back() == '\n') report.pop_back();
+    std::replace(report.begin(), report.end(), '\n', ';');
+    LNFS_INFO("reload (SIGHUP): {}", report);
+  });
 
   stack.lease_stop.store(true);
   stop_frontend(server_cfg, *frontend);

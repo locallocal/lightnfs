@@ -173,13 +173,21 @@ void StateMgr::load_grace_list() {
       grace_pending_.insert(owner);
     }
   }
+  uint32_t grace_secs = cfg_.grace_seconds ? cfg_.grace_seconds : cfg_.lease_seconds;
   if (!grace_pending_.empty()) {
-    grace_deadline_ =
-        std::chrono::steady_clock::now() + std::chrono::seconds(cfg_.lease_seconds);
+    grace_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(grace_secs);
     grace_active_.store(true, std::memory_order_relaxed);
     LNFS_INFO("grace period armed: {} clients expected to reclaim, {}s window",
-              grace_pending_.size(), cfg_.lease_seconds);
+              grace_pending_.size(), grace_secs);
   }
+}
+
+bool StateMgr::end_grace() {
+  std::lock_guard lock(grace_mu_);
+  grace_pending_.clear();
+  bool was = grace_active_.exchange(false, std::memory_order_relaxed);
+  if (was) LNFS_INFO("grace period ended by operator (grace-end)");
+  return was;
 }
 
 bool StateMgr::in_grace() const {

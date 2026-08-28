@@ -10,6 +10,8 @@
 // minorversion 0 is permanently rejected (decision D5); unimplemented ops answer
 // NOTSUPP, opcodes beyond the minor version's table answer OP_ILLEGAL.
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -40,6 +42,10 @@ class Engine {
 
   void register_with(rpc::Dispatcher& dispatcher);
   rt::Task<void> dispatch(transport::ConnCtx&, rpc::RpcCall&, const rpc::Cred&);
+
+  // Per-client (clientid) token-bucket defaults ([limits] client_*, plan doc 10 §4.3).
+  // Hot-reloadable: reconfigures every existing client bucket as well.
+  void configure_client_qos(uint64_t read_bps, uint64_t write_bps, uint32_t iops);
 
  private:
   // One filehandle register (CFH or SFH): raw bytes, validated on store.
@@ -168,6 +174,17 @@ class Engine {
   std::string server_owner_, server_scope_;
   std::mutex root_oid_mu_;
   std::unordered_map<uint32_t, backend::ObjId> root_oids_;  // fsid -> root oid
+
+  // Per-client QoS (plan doc 10 §4.3): buckets created lazily per clientid, bounded by
+  // the state manager's max_clients; rates 0/0/0 (the default) short-circuits to null.
+  struct ClientQos {
+    rt::TokenBucket read_bytes, write_bytes, ops;
+  };
+  ClientQos* client_qos(uint64_t clientid);
+  std::mutex cq_mu_;
+  std::unordered_map<uint64_t, std::unique_ptr<ClientQos>> cq_map_;
+  std::atomic<uint64_t> cq_read_bps_{0}, cq_write_bps_{0};
+  std::atomic<uint32_t> cq_iops_{0};
 };
 
 }  // namespace lnfs::nfsv4

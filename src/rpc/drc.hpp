@@ -63,6 +63,10 @@ class Drc {
   rt::Task<Claim> begin(const Key& key);
   rt::Task<void> complete(const Key& key, std::vector<std::byte> reply);
   rt::Task<void> abort(const Key& key);
+  // Operator flush (`lightnfs-ctl drc flush`, plan doc 10 §4.2): drops every entry.
+  // An in-progress owner completes into nothing; woken waiters re-execute — safe,
+  // the DRC is a best-effort retransmission shield.  Returns entries dropped.
+  rt::Task<size_t> flush();
   Stats stats() const;
 
  private:

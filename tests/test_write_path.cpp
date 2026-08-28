@@ -442,6 +442,21 @@ TEST(WritePath, DrcReplaysIdenticalReply) {
   auto dec3 = WriteFixture::result(third);
   EXPECT_EQ(*dec3.u32(), 17u);
   EXPECT_EQ(drc.stats().inserts, 2u);
+
+  // Operator flush (`ctl drc flush`, plan doc 10 §4.2): drops every cached entry;
+  // the old xid then re-executes instead of replaying.
+  size_t dropped = 0;
+  rt::spawn(
+      [](rpc::Drc* d, size_t* out) -> rt::Task<void> { *out = co_await d->flush(); }(
+          &drc, &dropped),
+      f.reactor);
+  while (f.reactor.poll_once()) {
+  }
+  EXPECT_EQ(dropped, 2u);
+  EXPECT_EQ(drc.stats().entries, 0u);
+  auto fourth = f.request(nfsv3::Proc::kMkdir, encode(), 0x777);
+  auto dec4 = WriteFixture::result(fourth);
+  EXPECT_EQ(*dec4.u32(), 17u);  // re-executed -> EEXIST, not a cached success replay
 }
 
 TEST(WritePath, ErrmapWhitelistForWriteProcs) {

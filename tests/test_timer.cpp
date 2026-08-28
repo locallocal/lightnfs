@@ -5,6 +5,7 @@
 #include "runtime/io.hpp"
 #include "runtime/reactor.hpp"
 #include "runtime/testing/fake_ring.hpp"
+#include "runtime/token_bucket.hpp"
 
 using namespace lnfs::rt;
 using namespace std::chrono_literals;
@@ -111,4 +112,74 @@ TEST(Timer, WithTimeoutTimerWins) {
   r.run();  // run drains the still-sleeping detached task too
   EXPECT_TRUE(got);
   EXPECT_TRUE(slow_done);  // discarded, but it did finish
+}
+
+// Token bucket (plan doc 10 §4.3) on the fake clock: unconfigured acquires are free,
+// a drained bucket parks the coroutine for exactly the refill time, and debt-mode
+// lets over-burst requests through while charging the following acquire.
+TEST(TokenBucket, ShapesToConfiguredRate) {
+  FakeRing ring;
+  FakeClock clk;
+  Reactor::Options opts;
+  opts.clock = [&clk] { return clk.now; };
+  Reactor r(ring, opts);
+  ring.on_wait = [&clk](std::optional<std::chrono::nanoseconds> t) {
+    if (t && t->count() > 0) clk.now += *t;
+  };
+
+  TokenBucket tb;
+  const TimePoint start = clk.now;
+  TimePoint after_free{}, after_shaped{};
+  spawn(
+      [](TokenBucket* tb, FakeClock* clk, TimePoint* free_t,
+         TimePoint* shaped_t) -> Task<void> {
+        co_await tb->acquire(1u << 20);  // unconfigured: immediate
+        *free_t = clk->now;
+        tb->configure(1000);        // 1000 tokens/s, burst = 1000, starts full
+        co_await tb->acquire(1000); // drains the bucket, still immediate
+        co_await tb->acquire(500);  // must wait ~0.5s of (fake) refill
+        *shaped_t = clk->now;
+      }(&tb, &clk, &after_free, &after_shaped),
+      r);
+  r.stop();
+  r.run();
+  EXPECT_TRUE(after_free == start);
+  auto waited =
+      std::chrono::duration_cast<std::chrono::milliseconds>(after_shaped - start).count();
+  EXPECT_TRUE(waited >= 500);
+  EXPECT_TRUE(waited < 1000);
+}
+
+TEST(TokenBucket, DebtModePassesOverBurstRequests) {
+  FakeRing ring;
+  FakeClock clk;
+  Reactor::Options opts;
+  opts.clock = [&clk] { return clk.now; };
+  Reactor r(ring, opts);
+  ring.on_wait = [&clk](std::optional<std::chrono::nanoseconds> t) {
+    if (t && t->count() > 0) clk.now += *t;
+  };
+
+  TokenBucket tb;
+  tb.configure(1000);  // burst 1000
+  const TimePoint start = clk.now;
+  TimePoint after_big{}, after_small{};
+  spawn(
+      [](TokenBucket* tb, FakeClock* clk, TimePoint* big_t,
+         TimePoint* small_t) -> Task<void> {
+        co_await tb->acquire(5000);  // > burst: passes at once, leaves a 4000 debt
+        *big_t = clk->now;
+        co_await tb->acquire(1);     // repays the debt: ~4s of refill
+        *small_t = clk->now;
+        tb->configure(0);            // disabling releases everything instantly
+        co_await tb->acquire(1u << 30);
+      }(&tb, &clk, &after_big, &after_small),
+      r);
+  r.stop();
+  r.run();
+  EXPECT_TRUE(after_big == start);
+  auto repaid =
+      std::chrono::duration_cast<std::chrono::milliseconds>(after_small - start).count();
+  EXPECT_TRUE(repaid >= 4000);
+  EXPECT_TRUE(repaid < 5000);
 }

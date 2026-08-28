@@ -3,8 +3,10 @@
 #include "obs/metrics.hpp"
 
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 
 #include "runtime/io.hpp"
@@ -86,6 +88,50 @@ void ConnTracker::remove(const Peer& p) {
 
 int ConnTracker::count() { return total_.load(std::memory_order_relaxed); }
 
+ConnRegistry& ConnRegistry::instance() {
+  static ConnRegistry r;
+  return r;
+}
+
+uint64_t ConnRegistry::add(int fd, const Peer& peer) {
+  std::lock_guard lock(mu_);
+  uint64_t id = next_id_++;
+  conns_.emplace(id, Ent{fd, peer, std::chrono::steady_clock::now()});
+  return id;
+}
+
+void ConnRegistry::remove(uint64_t id) {
+  std::lock_guard lock(mu_);
+  conns_.erase(id);
+}
+
+std::vector<ConnRegistry::Info> ConnRegistry::list() {
+  std::lock_guard lock(mu_);
+  auto now = std::chrono::steady_clock::now();
+  std::vector<Info> out;
+  out.reserve(conns_.size());
+  for (const auto& [id, ent] : conns_)
+    out.push_back({id, ent.peer.to_string(),
+                   std::chrono::duration_cast<std::chrono::seconds>(now - ent.since)
+                       .count()});
+  std::sort(out.begin(), out.end(),
+            [](const Info& a, const Info& b) { return a.id < b.id; });
+  return out;
+}
+
+size_t ConnRegistry::count() {
+  std::lock_guard lock(mu_);
+  return conns_.size();
+}
+
+bool ConnRegistry::kill(uint64_t id) {
+  std::lock_guard lock(mu_);
+  auto it = conns_.find(id);
+  if (it == conns_.end()) return false;
+  ::shutdown(it->second.fd, SHUT_RDWR);
+  return true;
+}
+
 Task<void> ConnCtx::send(rt::SendBuf buf) {
   auto r = co_await rs.write_record(std::move(buf));
   if (!r && !send_failed) {
@@ -119,6 +165,7 @@ Task<void> handle_one(ConnCtx* c, rpc::Dispatcher* d, BufferChain rec) {
 Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp,
                            ConnTracker* tracker) {
   ConnCtx* c = ctx.get();
+  uint64_t conn_id = ConnRegistry::instance().add(c->fd, c->peer);
   for (;;) {
     auto rec = co_await c->rs.read_record();
     if (!rec) {
@@ -144,6 +191,7 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp,
     c->drained.reset();
     if (c->live > 0) co_await c->drained.wait();
   }
+  ConnRegistry::instance().remove(conn_id);  // before close: kill() must not hit a reused fd
   co_await uring_close(c->fd);
   if (tracker) tracker->remove(c->peer);
 }
