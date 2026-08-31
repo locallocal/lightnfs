@@ -124,7 +124,7 @@ TEST(Offload, AdmissionCapDefersButCompletesAll) {
   for (int i = 0; i < 32; ++i) pool.submit([&] { done.fetch_add(1); });
   auto mid = pool.stats();
   EXPECT_TRUE(mid.deferred[0] > 0);        // cap engaged
-  EXPECT_TRUE(pool.queue_depth() >= 32u);  // queued + overflow all accounted
+  EXPECT_TRUE(mid.depth[0] + mid.depth[1] >= 32u);  // queued + overflow all accounted
   {
     std::lock_guard lk(mu);
     release = true;

@@ -8,6 +8,9 @@
 
 #include "core/boot_epoch.hpp"
 #include "core/errmap.hpp"
+#include "core/fs_props.hpp"
+#include "core/mutate.hpp"
+#include "core/names.hpp"
 #include "transport/connection.hpp"
 #include "core/readdir.hpp"
 #include "nfsv4/attrs.hpp"
@@ -39,49 +42,27 @@ void patch_u32(std::byte* gap, uint32_t value) {
 constexpr uint32_t kAccessRead = 0x01, kAccessLookup = 0x02, kAccessModify = 0x04,
                    kAccessExtend = 0x08, kAccessDelete = 0x10, kAccessExecute = 0x20;
 
-bool valid_utf8(std::span<const std::byte> bytes);
-
-bool valid_component4(std::string_view name) {
-  return !name.empty() && name.size() <= kMaxName &&
-         name.find('/') == std::string_view::npos &&
-         name.find('\0') == std::string_view::npos && name != "." && name != "..";
-}
+using core::MutateGuard;
 
 // utf8str_cs component discipline (RFC 8881 §14.1): malformed UTF-8 is INVAL.
-bool utf8_component(std::string_view name) {
-  return valid_utf8(std::span<const std::byte>(
-      reinterpret_cast<const std::byte*>(name.data()), name.size()));
+bool utf8_component(std::string_view name) { return core::valid_utf8(name); }
+
+// v4 mapping of a failed MutateGuard verdict (plan doc 10 §6.1): readonly exports are
+// ROFS, empty components INVAL (RFC 8881 §18.10), every other component failure BADNAME.
+uint32_t verdict_status4(const MutateGuard::Verdict& verdict) {
+  switch (verdict.kind) {
+    case MutateGuard::Verdict::kReadonly: return st(Status::kRofs);
+    case MutateGuard::Verdict::kBadName:
+      return verdict.name == core::NameCheck::kEmpty ? st(Status::kInval)
+                                                     : st(Status::kBadname);
+    default: return st(Status::kOk);
+  }
 }
 
 bool is_current_placeholder(const Stateid& sid) {
   if (sid.seqid != 1) return false;
   return std::all_of(sid.other.begin(), sid.other.end(),
                      [](std::byte b) { return b == std::byte{0}; });
-}
-
-bool valid_utf8(std::span<const std::byte> bytes) {
-  size_t i = 0, n = bytes.size();
-  while (i < n) {
-    uint8_t c = static_cast<uint8_t>(bytes[i]);
-    size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3
-                 : (c >> 3) == 0x1E ? 4 : 0;
-    if (len == 0 || i + len > n) return false;
-    for (size_t k = 1; k < len; ++k)
-      if ((static_cast<uint8_t>(bytes[i + k]) & 0xC0) != 0x80) return false;
-    if (len == 2 && c < 0xC2) return false;                    // overlong
-    if (len == 3 && c == 0xE0 && static_cast<uint8_t>(bytes[i + 1]) < 0xA0) return false;
-    if (len == 3 && c == 0xED && static_cast<uint8_t>(bytes[i + 1]) > 0x9F)
-      return false;  // UTF-16 surrogates
-    if (len == 3 && c == 0xEF && static_cast<uint8_t>(bytes[i + 1]) == 0xBF &&
-        (static_cast<uint8_t>(bytes[i + 2]) == 0xBE ||
-         static_cast<uint8_t>(bytes[i + 2]) == 0xBF))
-      return false;  // U+FFFE / U+FFFF
-    if (len == 4 && c == 0xF0 && static_cast<uint8_t>(bytes[i + 1]) < 0x90) return false;
-    if (len == 4 && (c > 0xF4 || (c == 0xF4 && static_cast<uint8_t>(bytes[i + 1]) > 0x8F)))
-      return false;
-    i += len;
-  }
-  return true;
 }
 
 bool sessionless_op(uint32_t op) {
@@ -205,7 +186,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
     co_return;
   }
   std::vector<std::byte> tag_bytes(tag->begin(), tag->end());
-  bool tag_ok = valid_utf8(tag_bytes);
+  bool tag_ok = core::valid_utf8(tag_bytes);
 
   Ctx ctx{.conn = conn, .cred = cred};
   ctx.minor = *minor;
@@ -756,7 +737,7 @@ rt::Task<uint32_t> Engine::op_lookup(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kInval));
     co_return st(Status::kInval);
   }
-  if (!valid_component4(*name)) {
+  if (!core::valid_component(*name)) {
     enc.u32(st(Status::kBadname));
     co_return st(Status::kBadname);
   }
@@ -865,26 +846,20 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
                                       const Bitmap& wanted, xdr::XdrEnc& enc) {
   AttrSource src;
   backend::Attr attr;
-  backend::FsLimits limits;
+  core::FsProps fs;
   backend::FsStats stats;
   if (resolved.pseudo()) {
     attr = pseudo_.attr_of(*resolved.node);
-    src.fsid = 0;
-    src.link_support = false;
-    src.symlink_support = false;
+    src.fsid = 0;  // src.fs stays null: pseudo defaults
   } else {
     auto lock = locks_.get(resolved.exp->fsid, resolved.oid);
     auto held = co_await lock->lock_shared();
     auto got = co_await resolved.obj->getattr();
     if (!got) co_return st(core::to_v4(got.error(), Op::kGetattr));
     attr = *got;
-    limits = resolved.exp->backend->limits();
-    src.limits = &limits;
+    fs = core::fs_props(*resolved.exp->backend);
+    src.fs = &fs;
     src.fsid = resolved.exp->fsid;
-    auto caps = resolved.exp->backend->caps();
-    src.link_support = caps.has(backend::Cap::kHardlink);
-    src.symlink_support = caps.has(backend::Cap::kSymlink);
-    src.case_insensitive = caps.has(backend::Cap::kCaseInsensitive);
     src.lease_seconds = state_.config().lease_seconds;
     if (wants_stats(wanted)) {
       auto s = co_await resolved.exp->backend->statfs();
@@ -1306,16 +1281,12 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
   backend::DirPage first_page;
   core::MappedCred mapped;
   backend::Cred cred{};
-  backend::FsLimits limits;
-  bool link_sup = false, symlink_sup = false;
+  core::FsProps fs;
   std::shared_ptr<rt::AsyncSharedMutex> lock;
   if (!resolved->pseudo()) {
     mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
     cred = mapped.view();
-    limits = resolved->exp->backend->limits();
-    auto caps = resolved->exp->backend->caps();
-    link_sup = caps.has(backend::Cap::kHardlink);
-    symlink_sup = caps.has(backend::Cap::kSymlink);
+    fs = core::fs_props(*resolved->exp->backend);
     lock = locks_.get(resolved->exp->fsid, resolved->oid);
     auto held = co_await lock->lock_shared();
     auto page = co_await core::readdir_page(resolved->obj, cred, *cookie, batch);
@@ -1338,8 +1309,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
 
   auto emit = [&](uint64_t entry_cookie, std::string_view name,
                   const backend::Attr& attr, const FhBytes& fh, uint64_t fsid_val,
-                  uint64_t mounted_on, const backend::FsLimits* lim_ptr,
-                  bool ent_link_sup, bool ent_symlink_sup) -> bool {
+                  uint64_t mounted_on, const core::FsProps* ent_fs) -> bool {
     size_t name_part = 8 + 4 + ((name.size() + 3) & ~size_t(3));
     if (used_dir + name_part > *dircount) {
       truncated = true;
@@ -1357,9 +1327,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     src.fsid = fsid_val;
     src.mounted_on_fileid = mounted_on;
     src.fh = fh;
-    src.limits = lim_ptr;
-    src.link_support = ent_link_sup;
-    src.symlink_support = ent_symlink_sup;
+    src.fs = ent_fs;
     src.lease_seconds = state_.config().lease_seconds;
     encode_fattr(enc, *wanted, src);
     const size_t entry_size = enc.size() - entry_start;
@@ -1386,15 +1354,12 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
         if (!obj) continue;
         auto attr = co_await (*obj)->getattr();
         if (!attr) continue;
-        backend::FsLimits child_limits = child->exp->backend->limits();
-        auto caps = child->exp->backend->caps();
+        core::FsProps child_fs = core::fs_props(*child->exp->backend);
         ok = emit(this_cookie, name, *attr, export_fh(*child->exp, (*obj)->id()),
-                  child->exp->fsid, child->id, &child_limits,
-                  caps.has(backend::Cap::kHardlink), caps.has(backend::Cap::kSymlink));
+                  child->exp->fsid, child->id, &child_fs);
       } else {
         auto attr = pseudo_.attr_of(*child);
-        ok = emit(this_cookie, name, attr, pseudo_fh(*child), 0, child->id, nullptr,
-                  false, false);
+        ok = emit(this_cookie, name, attr, pseudo_fh(*child), 0, child->id, nullptr);
       }
       if (!ok) {
         eof = false;
@@ -1427,7 +1392,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
           oid = (*child)->id();
         }
         if (!emit(ent.cookie, ent.name, attr, export_fh(*resolved->exp, oid),
-                  resolved->exp->fsid, attr.fileid, &limits, link_sup, symlink_sup))
+                  resolved->exp->fsid, attr.fileid, &fs))
           break;
       }
       if (truncated) break;
@@ -1613,7 +1578,7 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       enc.u32(st(Status::kInval));
       co_return st(Status::kInval);
     }
-    if (!valid_component4(name)) {
+    if (!core::valid_component(name)) {
       enc.u32(st(Status::kBadname));
       co_return st(Status::kBadname);
     }
@@ -1631,14 +1596,10 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       enc.u32(st(Status::kNotdir));
       co_return st(Status::kNotdir);
     }
-    if (create && exp->readonly) {
-      enc.u32(st(Status::kRofs));
-      co_return st(Status::kRofs);
-    }
-    auto mapped = exports_.squash_cred(ctx.cred, *exp);
-    auto cred = mapped.view();
-    auto lock = locks_.get(exp->fsid, dir->oid);
     if (!create) {
+      auto mapped = exports_.squash_cred(ctx.cred, *exp);
+      auto cred = mapped.view();
+      auto lock = locks_.get(exp->fsid, dir->oid);
       auto held = co_await lock->lock_shared();
       auto before = co_await dir->obj->getattr();
       auto found = co_await dir->obj->lookup(cred, name);
@@ -1652,10 +1613,15 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       }
       file = std::move(*found);
     } else {
-      auto held = co_await lock->lock();  // exclusive: change_info is atomic
+      MutateGuard guard(locks_, exports_, *exp, ctx.cred);
+      if (auto verdict = guard.precheck({}); !verdict) {
+        uint32_t code = verdict_status4(verdict);
+        enc.u32(code);
+        co_return code;
+      }
+      co_await guard.enter({dir->obj, dir->oid});  // exclusive: change_info is atomic
       atomic = true;
-      auto before = co_await dir->obj->getattr();
-      change_before = change_of(before);
+      const backend::Cred& cred = guard.cred();
       Result<backend::Created> made = Err(errno_from(EIO));
       if (create_mode == kCreateExclusive || create_mode == kCreateExclusive41) {
         made = co_await dir->obj->create(cred, name, {}, &excl_verf);
@@ -1715,8 +1681,9 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
           }
         }
       }
-      auto after = co_await dir->obj->getattr();
-      change_after = change_of(after);
+      co_await guard.finish();
+      change_before = guard.first().change_before();
+      change_after = guard.first().change_after();
       if (!made) {
         uint32_t code = st(core::to_v4(made.error(), Op::kOpen));
         enc.u32(code);
@@ -1990,16 +1957,16 @@ rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     enc.u32(check.status);
     co_return check.status;
   }
-  if (resolved->exp->readonly) {
-    enc.u32(st(Status::kRofs));
-    co_return st(Status::kRofs);
+  MutateGuard guard(locks_, exports_, *resolved->exp, ctx.cred);
+  if (auto verdict = guard.precheck({}); !verdict) {
+    uint32_t code = verdict_status4(verdict);
+    enc.u32(code);
+    co_return code;
   }
   if (*offset + *data_len < *offset) {  // offset+length overflow
     enc.u32(st(Status::kInval));
     co_return st(Status::kInval);
   }
-  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
-  auto cred = mapped.view();
   uint32_t count = static_cast<uint32_t>(
       std::min<size_t>(*data_len, resolved->exp->backend->limits().max_write));
   SmallVec<iovec, 8> iov;
@@ -2018,9 +1985,8 @@ rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     co_await cq->ops.acquire(1);
     co_await cq->write_bytes.acquire(count);
   }
-  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-  auto held = co_await lock->lock();
-  backend::OpenCtx open{cred, check.bopen.get()};
+  co_await guard.enter({resolved->obj, resolved->oid, /*sample=*/false});
+  backend::OpenCtx open{guard.cred(), check.bopen.get()};
   auto written = co_await resolved->obj->write(
       open, *offset, std::span<const iovec>(iov.data(), iov.size()), stability);
   if (!written) {
@@ -2111,16 +2077,15 @@ rt::Task<uint32_t> Engine::op_setattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
                                           resolved->oid, state::kShareWrite);
     if (check.status != 0) co_return fail(check.status);
   }
-  if (resolved->exp->readonly) co_return fail(st(Status::kRofs));
+  MutateGuard guard(locks_, exports_, *resolved->exp, ctx.cred);
+  if (auto verdict = guard.precheck({}); !verdict)
+    co_return fail(verdict_status4(verdict));
   // Attribute changes invalidate read delegations (plan doc 10 §5.2): recall + DELAY.
   if (uint32_t dc = co_await state_.deleg_conflict(resolved->exp->fsid, resolved->oid);
       dc != 0)
     co_return fail(dc);
-  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
-  auto cred = mapped.view();
-  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-  auto held = co_await lock->lock();
-  auto result = co_await resolved->obj->setattr(cred, attrs);
+  co_await guard.enter({resolved->obj, resolved->oid, /*sample=*/false});
+  auto result = co_await resolved->obj->setattr(guard.cred(), attrs);
   if (!result) co_return fail(st(core::to_v4(result.error(), Op::kSetattr)));
   enc.u32(st(Status::kOk));
   wanted.encode(enc);
@@ -2226,18 +2191,6 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kBadtype));
     co_return st(Status::kBadtype);
   }
-  if (name->empty()) {
-    enc.u32(st(Status::kInval));
-    co_return st(Status::kInval);
-  }
-  if (!utf8_component(*name)) {
-    enc.u32(st(Status::kInval));
-    co_return st(Status::kInval);
-  }
-  if (!valid_component4(*name)) {
-    enc.u32(st(Status::kBadname));
-    co_return st(Status::kBadname);
-  }
   if (*type == kNf4Lnk && linkdata.empty()) {
     enc.u32(st(Status::kInval));
     co_return st(Status::kInval);
@@ -2248,13 +2201,24 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(code);
     co_return code;
   }
-  if (dir->pseudo() || dir->exp->readonly) {
+  if (dir->pseudo()) {
     enc.u32(st(Status::kRofs));
     co_return st(Status::kRofs);
   }
   if (dir->obj->type() != backend::FType::kDir) {
     enc.u32(st(Status::kNotdir));
     co_return st(Status::kNotdir);
+  }
+  // Mutate-guard order (plan doc 10 §6.1): readonly -> name -> capability gates.
+  MutateGuard guard(locks_, exports_, *dir->exp, ctx.cred);
+  if (auto verdict = guard.precheck({*name}); !verdict) {
+    uint32_t code = verdict_status4(verdict);
+    enc.u32(code);
+    co_return code;
+  }
+  if (!utf8_component(*name)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
   }
   auto caps = dir->exp->backend->caps();
   if ((*type == kNf4Lnk && !caps.has(backend::Cap::kSymlink)) ||
@@ -2265,11 +2229,8 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     co_return st(Status::kNotsupp);
   }
   attrs.size.reset();  // size is meaningless for these object types
-  auto mapped = exports_.squash_cred(ctx.cred, *dir->exp);
-  auto cred = mapped.view();
-  auto lock = locks_.get(dir->exp->fsid, dir->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await dir->obj->getattr();
+  co_await guard.enter({dir->obj, dir->oid});
+  const backend::Cred& cred = guard.cred();
   Result<backend::Created> made = Err(errno_from(EIO));
   switch (*type) {
     case kNf4Dir: made = co_await dir->obj->mkdir(cred, *name, attrs); break;
@@ -2288,7 +2249,7 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
       break;
     default: break;
   }
-  auto after = co_await dir->obj->getattr();
+  co_await guard.finish();
   if (!made) {
     uint32_t code = st(core::to_v4(made.error(), Op::kCreate));
     enc.u32(code);
@@ -2296,7 +2257,8 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
   }
   ctx.cfh = export_fh(*dir->exp, made->obj->id());
   enc.u32(st(Status::kOk));
-  encode_change_info(enc, true, change_of(before), change_of(after));
+  encode_change_info(enc, true, guard.first().change_before(),
+                     guard.first().change_after());
   attrset.encode(enc);
   co_return st(Status::kOk);
 }
@@ -2311,25 +2273,13 @@ rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  if (name->empty()) {
-    enc.u32(st(Status::kInval));
-    co_return st(Status::kInval);
-  }
-  if (!utf8_component(*name)) {
-    enc.u32(st(Status::kInval));
-    co_return st(Status::kInval);
-  }
-  if (!valid_component4(*name)) {
-    enc.u32(st(Status::kBadname));
-    co_return st(Status::kBadname);
-  }
   auto dir = co_await resolve(ctx, ctx.cfh);
   if (!dir) {
     uint32_t code = st(core::to_v4(dir.error(), Op::kRemove));
     enc.u32(code);
     co_return code;
   }
-  if (dir->pseudo() || dir->exp->readonly) {
+  if (dir->pseudo()) {
     enc.u32(st(Status::kRofs));
     co_return st(Status::kRofs);
   }
@@ -2337,11 +2287,18 @@ rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kNotdir));
     co_return st(Status::kNotdir);
   }
-  auto mapped = exports_.squash_cred(ctx.cred, *dir->exp);
-  auto cred = mapped.view();
-  auto lock = locks_.get(dir->exp->fsid, dir->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await dir->obj->getattr();
+  MutateGuard guard(locks_, exports_, *dir->exp, ctx.cred);
+  if (auto verdict = guard.precheck({*name}); !verdict) {
+    uint32_t code = verdict_status4(verdict);
+    enc.u32(code);
+    co_return code;
+  }
+  if (!utf8_component(*name)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  co_await guard.enter({dir->obj, dir->oid});
+  const backend::Cred& cred = guard.cred();
   auto target = co_await dir->obj->lookup(cred, *name);
   if (!target) {
     uint32_t code = st(core::to_v4(target.error(), Op::kRemove));
@@ -2358,14 +2315,15 @@ rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
   Result<void> removed = (*target)->type() == backend::FType::kDir
                              ? co_await dir->obj->rmdir(cred, *name)
                              : co_await dir->obj->unlink(cred, *name);
-  auto after = co_await dir->obj->getattr();
+  co_await guard.finish();
   if (!removed) {
     uint32_t code = st(core::to_v4(removed.error(), Op::kRemove));
     enc.u32(code);
     co_return code;
   }
   enc.u32(st(Status::kOk));
-  encode_change_info(enc, true, change_of(before), change_of(after));
+  encode_change_info(enc, true, guard.first().change_before(),
+                     guard.first().change_after());
   co_return st(Status::kOk);
 }
 
@@ -2383,18 +2341,6 @@ rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
   if (ctx.sfh.empty()) {
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
-  }
-  if (oldname->empty() || newname->empty()) {
-    enc.u32(st(Status::kInval));
-    co_return st(Status::kInval);
-  }
-  if (!utf8_component(*oldname) || !utf8_component(*newname)) {
-    enc.u32(st(Status::kInval));
-    co_return st(Status::kInval);
-  }
-  if (!valid_component4(*oldname) || !valid_component4(*newname)) {
-    enc.u32(st(Status::kBadname));
-    co_return st(Status::kBadname);
   }
   auto from = co_await resolve(ctx, ctx.sfh);
   if (!from) {
@@ -2420,21 +2366,19 @@ rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kXdev));
     co_return st(Status::kXdev);
   }
-  if (from->exp->readonly) {
-    enc.u32(st(Status::kRofs));
-    co_return st(Status::kRofs);
+  MutateGuard guard(locks_, exports_, *from->exp, ctx.cred);
+  if (auto verdict = guard.precheck({*oldname, *newname}); !verdict) {
+    uint32_t code = verdict_status4(verdict);
+    enc.u32(code);
+    co_return code;
   }
-  // Two-directory lock ordering by ObjId (design 04 §4.2).
-  auto lock_a = locks_.get(from->exp->fsid, from->oid);
-  auto lock_b = locks_.get(to->exp->fsid, to->oid);
-  bool same = lock_a.get() == lock_b.get();
-  if (!same && to->oid < from->oid) std::swap(lock_a, lock_b);
-  auto held_a = co_await lock_a->lock();
-  std::optional<decltype(held_a)> held_b;
-  if (!same) held_b.emplace(co_await lock_b->lock());
-
-  auto mapped = exports_.squash_cred(ctx.cred, *from->exp);
-  auto cred = mapped.view();
+  if (!utf8_component(*oldname) || !utf8_component(*newname)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
+  }
+  // Two-directory lock ordering by ObjId happens inside the guard (design 04 §4.2).
+  co_await guard.enter({from->obj, from->oid}, {to->obj, to->oid});
+  const backend::Cred& cred = guard.cred();
   // A rename that replaces an existing target deletes it: recall the target's read
   // delegations first (plan doc 10 §5.2).  The source only changes name; its oid —
   // and therefore its delegations — stay coherent.
@@ -2446,19 +2390,18 @@ rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
       co_return dc;
     }
   }
-  auto before_from = co_await from->obj->getattr();
-  auto before_to = same ? before_from : co_await to->obj->getattr();
   auto renamed = co_await from->obj->rename(cred, *oldname, *to->obj, *newname);
-  auto after_from = co_await from->obj->getattr();
-  auto after_to = same ? after_from : co_await to->obj->getattr();
+  co_await guard.finish();
   if (!renamed) {
     uint32_t code = st(core::to_v4(renamed.error(), Op::kRename));
     enc.u32(code);
     co_return code;
   }
   enc.u32(st(Status::kOk));
-  encode_change_info(enc, true, change_of(before_from), change_of(after_from));
-  encode_change_info(enc, true, change_of(before_to), change_of(after_to));
+  encode_change_info(enc, true, guard.first().change_before(),
+                     guard.first().change_after());
+  encode_change_info(enc, true, guard.second().change_before(),
+                     guard.second().change_after());
   co_return st(Status::kOk);
 }
 
@@ -2471,18 +2414,6 @@ rt::Task<uint32_t> Engine::op_link(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   if (ctx.cfh.empty() || ctx.sfh.empty()) {
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
-  }
-  if (newname->empty()) {
-    enc.u32(st(Status::kInval));
-    co_return st(Status::kInval);
-  }
-  if (!utf8_component(*newname)) {
-    enc.u32(st(Status::kInval));
-    co_return st(Status::kInval);
-  }
-  if (!valid_component4(*newname)) {
-    enc.u32(st(Status::kBadname));
-    co_return st(Status::kBadname);
   }
   auto file = co_await resolve(ctx, ctx.sfh);
   if (!file) {
@@ -2512,34 +2443,33 @@ rt::Task<uint32_t> Engine::op_link(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     enc.u32(st(Status::kXdev));
     co_return st(Status::kXdev);
   }
-  if (dir->exp->readonly) {
-    enc.u32(st(Status::kRofs));
-    co_return st(Status::kRofs);
+  // Mutate-guard order (plan doc 10 §6.1): readonly -> name -> capability gate.
+  MutateGuard guard(locks_, exports_, *dir->exp, ctx.cred);
+  if (auto verdict = guard.precheck({*newname}); !verdict) {
+    uint32_t code = verdict_status4(verdict);
+    enc.u32(code);
+    co_return code;
+  }
+  if (!utf8_component(*newname)) {
+    enc.u32(st(Status::kInval));
+    co_return st(Status::kInval);
   }
   if (!dir->exp->backend->caps().has(backend::Cap::kHardlink)) {
     enc.u32(st(Status::kNotsupp));
     co_return st(Status::kNotsupp);
   }
-  auto lock_a = locks_.get(file->exp->fsid, file->oid);
-  auto lock_b = locks_.get(dir->exp->fsid, dir->oid);
-  bool same = lock_a.get() == lock_b.get();
-  if (!same && dir->oid < file->oid) std::swap(lock_a, lock_b);
-  auto held_a = co_await lock_a->lock();
-  std::optional<decltype(held_a)> held_b;
-  if (!same) held_b.emplace(co_await lock_b->lock());
-
-  auto mapped = exports_.squash_cred(ctx.cred, *dir->exp);
-  auto cred = mapped.view();
-  auto before = co_await dir->obj->getattr();
-  auto linked = co_await dir->obj->link(cred, *file->obj, *newname);
-  auto after = co_await dir->obj->getattr();
+  // The new link's directory carries the change_info; the file is locked unsampled.
+  co_await guard.enter({dir->obj, dir->oid}, {file->obj, file->oid, /*sample=*/false});
+  auto linked = co_await dir->obj->link(guard.cred(), *file->obj, *newname);
+  co_await guard.finish();
   if (!linked) {
     uint32_t code = st(core::to_v4(linked.error(), Op::kLink));
     enc.u32(code);
     co_return code;
   }
   enc.u32(st(Status::kOk));
-  encode_change_info(enc, true, change_of(before), change_of(after));
+  encode_change_info(enc, true, guard.first().change_before(),
+                     guard.first().change_after());
   co_return st(Status::kOk);
 }
 
@@ -2833,7 +2763,7 @@ rt::Task<uint32_t> Engine::op_secinfo(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     enc.u32(st(Status::kInval));
     co_return st(Status::kInval);
   }
-  if (!valid_component4(*name)) {
+  if (!core::valid_component(*name)) {
     enc.u32(st(Status::kBadname));
     co_return st(Status::kBadname);
   }
@@ -2986,15 +2916,14 @@ rt::Task<uint32_t> Engine::op_allocate(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& 
     enc.u32(check.status);
     co_return check.status;
   }
-  if (resolved->exp->readonly) {
-    enc.u32(st(Status::kRofs));
-    co_return st(Status::kRofs);
+  MutateGuard guard(locks_, exports_, *resolved->exp, ctx.cred);
+  if (auto verdict = guard.precheck({}); !verdict) {
+    uint32_t code = verdict_status4(verdict);
+    enc.u32(code);
+    co_return code;
   }
-  auto mapped = exports_.squash_cred(ctx.cred, *resolved->exp);
-  auto cred = mapped.view();
-  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-  auto held = co_await lock->lock();
-  backend::OpenCtx open{cred, check.bopen.get()};
+  co_await guard.enter({resolved->obj, resolved->oid, /*sample=*/false});
+  backend::OpenCtx open{guard.cred(), check.bopen.get()};
   auto done = deallocate ? co_await resolved->obj->deallocate(open, *offset, *length)
                          : co_await resolved->obj->allocate(open, *offset, *length);
   if (!done) {
@@ -3201,21 +3130,17 @@ rt::Task<uint32_t> Engine::op_clone(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     enc.u32(dcheck.status);
     co_return dcheck.status;
   }
-  if (dst->exp->readonly) {
-    enc.u32(st(Status::kRofs));
-    co_return st(Status::kRofs);
+  MutateGuard guard(locks_, exports_, *dst->exp, ctx.cred);
+  if (auto verdict = guard.precheck({}); !verdict) {
+    uint32_t code = verdict_status4(verdict);
+    enc.u32(code);
+    co_return code;
   }
-  auto mapped = exports_.squash_cred(ctx.cred, *dst->exp);
-  auto cred = mapped.view();
-  bool same = src->oid == dst->oid;
-  auto first = locks_.get(dst->exp->fsid, same || src->oid < dst->oid ? src->oid : dst->oid);
-  auto second = same ? nullptr
-                     : locks_.get(dst->exp->fsid, src->oid < dst->oid ? dst->oid : src->oid);
-  auto held1 = co_await first->lock();
-  std::optional<decltype(held1)> held2;
-  if (second) held2.emplace(co_await second->lock());
-  backend::OpenCtx sopen{cred, scheck.bopen.get()};
-  backend::OpenCtx dopen{cred, dcheck.bopen.get()};
+  // Same ObjId-ordered two-object locking as RENAME/LINK, via the guard.
+  co_await guard.enter({src->obj, src->oid, /*sample=*/false},
+                       {dst->obj, dst->oid, /*sample=*/false});
+  backend::OpenCtx sopen{guard.cred(), scheck.bopen.get()};
+  backend::OpenCtx dopen{guard.cred(), dcheck.bopen.get()};
   uint64_t length = *count;
   if (length == 0) {  // cl_count 0: through the source EOF (RFC 7862 §15.13.3)
     auto attr = co_await src->obj->getattr();

@@ -1412,9 +1412,9 @@ rt::Task<uint32_t> StateMgr::open_downgrade(const Stateid& sid, uint64_t clienti
 }
 
 rt::Task<uint32_t> StateMgr::free_stateid(const Stateid& sid) {
-  // FREE_STATEID applies to lock/delegation/layout stateids; an open stateid still in
-  // use answers LOCKS_HELD-equivalent BAD_STATEID.  Phase 4 has only open stateids, so
-  // this only validates (phase 5 adds lock stateids).
+  // FREE_STATEID (RFC 8881 §18.38): only a lock stateid whose ranges are all released
+  // may be freed; open and delegation stateids answer LOCKS_HELD (they are released by
+  // CLOSE / DELEGRETURN instead).
   if (sid.is_special()) co_return as_u32(Status::kBadStateid);
   if (epoch_of(sid.other) != static_cast<uint32_t>(cfg_.boot_epoch))
     co_return as_u32(Status::kStaleStateid);

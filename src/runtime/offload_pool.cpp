@@ -125,16 +125,6 @@ void OffloadPool::worker(Group& g, size_t idx) {
   }
 }
 
-size_t OffloadPool::queue_depth() {
-  size_t n = 0;
-  for (auto& g : groups_) {
-    n += g.depth.load(std::memory_order_relaxed);
-    std::lock_guard lk(g.overflow_mu);
-    n += g.overflow.size();
-  }
-  return n;
-}
-
 OffloadPool::Stats OffloadPool::stats() const {
   Stats out;
   for (int c = 0; c < kOffloadClasses; ++c) {
@@ -143,6 +133,8 @@ OffloadPool::Stats OffloadPool::stats() const {
     out.completed[c] = g.completed.load(std::memory_order_relaxed);
     out.deferred[c] = g.deferred.load(std::memory_order_relaxed);
     out.depth[c] = g.depth.load(std::memory_order_relaxed);
+    std::lock_guard lk(g.overflow_mu);
+    out.depth[c] += g.overflow.size();
   }
   return out;
 }
