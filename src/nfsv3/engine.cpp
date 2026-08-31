@@ -2,30 +2,31 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
-#include <chrono>
-
 #include "core/errmap.hpp"
+#include "core/fs_props.hpp"
+#include "core/mutate.hpp"
+#include "core/names.hpp"
 #include "core/readdir.hpp"
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
-#include "util/log.hpp"
 #include "transport/connection.hpp"
+#include "util/log.hpp"
 
 namespace lnfs::nfsv3 {
 namespace {
 
 using rpc::RpcCall;
 using transport::ConnCtx;
+using core::MutateGuard;
 
-rt::Task<void> send(ConnCtx& ctx, xdr::XdrEnc& enc) { co_await ctx.send(enc.take()); }
-
-// Send + optionally capture the reply bytes for the DRC (design 03 §3.7).
-rt::Task<void> send_captured(ConnCtx& ctx, xdr::XdrEnc& enc,
-                             std::vector<std::byte>* cap) {
+// Send + optionally capture the reply bytes for the DRC (design 03 §3.7).  `cap` is
+// null for procedures the DRC does not cache.
+rt::Task<void> reply(ConnCtx& ctx, xdr::XdrEnc& enc, std::vector<std::byte>* cap) {
   auto buf = enc.take();
   if (cap) *cap = buf.to_bytes();
   co_await ctx.send(std::move(buf));
@@ -69,16 +70,6 @@ struct ProcTimer {
   std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 };
 
-bool valid_component(std::string_view name) {  // LOOKUP may name "." / ".."
-  return !name.empty() && name.size() <= kMaxName &&
-         name.find('/') == std::string_view::npos &&
-         name.find('\0') == std::string_view::npos;
-}
-
-bool valid_new_name(std::string_view name) {  // creation family must not
-  return valid_component(name) && name != "." && name != "..";
-}
-
 // The nine non-idempotent procedures cached by the DRC (design 03 §3.7).
 bool drc_cached(Proc proc) {
   switch (proc) {
@@ -100,6 +91,41 @@ size_t dir_entry_size(std::string_view name) { return 24 + aligned4(name.size())
 
 std::optional<backend::Attr> attr_value(const Result<backend::Attr>& result) {
   return result ? std::optional<backend::Attr>(*result) : std::nullopt;
+}
+
+backend::Stability stability_from_wire(uint32_t stable) {
+  switch (stable) {
+    case kUnstable: return backend::Stability::kUnstable;
+    case kDataSync: return backend::Stability::kDataSync;
+    default: return backend::Stability::kFileSync;
+  }
+}
+
+// ---- WCC encoding from core::ChangeSample --------------------------------------
+// wcc_data = pre-op sample (size/mtime/ctime) + post-op attributes; both come from the
+// guard's samples.  A precheck failure (ROFS / bad name / unsupported) changed nothing,
+// so its reply carries one sample as both before and after.
+
+void encode_wcc_sample(xdr::XdrEnc& enc, const core::ChangeSample& sample,
+                       uint64_t fsid) {
+  encode_wcc(enc, wcc_pre(sample.before), sample.after, fsid);
+}
+
+void encode_wcc_unchanged(xdr::XdrEnc& enc, const std::optional<backend::Attr>& attr,
+                          uint64_t fsid) {
+  encode_wcc(enc, wcc_pre(attr), attr, fsid);
+}
+
+void encode_wcc_none(xdr::XdrEnc& enc) { encode_wcc(enc, std::nullopt, std::nullopt, 0); }
+
+// v3 has one answer for every name-discipline failure on a creation-family call:
+// ACCES.  RMDIR distinguishes "." (INVAL) and ".." (EXIST) per RFC 1813 §3.3.13.
+Status verdict_status(const MutateGuard::Verdict& verdict) {
+  switch (verdict.kind) {
+    case MutateGuard::Verdict::kReadonly: return Status::kRofs;
+    case MutateGuard::Verdict::kBadName: return Status::kAcces;
+    default: return Status::kOk;
+  }
 }
 
 }  // namespace
@@ -125,14 +151,14 @@ rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rp
   if (call.proc > static_cast<uint32_t>(Proc::kCommit)) {
     xdr::XdrEnc enc(ctx.pool);
     rpc::encode_reply_accepted_err(enc, call.xid, rpc::kProcUnavail);
-    co_await send(ctx, enc);
+    co_await reply(ctx, enc, nullptr);
     co_return;
   }
   Proc proc = static_cast<Proc>(call.proc);
   if (proc == Proc::kNull) {
     xdr::XdrEnc enc(ctx.pool);
     rpc::encode_reply_success(enc, call.xid);
-    co_await send(ctx, enc);
+    co_await reply(ctx, enc, nullptr);
     co_return;
   }
 
@@ -165,297 +191,321 @@ rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rp
 
 rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
                                      Capture* cap) {
-  Proc proc = static_cast<Proc>(call.proc);
+  // Indexed by Proc; NULL and out-of-range procedures never reach here (dispatch).
+  static constexpr Handler kHandlers[] = {
+      nullptr,                 // 0  NULL
+      &Engine::proc_getattr,   // 1
+      &Engine::proc_setattr,   // 2
+      &Engine::proc_lookup,    // 3
+      &Engine::proc_access,    // 4
+      &Engine::proc_readlink,  // 5
+      &Engine::proc_read,      // 6
+      &Engine::proc_write,     // 7
+      &Engine::proc_create,    // 8
+      &Engine::proc_mkdir,     // 9
+      &Engine::proc_symlink,   // 10
+      &Engine::proc_mknod,     // 11
+      &Engine::proc_remove,    // 12
+      &Engine::proc_rmdir,     // 13
+      &Engine::proc_rename,    // 14
+      &Engine::proc_link,      // 15
+      &Engine::proc_readdir,   // 16 READDIR
+      &Engine::proc_readdir,   // 17 READDIRPLUS
+      &Engine::proc_fs_query,  // 18 FSSTAT
+      &Engine::proc_fs_query,  // 19 FSINFO
+      &Engine::proc_fs_query,  // 20 PATHCONF
+      &Engine::proc_commit,    // 21
+  };
+  static_assert(std::size(kHandlers) == static_cast<size_t>(Proc::kCommit) + 1);
+  return (this->*kHandlers[call.proc])(ctx, call, rpc_cred, cap);
+}
 
-  if (proc == Proc::kSetattr) co_return co_await proc_setattr(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kWrite) co_return co_await proc_write(ctx, call, rpc_cred);
-  if (proc == Proc::kCreate) co_return co_await proc_create(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kMkdir) co_return co_await proc_mkdir(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kSymlink) co_return co_await proc_symlink(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kMknod) co_return co_await proc_mknod(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kRemove) co_return co_await proc_remove(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kRmdir) co_return co_await proc_rmdir(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kRename) co_return co_await proc_rename(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kLink) co_return co_await proc_link(ctx, call, rpc_cred, cap);
-  if (proc == Proc::kCommit) co_return co_await proc_commit(ctx, call, rpc_cred);
+// ---- read-only procedures ----------------------------------------------------------
 
-  if (proc == Proc::kGetattr) {
-    auto args = FileHandle::decode(call.args);
-    if (!args || !call.args.at_end()) {
-      co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
-      co_return;
-    }
-    auto resolved = co_await resolve(*args, ctx.peer.addr);
-    xdr::XdrEnc enc(ctx.pool);
-    if (!resolved) {
-      begin_result(enc, ctx, call, core::to_v3(resolved.error(), proc));
-    } else {
-      auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-      auto held = co_await lock->lock_shared();
-      auto attr = co_await resolved->obj->getattr();
-      if (!attr) begin_result(enc, ctx, call, core::to_v3(attr.error(), proc));
-      else {
-        begin_result(enc, ctx, call, Status::kOk);
-        encode_fattr(enc, *attr, resolved->exp->fsid);
-      }
-    }
-    co_await send(ctx, enc);
+rt::Task<void> Engine::proc_getattr(ConnCtx& ctx, RpcCall& call, const rpc::Cred&,
+                                    Capture* cap) {
+  auto args = FileHandle::decode(call.args);
+  if (!args || !call.args.at_end()) {
+    co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
     co_return;
   }
-
-  if (proc == Proc::kLookup) {
-    auto args = Diropargs::decode(call.args);
-    if (!args || !call.args.at_end() || !valid_component(args->name)) {
-      co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
-      co_return;
-    }
-    auto dir = co_await resolve(args->dir, ctx.peer.addr);
-    xdr::XdrEnc enc(ctx.pool);
-    if (!dir) {
-      begin_result(enc, ctx, call, core::to_v3(dir.error(), proc));
-      encode_post_attr(enc, std::nullopt, 0);
-      co_await send(ctx, enc);
-      co_return;
-    }
-    auto mapped = exports_.squash_cred(rpc_cred, *dir->exp);
-    auto cred = mapped.view();
-    auto lock = locks_.get(dir->exp->fsid, dir->oid);
-    auto held = co_await lock->lock_shared();
-    auto found = co_await dir->obj->lookup(cred, args->name);
-    auto dir_attr = co_await dir->obj->getattr();
-    if (!found) {
-      begin_result(enc, ctx, call, core::to_v3(found.error(), proc));
-      encode_post_attr(enc, attr_value(dir_attr), dir->exp->fsid);
-    } else {
-      auto obj_attr = co_await (*found)->getattr();
-      FileHandle wire{handles_.encode(*dir->exp, (*found)->id())};
-      begin_result(enc, ctx, call, Status::kOk);
-      wire.encode(enc);
-      encode_post_attr(enc, attr_value(obj_attr), dir->exp->fsid);
-      encode_post_attr(enc, attr_value(dir_attr), dir->exp->fsid);
-    }
-    co_await send(ctx, enc);
-    co_return;
-  }
-
-  if (proc == Proc::kAccess) {
-    auto args = AccessArgs::decode(call.args);
-    if (!args || !call.args.at_end()) {
-      co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
-      co_return;
-    }
-    auto resolved = co_await resolve(args->object, ctx.peer.addr);
-    xdr::XdrEnc enc(ctx.pool);
-    if (!resolved) {
-      begin_result(enc, ctx, call, core::to_v3(resolved.error(), proc));
-      encode_post_attr(enc, std::nullopt, 0);
-    } else {
-      auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
-      auto cred = mapped.view();
-      auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-      auto held = co_await lock->lock_shared();
-      auto allowed = co_await resolved->obj->access(cred, access_from_wire(args->access));
-      auto attr = co_await resolved->obj->getattr();
-      if (!allowed) {
-        begin_result(enc, ctx, call, core::to_v3(allowed.error(), proc));
-        encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-      } else {
-        if (resolved->exp->readonly)
-          allowed->clear(backend::Access::kModify)
-              .clear(backend::Access::kExtend)
-              .clear(backend::Access::kDelete);
-        begin_result(enc, ctx, call, Status::kOk);
-        encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-        enc.u32(access_to_wire(*allowed));
-      }
-    }
-    co_await send(ctx, enc);
-    co_return;
-  }
-
-  if (proc == Proc::kReadlink) {
-    auto args = FileHandle::decode(call.args);
-    if (!args || !call.args.at_end()) {
-      co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
-      co_return;
-    }
-    auto resolved = co_await resolve(*args, ctx.peer.addr);
-    xdr::XdrEnc enc(ctx.pool);
-    if (!resolved) {
-      begin_result(enc, ctx, call, core::to_v3(resolved.error(), proc));
-      encode_post_attr(enc, std::nullopt, 0);
-    } else {
-      auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-      auto held = co_await lock->lock_shared();
-      auto target = co_await resolved->obj->readlink();
-      auto attr = co_await resolved->obj->getattr();
-      if (!target) {
-        begin_result(enc, ctx, call, core::to_v3(target.error(), proc));
-        encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-      } else {
-        begin_result(enc, ctx, call, Status::kOk);
-        encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-        enc.string(*target);
-      }
-    }
-    co_await send(ctx, enc);
-    co_return;
-  }
-
-  if (proc == Proc::kRead) {
-    auto args = ReadArgs::decode(call.args);
-    if (!args || !call.args.at_end()) {
-      co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
-      co_return;
-    }
-    auto resolved = co_await resolve(args->file, ctx.peer.addr);
-    xdr::XdrEnc enc(ctx.pool);
-    if (!resolved) {
-      begin_result(enc, ctx, call, core::to_v3(resolved.error(), proc));
-      encode_post_attr(enc, std::nullopt, 0);
-      co_await send(ctx, enc);
-      co_return;
-    }
-    auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
-    auto cred = mapped.view();
-    uint32_t count = std::min(args->count, resolved->exp->backend->limits().max_read);
-    // Per-export QoS (plan doc 10 §4.3), before the shared object lock.
-    co_await resolved->exp->qos.throttle(false, count);
-    auto data = ctx.pool.alloc(std::max<uint32_t>(count, 1));
-    bool eof = false;
+  auto resolved = co_await resolve(*args, ctx.peer.addr);
+  xdr::XdrEnc enc(ctx.pool);
+  if (!resolved) {
+    begin_result(enc, ctx, call, core::to_v3(resolved.error(), Proc::kGetattr));
+  } else {
     auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
     auto held = co_await lock->lock_shared();
-    backend::OpenCtx open{cred, nullptr};
-    auto read = co_await resolved->obj->read(open, args->offset,
-                                             std::span<std::byte>(data.data(), count), eof);
     auto attr = co_await resolved->obj->getattr();
-    if (!read) {
-      begin_result(enc, ctx, call, core::to_v3(read.error(), proc));
-      encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-    } else {
+    if (!attr) begin_result(enc, ctx, call, core::to_v3(attr.error(), Proc::kGetattr));
+    else {
       begin_result(enc, ctx, call, Status::kOk);
-      encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-      obs::Metrics::instance().read_bytes.fetch_add(*read, std::memory_order_relaxed);
-      resolved->exp->metrics.read_bytes.fetch_add(*read, std::memory_order_relaxed);
-      resolved->exp->metrics.read_ops.fetch_add(1, std::memory_order_relaxed);
-      enc.u32(*read);
-      enc.boolean(eof);
-      enc.u32(*read);
-      enc.attach(std::move(data), 0, *read);
+      encode_fattr(enc, *attr, resolved->exp->fsid);
     }
-    co_await send(ctx, enc);
+  }
+  co_await reply(ctx, enc, cap);
+}
+
+rt::Task<void> Engine::proc_lookup(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
+                                   Capture* cap) {
+  auto args = Diropargs::decode(call.args);
+  // LOOKUP may name "." / ".."; the creation family may not (core/names.hpp).
+  if (!args || !call.args.at_end() || !core::valid_component(args->name, true)) {
+    co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
     co_return;
   }
+  auto dir = co_await resolve(args->dir, ctx.peer.addr);
+  xdr::XdrEnc enc(ctx.pool);
+  if (!dir) {
+    begin_result(enc, ctx, call, core::to_v3(dir.error(), Proc::kLookup));
+    encode_post_attr(enc, std::nullopt, 0);
+    co_await reply(ctx, enc, cap);
+    co_return;
+  }
+  auto mapped = exports_.squash_cred(rpc_cred, *dir->exp);
+  auto cred = mapped.view();
+  auto lock = locks_.get(dir->exp->fsid, dir->oid);
+  auto held = co_await lock->lock_shared();
+  auto found = co_await dir->obj->lookup(cred, args->name);
+  auto dir_attr = co_await dir->obj->getattr();
+  if (!found) {
+    begin_result(enc, ctx, call, core::to_v3(found.error(), Proc::kLookup));
+    encode_post_attr(enc, attr_value(dir_attr), dir->exp->fsid);
+  } else {
+    auto obj_attr = co_await (*found)->getattr();
+    FileHandle wire{handles_.encode(*dir->exp, (*found)->id())};
+    begin_result(enc, ctx, call, Status::kOk);
+    wire.encode(enc);
+    encode_post_attr(enc, attr_value(obj_attr), dir->exp->fsid);
+    encode_post_attr(enc, attr_value(dir_attr), dir->exp->fsid);
+  }
+  co_await reply(ctx, enc, cap);
+}
 
-  if (proc == Proc::kReaddir || proc == Proc::kReaddirplus) {
-    bool plus = proc == Proc::kReaddirplus;
-    FileHandle dir_fh;
-    uint64_t cookie = 0;
-    uint32_t dircount = 0, maxcount = 0;
-    std::array<std::byte, 8> client_verf{};
-    if (plus) {
-      auto args = ReaddirPlusArgs::decode(call.args);
-      if (!args || !call.args.at_end()) {
-        co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
-        co_return;
-      }
-      dir_fh = std::move(args->dir);
-      cookie = args->cookie;
-      client_verf = args->cookieverf;
-      dircount = args->dircount;
-      maxcount = args->maxcount;
-    } else {
-      auto args = ReaddirArgs::decode(call.args);
-      if (!args || !call.args.at_end()) {
-        co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
-        co_return;
-      }
-      dir_fh = std::move(args->dir);
-      cookie = args->cookie;
-      client_verf = args->cookieverf;
-      dircount = maxcount = args->count;
-    }
-    auto resolved = co_await resolve(dir_fh, ctx.peer.addr);
-    xdr::XdrEnc enc(ctx.pool);
-    if (!resolved) {
-      begin_result(enc, ctx, call, core::to_v3(resolved.error(), proc));
-      encode_post_attr(enc, std::nullopt, 0);
-      co_await send(ctx, enc);
-      co_return;
-    }
+rt::Task<void> Engine::proc_access(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
+                                   Capture* cap) {
+  auto args = AccessArgs::decode(call.args);
+  if (!args || !call.args.at_end()) {
+    co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
+    co_return;
+  }
+  auto resolved = co_await resolve(args->object, ctx.peer.addr);
+  xdr::XdrEnc enc(ctx.pool);
+  if (!resolved) {
+    begin_result(enc, ctx, call, core::to_v3(resolved.error(), Proc::kAccess));
+    encode_post_attr(enc, std::nullopt, 0);
+  } else {
     auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
     auto cred = mapped.view();
     auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
     auto held = co_await lock->lock_shared();
+    auto allowed = co_await resolved->obj->access(cred, access_from_wire(args->access));
     auto attr = co_await resolved->obj->getattr();
-    // Semantic cookie verifier (plan doc 10 §5.1): the directory change attribute.
-    // A directory modified between pages makes the verifier mismatch; BAD_COOKIE
-    // sends the client back to cookie 0 for a consistent restart instead of a
-    // silently duplicated/holey listing.
-    std::array<std::byte, 8> dir_verf{};
-    uint64_t dir_change = attr ? attr->change : 0;
-    std::memcpy(dir_verf.data(), &dir_change, sizeof(dir_change));
-    if (cookie != 0 && client_verf != dir_verf) {
-      begin_result(enc, ctx, call, Status::kBadCookie);
+    if (!allowed) {
+      begin_result(enc, ctx, call, core::to_v3(allowed.error(), Proc::kAccess));
       encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-      co_await send(ctx, enc);
-      co_return;
-    }
-    constexpr size_t kFixedReply = 24 + 4 + 88 + 8 + 8;
-    if (maxcount < kFixedReply || dircount < 24) {
-      begin_result(enc, ctx, call, Status::kToosmall);
+    } else {
+      if (resolved->exp->readonly)
+        allowed->clear(backend::Access::kModify)
+            .clear(backend::Access::kExtend)
+            .clear(backend::Access::kDelete);
+      begin_result(enc, ctx, call, Status::kOk);
       encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-      co_await send(ctx, enc);
-      co_return;
+      enc.u32(access_to_wire(*allowed));
     }
-    uint32_t max_entries = std::min<uint32_t>(4096, std::max<uint32_t>(1, dircount / 24));
-    auto page = co_await core::readdir_page(resolved->obj, cred, cookie, max_entries);
-    if (!page) {
-      Status status = cookie != 0 && page.error() == errno_from(EINVAL)
-                          ? Status::kBadCookie
-                          : core::to_v3(page.error(), proc);
-      begin_result(enc, ctx, call, status);
+  }
+  co_await reply(ctx, enc, cap);
+}
+
+rt::Task<void> Engine::proc_readlink(ConnCtx& ctx, RpcCall& call, const rpc::Cred&,
+                                     Capture* cap) {
+  auto args = FileHandle::decode(call.args);
+  if (!args || !call.args.at_end()) {
+    co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
+    co_return;
+  }
+  auto resolved = co_await resolve(*args, ctx.peer.addr);
+  xdr::XdrEnc enc(ctx.pool);
+  if (!resolved) {
+    begin_result(enc, ctx, call, core::to_v3(resolved.error(), Proc::kReadlink));
+    encode_post_attr(enc, std::nullopt, 0);
+  } else {
+    auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+    auto held = co_await lock->lock_shared();
+    auto target = co_await resolved->obj->readlink();
+    auto attr = co_await resolved->obj->getattr();
+    if (!target) {
+      begin_result(enc, ctx, call, core::to_v3(target.error(), Proc::kReadlink));
       encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-      co_await send(ctx, enc);
-      co_return;
+    } else {
+      begin_result(enc, ctx, call, Status::kOk);
+      encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
+      enc.string(*target);
     }
+  }
+  co_await reply(ctx, enc, cap);
+}
+
+rt::Task<void> Engine::proc_read(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
+                                 Capture* cap) {
+  auto args = ReadArgs::decode(call.args);
+  if (!args || !call.args.at_end()) {
+    co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
+    co_return;
+  }
+  auto resolved = co_await resolve(args->file, ctx.peer.addr);
+  xdr::XdrEnc enc(ctx.pool);
+  if (!resolved) {
+    begin_result(enc, ctx, call, core::to_v3(resolved.error(), Proc::kRead));
+    encode_post_attr(enc, std::nullopt, 0);
+    co_await reply(ctx, enc, cap);
+    co_return;
+  }
+  auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
+  auto cred = mapped.view();
+  uint32_t count = std::min(args->count, resolved->exp->backend->limits().max_read);
+  // Per-export QoS (plan doc 10 §4.3), before the shared object lock.
+  co_await resolved->exp->qos.throttle(false, count);
+  auto data = ctx.pool.alloc(std::max<uint32_t>(count, 1));
+  bool eof = false;
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock_shared();
+  backend::OpenCtx open{cred, nullptr};
+  auto read = co_await resolved->obj->read(open, args->offset,
+                                           std::span<std::byte>(data.data(), count), eof);
+  auto attr = co_await resolved->obj->getattr();
+  if (!read) {
+    begin_result(enc, ctx, call, core::to_v3(read.error(), Proc::kRead));
+    encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
+  } else {
     begin_result(enc, ctx, call, Status::kOk);
     encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-    enc.opaque_fixed(dir_verf);
-    size_t used_total = kFixedReply;
-    size_t used_dir = 0;
-    bool truncated = false;
-    for (const auto& ent : page->ents) {
-      size_t skeleton = dir_entry_size(ent.name);
-      std::optional<FileHandle> item_fh;
-      if (plus && ent.oid) item_fh = FileHandle{handles_.encode(*resolved->exp, *ent.oid)};
-      size_t extra = 0;
-      if (plus) {
-        extra += ent.attr ? 88 : 4;
-        extra += item_fh ? 8 + aligned4(item_fh->data.size()) : 4;
-      }
-      if (used_dir + skeleton > dircount || used_total + skeleton + extra > maxcount) {
-        truncated = true;
-        break;
-      }
-      enc.boolean(true);
-      enc.u64(ent.fileid);
-      enc.string(ent.name);
-      enc.u64(ent.cookie);
-      if (plus) {
-        encode_post_attr(enc, ent.attr, resolved->exp->fsid);
-        encode_post_fh(enc, item_fh);
-      }
-      used_dir += skeleton;
-      used_total += skeleton + extra;
+    obs::Metrics::instance().read_bytes.fetch_add(*read, std::memory_order_relaxed);
+    resolved->exp->metrics.read_bytes.fetch_add(*read, std::memory_order_relaxed);
+    resolved->exp->metrics.read_ops.fetch_add(1, std::memory_order_relaxed);
+    enc.u32(*read);
+    enc.boolean(eof);
+    enc.u32(*read);
+    enc.attach(std::move(data), 0, *read);
+  }
+  co_await reply(ctx, enc, cap);
+}
+
+// READDIR and READDIRPLUS share one body; `plus` selects the per-entry fh/attr tail.
+rt::Task<void> Engine::proc_readdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
+                                    Capture* cap) {
+  Proc proc = static_cast<Proc>(call.proc);
+  bool plus = proc == Proc::kReaddirplus;
+  FileHandle dir_fh;
+  uint64_t cookie = 0;
+  uint32_t dircount = 0, maxcount = 0;
+  std::array<std::byte, 8> client_verf{};
+  if (plus) {
+    auto args = ReaddirPlusArgs::decode(call.args);
+    if (!args || !call.args.at_end()) {
+      co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
+      co_return;
     }
-    enc.boolean(false);
-    enc.boolean(page->eof && !truncated);
-    co_await send(ctx, enc);
+    dir_fh = std::move(args->dir);
+    cookie = args->cookie;
+    client_verf = args->cookieverf;
+    dircount = args->dircount;
+    maxcount = args->maxcount;
+  } else {
+    auto args = ReaddirArgs::decode(call.args);
+    if (!args || !call.args.at_end()) {
+      co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
+      co_return;
+    }
+    dir_fh = std::move(args->dir);
+    cookie = args->cookie;
+    client_verf = args->cookieverf;
+    dircount = maxcount = args->count;
+  }
+  auto resolved = co_await resolve(dir_fh, ctx.peer.addr);
+  xdr::XdrEnc enc(ctx.pool);
+  if (!resolved) {
+    begin_result(enc, ctx, call, core::to_v3(resolved.error(), proc));
+    encode_post_attr(enc, std::nullopt, 0);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
+  auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
+  auto cred = mapped.view();
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock_shared();
+  auto attr = co_await resolved->obj->getattr();
+  // Semantic cookie verifier (plan doc 10 §5.1): the directory change attribute.
+  // A directory modified between pages makes the verifier mismatch; BAD_COOKIE
+  // sends the client back to cookie 0 for a consistent restart instead of a
+  // silently duplicated/holey listing.
+  std::array<std::byte, 8> dir_verf{};
+  uint64_t dir_change = attr ? attr->change : 0;
+  std::memcpy(dir_verf.data(), &dir_change, sizeof(dir_change));
+  if (cookie != 0 && client_verf != dir_verf) {
+    begin_result(enc, ctx, call, Status::kBadCookie);
+    encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
+    co_await reply(ctx, enc, cap);
+    co_return;
+  }
+  constexpr size_t kFixedReply = 24 + 4 + 88 + 8 + 8;
+  if (maxcount < kFixedReply || dircount < 24) {
+    begin_result(enc, ctx, call, Status::kToosmall);
+    encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
+    co_await reply(ctx, enc, cap);
+    co_return;
+  }
+  uint32_t max_entries = std::min<uint32_t>(4096, std::max<uint32_t>(1, dircount / 24));
+  auto page = co_await core::readdir_page(resolved->obj, cred, cookie, max_entries);
+  if (!page) {
+    Status status = cookie != 0 && page.error() == errno_from(EINVAL)
+                        ? Status::kBadCookie
+                        : core::to_v3(page.error(), proc);
+    begin_result(enc, ctx, call, status);
+    encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
+    co_await reply(ctx, enc, cap);
+    co_return;
+  }
+  begin_result(enc, ctx, call, Status::kOk);
+  encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
+  enc.opaque_fixed(dir_verf);
+  size_t used_total = kFixedReply;
+  size_t used_dir = 0;
+  bool truncated = false;
+  for (const auto& ent : page->ents) {
+    size_t skeleton = dir_entry_size(ent.name);
+    std::optional<FileHandle> item_fh;
+    if (plus && ent.oid) item_fh = FileHandle{handles_.encode(*resolved->exp, *ent.oid)};
+    size_t extra = 0;
+    if (plus) {
+      extra += ent.attr ? 88 : 4;
+      extra += item_fh ? 8 + aligned4(item_fh->data.size()) : 4;
+    }
+    if (used_dir + skeleton > dircount || used_total + skeleton + extra > maxcount) {
+      truncated = true;
+      break;
+    }
+    enc.boolean(true);
+    enc.u64(ent.fileid);
+    enc.string(ent.name);
+    enc.u64(ent.cookie);
+    if (plus) {
+      encode_post_attr(enc, ent.attr, resolved->exp->fsid);
+      encode_post_fh(enc, item_fh);
+    }
+    used_dir += skeleton;
+    used_total += skeleton + extra;
+  }
+  enc.boolean(false);
+  enc.boolean(page->eof && !truncated);
+  co_await reply(ctx, enc, cap);
+}
 
-  // FSSTAT / FSINFO / PATHCONF all take one file handle and return post-op attributes.
+// FSSTAT / FSINFO / PATHCONF all take one file handle and return post-op attributes;
+// FSINFO/PATHCONF read the shared core::FsProps derivation (plan doc 10 §6.4).
+rt::Task<void> Engine::proc_fs_query(ConnCtx& ctx, RpcCall& call, const rpc::Cred&,
+                                     Capture* cap) {
+  Proc proc = static_cast<Proc>(call.proc);
   auto args = FileHandle::decode(call.args);
   if (!args || !call.args.at_end()) {
     co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
@@ -466,7 +516,7 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
   if (!resolved) {
     begin_result(enc, ctx, call, core::to_v3(resolved.error(), proc));
     encode_post_attr(enc, std::nullopt, 0);
-    co_await send(ctx, enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
   auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
@@ -489,62 +539,80 @@ rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cre
       enc.u32(0);
     }
   } else if (proc == Proc::kFsinfo) {
-    auto limits = resolved->exp->backend->limits();
-    auto caps = resolved->exp->backend->caps();
+    core::FsProps fs = core::fs_props(*resolved->exp->backend);
     begin_result(enc, ctx, call, Status::kOk);
     encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-    enc.u32(limits.max_read);
-    enc.u32(std::min(limits.pref_read, limits.max_read));
+    enc.u32(fs.limits.max_read);
+    enc.u32(fs.limits.pref_read);
     enc.u32(4096);
     // A read-only export still advertises legal transfer geometry.  Linux clients consume
     // these values while mounting and expect non-zero multiples; mutations are rejected by
     // ACCESS/procedure policy, not by malformed FSINFO limits.
-    enc.u32(limits.max_write);
-    enc.u32(std::min(limits.pref_write, limits.max_write));
+    enc.u32(fs.limits.max_write);
+    enc.u32(fs.limits.pref_write);
     enc.u32(4096);
-    enc.u32(limits.pref_readdir);
-    enc.u64(limits.max_filesize);
-    encode_time(enc, limits.time_delta);
-    uint32_t props = kFsfHomogeneous;
-    if (caps.has(backend::Cap::kHardlink)) props |= kFsfLink;
-    if (caps.has(backend::Cap::kSymlink)) props |= kFsfSymlink;
+    enc.u32(fs.limits.pref_readdir);
+    enc.u64(fs.limits.max_filesize);
+    encode_time(enc, fs.limits.time_delta);
+    uint32_t props = fs.kHomogeneous ? kFsfHomogeneous : 0;
+    if (fs.link_support) props |= kFsfLink;
+    if (fs.symlink_support) props |= kFsfSymlink;
     enc.u32(props);
   } else {
-    auto limits = resolved->exp->backend->limits();
-    auto caps = resolved->exp->backend->caps();
+    core::FsProps fs = core::fs_props(*resolved->exp->backend);
     begin_result(enc, ctx, call, Status::kOk);
     encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
-    enc.u32(limits.max_link);
-    enc.u32(limits.max_name);
-    enc.boolean(true);
-    enc.boolean(true);
-    enc.boolean(caps.has(backend::Cap::kCaseInsensitive));
-    enc.boolean(true);
+    enc.u32(fs.limits.max_link);
+    enc.u32(fs.limits.max_name);
+    enc.boolean(fs.kNoTrunc);
+    enc.boolean(fs.kChownRestricted);
+    enc.boolean(fs.case_insensitive);
+    enc.boolean(fs.kCasePreserving);
   }
-  co_await send(ctx, enc);
+  co_await reply(ctx, enc, cap);
 }
 
-// ---- phase-2 write procedures ---------------------------------------------
-// Shared shape (core mutate template, design 04 §4.2): resolve -> ROFS precheck ->
-// exclusive object lock -> sample before -> backend op -> sample after.  Failure paths
-// sample `after` too so every branch carries usable WCC data.
-
-namespace {
-
-rt::Task<std::optional<backend::Attr>> sample(const backend::ObjPtr& obj) {
-  auto attr = co_await obj->getattr();
-  co_return attr ? std::optional<backend::Attr>(*attr) : std::nullopt;
-}
-
-backend::Stability stability_from_wire(uint32_t stable) {
-  switch (stable) {
-    case kUnstable: return backend::Stability::kUnstable;
-    case kDataSync: return backend::Stability::kDataSync;
-    default: return backend::Stability::kFileSync;
+rt::Task<void> Engine::proc_commit(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
+                                   Capture* cap) {
+  auto args = CommitArgs::decode(call.args);
+  if (!args || !call.args.at_end()) {
+    co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
+    co_return;
   }
+  auto resolved = co_await resolve(args->file, ctx.peer.addr);
+  xdr::XdrEnc enc(ctx.pool);
+  if (!resolved) {
+    begin_result(enc, ctx, call, core::to_v3(resolved.error(), Proc::kCommit));
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
+    co_return;
+  }
+  // Flushing does not mutate: shared lock, but the reply still carries wcc_data.
+  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
+  auto held = co_await lock->lock_shared();
+  core::ChangeSample sample;
+  sample.before = co_await core::sample_attr(resolved->obj);
+  auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
+  auto cred = mapped.view();
+  backend::OpenCtx open{cred, nullptr};
+  auto committed = co_await resolved->obj->commit(open, args->offset, args->count);
+  sample.after = co_await core::sample_attr(resolved->obj);
+  if (!committed) {
+    begin_result(enc, ctx, call, core::to_v3(committed.error(), Proc::kCommit));
+    encode_wcc_sample(enc, sample, resolved->exp->fsid);
+  } else {
+    begin_result(enc, ctx, call, Status::kOk);
+    encode_wcc_sample(enc, sample, resolved->exp->fsid);
+    enc.opaque_fixed(verf_);
+  }
+  co_await reply(ctx, enc, cap);
 }
 
-}  // namespace
+// ---- mutating procedures -----------------------------------------------------------
+// Every handler follows the core::MutateGuard sequence (plan doc 10 §6.1): resolve ->
+// precheck (readonly, names) -> guard.enter (squash, exclusive lock, before sample) ->
+// backend op -> guard.finish (after sample).  Failure paths after the lock still carry
+// usable WCC data; precheck failures reply with one unlocked sample.
 
 rt::Task<void> Engine::proc_setattr(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
                                     Capture* cap) {
@@ -557,42 +625,42 @@ rt::Task<void> Engine::proc_setattr(ConnCtx& ctx, RpcCall& call, const rpc::Cred
   xdr::XdrEnc enc(ctx.pool);
   if (!resolved) {
     begin_result(enc, ctx, call, core::to_v3(resolved.error(), Proc::kSetattr));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await sample(resolved->obj);
-  if (resolved->exp->readonly) {
-    begin_result(enc, ctx, call, Status::kRofs);
-    encode_wcc(enc, wcc_pre(before), before, resolved->exp->fsid);
-    co_await send_captured(ctx, enc, cap);
+  MutateGuard guard(locks_, exports_, *resolved->exp, rpc_cred);
+  if (auto verdict = guard.precheck({}); !verdict) {
+    auto attr = co_await core::sample_attr(resolved->obj);
+    begin_result(enc, ctx, call, verdict_status(verdict));
+    encode_wcc_unchanged(enc, attr, resolved->exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
+  co_await guard.enter({resolved->obj, resolved->oid});
+  const auto& before = guard.first().before;
   if (args->guard && before &&
       (before->ctime.sec != args->guard_ctime.sec ||
        before->ctime.nsec != args->guard_ctime.nsec)) {
     begin_result(enc, ctx, call, Status::kNotSync);
-    encode_wcc(enc, wcc_pre(before), before, resolved->exp->fsid);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_unchanged(enc, before, resolved->exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
-  auto cred = mapped.view();
-  auto result = co_await resolved->obj->setattr(cred, args->attrs);
+  auto result = co_await resolved->obj->setattr(guard.cred(), args->attrs);
   if (!result) {
-    auto after = co_await sample(resolved->obj);
+    co_await guard.finish();
     begin_result(enc, ctx, call, core::to_v3(result.error(), Proc::kSetattr));
-    encode_wcc(enc, wcc_pre(before), after, resolved->exp->fsid);
-  } else {
+    encode_wcc_sample(enc, guard.first(), resolved->exp->fsid);
+  } else {  // setattr returns the post-op attributes: no second sample needed
     begin_result(enc, ctx, call, Status::kOk);
     encode_wcc(enc, wcc_pre(before), *result, resolved->exp->fsid);
   }
-  co_await send_captured(ctx, enc, cap);
+  co_await reply(ctx, enc, cap);
 }
 
-rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred) {
+rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
+                                  Capture* cap) {
   auto args = WriteArgs::decode(call.args);
   if (!args || !call.args.at_end()) {
     co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
@@ -602,8 +670,16 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
   xdr::XdrEnc enc(ctx.pool);
   if (!resolved) {
     begin_result(enc, ctx, call, core::to_v3(resolved.error(), Proc::kWrite));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send(ctx, enc);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
+    co_return;
+  }
+  MutateGuard guard(locks_, exports_, *resolved->exp, rpc_cred);
+  if (auto verdict = guard.precheck({}); !verdict) {
+    auto attr = co_await core::sample_attr(resolved->obj);
+    begin_result(enc, ctx, call, verdict_status(verdict));
+    encode_wcc_unchanged(enc, attr, resolved->exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
   uint32_t count = std::min<uint32_t>(
@@ -611,17 +687,7 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
       resolved->exp->backend->limits().max_write);
   // Per-export QoS (plan doc 10 §4.3), before the exclusive object lock.
   co_await resolved->exp->qos.throttle(true, count);
-  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await sample(resolved->obj);
-  if (resolved->exp->readonly) {
-    begin_result(enc, ctx, call, Status::kRofs);
-    encode_wcc(enc, wcc_pre(before), before, resolved->exp->fsid);
-    co_await send(ctx, enc);
-    co_return;
-  }
-  auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
-  auto cred = mapped.view();
+  co_await guard.enter({resolved->obj, resolved->oid});
   // Hand the payload down as the received segments, truncated to `count` (§2.4).
   SmallVec<iovec, 8> iov;
   for (uint32_t left = count; const auto& seg : args->data) {
@@ -630,17 +696,17 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     iov.push_back(iovec{const_cast<std::byte*>(seg.data()), k});
     left -= k;
   }
-  backend::OpenCtx open{cred, nullptr};
+  backend::OpenCtx open{guard.cred(), nullptr};
   auto written = co_await resolved->obj->write(open, args->offset,
                                                std::span<const iovec>(iov.data(), iov.size()),
                                                stability_from_wire(args->stable));
-  auto after = co_await sample(resolved->obj);
+  co_await guard.finish();
   if (!written) {
     begin_result(enc, ctx, call, core::to_v3(written.error(), Proc::kWrite));
-    encode_wcc(enc, wcc_pre(before), after, resolved->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), resolved->exp->fsid);
   } else {
     begin_result(enc, ctx, call, Status::kOk);
-    encode_wcc(enc, wcc_pre(before), after, resolved->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), resolved->exp->fsid);
     obs::Metrics::instance().write_bytes.fetch_add(*written, std::memory_order_relaxed);
     resolved->exp->metrics.write_bytes.fetch_add(*written, std::memory_order_relaxed);
     resolved->exp->metrics.write_ops.fetch_add(1, std::memory_order_relaxed);
@@ -648,7 +714,7 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     enc.u32(args->stable);  // the backend honored the requested stability exactly
     enc.opaque_fixed(verf_);
   }
-  co_await send(ctx, enc);
+  co_await reply(ctx, enc, cap);
 }
 
 rt::Task<void> Engine::proc_create(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
@@ -662,29 +728,24 @@ rt::Task<void> Engine::proc_create(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
   xdr::XdrEnc enc(ctx.pool);
   if (!dir) {
     begin_result(enc, ctx, call, core::to_v3(dir.error(), Proc::kCreate));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto lock = locks_.get(dir->exp->fsid, dir->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await sample(dir->obj);
-  auto fail = [&](Status status, const std::optional<backend::Attr>& after) {
+  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  if (auto verdict = guard.precheck({args->where.name}); !verdict) {
+    auto attr = co_await core::sample_attr(dir->obj);
+    begin_result(enc, ctx, call, verdict_status(verdict));
+    encode_wcc_unchanged(enc, attr, dir->exp->fsid);
+    co_await reply(ctx, enc, cap);
+    co_return;
+  }
+  co_await guard.enter({dir->obj, dir->oid});
+  const auto& cred = guard.cred();
+  auto fail = [&](Status status) {
     begin_result(enc, ctx, call, status);
-    encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
   };
-  if (dir->exp->readonly) {
-    fail(Status::kRofs, before);
-    co_await send_captured(ctx, enc, cap);
-    co_return;
-  }
-  if (!valid_new_name(args->where.name)) {
-    fail(Status::kAcces, before);
-    co_await send_captured(ctx, enc, cap);
-    co_return;
-  }
-  auto mapped = exports_.squash_cred(rpc_cred, *dir->exp);
-  auto cred = mapped.view();
 
   Result<backend::Created> created = Err(errno_from(EIO));
   if (args->mode == kCreateExclusive) {
@@ -703,9 +764,9 @@ rt::Task<void> Engine::proc_create(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
           size_only.size = args->attrs.size;
           auto set = co_await (*existing)->setattr(cred, size_only);
           if (!set) {
-            auto after = co_await sample(dir->obj);
-            fail(core::to_v3(set.error(), Proc::kCreate), after);
-            co_await send_captured(ctx, enc, cap);
+            co_await guard.finish();
+            fail(core::to_v3(set.error(), Proc::kCreate));
+            co_await reply(ctx, enc, cap);
             co_return;
           }
           attr = *set;
@@ -718,17 +779,17 @@ rt::Task<void> Engine::proc_create(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
     }
   }
 
-  auto after = co_await sample(dir->obj);
+  co_await guard.finish();
   if (!created) {
-    fail(core::to_v3(created.error(), Proc::kCreate), after);
+    fail(core::to_v3(created.error(), Proc::kCreate));
   } else {
     begin_result(enc, ctx, call, Status::kOk);
     FileHandle fh{handles_.encode(*dir->exp, created->obj->id())};
     encode_post_fh(enc, fh);
     encode_post_attr(enc, created->attr, dir->exp->fsid);
-    encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
   }
-  co_await send_captured(ctx, enc, cap);
+  co_await reply(ctx, enc, cap);
 }
 
 rt::Task<void> Engine::proc_mkdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
@@ -742,37 +803,32 @@ rt::Task<void> Engine::proc_mkdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
   xdr::XdrEnc enc(ctx.pool);
   if (!dir) {
     begin_result(enc, ctx, call, core::to_v3(dir.error(), Proc::kMkdir));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto lock = locks_.get(dir->exp->fsid, dir->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await sample(dir->obj);
-  Status precheck = Status::kOk;
-  if (dir->exp->readonly) precheck = Status::kRofs;
-  else if (!valid_new_name(args->where.name)) precheck = Status::kAcces;
-  if (precheck != Status::kOk) {
-    begin_result(enc, ctx, call, precheck);
-    encode_wcc(enc, wcc_pre(before), before, dir->exp->fsid);
-    co_await send_captured(ctx, enc, cap);
+  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  if (auto verdict = guard.precheck({args->where.name}); !verdict) {
+    auto attr = co_await core::sample_attr(dir->obj);
+    begin_result(enc, ctx, call, verdict_status(verdict));
+    encode_wcc_unchanged(enc, attr, dir->exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto mapped = exports_.squash_cred(rpc_cred, *dir->exp);
-  auto cred = mapped.view();
-  auto created = co_await dir->obj->mkdir(cred, args->where.name, args->attrs);
-  auto after = co_await sample(dir->obj);
+  co_await guard.enter({dir->obj, dir->oid});
+  auto created = co_await dir->obj->mkdir(guard.cred(), args->where.name, args->attrs);
+  co_await guard.finish();
   if (!created) {
     begin_result(enc, ctx, call, core::to_v3(created.error(), Proc::kMkdir));
-    encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
   } else {
     begin_result(enc, ctx, call, Status::kOk);
     FileHandle fh{handles_.encode(*dir->exp, created->obj->id())};
     encode_post_fh(enc, fh);
     encode_post_attr(enc, created->attr, dir->exp->fsid);
-    encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
   }
-  co_await send_captured(ctx, enc, cap);
+  co_await reply(ctx, enc, cap);
 }
 
 rt::Task<void> Engine::proc_symlink(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
@@ -786,40 +842,36 @@ rt::Task<void> Engine::proc_symlink(ConnCtx& ctx, RpcCall& call, const rpc::Cred
   xdr::XdrEnc enc(ctx.pool);
   if (!dir) {
     begin_result(enc, ctx, call, core::to_v3(dir.error(), Proc::kSymlink));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto lock = locks_.get(dir->exp->fsid, dir->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await sample(dir->obj);
-  Status precheck = Status::kOk;
-  if (dir->exp->readonly) precheck = Status::kRofs;
-  else if (!dir->exp->backend->caps().has(backend::Cap::kSymlink))
+  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  Status precheck = verdict_status(guard.precheck({args->where.name}));
+  if (precheck == Status::kOk && !dir->exp->backend->caps().has(backend::Cap::kSymlink))
     precheck = Status::kNotsupp;
-  else if (!valid_new_name(args->where.name)) precheck = Status::kAcces;
   if (precheck != Status::kOk) {
+    auto attr = co_await core::sample_attr(dir->obj);
     begin_result(enc, ctx, call, precheck);
-    encode_wcc(enc, wcc_pre(before), before, dir->exp->fsid);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_unchanged(enc, attr, dir->exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto mapped = exports_.squash_cred(rpc_cred, *dir->exp);
-  auto cred = mapped.view();
-  auto created = co_await dir->obj->symlink(cred, args->where.name, args->target,
+  co_await guard.enter({dir->obj, dir->oid});
+  auto created = co_await dir->obj->symlink(guard.cred(), args->where.name, args->target,
                                             args->attrs);
-  auto after = co_await sample(dir->obj);
+  co_await guard.finish();
   if (!created) {
     begin_result(enc, ctx, call, core::to_v3(created.error(), Proc::kSymlink));
-    encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
   } else {
     begin_result(enc, ctx, call, Status::kOk);
     FileHandle fh{handles_.encode(*dir->exp, created->obj->id())};
     encode_post_fh(enc, fh);
     encode_post_attr(enc, created->attr, dir->exp->fsid);
-    encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
   }
-  co_await send_captured(ctx, enc, cap);
+  co_await reply(ctx, enc, cap);
 }
 
 rt::Task<void> Engine::proc_mknod(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
@@ -833,44 +885,42 @@ rt::Task<void> Engine::proc_mknod(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
   xdr::XdrEnc enc(ctx.pool);
   if (!dir) {
     begin_result(enc, ctx, call, core::to_v3(dir.error(), Proc::kMknod));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto lock = locks_.get(dir->exp->fsid, dir->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await sample(dir->obj);
-  Status precheck = Status::kOk;
+  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
   bool device = args->type == backend::FType::kChr || args->type == backend::FType::kBlk;
   bool special = device || args->type == backend::FType::kSock ||
                  args->type == backend::FType::kFifo;
-  if (dir->exp->readonly) precheck = Status::kRofs;
-  else if (!special) precheck = Status::kBadtype;
-  else if (!dir->exp->backend->caps().has(backend::Cap::kMknod))
-    precheck = Status::kNotsupp;
-  else if (!valid_new_name(args->where.name)) precheck = Status::kAcces;
+  Status precheck = verdict_status(guard.precheck({args->where.name}));
+  if (precheck == Status::kOk) {
+    if (!special) precheck = Status::kBadtype;
+    else if (!dir->exp->backend->caps().has(backend::Cap::kMknod))
+      precheck = Status::kNotsupp;
+  }
   if (precheck != Status::kOk) {
+    auto attr = co_await core::sample_attr(dir->obj);
     begin_result(enc, ctx, call, precheck);
-    encode_wcc(enc, wcc_pre(before), before, dir->exp->fsid);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_unchanged(enc, attr, dir->exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto mapped = exports_.squash_cred(rpc_cred, *dir->exp);
-  auto cred = mapped.view();
-  auto created = co_await dir->obj->mknod(cred, args->where.name, args->type, args->dev,
-                                          args->attrs);
-  auto after = co_await sample(dir->obj);
+  co_await guard.enter({dir->obj, dir->oid});
+  auto created = co_await dir->obj->mknod(guard.cred(), args->where.name, args->type,
+                                          args->dev, args->attrs);
+  co_await guard.finish();
   if (!created) {
     begin_result(enc, ctx, call, core::to_v3(created.error(), Proc::kMknod));
-    encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
   } else {
     begin_result(enc, ctx, call, Status::kOk);
     FileHandle fh{handles_.encode(*dir->exp, created->obj->id())};
     encode_post_fh(enc, fh);
     encode_post_attr(enc, created->attr, dir->exp->fsid);
-    encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
+    encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
   }
-  co_await send_captured(ctx, enc, cap);
+  co_await reply(ctx, enc, cap);
 }
 
 rt::Task<void> Engine::proc_remove(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
@@ -884,30 +934,25 @@ rt::Task<void> Engine::proc_remove(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
   xdr::XdrEnc enc(ctx.pool);
   if (!dir) {
     begin_result(enc, ctx, call, core::to_v3(dir.error(), Proc::kRemove));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto lock = locks_.get(dir->exp->fsid, dir->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await sample(dir->obj);
-  Status precheck = Status::kOk;
-  if (dir->exp->readonly) precheck = Status::kRofs;
-  else if (!valid_new_name(args->name)) precheck = Status::kAcces;
-  if (precheck != Status::kOk) {
-    begin_result(enc, ctx, call, precheck);
-    encode_wcc(enc, wcc_pre(before), before, dir->exp->fsid);
-    co_await send_captured(ctx, enc, cap);
+  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  if (auto verdict = guard.precheck({args->name}); !verdict) {
+    auto attr = co_await core::sample_attr(dir->obj);
+    begin_result(enc, ctx, call, verdict_status(verdict));
+    encode_wcc_unchanged(enc, attr, dir->exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto mapped = exports_.squash_cred(rpc_cred, *dir->exp);
-  auto cred = mapped.view();
-  auto removed = co_await dir->obj->unlink(cred, args->name);
-  auto after = co_await sample(dir->obj);
+  co_await guard.enter({dir->obj, dir->oid});
+  auto removed = co_await dir->obj->unlink(guard.cred(), args->name);
+  co_await guard.finish();
   begin_result(enc, ctx, call,
                removed ? Status::kOk : core::to_v3(removed.error(), Proc::kRemove));
-  encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
-  co_await send_captured(ctx, enc, cap);
+  encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
+  co_await reply(ctx, enc, cap);
 }
 
 rt::Task<void> Engine::proc_rmdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
@@ -921,32 +966,28 @@ rt::Task<void> Engine::proc_rmdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
   xdr::XdrEnc enc(ctx.pool);
   if (!dir) {
     begin_result(enc, ctx, call, core::to_v3(dir.error(), Proc::kRmdir));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto lock = locks_.get(dir->exp->fsid, dir->oid);
-  auto held = co_await lock->lock();
-  auto before = co_await sample(dir->obj);
-  Status precheck = Status::kOk;
-  if (dir->exp->readonly) precheck = Status::kRofs;
-  else if (args->name == ".") precheck = Status::kInval;
-  else if (args->name == "..") precheck = Status::kExist;
-  else if (!valid_new_name(args->name)) precheck = Status::kAcces;
-  if (precheck != Status::kOk) {
-    begin_result(enc, ctx, call, precheck);
-    encode_wcc(enc, wcc_pre(before), before, dir->exp->fsid);
-    co_await send_captured(ctx, enc, cap);
+  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  if (auto verdict = guard.precheck({args->name}); !verdict) {
+    Status status = verdict_status(verdict);
+    if (verdict.name == core::NameCheck::kDot)  // RFC 1813 §3.3.13
+      status = args->name == "." ? Status::kInval : Status::kExist;
+    auto attr = co_await core::sample_attr(dir->obj);
+    begin_result(enc, ctx, call, status);
+    encode_wcc_unchanged(enc, attr, dir->exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto mapped = exports_.squash_cred(rpc_cred, *dir->exp);
-  auto cred = mapped.view();
-  auto removed = co_await dir->obj->rmdir(cred, args->name);
-  auto after = co_await sample(dir->obj);
+  co_await guard.enter({dir->obj, dir->oid});
+  auto removed = co_await dir->obj->rmdir(guard.cred(), args->name);
+  co_await guard.finish();
   begin_result(enc, ctx, call,
                removed ? Status::kOk : core::to_v3(removed.error(), Proc::kRmdir));
-  encode_wcc(enc, wcc_pre(before), after, dir->exp->fsid);
-  co_await send_captured(ctx, enc, cap);
+  encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
+  co_await reply(ctx, enc, cap);
 }
 
 rt::Task<void> Engine::proc_rename(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
@@ -963,60 +1004,40 @@ rt::Task<void> Engine::proc_rename(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
   if (!from || !to_res) {
     begin_result(enc, ctx, call,
                  core::to_v3(!from ? from.error() : to_res.error(), Proc::kRename));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
   auto& to = *to_res;
   // Cross-export rename is not expressible for the backend: intercept as XDEV.
   if (from->exp != to.exp) {
     begin_result(enc, ctx, call, Status::kXdev);
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  // Two-directory lock ordering by ObjId (design 04 §4.2).
-  auto lock_a = locks_.get(from->exp->fsid, from->oid);
-  auto lock_b = locks_.get(to.exp->fsid, to.oid);
-  bool same = lock_a.get() == lock_b.get();
-  if (!same && to.oid < from->oid) std::swap(lock_a, lock_b);
-  auto held_a = co_await lock_a->lock();
-  std::optional<decltype(held_a)> held_b;
-  if (!same) held_b.emplace(co_await lock_b->lock());
-
-  auto before_from = co_await sample(from->obj);
-  auto before_to = same ? before_from : co_await sample(to.obj);
-  auto fail = [&](Status status, const std::optional<backend::Attr>& after_from,
-                  const std::optional<backend::Attr>& after_to) {
-    begin_result(enc, ctx, call, status);
-    encode_wcc(enc, wcc_pre(before_from), after_from, from->exp->fsid);
-    encode_wcc(enc, wcc_pre(before_to), after_to, to.exp->fsid);
-  };
-  Status precheck = Status::kOk;
-  if (from->exp->readonly) precheck = Status::kRofs;
-  else if (!valid_new_name(args->from.name) || !valid_new_name(args->to.name))
-    precheck = Status::kAcces;
-  if (precheck != Status::kOk) {
-    fail(precheck, before_from, before_to);
-    co_await send_captured(ctx, enc, cap);
+  MutateGuard guard(locks_, exports_, *from->exp, rpc_cred);
+  if (auto verdict = guard.precheck({args->from.name, args->to.name}); !verdict) {
+    auto attr_from = co_await core::sample_attr(from->obj);
+    auto attr_to = from->oid == to.oid ? attr_from : co_await core::sample_attr(to.obj);
+    begin_result(enc, ctx, call, verdict_status(verdict));
+    encode_wcc_unchanged(enc, attr_from, from->exp->fsid);
+    encode_wcc_unchanged(enc, attr_to, to.exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto mapped = exports_.squash_cred(rpc_cred, *from->exp);
-  auto cred = mapped.view();
-  auto renamed = co_await from->obj->rename(cred, args->from.name, *to.obj,
+  // Two-directory lock ordering by ObjId happens inside the guard (design 04 §4.2).
+  co_await guard.enter({from->obj, from->oid}, {to.obj, to.oid});
+  auto renamed = co_await from->obj->rename(guard.cred(), args->from.name, *to.obj,
                                             args->to.name);
-  auto after_from = co_await sample(from->obj);
-  auto after_to = same ? after_from : co_await sample(to.obj);
-  if (!renamed) {
-    fail(core::to_v3(renamed.error(), Proc::kRename), after_from, after_to);
-  } else {
-    begin_result(enc, ctx, call, Status::kOk);
-    encode_wcc(enc, wcc_pre(before_from), after_from, from->exp->fsid);
-    encode_wcc(enc, wcc_pre(before_to), after_to, to.exp->fsid);
-  }
-  co_await send_captured(ctx, enc, cap);
+  co_await guard.finish();
+  begin_result(enc, ctx, call,
+               renamed ? Status::kOk : core::to_v3(renamed.error(), Proc::kRename));
+  encode_wcc_sample(enc, guard.first(), from->exp->fsid);
+  encode_wcc_sample(enc, guard.second(), to.exp->fsid);
+  co_await reply(ctx, enc, cap);
 }
 
 rt::Task<void> Engine::proc_link(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred,
@@ -1034,83 +1055,42 @@ rt::Task<void> Engine::proc_link(ConnCtx& ctx, RpcCall& call, const rpc::Cred& r
     begin_result(enc, ctx, call,
                  core::to_v3(!file ? file.error() : dir_res.error(), Proc::kLink));
     encode_post_attr(enc, std::nullopt, 0);
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
   auto& dir = *dir_res;
   if (file->exp != dir.exp) {
     begin_result(enc, ctx, call, Status::kXdev);
     encode_post_attr(enc, std::nullopt, 0);
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_none(enc);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto lock_a = locks_.get(file->exp->fsid, file->oid);
-  auto lock_b = locks_.get(dir.exp->fsid, dir.oid);
-  bool same = lock_a.get() == lock_b.get();
-  if (!same && dir.oid < file->oid) std::swap(lock_a, lock_b);
-  auto held_a = co_await lock_a->lock();
-  std::optional<decltype(held_a)> held_b;
-  if (!same) held_b.emplace(co_await lock_b->lock());
-
-  auto before_dir = co_await sample(dir.obj);
-  Status precheck = Status::kOk;
-  if (dir.exp->readonly) precheck = Status::kRofs;
-  else if (!dir.exp->backend->caps().has(backend::Cap::kHardlink))
+  MutateGuard guard(locks_, exports_, *dir.exp, rpc_cred);
+  Status precheck = verdict_status(guard.precheck({args->to.name}));
+  if (precheck == Status::kOk && !dir.exp->backend->caps().has(backend::Cap::kHardlink))
     precheck = Status::kNotsupp;
-  else if (!valid_new_name(args->to.name)) precheck = Status::kAcces;
   if (precheck != Status::kOk) {
-    auto file_attr = co_await sample(file->obj);
+    auto file_attr = co_await core::sample_attr(file->obj);
+    auto dir_attr = co_await core::sample_attr(dir.obj);
     begin_result(enc, ctx, call, precheck);
     encode_post_attr(enc, file_attr, file->exp->fsid);
-    encode_wcc(enc, wcc_pre(before_dir), before_dir, dir.exp->fsid);
-    co_await send_captured(ctx, enc, cap);
+    encode_wcc_unchanged(enc, dir_attr, dir.exp->fsid);
+    co_await reply(ctx, enc, cap);
     co_return;
   }
-  auto mapped = exports_.squash_cred(rpc_cred, *dir.exp);
-  auto cred = mapped.view();
-  auto linked = co_await dir.obj->link(cred, *file->obj, args->to.name);
-  auto file_attr = co_await sample(file->obj);
-  auto after_dir = co_await sample(dir.obj);
+  // The directory carries wcc_data; the file only needs post-op attributes, so it is
+  // locked but not sampled up front.
+  co_await guard.enter({dir.obj, dir.oid}, {file->obj, file->oid, /*sample=*/false});
+  auto linked = co_await dir.obj->link(guard.cred(), *file->obj, args->to.name);
+  auto file_attr = co_await core::sample_attr(file->obj);
+  co_await guard.finish();
   begin_result(enc, ctx, call,
                linked ? Status::kOk : core::to_v3(linked.error(), Proc::kLink));
   encode_post_attr(enc, file_attr, file->exp->fsid);
-  encode_wcc(enc, wcc_pre(before_dir), after_dir, dir.exp->fsid);
-  co_await send_captured(ctx, enc, cap);
-}
-
-rt::Task<void> Engine::proc_commit(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred) {
-  auto args = CommitArgs::decode(call.args);
-  if (!args || !call.args.at_end()) {
-    co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
-    co_return;
-  }
-  auto resolved = co_await resolve(args->file, ctx.peer.addr);
-  xdr::XdrEnc enc(ctx.pool);
-  if (!resolved) {
-    begin_result(enc, ctx, call, core::to_v3(resolved.error(), Proc::kCommit));
-    encode_wcc(enc, std::nullopt, std::nullopt, 0);
-    co_await send(ctx, enc);
-    co_return;
-  }
-  auto lock = locks_.get(resolved->exp->fsid, resolved->oid);
-  auto held = co_await lock->lock_shared();  // flushing does not mutate
-  auto before = co_await sample(resolved->obj);
-  auto mapped = exports_.squash_cred(rpc_cred, *resolved->exp);
-  auto cred = mapped.view();
-  backend::OpenCtx open{cred, nullptr};
-  auto committed = co_await resolved->obj->commit(open, args->offset, args->count);
-  auto after = co_await sample(resolved->obj);
-  if (!committed) {
-    begin_result(enc, ctx, call, core::to_v3(committed.error(), Proc::kCommit));
-    encode_wcc(enc, wcc_pre(before), after, resolved->exp->fsid);
-  } else {
-    begin_result(enc, ctx, call, Status::kOk);
-    encode_wcc(enc, wcc_pre(before), after, resolved->exp->fsid);
-    enc.opaque_fixed(verf_);
-  }
-  co_await send(ctx, enc);
+  encode_wcc_sample(enc, guard.first(), dir.exp->fsid);
+  co_await reply(ctx, enc, cap);
 }
 
 }  // namespace lnfs::nfsv3

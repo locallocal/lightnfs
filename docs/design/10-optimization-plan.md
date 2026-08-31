@@ -353,7 +353,7 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 
 ---
 
-## 6. 结构性重构
+## 6. 结构性重构 ✅ 已完成（2026-08-31）
 
 均为降低后续演进成本的投资，可穿插在功能里程碑之间：
 
@@ -372,6 +372,26 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
    `OffloadPool::queue_depth`（接入指标后即非死代码）、`state_mgr.cpp:922-924`
    过时注释。
 6. v3 `dispatch_proc` 的 22 连 `if` 改跳转表/switch（`nfsv3/engine.cpp:157-180`）。
+
+落地说明（2026-08-31）：
+
+- §6.1+§6.3 → `core/mutate.hpp`：`core::MutateGuard`（precheck: readonly → 名字；
+  enter: squash → ObjId 排序独占锁 → before 采样；finish: after 采样）与
+  `core::ChangeSample`（v3 WCC 与 v4 change_info 的唯一采样源）。v3 全部 9 个写过程、
+  v4 的 OPEN(create)/CREATE/REMOVE/RENAME/LINK/SETATTR/WRITE/ALLOCATE/DEALLOCATE/CLONE
+  均已接入；COPY 因分片放锁模式保留自管锁（语义不变）。两边 readonly 与名字校验
+  统一为 readonly → 名字 → 类型/能力位。
+- §6.2 → `core/names.hpp`：`check_component`/`valid_component`/`valid_utf8`，
+  v3/v4/mountd 三处接入；v4 保留 UTF-8 校验与 INVAL/BADNAME 映射。
+- §6.4 → `core/fs_props.hpp`：caps/limits → `FsProps`（pref 钳位、link/symlink/case
+  布尔、固定属性常量），v3 FSINFO/PATHCONF 与 v4 属性编码（`AttrSource.fs`）共用；
+  statfs 空间属性两边本就共享 `backend::FsStats`，无需再抽。
+- §6.5：`Reactor::op_finished` 已删；`OffloadPool::queue_depth()` 删除并把 overflow
+  计入 `stats().depth`（指标 `lightnfs_offload_queue_depth` 语义补全为 admitted+overflow）；
+  `StateMgr::client_shard` 已在 §2.6 提交中移除；`state_mgr.cpp` free_stateid 的
+  过时注释已按现状重写。
+- §6.6：v3 `dispatch_proc` 改为按 `Proc` 索引的成员函数指针跳转表，只读过程
+  同步拆分为独立 handler。
 
 ---
 

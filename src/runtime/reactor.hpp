@@ -82,7 +82,6 @@ class Reactor {
 
   // ---- io / timer plumbing (called from this reactor's thread) ----
   void op_started() { ++pending_ops_; }
-  void op_finished() { --pending_ops_; }
   void add_timer(TimePoint deadline, std::coroutine_handle<> h);
 
   // ---- spawn bookkeeping ----

@@ -70,7 +70,7 @@ class OffloadPool {
     uint64_t submitted[kOffloadClasses]{};
     uint64_t completed[kOffloadClasses]{};
     uint64_t deferred[kOffloadClasses]{};  // held in admission overflow at least once
-    size_t depth[kOffloadClasses]{};       // currently queued (admitted, not started)
+    size_t depth[kOffloadClasses]{};       // queued: admitted + overflow (design 08 §8.3)
   };
 
   explicit OffloadPool(int threads) : OffloadPool(Config{.threads = threads}) {}
@@ -78,7 +78,6 @@ class OffloadPool {
   ~OffloadPool();
 
   void submit(MoveOnlyFn job, OffloadClass cls = OffloadClass::kLight);
-  size_t queue_depth();  // both classes, admitted + overflow (design 08 §8.3 metric)
   Stats stats() const;
   void stop_and_join();
 
@@ -94,7 +93,7 @@ class OffloadPool {
     std::atomic<uint64_t> rr{0};
     std::atomic<size_t> depth{0};
     std::atomic<uint64_t> submitted{0}, completed{0}, deferred{0};
-    std::mutex overflow_mu;
+    mutable std::mutex overflow_mu;
     std::deque<MoveOnlyFn> overflow;
     size_t queue_cap = 0;
   };

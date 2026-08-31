@@ -5,6 +5,7 @@
 // owner/owner_group are decimal strings (AUTH_SYS convention, zero idmap dependency).
 
 #include "backend/api.hpp"
+#include "core/fs_props.hpp"
 #include "nfsv4/nfs4_types.hpp"
 
 namespace lnfs::nfsv4 {
@@ -31,11 +32,8 @@ struct AttrSource {
   uint64_t fsid = 0;                          // fsid4.major; 0 = pseudo-fs
   uint64_t mounted_on_fileid = 0;             // defaults to attr->fileid when 0
   std::span<const std::byte> fh{};            // attr 19 (filehandle)
-  const backend::FsLimits* limits = nullptr;  // null -> defaults (pseudo)
+  const core::FsProps* fs = nullptr;          // caps/limits derivation; null = pseudo
   const backend::FsStats* stats = nullptr;    // null -> zeros (pseudo)
-  bool link_support = true;
-  bool symlink_support = true;
-  bool case_insensitive = false;
   uint32_t lease_seconds = kLeaseSeconds;     // attr 10 (lease_time)
 };
 

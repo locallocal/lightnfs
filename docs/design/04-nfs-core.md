@@ -48,7 +48,7 @@ class NfsCore {
 } // namespace lnfs::core
 ```
 
-- `mutate()` 封装 02 分册 2.5 的"exclusive 锁 → before → 后端 op → after"模板，双目录（RENAME/LINK）传 secondary，按 ObjId 排序取锁。
+- `mutate()` 封装 02 分册 2.5 的"exclusive 锁 → before → 后端 op → after"模板，双目录（RENAME/LINK）传 secondary，按 ObjId 排序取锁。实现落地为 `core::MutateGuard`（`src/core/mutate.hpp`，plan doc 10 §6.1）：precheck（readonly → 名字校验）→ enter（squash → 排序取锁 → before 采样）→ finish（after 采样），v3/v4 引擎只做编码。
 - 权限模型：core 在后端操作前做**协议层检查**（导出只读→ROFS、squash 后的 uid 对 mode 位的快速判定、属主放宽惯例 nfsv3/04 §6），后端返回的 EACCES/EPERM 仍是最终权威（Lustre/Gluster 有服务端 ACL）。ACCESS 过程直接问后端 `access()`（能力位支持时）或用协议层判定兜底。
 
 ## 4.3 文件句柄（两版通用，决策 D3）
@@ -120,7 +120,9 @@ nfsstat4 to_v4(Errno e, OpId op);    // 同上（RFC 8881 §15.2 表）
 | 语义 | 唯一实现点 |
 |------|-----------|
 | 句柄编解码/校验 | core::decode_fh |
-| WCC 与 change_info 采样 | core::mutate |
+| WCC 与 change_info 采样 | core::MutateGuard / core::ChangeSample（core/mutate.hpp） |
+| 名字合法性校验 | core::check_component（core/names.hpp） |
+| caps/limits → 协议属性推导 | core::fs_props（core/fs_props.hpp） |
 | write verifier | core::boot_verf |
 | squash 与属主放宽 | core 权限层 |
 | readdir cookie 空间 | core 游标簿记 + 后端契约 |

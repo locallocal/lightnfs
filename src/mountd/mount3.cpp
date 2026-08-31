@@ -1,5 +1,6 @@
 #include "mountd/mount3.hpp"
 
+#include "core/names.hpp"
 #include "obs/metrics.hpp"
 
 #include <cerrno>
@@ -38,11 +39,6 @@ MountStatus map_error(Errno error) {
 
 rt::Task<void> send(transport::ConnCtx& ctx, xdr::XdrEnc& enc) {
   co_await ctx.send(enc.take());
-}
-
-bool valid_path_component(std::string_view part) {
-  return !part.empty() && part != "." && part != ".." && part.size() <= 255 &&
-         part.find('/') == std::string_view::npos && part.find('\0') == std::string_view::npos;
 }
 
 }  // namespace
@@ -124,7 +120,7 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call,
   while (obj && !relative.empty()) {
     size_t slash = relative.find('/');
     std::string part = relative.substr(0, slash);
-    if (!valid_path_component(part)) {
+    if (!core::valid_component(part)) {
       failure = errno_from(EINVAL);
       break;
     }

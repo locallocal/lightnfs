@@ -59,6 +59,9 @@ add_library(lnfs_core STATIC
   src/core/obj_lock.cpp
   src/core/readdir.cpp
   src/core/errmap.cpp
+  src/core/names.cpp
+  src/core/fs_props.cpp
+  src/core/mutate.cpp
   src/nfsv3/nfs3_types.cpp
   src/nfsv4/nfs4_types.cpp
   src/nfsv4/attrs.cpp
@@ -135,6 +138,7 @@ add_executable(lnfs_tests
   tests/test_offload.cpp
   tests/test_transport_loopback.cpp
   tests/test_backend.cpp
+  tests/test_core_helpers.cpp
   tests/test_backend_write.cpp
   tests/test_nfs3.cpp
   tests/test_write_path.cpp
