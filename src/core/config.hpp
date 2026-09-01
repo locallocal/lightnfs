@@ -93,6 +93,15 @@ struct ServerConfig {
   uint64_t client_read_bps = 0;
   uint64_t client_write_bps = 0;
   uint32_t client_iops = 0;
+  // RPC-over-TLS (RFC 9289), [tls] section (design 09 §"长期观察项", plan doc 10 §5.4).
+  // mode: "off" (default) | "optional" (offer STARTTLS, still serve cleartext) |
+  // "required" (offer STARTTLS, refuse cleartext NFS ops).  cert/key are PEM paths; ca
+  // (optional) enables client-certificate verification (mutual TLS with client_cert).
+  std::string tls_mode = "off";
+  std::string tls_cert;
+  std::string tls_key;
+  std::string tls_ca;
+  bool tls_require_client_cert = false;
 };
 
 struct ExportConfig {

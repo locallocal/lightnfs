@@ -48,6 +48,18 @@ message(STATUS "liburing: ${LIBURING_LIBRARY} (${LIBURING_INCLUDE_DIR})")
 # spdlog: logging implementation (git submodule, static lib; util/log.hpp is the facade)
 add_subdirectory(third_party/spdlog EXCLUDE_FROM_ALL)
 
+# ---- OpenSSL: RPC-over-TLS (RFC 9289, design 09 / plan doc 10 §5.4) ----
+# Optional: when present, transport/tls.cpp is compiled with LNFS_TLS and the [tls]
+# config section works.  Without it the module builds as stubs and a non-off tls mode
+# is rejected at config validation, so the build matrix stays green on hosts with no
+# OpenSSL.
+find_package(OpenSSL)
+if(OpenSSL_FOUND)
+  message(STATUS "OpenSSL: ${OPENSSL_VERSION} (RPC-over-TLS enabled)")
+else()
+  message(STATUS "OpenSSL not found: RPC-over-TLS disabled (tls must stay \"off\")")
+endif()
+
 # ---- core library ----
 add_library(lnfs_core STATIC
   src/backend/api.cpp
@@ -86,6 +98,7 @@ add_library(lnfs_core STATIC
   src/transport/listener.cpp
   src/transport/connection.cpp
   src/transport/backchannel.cpp
+  src/transport/tls.cpp
   src/nfsv4/callback.cpp
   src/rpc/rpc_msg.cpp
   src/rpc/auth.cpp
@@ -98,6 +111,10 @@ target_link_libraries(lnfs_core PUBLIC ${LIBURING_LIBRARY} Threads::Threads
 target_compile_definitions(lnfs_core PUBLIC LIGHTNFS_VERSION="${PROJECT_VERSION}")
 if(LNFS_RING STREQUAL "epoll")
   target_compile_definitions(lnfs_core PUBLIC LNFS_DEFAULT_RING_EPOLL=1)
+endif()
+if(OpenSSL_FOUND)
+  target_compile_definitions(lnfs_core PUBLIC LNFS_TLS=1)
+  target_link_libraries(lnfs_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # ccmd: command-line framework for the lightnfsd entry point (git submodule,
@@ -146,8 +163,13 @@ add_executable(lnfs_tests
   tests/test_state.cpp
   tests/test_lock_mgr.cpp
   tests/test_ctl.cpp
+  tests/test_tls.cpp
 )
 target_link_libraries(lnfs_tests PRIVATE lnfs_core)
+if(OpenSSL_FOUND)
+  target_compile_definitions(lnfs_tests PRIVATE LNFS_TLS=1)
+  target_link_libraries(lnfs_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 add_test(NAME lnfs_tests COMMAND lnfs_tests)
 
 # Acceptance client: userspace NFSv3/v4.1 client that drives a running lightnfsd over

@@ -57,6 +57,18 @@ inflight_per_conn = 64
 # client_write_bps = "0"
 # client_iops = 0
 
+# RPC-over-TLS (RFC 9289): opportunistic transport encryption negotiated with a client
+# AUTH_TLS probe on the NULL procedure ("xprtsec=tls" on Linux 6.x mounts).  "TLS 保通道、
+# AUTH_SYS 报身份": TLS authenticates+encrypts the channel while AUTH_SYS still declares
+# the user.  Requires a build with OpenSSL.  Applying a changed [tls] needs a restart.
+# [tls]
+# mode = "off"             # off (default) | optional (offer STARTTLS, still serve
+#                          # cleartext) | required (offer STARTTLS, refuse cleartext ops)
+# cert = "/etc/lightnfs/tls/server.pem"   # PEM certificate chain
+# key  = "/etc/lightnfs/tls/server.key"   # PEM private key
+# ca   = "/etc/lightnfs/tls/clients-ca.pem"  # optional: verify client certs against this
+# client_cert = false      # require a client certificate (mutual TLS; needs `ca`)
+
 [[export]]
 path = "/tmp" # replace with the directory to export
 backend = "local"

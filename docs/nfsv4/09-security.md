@@ -5,7 +5,11 @@
 RFC 要求：v4 实现**必须实现** RPCSEC_GSS（Kerberos 5 三件套 krb5/krb5i/krb5p）；AUTH_SYS 只是"可以用"。
 部署现实：绝大多数 v4 部署仍在跑 **AUTH_SYS**（Kerberos 的 KDC/keytab/时钟同步运维成本高）。方向性补救是 RPC-over-TLS（RFC 9289，`xprtsec=tls` 挂载选项，Linux 6.x 双端已支持）：传输层加密+服务器认证，AUTH_SYS 继续做用户声明——"TLS 保通道、AUTH_SYS 报身份"正在成为新的现实基线。
 
-lightnfs 定位建议与 v3 相同：AUTH_NONE/AUTH_SYS 起步，声明仅限受信网络；架构上给 flavor 留插槽；TLS 可通过前置 stunnel/haproxy 过渡。
+lightnfs 定位建议与 v3 相同：AUTH_NONE/AUTH_SYS 起步，声明仅限受信网络；架构上给 flavor 留插槽。
+
+**RPC-over-TLS（RFC 9289）已内置**（plan doc 10 §5.4、09 册长期观察项）：客户端 `xprtsec=tls`
+触发 AUTH_TLS 探测 → 服务器 STARTTLS 应答 → 同连接 TLS 会话；传输层加密 + 服务器证书认证，
+AUTH_SYS 继续报身份。故不再必须前置 stunnel/haproxy（前置仍是可选过渡）。仍不做 RPCSEC_GSS/krb5。
 
 ## 9.2 RPCSEC_GSS 要点（实现时再展开）
 

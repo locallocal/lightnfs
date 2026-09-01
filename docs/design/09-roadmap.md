@@ -45,9 +45,26 @@
 
 ## 长期观察项（不承诺）
 
-- RPC-over-TLS（RFC 9289）：auth 插槽 + 传输层已预留位置
-- 写委托 / 目录委托 / pNFS flexfiles MDS：均有明确的"值得做的前提"（nfsv4 分册相应章节），出现前提再评估
-- 多网关一致性：依赖 kNativeChange + kByteLocks 后端（05 分册 5.6/5.8 已定义边界）
+- **RPC-over-TLS（RFC 9289）✅ 已落地**（2026-09-01，plan doc 10 §5.4）：预留的
+  auth 插槽 + 传输层位置已填实。客户端在新连接首个 RPC 用 AUTH_TLS 凭据探测 NULL 过程，
+  服务器以 `verifier = AUTH_TLS + "STARTTLS"` 应答后就地在同一 TCP 连接上握手，其后所有
+  RPC 记录走 TLS 会话（`xprtsec=tls`，Linux 6.x 双端支持）。异步实现：socket IO 仍全走
+  io_uring，OpenSSL 在一对 memory BIO 上做密码学，`transport::TlsConn` 在 BIO 与 socket
+  间搬运密文——reactor 线程从不阻塞在 OpenSSL 的 socket 调用里。回传通道（委托召回 /
+  CB_NOTIFY_LOCK）复用同一条 `rs`，握手后自动加密。配置 `[tls] mode = off|optional|
+  required`（+ cert/key，可选 ca + client_cert 做双向 TLS）；`required` 拒绝明文
+  NFS/MOUNT 操作（AUTH_TOOWEAK），仅放行 NULL（探测/健康检查）。无 OpenSSL 的构建编译为
+  stub，非 off 模式在配置校验期即被拒。**"TLS 保通道、AUTH_SYS 报身份"**：仍不做
+  RPCSEC_GSS/krb5（身份层仍是 AUTH_SYS + 受信网络假设）。
+- 写委托 / 目录委托 / pNFS flexfiles MDS：**前提未变，仍不做**。写委托需 CB_GETATTR
+  代答（05 §5.3 明示"实现写委托的主要麻烦"）+ 真实单写者工作负载证据（05 §5.6 第 3 步）；
+  目录委托 Linux 长期默认关闭（05 §5.5 → NOTSUPP）；pNFS 是决策 D8 的明确非目标
+  （07 §7.4 = "零成本合规"，layout 类回 NOTSUPP）。读委托 + 回传通道已在 M8/§5.2 交付，
+  这三项在其上再评估。
+- 多网关一致性：**前提未变，仍不做**。依赖 kNativeChange + kByteLocks 后端
+  （05 分册 5.6/5.8 已定义边界）；本地后端有 kNativeChange（STATX_CHANGE_COOKIE）但
+  `native_locks()` 返回空——kByteLocks 需要一个下沉原生锁的集群后端（Lustre flock /
+  gluster posix-locks），随第二后端启动时才具备真实检验条件。
 
 ## 风险登记
 

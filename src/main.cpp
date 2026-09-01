@@ -276,6 +276,9 @@ struct Frontend {
   std::unique_ptr<lnfs::transport::Listener> nfs, mount;
   std::unique_ptr<lnfs::server::CtlServer> ctl;        // null when unavailable
   std::unique_ptr<lnfs::server::MetricsHttp> metrics;  // null when disabled/unavailable
+  // RPC-over-TLS (RFC 9289): process-global server context (null when tls = off); it
+  // outlives every connection served by the listeners below.
+  std::unique_ptr<lnfs::transport::TlsContext> tls;
   // `ctl drain` state (plan doc 10 §4.2): heap-owned so Frontend stays movable while
   // CtlDeps keeps a stable pointer.
   std::shared_ptr<std::atomic<bool>> draining = std::make_shared<std::atomic<bool>>(false);
@@ -290,6 +293,32 @@ std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
   transport_cfg.max_inflight_per_conn = cfg.inflight_per_conn;
   transport_cfg.max_connections = cfg.max_connections;
   transport_cfg.per_peer_limit = cfg.per_peer_limit;
+
+  // RPC-over-TLS (RFC 9289, plan doc 10 §5.4): build the server context before the
+  // listeners so both the NFS and MOUNT ports offer STARTTLS.  A cert/key error aborts
+  // startup (config validation already checked the mode and file presence).
+  std::unique_ptr<lnfs::transport::TlsContext> tls_ctx;
+  if (cfg.tls_mode != "off") {
+    lnfs::transport::TlsConfig tls_cfg;
+    tls_cfg.policy = cfg.tls_mode == "required" ? lnfs::transport::TlsPolicy::kRequired
+                                                : lnfs::transport::TlsPolicy::kOptional;
+    tls_cfg.cert = cfg.tls_cert;
+    tls_cfg.key = cfg.tls_key;
+    tls_cfg.ca = cfg.tls_ca;
+    tls_cfg.require_client_cert = cfg.tls_require_client_cert;
+    auto ctx = lnfs::transport::TlsContext::create(tls_cfg);
+    if (!ctx) {
+      LNFS_ERROR("cannot initialize TLS ({} mode): {}", cfg.tls_mode,
+                 lnfs::errno_name(ctx.error()));
+      return std::nullopt;
+    }
+    tls_ctx = std::move(*ctx);
+    transport_cfg.tls = tls_ctx.get();
+    transport_cfg.tls_policy = tls_cfg.policy;
+    LNFS_INFO("RPC-over-TLS enabled (mode={}, mutual={})", cfg.tls_mode,
+              cfg.tls_require_client_cert);
+  }
+
   auto nfs_listener = lnfs::transport::Listener::create(cfg.port, transport_cfg,
                                                         stack.dispatcher, runtime, cfg.bind);
   auto mount_listener = lnfs::transport::Listener::create(
@@ -300,7 +329,8 @@ std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
                mount_listener ? "ok" : lnfs::errno_name(mount_listener.error()));
     return std::nullopt;
   }
-  Frontend fe{std::move(*nfs_listener), std::move(*mount_listener), nullptr, nullptr};
+  Frontend fe{std::move(*nfs_listener), std::move(*mount_listener), nullptr, nullptr,
+              std::move(tls_ctx)};
   fe.nfs->start();    // per-reactor REUSEPORT accept loops (plan doc 10 §2.3)
   fe.mount->start();
   // Buffer-pool watermark (plan doc 10 §3.5); the listeners are heap-allocated and

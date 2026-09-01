@@ -16,6 +16,7 @@ namespace lnfs::rpc {
 
 inline constexpr uint32_t kRpcVersion = 2;
 inline constexpr uint32_t kMaxAuthBody = 400;  // RFC 5531 limit
+inline constexpr uint32_t kAuthTls = 7;        // RFC 9289 AUTH_TLS (STARTTLS probe)
 
 enum MsgType : uint32_t { kCall = 0, kReply = 1 };
 enum ReplyStat : uint32_t { kMsgAccepted = 0, kMsgDenied = 1 };

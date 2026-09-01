@@ -72,7 +72,8 @@ be auditable and testable in userspace. lightnfs targets exactly that gap:
 | **MOUNTv3** | MNT/UMNT/EXPORT/DUMP, export-table ACLs by CIDR. |
 | **NFSv4.1** (RFC 8881) | Sessions (EXCHANGE_ID/CREATE_SESSION/SEQUENCE with exactly-once slot replay, BIND_CONN_TO_SESSION), pseudo-filesystem root spanning all exports, full open-state machine (OPEN claim NULL/FH/PREVIOUS, share reservations, OPEN_DOWNGRADE, CLOSE), stateid-checked READ/WRITE/COMMIT/SETATTR, namespace ops, byte-range locks (LOCK/LOCKT/LOCKU with POSIX merge/split, non-blocking DENIED with holder info), leases with courtesy clients, grace period with a persistent reclaim list, RECLAIM_COMPLETE, FREE_STATEID/TEST_STATEID, SECINFO/SECINFO_NO_NAME, current-stateid semantics, response-size budgeting (REP_TOO_BIG), UTF-8 name discipline. |
 | **NFSv4.2** (RFC 7862) | `minorversion=2` on the unchanged 4.1 state machine: SEEK / ALLOCATE / DEALLOCATE (sparse files), synchronous intra-server COPY (`cp` of large files without the network round trip), CLONE (reflink on XFS/Btrfs exports). Each is advertised per export from a startup capability probe; unimplemented 4.2 ops answer NOTSUPP so clients degrade per operation. |
-| **Not served** | NFSv4.0 (`minorversion=0` is rejected; clients fall back to v3 or 4.1), NLM/NSM (v3 locking), pNFS, delegations, RPCSEC_GSS/TLS, UDP. |
+| **RPC-over-TLS** (RFC 9289) | Optional transport encryption negotiated with the client's AUTH_TLS STARTTLS probe (`xprtsec=tls` on Linux 6.x), TLS session on the same TCP connection, socket I/O still on io_uring (OpenSSL over memory BIOs). `[tls] mode = optional\|required`, server cert/key, optional mutual TLS. "TLS secures the channel; AUTH_SYS declares the identity." Built when OpenSSL is present. |
+| **Not served** | NFSv4.0 (`minorversion=0` is rejected; clients fall back to v3 or 4.1), NLM/NSM (v3 locking), pNFS, write/directory delegations, RPCSEC_GSS/Kerberos, UDP. |
 
 ### Storage backends
 
@@ -306,8 +307,10 @@ Read [docs/deployment.md](docs/deployment.md) before exposing the server. The sh
 version:
 
 - **Trust boundary: AUTH_SYS only.** The client's uid/gid are trusted as presented;
-  run on a trusted network or behind WireGuard/TLS termination, and use the CIDR client
-  lists and squash modes on every export.
+  run on a trusted network. Enable built-in **RPC-over-TLS** (`[tls]`, RFC 9289) or
+  front with WireGuard for channel encryption, and use the CIDR client lists and squash
+  modes on every export. TLS secures the channel but AUTH_SYS still declares identity —
+  the trusted-network assumption stands.
 - **Least privilege.** `packaging/systemd/lightnfs.service` runs as a dedicated user
   with `CAP_DAC_READ_SEARCH` + `CAP_NET_BIND_SERVICE`, `ProtectSystem=strict`, and a
   seccomp allowlist generated from a real workload (`scripts/gen_seccomp_allowlist.sh`).
@@ -360,13 +363,16 @@ in phases, each closed by an acceptance run:
 | 5 | M7 | byte-range locks, SECINFO, error-whitelist audit, security hardening — **v1 release candidate** |
 | 6 | M8 | **done:** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE, COPY, CLONE; test infrastructure. **Demand-gated:** second backend (Lustre/GlusterFS), read delegations + callback channel, NLM/NSM |
 
-Longer-term observations (not commitments): RPC-over-TLS, write/directory delegations,
-pNFS flexfiles MDS, multi-gateway consistency on backends with native change cookies
-and locks.
+Longer-term observations: **RPC-over-TLS (RFC 9289) is now implemented** (`[tls]`).
+Still not committed — write/directory delegations (need CB_GETATTR and single-writer
+workload evidence), pNFS flexfiles MDS (a deliberate non-goal, decision D8), and
+multi-gateway consistency (needs a clustered backend that sinks native change cookies
+and byte locks).
 
 ## Known limitations
 
-- AUTH_SYS only; no Kerberos/RPCSEC_GSS, no TLS.
+- AUTH_SYS only for **identity**; no Kerberos/RPCSEC_GSS. Channel encryption is available
+  via built-in RPC-over-TLS (`[tls]`, RFC 9289) or an external tunnel.
 - No NLM/NSM: v3 clients have no byte-range locks, and v3 writes are not constrained
   by v4 share reservations or locks on the same export (documented boundary).
 - No delegations, no pNFS, no asynchronous or inter-server COPY, no READ_PLUS/xattr.

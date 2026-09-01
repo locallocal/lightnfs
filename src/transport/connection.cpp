@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 
 #include "runtime/io.hpp"
 #include "util/log.hpp"
@@ -159,6 +160,66 @@ void ConnCtx::route_cb_reply(rt::BufferChain rec) {
 }
 
 namespace {
+
+// RFC 9289 STARTTLS probe detector: a NULL call (proc 0) whose credential flavor is
+// AUTH_TLS.  Returns its xid so the reply can echo it, or nullopt for any other record.
+std::optional<uint32_t> starttls_probe_xid(const BufferChain& rec) {
+  xdr::XdrDec d(rec);
+  auto xid = d.u32();
+  auto mtype = d.u32();
+  auto rpcvers = d.u32();
+  (void)d.u32();  // prog
+  (void)d.u32();  // vers
+  auto proc = d.u32();
+  auto cred_flavor = d.u32();
+  if (!xid || !mtype || !rpcvers || !proc || !cred_flavor) return std::nullopt;
+  if (*mtype != rpc::kCall || *proc != 0 || *cred_flavor != rpc::kAuthTls)
+    return std::nullopt;
+  return *xid;
+}
+
+// Answers the AUTH_TLS NULL probe (design 09 / plan doc 10 §5.4).  When TLS is offered,
+// the reply's verifier is AUTH_TLS + "STARTTLS" and the server drives the TLS handshake
+// on this connection; the caller then reads over the TLS session.  When declined, the
+// reply is an ordinary AUTH_NONE NULL reply and the connection stays cleartext (the
+// client's xprtsec policy decides whether to proceed).
+Task<void> negotiate_starttls(ConnCtx* c, uint32_t xid) {
+  const bool offer = c->tls_ctx && c->tls_policy != TlsPolicy::kOff;
+  xdr::XdrEnc enc(c->pool);
+  enc.u32(xid);
+  enc.u32(rpc::kReply);
+  enc.u32(rpc::kMsgAccepted);
+  if (offer) {
+    enc.u32(rpc::kAuthTls);  // verifier flavor
+    static const char kStartTls[] = {'S', 'T', 'A', 'R', 'T', 'T', 'L', 'S'};
+    enc.opaque(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(kStartTls), sizeof kStartTls));
+  } else {
+    enc.u32(0);  // AUTH_NONE verifier
+    enc.u32(0);
+  }
+  enc.u32(rpc::kSuccess);  // NULL has void results
+  co_await c->send(enc.take());  // cleartext: rs is not yet upgraded
+  if (!offer) co_return;
+
+  auto made = TlsConn::create(*c->tls_ctx);
+  if (!made) {
+    LNFS_WARN("conn {}: TLS session alloc failed, tearing down", c->peer.to_string());
+    c->cancel.request();
+    co_return;
+  }
+  std::unique_ptr<TlsConn> tls = std::move(*made);
+  if (auto ok = co_await tls->accept(c->fd); !ok) {
+    LNFS_WARN("conn {}: TLS handshake failed ({}), tearing down", c->peer.to_string(),
+              errno_name(ok.error()));
+    c->cancel.request();
+    co_return;
+  }
+  c->tls_active = true;
+  c->rs.set_tls(std::move(tls));
+  LNFS_DEBUG("conn {}: STARTTLS upgrade complete", c->peer.to_string());
+}
+
 Task<void> handle_one(ConnCtx* c, rpc::Dispatcher* d, BufferChain rec) {
   // Failure isolation (plan doc 10 §2.4): an exception that escapes the dispatcher's
   // own error handling (e.g. bad_alloc while encoding the error reply) costs this
@@ -182,6 +243,7 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp,
                            ConnTracker* tracker) {
   ConnCtx* c = ctx.get();
   uint64_t conn_id = ConnRegistry::instance().add(c->fd, c->peer);
+  bool tls_probe_seen = false;  // RFC 9289: the AUTH_TLS probe is the first RPC or never
   for (;;) {
     auto rec = co_await c->rs.read_record();
     if (!rec) {
@@ -193,6 +255,17 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp,
     }
     if (rec->empty()) continue;  // empty record: ignore
     if (c->cancel.cancel_requested()) break;
+    if (!tls_probe_seen) {
+      // STARTTLS negotiation runs inline in the read loop (before any handler spawns):
+      // the reply goes out cleartext and the handshake must complete before the next
+      // record is read, so it cannot be a per-record handler coroutine.
+      tls_probe_seen = true;
+      if (auto xid = starttls_probe_xid(*rec)) {
+        co_await negotiate_starttls(c, *xid);
+        if (c->cancel.cancel_requested()) break;
+        continue;
+      }
+    }
     {
       // RPC REPLY records answer our backchannel calls (plan doc 10 §5.2): routed by
       // xid to the pending callback, never dispatched as requests.
