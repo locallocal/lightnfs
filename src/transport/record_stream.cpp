@@ -17,9 +17,15 @@ Task<Result<void>> RecordStream::fill() {
     }
     roff_ = rend_ = 0;
   }
+  std::span<std::byte> dst(rbuf_.data() + rend_, rbuf_.capacity() - rend_);
+  if (tls_) {  // RFC 9289: plaintext comes out of the TLS session
+    auto r = co_await tls_->read(fd_, dst);
+    if (!r) co_return Err(r.error());
+    rend_ += *r;
+    co_return Result<void>{};
+  }
   for (;;) {
-    int n = co_await uring_recv(
-        fd_, std::span<std::byte>(rbuf_.data() + rend_, rbuf_.capacity() - rend_));
+    int n = co_await uring_recv(fd_, dst);
     if (n == -EINTR || n == -EAGAIN) continue;
     if (n == 0) co_return Err(Errno::kEof);
     if (n < 0) co_return Err(errno_from_neg(n));
@@ -79,6 +85,18 @@ Task<Result<void>> RecordStream::write_record(SendBuf buf) {
 
   // 4-byte record mark (single fragment; RPC replies are bounded by reply-size budgets).
   uint32_t marker = xdr::to_be32(0x80000000u | static_cast<uint32_t>(total));
+  if (tls_) {  // RFC 9289: marker + body become TLS application data (SSL_write frames it)
+    std::byte mk[4];
+    std::memcpy(mk, &marker, 4);
+    Result<void> w = co_await tls_->write(fd_, std::span<const std::byte>(mk, 4));
+    for (size_t i = 0; w && i < buf.seg_count(); ++i) {
+      const auto& s = buf.seg(i);
+      w = co_await tls_->write(
+          fd_, std::span<const std::byte>(s.buf.data() + s.off, s.len));
+    }
+    send_queued_ -= total;
+    co_return w;
+  }
   SmallVec<iovec, 8> iov;   // typical replies: marker + a few segments — no heap (§2.4)
   SmallVec<iovec, 8> body;
   size_t sent = 0;

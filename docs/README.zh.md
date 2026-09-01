@@ -61,7 +61,8 @@
 | **MOUNTv3** | MNT/UMNT/EXPORT/DUMP，导出表 CIDR 访问控制。 |
 | **NFSv4.1**（RFC 8881） | 会话（EXCHANGE_ID/CREATE_SESSION/SEQUENCE 槽位 exactly-once 重放、BIND_CONN_TO_SESSION），横跨所有导出的伪根，完整 open 状态机（OPEN claim NULL/FH/PREVIOUS、share 预留、OPEN_DOWNGRADE、CLOSE），stateid 校验的 READ/WRITE/COMMIT/SETATTR，命名空间操作，字节区间锁（LOCK/LOCKT/LOCKU，POSIX 合并/拆分，非阻塞 DENIED 带持有者），租约与 courtesy 客户端，带持久 reclaim 名单的宽限期，RECLAIM_COMPLETE，FREE_STATEID/TEST_STATEID，SECINFO/SECINFO_NO_NAME，current stateid 语义，应答大小预算（REP_TOO_BIG），UTF-8 名字纪律。 |
 | **NFSv4.2**（RFC 7862） | 在不变的 4.1 状态机上宣告 `minorversion=2`：SEEK / ALLOCATE / DEALLOCATE（稀疏文件）、同步同服 COPY（大文件 `cp` 不再绕经客户端）、CLONE（XFS/Btrfs 导出上的 reflink）。每项由启动时的能力探测按导出宣告；未实现的 4.2 操作回 NOTSUPP，客户端逐操作降级。 |
-| **不提供** | NFSv4.0（`minorversion=0` 拒绝，客户端回退 v3 或 4.1）、NLM/NSM（v3 锁）、pNFS、委托、RPCSEC_GSS/TLS、UDP。 |
+| **RPC-over-TLS**（RFC 9289） | 可选的传输层加密：客户端以 AUTH_TLS 探测 NULL 过程触发 STARTTLS（Linux 6.x 的 `xprtsec=tls`），在同一 TCP 连接上握手，其后 RPC 走 TLS 会话；socket IO 仍全走 io_uring（OpenSSL 在 memory BIO 上做密码学）。`[tls] mode = optional\|required`、服务器证书/私钥、可选双向 TLS。"TLS 保通道、AUTH_SYS 报身份"。构建时有 OpenSSL 即启用。 |
+| **不提供** | NFSv4.0（`minorversion=0` 拒绝，客户端回退 v3 或 4.1）、NLM/NSM（v3 锁）、pNFS、写/目录委托、RPCSEC_GSS/Kerberos、UDP。 |
 
 ### 存储后端
 
@@ -279,8 +280,9 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 
 对外暴露前请先读 [deployment.md](deployment.md)。要点：
 
-- **信任边界：仅 AUTH_SYS。** 客户端声明的 uid/gid 被直接信任；只在受信网络或
-  WireGuard/TLS 终结之后运行，每个导出都用 CIDR 客户端列表与 squash。
+- **信任边界：仅 AUTH_SYS。** 客户端声明的 uid/gid 被直接信任；只在受信网络运行。
+  启用内置 **RPC-over-TLS**（`[tls]`，RFC 9289）或前置 WireGuard 做通道加密，每个导出都用
+  CIDR 客户端列表与 squash。TLS 保通道但 AUTH_SYS 仍报身份——受信网络假设不变。
 - **最小特权。** `packaging/systemd/lightnfs.service` 以专用用户运行，仅
   `CAP_DAC_READ_SEARCH` + `CAP_NET_BIND_SERVICE`，`ProtectSystem=strict`，seccomp 白名单由
   真实负载生成（`scripts/gen_seccomp_allowlist.sh`）。
@@ -326,15 +328,17 @@ TSAN、epoll ring）、逐次改动回归与长稳任务（24h fuzz、fsx 过夜
 | 5 | M7 | 字节区间锁、SECINFO、错误白名单复查、安全加固——**v1 发布候选** |
 | 6 | M8 | **已完成：** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE、COPY、CLONE；测试基建。**按需触发：** 第二后端（Lustre/GlusterFS）、读委托 + 回传通道、NLM/NSM |
 
-长期观察项（不承诺）：RPC-over-TLS、写/目录委托、pNFS flexfiles MDS、基于原生 change
-与锁的多网关一致性。
+长期观察项：**RPC-over-TLS（RFC 9289）已实现**（`[tls]`）。仍不承诺——写/目录委托
+（需 CB_GETATTR 与单写者工作负载证据）、pNFS flexfiles MDS（决策 D8 的明确非目标）、
+基于原生 change 与锁的多网关一致性（需下沉原生锁的集群后端）。
 
 ## 已知限制
 
-- 仅 AUTH_SYS；无 Kerberos/RPCSEC_GSS，无 TLS。
+- 身份仅 AUTH_SYS；无 Kerberos/RPCSEC_GSS。通道加密可用内置 RPC-over-TLS（`[tls]`，
+  RFC 9289）或外部隧道。
 - 无 NLM/NSM：v3 客户端没有字节锁，同一导出上 v3 写不受 v4 share 预留或锁约束
   （文档化边界）。
-- 无委托、无 pNFS、无异步或跨服 COPY、无 READ_PLUS/xattr。
+- 无写/目录委托、无 pNFS、无异步或跨服 COPY、无 READ_PLUS/xattr。
 - 单网关：v4 状态在进程内存 + 磁盘 reclaim 名单；网关间不共享状态。
 - `handles = "auto"` 兜底模式下句柄稳定性取决于文件系统（已文档化；生产用
   `CAP_DAC_READ_SEARCH` + 内核句柄）。

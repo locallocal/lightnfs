@@ -346,10 +346,20 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 
 ### 5.4 长期观察（维持 09 册口径，补充新证据）
 
-- RPC-over-TLS（RFC 9289）与 RPCSEC_GSS：AUTH_SYS-only 仍是最大的部署边界；
+- **RPC-over-TLS（RFC 9289）✅ 已落地**（2026-09-01）：AUTH_SYS-only 曾是最大的部署边界，
+  现补上传输层加密+服务器认证这一半。落地点：`transport/tls.{hpp,cpp}`（OpenSSL memory-BIO
+  异步封装，socket IO 仍全走 io_uring）、`transport/connection.cpp`（STARTTLS 探测在读循环内
+  就地协商）、`transport/record_stream.cpp`（`set_tls` 后 recv/send 走 TLS）、`rpc/dispatch.cpp`
+  （`required` 模式对明文 NFS 操作回 AUTH_TOOWEAK）、`core/config.cpp` `[tls]` 段 + 校验、
+  `main.cpp` 构建 `TlsContext` 接入两个监听器。CMake `find_package(OpenSSL)` 可选：缺 OpenSSL
+  时编译为 stub、非 off 模式配置期即拒，构建矩阵不受影响。测试 `tests/test_tls.cpp`：真实
+  OpenSSL 客户端跑通 STARTTLS 握手 + TLS 内 echo、optional 仍服务明文、required 拒明文、
+  off 拒探测、`[tls]` 配置解析/校验。仍不做 **RPCSEC_GSS/krb5**（身份层仍 AUTH_SYS）。
 - NLM/NSM（v3 锁）：按需；
-- pNFS flexfiles、写/目录委托：前提未变；
-- 多网关一致性：依赖 kNativeChange + kByteLocks 后端（见 §5.3）。
+- pNFS flexfiles、写/目录委托：前提未变（写委托需 CB_GETATTR + 单写者工作负载证据；pNFS 为
+  决策 D8 非目标）；
+- 多网关一致性：依赖 kNativeChange + kByteLocks 后端（见 §5.3；本地后端无 `native_locks()`，
+  需集群后端才具备真实检验条件）。
 
 ---
 

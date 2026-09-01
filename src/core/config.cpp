@@ -162,7 +162,9 @@ bool Cidr::contains(const sockaddr_storage& peer) const {
 
 Result<Config> parse_config(std::string_view text) {
   Config config;
-  enum class Section { kNone, kServer, kLimits, kProtocol, kExport, kExportBackend };
+  enum class Section {
+    kNone, kServer, kLimits, kProtocol, kTls, kExport, kExportBackend
+  };
   Section section = Section::kNone;
   ExportConfig* exp = nullptr;
   std::istringstream input{std::string(text)};
@@ -181,6 +183,7 @@ Result<Config> parse_config(std::string_view text) {
       if (line == "[server]") section = Section::kServer;
       else if (line == "[limits]") section = Section::kLimits;
       else if (line == "[protocol]") section = Section::kProtocol;
+      else if (line == "[tls]") section = Section::kTls;
       else if (line.starts_with("[export.") && exp) section = Section::kExportBackend;
       else return Err(errno_from(EINVAL));
       continue;
@@ -295,6 +298,14 @@ Result<Config> parse_config(std::string_view text) {
         config.server.client_iops = static_cast<uint32_t>(n);
       }
       // rtmax/wtmax/dtpref are backend limits in phase 1; unknown limit keys are accepted.
+    } else if (section == Section::kTls) {
+      if (key == "mode") config.server.tls_mode = LNFS_TRY(string_value(value));
+      else if (key == "cert") config.server.tls_cert = LNFS_TRY(string_value(value));
+      else if (key == "key") config.server.tls_key = LNFS_TRY(string_value(value));
+      else if (key == "ca") config.server.tls_ca = LNFS_TRY(string_value(value));
+      else if (key == "client_cert")
+        config.server.tls_require_client_cert = LNFS_TRY(bool_value(value));
+      else return Err(errno_from(EINVAL));
     } else if (section == Section::kProtocol) {
       if (key == "v3") LNFS_TRY(bool_value(value));
       else if (key == "v4") config.server.enable_v4 = LNFS_TRY(bool_value(value));
@@ -403,6 +414,24 @@ Result<void> validate_config(const Config& config) {
     if (inet_pton(AF_INET, config.server.bind.c_str(), &a4) != 1 &&
         inet_pton(AF_INET6, config.server.bind.c_str(), &a6) != 1)
       return Err(errno_from(EINVAL));
+  }
+  {  // RPC-over-TLS (RFC 9289): validate the [tls] section up front (plan doc 10 §5.4).
+    const auto& s = config.server;
+    if (s.tls_mode != "off" && s.tls_mode != "optional" && s.tls_mode != "required")
+      return Err(errno_from(EINVAL));
+    if (s.tls_mode != "off") {
+#ifndef LNFS_TLS
+      return Err(errno_from(ENOTSUP));  // built without OpenSSL: a non-off mode is invalid
+#endif
+      if (s.tls_cert.empty() || s.tls_key.empty()) return Err(errno_from(EINVAL));
+      struct stat st {};
+      if (stat(s.tls_cert.c_str(), &st) < 0 || stat(s.tls_key.c_str(), &st) < 0)
+        return Err(errno_from(errno ? errno : ENOENT));
+      if (!s.tls_ca.empty() && stat(s.tls_ca.c_str(), &st) < 0)
+        return Err(errno_from(errno ? errno : ENOENT));
+      if (s.tls_require_client_cert && s.tls_ca.empty())
+        return Err(errno_from(EINVAL));  // mutual TLS needs a CA bundle to verify against
+    }
   }
   std::set<uint32_t> fsids;
   std::set<std::string> paths;

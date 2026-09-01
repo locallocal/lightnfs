@@ -87,10 +87,27 @@ fuzz：`fuzz/fuzz_handle_request.cpp` 直喂 `Dispatcher::handle_request`，阶�
 
 ## 8. AUTH_SYS 信任边界写入部署文档 ✅（阶段 5）
 
-- `docs/deployment.md` §1 明确：AUTH_SYS 身份不可验证 ⇒ 仅受信网络部署，公网必须前置
-  WireGuard/IPsec 或 TLS；`clients` CIDR 白名单 + `squash` 收敛；句柄 HMAC 防伪造句柄
-  但不防伪造身份。§5 归档全部已知限制（无 GSS、无 NLM、v3/v4 混布锁边界、句柄稳定性、
-  单机网关）。
+- `docs/deployment.md` §1 明确：AUTH_SYS 身份不可验证 ⇒ 仅受信网络部署，公网必须加密——
+  内置 **RPC-over-TLS**（RFC 9289，`[tls]`，`xprtsec=tls`）或前置 WireGuard/IPsec/stunnel；
+  `clients` CIDR 白名单 + `squash` 收敛；句柄 HMAC 防伪造句柄但不防伪造身份。§5 归档全部
+  已知限制（无 GSS、无 NLM、v3/v4 混布锁边界、句柄稳定性、单机网关）。
+
+## RPC-over-TLS（RFC 9289）✅（长期观察项落地，2026-09-01）
+
+- **协商**：客户端在新连接首个 RPC 用 AUTH_TLS 凭据探测 NULL；服务器 `verifier =
+  AUTH_TLS + "STARTTLS"` 应答后就地握手（`transport/connection.cpp` 读循环内，早于任何
+  handler 派发）。`mode = required` 时明文连接上的非 NULL 操作一律 AUTH_TOOWEAK
+  （`rpc/dispatch.cpp`），仅放行 NULL。
+- **传输**：`transport/tls.{hpp,cpp}` 用 OpenSSL 一对 memory BIO 做密码学，密文经 io_uring
+  的 `uring_recv`/`uring_sendv` 收发——reactor 线程从不阻塞在 OpenSSL socket 调用里；每次
+  SSL_* 调用同步返回，协程只在完整 SSL_* 调用之间挂起，故单连接的读循环与回复 handler
+  永不并发重入 OpenSSL（单 reactor 单线程）。空 memory rbio 置 `BIO_set_mem_eof_return(-1)`，
+  瞬时清空不被误判为连接关闭。
+- **信任边界不放宽**：TLS 加密+认证信道，身份仍是 AUTH_SYS 声明（"TLS 保通道、AUTH_SYS
+  报身份"）；仍不做 RPCSEC_GSS/krb5。构建无 OpenSSL 时编译为 stub、非 off 模式配置期即拒。
+- **验证**：`tests/test_tls.cpp`——真实 OpenSSL 客户端 STARTTLS 握手 + TLS 内 echo、
+  optional 服务明文、required 拒明文（AUTH_TOOWEAK）、off 拒探测、`[tls]` 配置解析/校验；
+  uring 与 epoll 兜底两条 ring 均过。
 
 ---
 

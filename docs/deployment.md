@@ -9,9 +9,16 @@ lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面�
 服务器无法验证——**这等同于"网络内任意主机可声称任意用户身份"**。因此：
 
 - **只在受信网络部署**（专用存储 VLAN、容器内网、回环）。**严禁裸露公网。**
-- 公网/跨信任域访问**必须**前置加密与身份层：WireGuard / IPsec 隧道，或 stunnel/TLS
-  终止后再转发到 lightnfs 的 2049 端口。lightnfs 自身不做 RPCSEC_GSS/krb5（设计取舍
-  D8；v1 范围外）。
+- 公网/跨信任域访问**必须**加密。两条路：(a) 内置 **RPC-over-TLS**（RFC 9289，见下）——
+  客户端以 `xprtsec=tls` 挂载即触发 STARTTLS，传输层加密 + 服务器证书认证；(b) 前置
+  WireGuard / IPsec 隧道，或 stunnel 终止后转发到 2049。lightnfs 自身仍不做
+  RPCSEC_GSS/krb5（设计取舍 D8）——**TLS 保通道、AUTH_SYS 报身份**：TLS 加密并认证信道，
+  但用户身份仍由客户端 AUTH_SYS 声明，故上面的受信网络假设不因 TLS 而放宽。
+- **RPC-over-TLS 配置**（`[tls]` 段，需构建时带 OpenSSL）：`mode = "off"`（默认）/
+  `"optional"`（宣告 STARTTLS，同时仍服务明文客户端）/`"required"`（宣告 STARTTLS 并拒绝
+  明文 NFS/MOUNT 操作，回 AUTH_TOOWEAK，仅放行 NULL 探测/健康检查）；`cert`/`key` 为服务器
+  PEM 证书链与私钥；可选 `ca` + `client_cert = true` 启用双向 TLS（校验客户端证书）。
+  改动 `[tls]` 需重启（非热重载项）。
 - 用 `[[export]] clients = [...]` CIDR 白名单收敛来源，用 `squash` 把不受信客户端的
   root 映射为匿名（默认 `root`；完全不信任时用 `all`）。
 - 句柄经 SipHash-2-4 HMAC 签名（`state_dir/hmac.key`，首启生成，0600），伪造句柄→
@@ -66,6 +73,7 @@ sudo systemctl enable --now lightnfs
 | 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none` |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
 | 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |
+| 传输加密 | `[tls] mode` / `cert` / `key` / `ca` / `client_cert` | RPC-over-TLS（RFC 9289）：off/optional/required + 证书；改动需重启 |
 | 租约 | `[protocol] lease` | v4.1 租约（默认 90s） |
 | 宽限 | `[protocol] grace` | 重启后 reclaim 窗口；`auto`（默认）= lease，可设更短加快恢复 |
 | 日志文件 | `[server] log_file` / `log_rotate_*` | 空 = stderr；否则按大小轮转的文件 |
@@ -117,7 +125,12 @@ sudo systemctl enable --now lightnfs
 
 ## 5. 已知限制（v1）
 
-- **仅 AUTH_SYS**：无 krb5/RPCSEC_GSS（见 §1）。
+- **身份仅 AUTH_SYS**：无 krb5/RPCSEC_GSS（见 §1）。通道加密可用内置 **RPC-over-TLS**
+  （`[tls]`，RFC 9289）：STARTTLS 探测 + 同连接 TLS 会话；socket IO 仍全走 io_uring
+  （OpenSSL 在 memory BIO 上做密码学，reactor 不阻塞）。回传通道（委托召回 /
+  CB_NOTIFY_LOCK）复用同一连接，握手后自动加密。**仍不做写/目录委托、pNFS、多网关一致性**
+  （前提未变：写委托需 CB_GETATTR + 单写者证据，pNFS 为决策 D8 非目标，多网关需下沉原生锁的
+  集群后端）。
 - **不实现 NLM/NSM**：v3 无字节锁（设计 D8）。v4.1 有完整字节锁；**v3 与 v4 同挂一后端时，
   v3 写不受 v4 的 share deny / 字节锁约束**（v3 侧本无锁语义，文档明示的边界）。
 - **v4.2 按 op 宣告**：启动时对每个导出探测 `kSparseOps`/`kCopyRange`/`kCloneRange` 并写

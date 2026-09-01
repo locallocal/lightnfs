@@ -30,7 +30,9 @@
 
 覆盖要点：fake ring 时序注入（EINTR/短读/乱序/取消）、StateMgr 并发矩阵（分片锁死锁自由）、
 DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放 / stateid 家族 /
-名字空间 op / 锁生命周期、错误映射白名单生成式对照（v3+v4）。
+名字空间 op / 锁生命周期、错误映射白名单生成式对照（v3+v4）、RPC-over-TLS（RFC 9289）端到端
+（`tests/test_tls.cpp`：真实 OpenSSL 客户端 STARTTLS 握手 + TLS 内 echo、optional 服务明文、
+required 拒明文回 AUTH_TOOWEAK、off 拒探测、`[tls]` 配置解析/校验；uring 与 epoll 两条 ring 均过）。
 
 ## 3. 协议一致性
 

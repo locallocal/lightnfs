@@ -36,6 +36,16 @@ Task<void> Dispatcher::handle_request(transport::ConnCtx& ctx, rt::BufferChain r
     co_return;
   }
 
+  // RFC 9289 tls = "required" (plan doc 10 §5.4): a cleartext connection may only carry
+  // the NULL procedure (health checks and the STARTTLS probe itself); every real
+  // NFS/MOUNT operation is refused AUTH_TOOWEAK until the connection upgrades.
+  if (ctx.tls_policy == transport::TlsPolicy::kRequired && !ctx.tls_active &&
+      call->proc != 0) {
+    encode_reply_auth_error(enc, call->xid, kAuthTooweak);
+    co_await send_enc(ctx, enc);
+    co_return;
+  }
+
   const Program* prog = nullptr;
   bool prog_known = false;
   for (const auto& p : programs_) {

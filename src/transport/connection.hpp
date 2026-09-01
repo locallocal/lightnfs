@@ -21,6 +21,7 @@
 #include "runtime/sync.hpp"
 #include "transport/backchannel.hpp"
 #include "transport/record_stream.hpp"
+#include "transport/tls.hpp"
 
 namespace lnfs::transport {
 
@@ -30,6 +31,10 @@ struct TransportConfig {
   int max_inflight_per_conn = 64;                      // v3 path; v4.1 uses session slots
   int max_connections = 4096;
   int per_peer_limit = 128;
+  // RPC-over-TLS (RFC 9289): null unless the server was configured with a cert.  The
+  // context is process-global and outlives every connection.
+  const TlsContext* tls = nullptr;
+  TlsPolicy tls_policy = TlsPolicy::kOff;
 };
 
 // Binary per-peer key: the address without the port, v4 addresses v6-mapped so the two
@@ -78,7 +83,9 @@ struct ConnCtx {
         peer(std::move(peer_)),
         pool(pool_),
         rs(fd_, pool_, cfg.max_fragment, cfg.max_request_size),
-        inflight(cfg.max_inflight_per_conn) {}
+        inflight(cfg.max_inflight_per_conn),
+        tls_ctx(cfg.tls),
+        tls_policy(cfg.tls_policy) {}
 
   int fd;
   Peer peer;
@@ -89,6 +96,13 @@ struct ConnCtx {
   int64_t live = 0;  // in-flight handler coroutines (same-reactor)
   rt::Event drained;
   bool send_failed = false;
+
+  // RPC-over-TLS (RFC 9289): the server context (null when TLS is off), the enforcement
+  // policy, and whether this connection completed a STARTTLS upgrade.  tls_active gates
+  // the "required" rejection of cleartext NFS ops in the dispatcher.
+  const TlsContext* tls_ctx = nullptr;
+  TlsPolicy tls_policy = TlsPolicy::kOff;
+  bool tls_active = false;
 
   // Serialized reply send; on failure marks the connection for teardown.
   rt::Task<void> send(rt::SendBuf buf);

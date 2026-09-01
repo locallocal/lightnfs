@@ -85,7 +85,10 @@ Result<Cred> authenticate(const RpcCall&, const ExportEntry&);  // AUTH_NONE/AUT
 ```
 
 - AUTH_SYS 解析 + 按导出配置 squash（root_squash/all_squash → anon uid/gid）在**此处一次完成**，引擎与后端只见映射后的 `Cred`。
-- flavor 插槽：`Authenticator` 接口注册表，未来挂 RPCSEC_GSS/TLS 通道属性，接口位置预留、v1 只有两个实现。
+- flavor 插槽：`Authenticator` 接口注册表，未来挂 RPCSEC_GSS 通道属性，接口位置预留、v1 只有两个实现。
+  **RPC-over-TLS（RFC 9289）已落地**（plan doc 10 §5.4）：它是传输绑定而非 auth flavor——
+  AUTH_TLS(7) 只在 NULL 过程上探测触发 STARTTLS，握手后 `transport::TlsConn` 就在同一连接上
+  加密收发，不经 `Authenticator`；`AuthFlavor` 仍只有 NONE/SYS 两个真实身份实现。
 - MOUNT/NFS 层导出 IP 校验也在此层入口做（`ExportTable::check_client(peer, export)`），v4 伪根除外（允许任意来源浏览伪根、进导出时校验）。
 
 ## 3.6 XDR 基建
