@@ -1,0 +1,3 @@
+[server]
+bid =:1"
+metrics_allow = ["0"]

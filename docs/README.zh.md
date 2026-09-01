@@ -143,8 +143,12 @@ src/
   main.cpp    lightnfsd
 tools/        lightnfs-ctl（管理 CLI + tools/bench/ 下的三层基准与基线）、lightnfs-fh
 tests/        单测/集成测试（迷你测试框架、fake ring）与用户态验收客户端
-fuzz/         覆盖完整请求路径的 libFuzzer 入口 + 入库语料
-scripts/      一键验收（回环与 VM）、数据集/工具获取、基准门禁、故障注入、seccomp 白名单生成
+fuzz/         六个 libFuzzer 目标（请求路径、filehandle 解码、TOML 配置、record
+              stream 重组、v4 attrs、local ObjId 解析），种子语料（fuzz/seed/）与
+              字典（fuzz/dict/）入库，增长语料留在本机 fuzz/corpus/
+scripts/      ci.sh（一站式构建矩阵 + 门禁）、fuzz.sh（种子/过夜跑、语料最小化）、
+              一键验收（回环与 VM）、钉定版本的工具获取、基准门禁、故障注入、
+              format/tidy/coverage、seccomp 白名单生成
 packaging/    systemd 单元
 config/       配置样例
 docs/         设计、协议调研与部署文档
@@ -163,16 +167,20 @@ docs/         设计、协议调研与部署文档
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
-ctest --test-dir build            # 单测 + 集成测试（约 120 项，< 1 分钟）
+ctest --test-dir build            # lnfs_tests 约 200 项用例，另有各 fuzz 目标的
+                                  # regress 回放与 errmap 漂移门禁
+scripts/ci.sh                     # 完整矩阵：GCC/Clang × Debug/Release × ASAN+UBSAN
+                                  # × TSAN × epoll × fuzz smoke + lint 门禁
 ```
 
 构建选项：
 
 | 选项 | 取值 | 用途 |
 |------|------|------|
-| `LNFS_SANITIZE` | `address`、`thread` | sanitizer 构建（常规矩阵两者都跑） |
+| `LNFS_SANITIZE` | `address`、`thread` | sanitizer 构建（`scripts/ci.sh` 矩阵两者都跑） |
 | `LNFS_RING` | `auto`（默认）、`uring`、`epoll` | 默认 ring 后端；`epoll` 强制兜底路径 |
-| `LNFS_BUILD_FUZZ` | `ON` | libFuzzer 目标（仅 clang）：`./build/fuzz_handle_request fuzz/corpus` |
+| `LNFS_BUILD_FUZZ` | `ON` | libFuzzer 目标（仅 clang），由 `scripts/fuzz.sh` 驱动 |
+| `LNFS_ENABLE_BENCH_GATE` | `ON` | 把 `scripts/bench_gate.sh` 注册为 ctest 测试（Release 构建） |
 
 基准（设计 02 §2.8 三层）：
 
@@ -299,9 +307,10 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 | 层 | 手段 |
 |----|------|
 | 运行时 | fake ring 时序测试、ASAN + TSAN 构建、EINTR/短读注入 |
-| XDR / 请求路径 | round-trip 测试；覆盖完整请求路径的 libFuzzer（每 PR 120s 种子跑，每日 1h 长跑并增长语料） |
+| XDR / 请求路径 | round-trip 测试；六个解析边界的 libFuzzer——`scripts/fuzz.sh smoke`（每次改动 120s 种子跑，也在 `ci.sh` 内）与 `scripts/fuzz.sh nightly`（1h）；种子入库，增长语料留在本机（`fuzz.sh minimize` 压缩） |
 | 后端契约 | 句柄稳定性、10 万项 cookie 稳定性、写稳定级 + 粘性 fsync EIO、v4.2 稀疏/拷贝/clone |
-| 错误映射 | v3 白名单测试**由调研文档生成**（`scripts/gen_errmap_cases.py`），文档/代码偏差即测试失败；v4 行对照 RFC 表 |
+| 错误映射 | v3 白名单测试**由调研文档生成**（`scripts/gen_errmap_cases.py`），文档/代码漂移令 ctest（`errmap_check`）失败；v4 行对照 RFC 表 |
+| lint / 覆盖率 | `scripts/format_check.sh`（clang-format 门禁，`ci.sh` 内）、`scripts/tidy.sh`（clang-tidy：bugprone/performance/concurrency）、`scripts/coverage.sh`（llvm-cov 报告） |
 | 性能 | 三层基准对照 `tools/bench/baseline.txt` 的门禁 |
 | 一致性 | cthon04、fsx、pynfs（4.1）经 `accept_m*_vm.sh` 在真实内核挂载上运行；过夜 fsx 与 pynfs 全量为长稳项 |
 | v3/v4 一致 | 双挂载对比与混合版本写 |
@@ -310,9 +319,12 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 验收全部脚本化，按协议代际各留一对：`scripts/accept_m2_local.sh`（NFSv3 读写）与
 `scripts/accept_m6_local.sh`（NFSv4.1/4.2 含锁、reclaim、courtesy）无 root——用户态
 NFS 客户端经回环驱动真实服务器，与后备目录树逐字节对照，Release + ASAN；对应的
-`accept_m2_vm.sh`/`accept_m6_vm.sh` 在 root 机器上做真实内核挂载。全部测试都由这些脚本驱动——构建矩阵（GCC/Clang、ASAN、
-TSAN、epoll ring）、逐次改动回归与长稳任务（24h fuzz、fsx 过夜、每周故障注入）均可
-本地或用任意调度器按需执行；仓库不携带托管 CI 流水线。
+`accept_m2_vm.sh`/`accept_m6_vm.sh` 在 root 机器上做真实内核挂载。`scripts/ci.sh` 是
+一站式入口：构建矩阵（GCC/Clang、ASAN、TSAN、epoll ring、fuzz regress）加 errmap 与
+format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门禁与 1h fuzz。长稳任务
+（`fuzz.sh` 的 24h fuzz、fsx 过夜、每周 `fault_inject.sh`）可本地或用任意调度器按需
+执行；仓库不携带托管 CI 流水线。外部套件按钉定 commit 获取
+（`scripts/fetch_{cthon,fsx,pynfs}.sh`，`LNFS_FETCH_HEAD=1` 用于升 pin）。
 
 ## 项目状态与路线
 

@@ -1,0 +1,15 @@
+[server]
+port = 2049
+state_dir = "/var/lib/lightnfs"
+max_request_size = "2MiB"
+
+[[export]]
+path = "/srv/data"
+backend = "local"
+fsid = 9
+clients = ["10.0.0.0/8", "::1/128"]
+squash = "root"
+readonly = true
+[export.local]
+handles = "fallback"
+fd_cache = 32

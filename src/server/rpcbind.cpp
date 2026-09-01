@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -13,6 +14,8 @@
 
 namespace lnfs::server {
 namespace {
+
+std::atomic<uint16_t> g_pmap_port{111};
 
 void put32(std::array<std::byte, 128>& buf, size_t& pos, uint32_t value) {
   value = htonl(value);
@@ -34,7 +37,7 @@ Result<void> call_portmapper(uint32_t procedure, uint32_t program, uint32_t vers
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   sockaddr_in address{};
   address.sin_family = AF_INET;
-  address.sin_port = htons(111);
+  address.sin_port = htons(g_pmap_port.load(std::memory_order_relaxed));
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   uint32_t xid = static_cast<uint32_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
@@ -86,6 +89,10 @@ Result<void> rpcbind_set(uint32_t program, uint32_t version, uint16_t port) {
 
 Result<void> rpcbind_unset(uint32_t program, uint32_t version) {
   return call_portmapper(2, program, version, 0);
+}
+
+void rpcbind_target_port(uint16_t port) {
+  g_pmap_port.store(port, std::memory_order_relaxed);
 }
 
 }  // namespace lnfs::server

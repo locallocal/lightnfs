@@ -529,3 +529,252 @@ TEST(Backend, LocalOpenStateFdSemantics) {
   std::error_code ec;
   std::filesystem::remove_all(path, ec);
 }
+
+// ---- plan doc 10 §7.1 additions: kernel-handle mode, identity modes, fd cache ----
+
+namespace {
+
+int count_open_fds() {
+  int n = 0;
+  for ([[maybe_unused]] auto& e : std::filesystem::directory_iterator("/proc/self/fd")) ++n;
+  return n;
+}
+
+}  // namespace
+
+TEST(Backend, KernelHandleModeStableAcrossRestart) {
+  // Prefer the working directory (usually a real filesystem with exportable handles)
+  // over /tmp, which is commonly tmpfs; fall back when it is not writable.
+  char cwd_tmpl[] = "lnfs-khandle-XXXXXX";
+  char tmp_tmpl[] = "/tmp/lnfs-khandle-XXXXXX";
+  char* dir = mkdtemp(cwd_tmpl);
+  std::string path = dir ? dir : mkdtemp(tmp_tmpl);
+  path = std::filesystem::absolute(path).string();
+  std::string file_path = path + "/data";
+  int fd = open(file_path.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+  ASSERT_TRUE(fd >= 0);
+  ASSERT_TRUE(write(fd, "payload", 7) == 7);
+  close(fd);
+
+  backend::LocalBackend::Config cfg{.path = path,
+                                    .fsid = 33,
+                                    .fd_cache = 8,
+                                    .handles = backend::LocalBackend::HandleMode::kKernel};
+  auto made = backend::LocalBackend::create(cfg);
+  if (!made.has_value()) {
+    // Forced kernel mode on a filesystem without exportable handles must fail create()
+    // rather than degrade silently; nothing more to test on this fs.
+    EXPECT_EQ((int)made.error(), EOPNOTSUPP);
+    std::printf("  note: kernel handles unavailable on %s (fs support or "
+                "CAP_DAC_READ_SEARCH) — create() correctly refused\n",
+                path.c_str());
+    std::filesystem::remove_all(path);
+    return;
+  }
+  auto backend = std::move(*made);
+  EXPECT_TRUE(backend->caps().has(backend::Cap::kStableHandles));
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  backend::Cred cred{static_cast<uint32_t>(getuid()), static_cast<uint32_t>(getgid()), {}};
+  auto root = run_runtime(runtime, backend->root());
+  ASSERT_TRUE(root.has_value());
+  // Kernel-mode ObjIds are tagged with the kernel-handle discriminator byte.
+  EXPECT_EQ((int)(*root)->id().view()[0], 1);
+  auto file = run_runtime(runtime, (*root)->lookup(cred, "data"));
+  ASSERT_TRUE(file.has_value());
+  backend::ObjId file_id = (*file)->id();
+  backend::ObjId root_id = (*root)->id();
+  file = Err(errno_from(ESTALE));
+  root = Err(errno_from(ESTALE));
+  backend.reset();
+
+  // Restart: kernel handles are derived from the filesystem, so the same object gets
+  // the same ObjId — the §1.6 stability property fallback mode cannot give.
+  auto restarted = backend::LocalBackend::create(cfg);
+  ASSERT_TRUE(restarted.has_value());
+  auto root2 = run_runtime(runtime, (*restarted)->root());
+  ASSERT_TRUE(root2.has_value());
+  EXPECT_TRUE((*root2)->id() == root_id);
+  auto file2 = run_runtime(runtime, (*root2)->lookup(cred, "data"));
+  ASSERT_TRUE(file2.has_value());
+  EXPECT_TRUE((*file2)->id() == file_id);
+  // resolve() goes through open_by_handle_at, which needs CAP_DAC_READ_SEARCH; without
+  // privilege the kernel answers EPERM (and must NOT be mistaken for ESTALE).
+  auto resolved = run_runtime(runtime, (*restarted)->resolve(file_id));
+  if (resolved.has_value()) {
+    std::array<std::byte, 16> buf{};
+    bool eof = false;
+    auto n = run_runtime(runtime,
+                         (*resolved)->read(backend::OpenCtx{cred}, 0, buf, eof));
+    ASSERT_TRUE(n.has_value());
+    EXPECT_EQ(*n, 7u);
+  } else {
+    EXPECT_EQ((int)resolved.error(), EPERM);
+    std::printf("  note: open_by_handle_at needs CAP_DAC_READ_SEARCH — resolve gave "
+                "EPERM as expected for an unprivileged run\n");
+  }
+  resolved = Err(errno_from(ESTALE));
+  file2 = Err(errno_from(ESTALE));
+  root2 = Err(errno_from(ESTALE));
+  runtime.stop_and_join();
+  std::filesystem::remove_all(path);
+}
+
+TEST(Backend, IdentityStrictDeniesForeignCred) {
+  char tmpl[] = "/tmp/lnfs-strict-XXXXXX";
+  std::string path = mkdtemp(tmpl);
+  backend::LocalBackend::Config cfg{.path = path,
+                                    .fsid = 34,
+                                    .handles = backend::LocalBackend::HandleMode::kFallback,
+                                    .identity = backend::LocalBackend::Identity::kStrict};
+  auto made = backend::LocalBackend::create(cfg);
+  ASSERT_TRUE(made.has_value());
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  {
+    backend::Cred self{static_cast<uint32_t>(getuid()), static_cast<uint32_t>(getgid()), {}};
+    backend::Cred foreign{self.uid + 1000, self.gid + 1000, {}};
+    auto root = run_runtime(runtime, (*made)->root());
+    ASSERT_TRUE(root.has_value());
+    backend::SetAttr attrs;
+    attrs.mode = 0600;  // owner-only: the strict check must deny every other uid
+    auto created = run_runtime(runtime, (*root)->create(self, "secret", attrs, nullptr));
+    ASSERT_TRUE(created.has_value());
+    auto w = run_runtime(runtime, created->obj->write(
+        backend::OpenCtx{self}, 0, std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>("top"), 3), backend::Stability::kUnstable));
+    ASSERT_TRUE(w.has_value());
+
+    std::array<std::byte, 8> buf{};
+    bool eof = false;
+    auto own = run_runtime(runtime,
+                           created->obj->read(backend::OpenCtx{self}, 0, buf, eof));
+    EXPECT_TRUE(own.has_value());
+    auto denied = run_runtime(runtime,
+                              created->obj->read(backend::OpenCtx{foreign}, 0, buf, eof));
+    ASSERT_TRUE(!denied.has_value());
+    EXPECT_EQ((int)denied.error(), EACCES);
+    auto wdenied = run_runtime(runtime, created->obj->write(
+        backend::OpenCtx{foreign}, 0, std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>("x"), 1), backend::Stability::kUnstable));
+    ASSERT_TRUE(!wdenied.has_value());
+    EXPECT_EQ((int)wdenied.error(), EACCES);
+  }
+  runtime.stop_and_join();
+  std::filesystem::remove_all(path);
+}
+
+TEST(Backend, IdentitySetFsuidUnprivilegedIsDocumentedNoop) {
+  if (geteuid() == 0) {
+    std::printf("  note: running as root — the unprivileged-degraded assertion does not "
+                "apply; VM acceptance covers the privileged path\n");
+    return;
+  }
+  char tmpl[] = "/tmp/lnfs-fsuid-XXXXXX";
+  std::string path = mkdtemp(tmpl);
+  backend::LocalBackend::Config cfg{.path = path,
+                                    .fsid = 35,
+                                    .handles = backend::LocalBackend::HandleMode::kFallback,
+                                    .identity = backend::LocalBackend::Identity::kSetFsuid};
+  auto made = backend::LocalBackend::create(cfg);
+  ASSERT_TRUE(made.has_value());
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  {
+    backend::Cred self{static_cast<uint32_t>(getuid()), static_cast<uint32_t>(getgid()), {}};
+    backend::Cred foreign{self.uid + 1000, self.gid + 1000, {}};
+    auto root = run_runtime(runtime, (*made)->root());
+    ASSERT_TRUE(root.has_value());
+    backend::SetAttr attrs;
+    attrs.mode = 0600;
+    auto created = run_runtime(runtime, (*root)->create(self, "f", attrs, nullptr));
+    ASSERT_TRUE(created.has_value());
+    // setfsuid mode delegates the check to the kernel; without privilege setfsuid is a
+    // no-op (documented in design 06 §6.4), so the foreign write is admitted by the
+    // process's own credentials rather than denied in userspace.
+    auto w = run_runtime(runtime, created->obj->write(
+        backend::OpenCtx{foreign}, 0, std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>("k"), 1), backend::Stability::kUnstable));
+    EXPECT_TRUE(w.has_value());
+  }
+  runtime.stop_and_join();
+  std::filesystem::remove_all(path);
+}
+
+TEST(Backend, FdCacheConcurrentStressFlushAndNoFdLeak) {
+  char tmpl[] = "/tmp/lnfs-fdstress-XXXXXX";
+  std::string path = mkdtemp(tmpl);
+  rt::Runtime runtime({.reactors = 2, .offload_threads = 4});
+  runtime.start();
+  int fds_baseline = count_open_fds();
+  {
+    auto made = backend::LocalBackend::create({.path = path, .fsid = 36, .fd_cache = 4});
+    ASSERT_TRUE(made.has_value());
+    auto& be = **made;
+    backend::Cred cred{static_cast<uint32_t>(getuid()), static_cast<uint32_t>(getgid()), {}};
+    auto root = run_runtime(runtime, be.root());
+    ASSERT_TRUE(root.has_value());
+
+    constexpr int kFiles = 16, kTasks = 8, kIters = 64;
+    std::vector<backend::ObjPtr> files;
+    for (int i = 0; i < kFiles; ++i) {
+      auto created = run_runtime(runtime,
+                                 (*root)->create(cred, "f" + std::to_string(i), {}, nullptr));
+      ASSERT_TRUE(created.has_value());
+      files.push_back(created->obj);
+    }
+
+    // 8 tasks × 64 iterations over 16 files on 2 reactors with a 4-entry cache: pins,
+    // evictions and (with unlucky interleaving) all-pinned overflow all race here.
+    std::atomic<int> failures{0};
+    std::mutex mu;
+    std::condition_variable cv;
+    int done = 0;
+    for (int t = 0; t < kTasks; ++t) {
+      rt::spawn(
+          [](int task, std::vector<backend::ObjPtr>* files, backend::Cred cred,
+             std::atomic<int>* failures, std::mutex* mu, std::condition_variable* cv,
+             int* done) -> rt::Task<void> {
+            std::byte buf[16];
+            for (int i = 0; i < kIters; ++i) {
+              auto& obj = *(*files)[(task * 7 + i) % kFiles];
+              backend::OpenCtx open{cred, nullptr};
+              const char msg[] = "stress";
+              auto w = co_await obj.write(
+                  open, static_cast<uint64_t>(task) * 64,
+                  std::span<const std::byte>(reinterpret_cast<const std::byte*>(msg), 6),
+                  backend::Stability::kUnstable);
+              if (!w) failures->fetch_add(1);
+              bool eof = false;
+              auto r = co_await obj.read(open, 0, std::span<std::byte>(buf), eof);
+              if (!r) failures->fetch_add(1);
+            }
+            std::lock_guard lock(*mu);
+            ++*done;
+            cv->notify_one();
+          }(t, &files, cred, &failures, &mu, &cv, &done),
+          runtime.reactor(t % 2));
+    }
+    {
+      std::unique_lock lock(mu);
+      cv.wait(lock, [&] { return done == kTasks; });
+    }
+    EXPECT_EQ(failures.load(), 0);
+    auto st = be.fd_cache_stats();
+    // The cap holds unless an eviction pass found every entry pinned (counted).
+    EXPECT_TRUE(st.entries <= 4 || st.overflows > 0);
+    EXPECT_TRUE(st.hits + st.misses > 0);
+
+    // flush drops every unpinned entry from both caches.
+    files.clear();
+    root = Err(errno_from(ESTALE));
+    size_t flushed = be.flush_fd_cache();
+    EXPECT_TRUE(flushed >= 1);
+    EXPECT_EQ(be.fd_cache_stats().entries, 0u);
+  }
+  // Backend gone: every cached/pinned fd must be returned to the process.
+  int fds_after = count_open_fds();
+  EXPECT_TRUE(fds_after <= fds_baseline + 1);
+  runtime.stop_and_join();
+  std::filesystem::remove_all(path);
+}

@@ -1,0 +1,9 @@
+[server]
+port = 2041
+
+[[export]]
+ =
+c2l=e
+[export.loc]
+= "bac8k"
+fd_cch =32

@@ -8,8 +8,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <arpa/inet.h>
+#include <filesystem>
+#include <vector>
 
 #include "backend/memory.hpp"
 #include "core/config.hpp"
@@ -35,6 +38,26 @@ using namespace lnfs::transport;
 namespace {
 
 constexpr uint32_t kFuzzProg = 300000;
+
+// Hermetic state_dir (plan doc 10 §7.2): a per-process private directory under $TMPDIR,
+// removed at exit.  The old fixed "/tmp/lnfs-fuzz-state" made every EXCHANGE_ID exec
+// write+fsync into a world-shared path and leak state across runs.
+std::string g_state_dir;
+void cleanup_state_dir() {
+  std::error_code ec;
+  if (!g_state_dir.empty()) std::filesystem::remove_all(g_state_dir, ec);
+}
+const std::string& fuzz_state_dir() {
+  [[maybe_unused]] static bool init = [] {
+    const char* base = std::getenv("TMPDIR");
+    std::string tmpl = std::string(base && *base ? base : "/tmp") + "/lnfs-fuzz-XXXXXX";
+    std::vector<char> buf(tmpl.c_str(), tmpl.c_str() + tmpl.size() + 1);
+    if (const char* got = mkdtemp(buf.data())) g_state_dir = got;
+    std::atexit(cleanup_state_dir);
+    return true;
+  }();
+  return g_state_dir;
+}
 
 // A handler that exercises the decoder shapes engines will use.
 Task<void> fuzz_handler(void*, ConnCtx& c, RpcCall& call, const Cred&) {
@@ -86,7 +109,7 @@ extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
   mount.register_with(disp);
   // v4.1 stack: COMPOUND decode surface + session/state machinery (phase 3).
   core::PseudoFs pseudo(exports);
-  state::StateMgr state({.boot_epoch = 1, .state_dir = "/tmp/lnfs-fuzz-state"});
+  state::StateMgr state({.boot_epoch = 1, .state_dir = fuzz_state_dir()});
   nfsv4::Engine nfs4(exports, handles, locks, pseudo, state);
   nfs4.register_with(disp);
 

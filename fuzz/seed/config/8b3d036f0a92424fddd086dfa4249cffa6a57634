@@ -1,0 +1,3 @@
+[server]
+
+metrics_allow= ["8", "", "::1"]

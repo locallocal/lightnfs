@@ -405,43 +405,68 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 
 ---
 
-## 7. 测试与工程化
+## 7. 测试与工程化 ✅ 已完成（2026-09-01）
 
-### 7.1 测试缺口
+### 7.1 测试缺口 ✅
 
-- **零单测模块**：`server/ctl.cpp`（含 metrics HTTP）、`obs/metrics.cpp`、
-  `server/rpcbind.cpp`。ctl 仅被验收脚本冒烟。
-- backend：fd cache 容量/淘汰/并发压力（§1.3 修复的回归）、kernel-handle 模式
-  （现有测试只断言 fallback 路径）、identity strict/setfsuid（§1.1 修复后补端到端）、
-  poison 语义单测。
-- v4.2 边界：CLONE 非块对齐（FICLONERANGE EINVAL 透传无用例，
-  `local.cpp:1150-1154`）、同文件重叠 COPY、超 EOF 的 ALLOCATE/DEALLOCATE、
-  `max_filesize` 边界。
-- 并发/长稳：§1.2 数据竞争的针对性 TSAN 用例；fd 泄漏与内存增长的长稳回归
-  （§1.5 的三处无界增长正需要它）。
-- 故障注入面太窄：目前只有 `LNFS_FAULT_FSYNC_EIO` 一个钩子（`local.cpp:998-1012`），
-  补 ENOSPC/EDQUOT/读 EIO/短写/慢盘、网络 RST/半关闭。
+- **零单测模块** ✅：`tests/test_metrics.cpp`（ExportMetrics、text provider、v3 序列
+  与 calls==0 跳过规则、扁平计数、append_histogram span 重载）；
+  `tests/test_rpcbind.cpp`（假 portmapper 应答器覆盖请求编码与全部应答解析分支——
+  成功/带填充 verifier/短应答/xid 不匹配/MSG_DENIED/accept 失败/bool false；
+  `rpcbind_target_port()` 测试缝）；test_ctl.cpp 补齐剩余命令面（`answer_async` 的
+  state/expire-client/drc flush、metrics/dump-errors/conns/kill-conn 成功路径/
+  fdcache [flush]/clear-poison）与 metrics HTTP 头部契约
+  （Content-Type/Content-Length/body= exposition）。
+- backend ✅：fd cache 并发压力 + `flush_fd_cache` + `/proc/self/fd` 无泄漏回归
+  （`Backend.FdCacheConcurrentStressFlushAndNoFdLeak`）；kernel-handle 模式
+  （强制 kKernel：无特权/不支持的 fs 断言 create() 拒绝，特权环境断言
+  kStableHandles + ObjId 跨重启稳定 + resolve）；identity strict 端到端拒绝外来
+  cred，setfsuid 无特权降级语义（root 下自跳过，特权路径归 VM 验收）；poison 语义
+  已有单测，另经真实注入 fsync EIO 触发（见下）。
+- v4.2 边界 ✅：同文件 COPY（同对象单锁分支 + 重叠区间 + ca_count==0）、
+  DEALLOCATE 全超 EOF/跨 EOF/恰在 EOF、`max_filesize` 边界（memory 后端补
+  `set_max_filesize` 保真旋钮并强制 EFBIG，引擎级断言 WRITE/ALLOCATE 越界回
+  FBIG）；CLONE 非块对齐 EINVAL 透传（`BackendWrite.CloneMisalignedEinvalPassthrough`，
+  依赖 reflink fs，非 reflink 环境自跳过）。
+- 并发/长稳 ✅：§1.2 的 TSAN 用例此前已有（`StateMgr.LockStateidIoRacesParentClose`），
+  现由 `scripts/ci.sh` 的 TSAN 腿承载；fd 泄漏回归见上；RSS 级长稳仍归
+  `fuzz.sh nightly` / fsx 过夜等 soak 项。
+- 故障注入 ✅：`backend/fault.{hpp,cpp}` 统一预算表——fsync EIO（原钩子迁入）、
+  写 ENOSPC/EDQUOT、读 EIO、短写（真实写 1 字节，锻炼两个 write 重载的续传环）、
+  慢盘（reactor 上 sleep）；env（`LNFS_FAULT_*`，fault_inject.sh 兼容）与
+  `fault::arm()/clear()`（进程内可重置，单测可驱动）双入口，`tests/test_fault.cpp`
+  覆盖；网络 RST/半关闭在 `test_transport_loopback.cpp`
+  （中途 RST 后服务器保持健康、半关闭仍排空流水线应答、记录中途半关闭走 EBADMSG）。
 
-### 7.2 fuzz 扩面
+### 7.2 fuzz 扩面 ✅
 
-现在只有 1 个 target（`fuzz/fuzz_handle_request.cpp`）、17 个语料。新增 target：
-`core/file_handle` 解码（HMAC 边界，`lightnfs-fh` 直接吃用户 hex）、
-`LocalBackend::open_oid` 的 ObjId 解析（`local.cpp:328-361`，句柄内容客户端可影响）、
-自研 TOML 解析器（`core/config.cpp`）、record_stream 分片重组（现在喂的是完整记录）、
-v4 attrs bitmap。配 fuzz 字典、语料最小化脚本，target 去掉真实文件系统依赖
-（现 state_dir 落 /tmp，非 hermetic）。
+6 个 target（`fuzz/fuzz_{handle_request,file_handle,config,record_stream,v4_attrs,
+objid_local}.cpp`）：file_handle 解码（含对带正确 HMAC 句柄的定向突变）、
+`LocalBackend::open_oid`（原始字节 + 对活 fallback ObjId 的突变，触达反查表命中与
+re-verify）、TOML 解析器、record_stream 分片重组（FakeRing 按输入自导的 1–16 字节
+完成粒度投喂）、v4 attrs bitmap/settable-fattr。种子语料入库
+（`fuzz/seed/<target>/`，原 17 个语料转正为 handle_request 种子）、字典
+（`fuzz/dict/*.dict`）、`scripts/fuzz.sh`（smoke 120s / nightly 1h / run / minimize
+（-merge）/ regress）。hermetic：state_dir 改为 $TMPDIR 下 mkdtemp、退出清理；
+无 clang 构建下每 target 一个 `fuzz_regress_<t>` 进 ctest 回放种子 + 本机语料
+（旧的 ctest 注册不带参数、从不回放语料的问题一并修正）。
 
-### 7.3 工程化
+### 7.3 工程化 ✅
 
-- **README 与实际不符处修正或补齐**：宣称的 GCC/Clang × TSAN × epoll 构建矩阵
-  没有脚本承载（build-tsan/、build-epoll/ 是手工产物）；`gen_errmap_cases.py --check`
-  与 `bench_gate.sh` 未接入 ctest；宣称的每 PR 120s / 夜间 1h fuzz 无驱动脚本。
-  建议补 `scripts/ci.sh` 一站承载（本地或任意调度器可跑），并把 errmap check
-  注册进 ctest。
-- 外部依赖固定 commit：`fetch_{cthon,fsx,pynfs}.sh` 都是 clone HEAD，不可复现。
-- 孤儿清理：`gen_dataset.sh` 无引用；`docs/test-report.md` 引用的
-  `pynfs_m4_expected.txt` 不存在。
-- lint：有 `.clang-format` 无检查脚本；评估 clang-tidy 与覆盖率（llvm-cov）接入。
+- `scripts/ci.sh` 一站承载：GCC/Clang × Debug/Release × ASAN+UBSAN × TSAN × epoll ×
+  fuzz（regress + smoke）+ errmap/format 门禁；`quick`/`full`/`nightly`（nightly 追加
+  bench 门禁与 1h fuzz）；并行度默认半数核（`LNFS_JOBS` 可调）。
+  `gen_errmap_cases.py --check` 注册进 ctest（`errmap_check`）；`bench_gate.sh` 经
+  `LNFS_ENABLE_BENCH_GATE=ON` 注册（默认关：需 Release 与安静机器）。README（中英）
+  的矩阵/fuzz 节奏/语料表述改为与脚本一致。
+- 外部依赖固定 commit ✅：`fetch_{cthon,fsx,pynfs}.sh` 按钉定 SHA 浅取
+  （GitHub 镜像优先 + 上游回退），`LNFS_FETCH_HEAD=1` 用于升 pin。
+- 孤儿清理 ✅：`gen_dataset.sh` 删除（其 M1 数据集验收入口已随发布清理移除）；
+  `docs/test-report.md` 的 `pynfs_m4_expected.txt` 悬空引用改为注明随 M4 脚本移除。
+- lint ✅：`scripts/format_check.sh`（clang-format 门禁，`--fix` 可就地改写，工具
+  缺失时跳过）；clang-tidy 评估通过并接入——`.clang-tidy`
+  （bugprone/performance/concurrency，无风格噪声）+ `scripts/tidy.sh`；覆盖率评估
+  通过并接入——`scripts/coverage.sh`（clang 源级覆盖 + llvm-cov，按需报告不设门禁）。
 
 ---
 

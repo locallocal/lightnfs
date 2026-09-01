@@ -3,16 +3,33 @@
 # Handles Python >= 3.13 (stdlib xdrlib removal) via the xdrlib3 backport + shim.
 #
 # usage: fetch_pynfs.sh DEST_DIR
+# Pinned to a fixed upstream commit (plan doc 10 §7.3); LNFS_FETCH_HEAD=1 takes the
+# current upstream HEAD instead (for bumping the pin).
 set -euo pipefail
 
 dest=${1:?usage: fetch_pynfs.sh DEST_DIR}
 
+pin=cd4701827a8261fedbfb4c6e39029fb9671321a6  # upstream HEAD, 2026-09-01
+urls=("https://github.com/linux-nfs/pynfs.git"
+      "git://git.linux-nfs.org/projects/bfields/pynfs.git"
+      "https://git.linux-nfs.org/projects/bfields/pynfs.git")
+
 if [[ ! -d $dest/.git ]]; then
-  for url in "git://git.linux-nfs.org/projects/bfields/pynfs.git" \
-             "https://git.linux-nfs.org/projects/bfields/pynfs.git"; do
-    if git clone --depth 1 "$url" "$dest" 2>/dev/null; then break; fi
+  cloned=""
+  for url in "${urls[@]}"; do
+    if [[ ${LNFS_FETCH_HEAD:-0} == 1 ]]; then
+      git clone --depth 1 "$url" "$dest" 2>/dev/null && { cloned=$url; break; }
+    else
+      if git init -q "$dest" &&
+        git -C "$dest" fetch -q --depth 1 "$url" "$pin" 2>/dev/null &&
+        git -C "$dest" checkout -q FETCH_HEAD; then
+        cloned=$url
+        break
+      fi
+      rm -rf "$dest/.git"  # failed attempt: drop only the git metadata
+    fi
   done
-  [[ -d $dest/.git ]] || { echo "cannot clone pynfs" >&2; exit 1; }
+  [[ -n $cloned ]] || { echo "cannot clone pynfs @$pin" >&2; exit 1; }
 fi
 
 python3 -c "import ply" 2>/dev/null || \

@@ -197,3 +197,73 @@ TEST(Loopback, ManyConnections) {
   for (auto& c : clients) c.join();
   EXPECT_EQ(ok.load(), 8);
 }
+
+// ---- plan doc 10 §7.1: network fault injection — RST and half-close -----------------
+
+TEST(Loopback, AbortiveResetMidRecordLeavesServerHealthy) {
+  Server srv;
+  for (int round = 0; round < 3; ++round) {
+    int fd = connect_loopback(srv.port());
+    ASSERT_TRUE(fd >= 0);
+    // Send only the record marker + a truncated body, then RST (SO_LINGER 0 + close):
+    // the connection dies mid-record with ECONNRESET on the server's recv.
+    auto call = build_call(7, 1, "half a payload");
+    ASSERT_TRUE(write(fd, call.data(), call.size() / 2) == (ssize_t)(call.size() / 2));
+    linger lg{1, 0};
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(fd);
+  }
+  // The server survived all three aborts: a fresh connection still gets answers.
+  int fd = connect_loopback(srv.port());
+  ASSERT_TRUE(fd >= 0);
+  auto call = build_call(8, 1, "after-rst");
+  ASSERT_TRUE(write(fd, call.data(), call.size()) == (ssize_t)call.size());
+  std::vector<std::byte> rep;
+  ASSERT_TRUE(read_record(fd, rep));
+  xdr::XdrDec dec{std::span<const std::byte>(rep.data(), rep.size())};
+  EXPECT_EQ(*dec.u32(), 8u);
+  close(fd);
+}
+
+TEST(Loopback, HalfCloseDrainsPipelinedRepliesThenTearsDown) {
+  Server srv;
+  int fd = connect_loopback(srv.port());
+  ASSERT_TRUE(fd >= 0);
+  // Two pipelined calls, then shutdown(SHUT_WR): the client half-closes but must still
+  // receive both replies before the server finishes the record stream with EOF.
+  auto c1 = build_call(21, 1, "first");
+  auto c2 = build_call(22, 1, "second");
+  std::vector<std::byte> all(c1);
+  all.insert(all.end(), c2.begin(), c2.end());
+  ASSERT_TRUE(write(fd, all.data(), all.size()) == (ssize_t)all.size());
+  ASSERT_TRUE(shutdown(fd, SHUT_WR) == 0);
+  std::vector<uint32_t> xids;
+  std::vector<std::byte> rep;
+  while (read_record(fd, rep)) {
+    xdr::XdrDec dec{std::span<const std::byte>(rep.data(), rep.size())};
+    xids.push_back(*dec.u32());
+  }
+  std::sort(xids.begin(), xids.end());
+  ASSERT_TRUE(xids.size() == 2);
+  EXPECT_EQ(xids[0], 21u);
+  EXPECT_EQ(xids[1], 22u);
+  // After EOF the server closed its side too (read_record already saw EOF above).
+  close(fd);
+
+  // A half-close mid-record is a protocol error (EBADMSG path), not a hang.
+  fd = connect_loopback(srv.port());
+  ASSERT_TRUE(fd >= 0);
+  auto partial = build_call(23, 1, "never finished");
+  ASSERT_TRUE(write(fd, partial.data(), 6) == 6);
+  ASSERT_TRUE(shutdown(fd, SHUT_WR) == 0);
+  EXPECT_FALSE(read_record(fd, rep));  // server tears down instead of waiting forever
+  close(fd);
+
+  // And the listener still serves new connections.
+  fd = connect_loopback(srv.port());
+  ASSERT_TRUE(fd >= 0);
+  auto ok = build_call(24, 0, "");
+  ASSERT_TRUE(write(fd, ok.data(), ok.size()) == (ssize_t)ok.size());
+  ASSERT_TRUE(read_record(fd, rep));
+  close(fd);
+}

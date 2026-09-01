@@ -1,0 +1,10 @@
+# fattr4 shapes: bitmap word counts, attr bits, SET_TO_CLIENT_TIME discriminants.
+words1="\x00\x00\x00\x01"
+words2="\x00\x00\x00\x02"
+words3="\x00\x00\x00\x03"
+bit_size="\x00\x00\x00\x10"
+bit_mode="\x00\x00\x00\x02"
+bit_owner="\x00\x02\x00\x00"
+set_to_client="\x00\x00\x00\x01"
+set_to_server="\x00\x00\x00\x00"
+mode644="\x00\x00\x01\xa4"

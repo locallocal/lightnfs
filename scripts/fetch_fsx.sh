@@ -4,15 +4,27 @@
 # generated global.h with a minimal static shim — only fsx is built, nothing else.
 #
 # usage: fetch_fsx.sh DEST_DIR      # produces DEST_DIR/fsx
+#
+# Pinned to a fixed xfstests commit (plan doc 10 §7.3); LNFS_FETCH_HEAD=1 takes the
+# current upstream HEAD instead (for bumping the pin).
 set -euo pipefail
 
 dest=${1:?usage: fetch_fsx.sh DEST_DIR}
 mkdir -p "$dest"
 
+pin=56c410ad0f69da5b13c5807bc47b4876dcfa02b2  # upstream HEAD, 2026-09-01
+
 if [[ ! -x $dest/fsx ]]; then
   src="$dest/xfstests"
   if [[ ! -d $src ]]; then
-    git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "$src"
+    if [[ ${LNFS_FETCH_HEAD:-0} == 1 ]]; then
+      git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "$src"
+    else
+      git init -q "$src"
+      git -C "$src" fetch -q --depth 1 \
+        https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "$pin"
+      git -C "$src" checkout -q FETCH_HEAD
+    fi
   fi
   cat > "$src/ltp/global.h" <<'EOF'
 /* Minimal standalone shim replacing xfstests' generated global.h (fsx-only build). */

@@ -49,7 +49,7 @@ required 拒明文回 AUTH_TOOWEAK、off 拒探测、`[tls]` 配置解析/校验
 | 里程碑 | 范围 | 结果 |
 |--------|------|------|
 | M5（阶段 3） | 会话五组 + 扩展组 | 67/75 + 37/44，失败全部为写依赖或需 root 的树对象 |
-| M6（阶段 4） | open/rename/verify/courteous/currentstateid + 阶段 3 全部组 | **184 用例：162 通过，22 失败全部命中预期排除表**（`pynfs_m4_expected.txt`） |
+| M6（阶段 4） | open/rename/verify/courteous/currentstateid + 阶段 3 全部组 | **184 用例：162 通过，22 失败全部命中预期排除表**（其排除表 `pynfs_m4_expected.txt` 已随 M4 脚本在发布清理时移除，见上；现行排除表为 `pynfs_m5_expected.txt`） |
 | M7（阶段 5） | 锁 / secinfo / courtesy 组 | 26 通过 / 1 失败（CSID7 为 pynfs 自身 NameError） |
 | M8（阶段 6.1） | + secinfo_no_name/SEC1/SEC2 等 | **186 用例：168 通过，18 失败全部命中预期排除表**（`pynfs_m5_expected.txt`：委托/回传属 M8 遗留、需 root 的设备节点、CSID7） |
 

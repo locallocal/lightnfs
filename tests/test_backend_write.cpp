@@ -452,3 +452,46 @@ TEST(BackendWrite, ScatterWriteVectored) {
   }
   runtime.stop_and_join();
 }
+
+// plan doc 10 §7.1: FICLONERANGE requires block-aligned offsets; the backend must pass
+// the kernel's EINVAL through untouched.  Needs a reflink filesystem (Btrfs/XFS) — on
+// others kCloneRange is not advertised and the case self-skips (CI covers reflink).
+TEST(BackendWrite, CloneMisalignedEinvalPassthrough) {
+  char cwd_tmpl[] = "lnfs-clone-XXXXXX";
+  char tmp_tmpl[] = "/tmp/lnfs-clone-XXXXXX";
+  char* dir = mkdtemp(cwd_tmpl);
+  std::string path = fs::absolute(dir ? dir : mkdtemp(tmp_tmpl)).string();
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  {
+    auto made = backend::LocalBackend::create({.path = path, .fsid = 7});
+    ASSERT_TRUE(made.has_value());
+    auto& be = **made;
+    if (!be.caps().has(backend::Cap::kCloneRange)) {
+      std::printf("  note: no reflink support on %s — CLONE EINVAL passthrough not "
+                  "reachable here\n", path.c_str());
+    } else {
+      auto cred = self_cred();
+      backend::OpenCtx open{cred, nullptr};
+      auto root = run_runtime(runtime, be.root());
+      ASSERT_TRUE(root.has_value());
+      auto src = run_runtime(runtime, (*root)->create(cred, "src", {}, nullptr));
+      auto dst = run_runtime(runtime, (*root)->create(cred, "dst", {}, nullptr));
+      ASSERT_TRUE(src.has_value() && dst.has_value());
+      std::vector<std::byte> block(8192, std::byte{0x5a});
+      auto w = run_runtime(runtime, src->obj->write(open, 0, std::span<const std::byte>(block),
+                                                    backend::Stability::kFileSync));
+      ASSERT_TRUE(w.has_value());
+      // Aligned clone works; a 1-byte source offset violates FICLONERANGE's block
+      // alignment and the kernel's EINVAL must surface (not EOPNOTSUPP, not success).
+      auto ok = run_runtime(runtime, src->obj->clone(open, *dst->obj, open, 0, 0, 4096));
+      EXPECT_TRUE(ok.has_value());
+      auto bad = run_runtime(runtime, src->obj->clone(open, *dst->obj, open, 1, 0, 4096));
+      ASSERT_TRUE(!bad.has_value());
+      EXPECT_EQ(raw(bad.error()), EINVAL);
+    }
+  }
+  runtime.stop_and_join();
+  std::error_code ec;
+  fs::remove_all(path, ec);
+}

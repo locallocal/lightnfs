@@ -1,0 +1,10 @@
+[server]
+port = 2041
+stae = "2MiB"
+
+[[export]]
+p = 9
+clnly = true
+[export.local]
+handles = "fallback"
+fd_cache = 32
