@@ -1,0 +1,5 @@
+[limits]
+client_iops = 500
+[protocol]
+lease = "90s"
+delegations = false

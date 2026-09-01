@@ -1,0 +1,9 @@
+[server]
+port = 2041
+
+[[export]]
+p = 0
+cl=e
+[export.local]
+= "fallbac8k"
+fd_cache = 32

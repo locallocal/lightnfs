@@ -1,0 +1,11 @@
+# Narrow, high-signal set (plan doc 10 §7.3): correctness and performance checks only —
+# no naming/style churn (clang-format owns layout).  Run via scripts/tidy.sh.
+Checks: >
+  bugprone-*,
+  performance-*,
+  concurrency-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-unchecked-optional-access,
+  -performance-avoid-endl
+WarningsAsErrors: ''
+HeaderFilterRegex: '^.*/src/.*'

@@ -14,7 +14,7 @@
 | readdir 预算 | dircount/maxcount 双预算 + TOOSMALL 下限 | `nfsv3/engine.cpp` |
 
 fuzz：`fuzz/fuzz_handle_request.cpp` 直喂 `Dispatcher::handle_request`，阶段 2 起覆盖全部
-21 个过程的解码路径（写过程随实现自动纳入）；非 clang 配置以 `fuzz_regress` 回放语料。
+21 个过程的解码路径（写过程随实现自动纳入）；非 clang 配置以每 target 一个的 `fuzz_regress_<t>` 回放种子与本机语料（ctest 内）。
 
 ## 2. 句柄 HMAC + 每请求导出/IP 校验 ✅
 

@@ -68,6 +68,10 @@ class LocalBackend final : public Backend {
 
   size_t fallback_path_count() const;  // observability for the §1.5 cap
 
+  // Handle-content parser + open. Public because handle bytes are client-controlled and
+  // this is the parse boundary fuzz targets exercise directly (plan doc 10 §7.2).
+  Result<int> open_oid(const ObjId& oid, int flags);
+
  private:
   friend class LocalObject;
   class FdCache;
@@ -75,7 +79,6 @@ class LocalBackend final : public Backend {
 
   LocalBackend(Config cfg, int root_fd, int mount_fd);
   Result<ObjId> oid_from_fd(int fd, std::string_view relative, bool remember = true);
-  Result<int> open_oid(const ObjId& oid, int flags);
   Result<ObjPtr> object_from_fd(int fd, std::string relative, bool remember = true);
   Result<Attr> attr_from_fd(int fd) const;
   Result<DirPage> readdir_sync(const LocalObject& dir, int fd, std::mutex& dents_mu,

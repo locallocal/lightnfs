@@ -164,9 +164,14 @@ tools/        lightnfs-ctl (admin CLI + the three-layer benchmarks under
               tools/bench/ with their baseline), lightnfs-fh
 tests/        unit/integration tests (mini test framework, fake ring) and the
               userspace acceptance client
-fuzz/         libFuzzer entry over the full request path + checked-in corpus
-scripts/      one-click acceptance (loopback and VM), dataset/tool fetchers,
-              bench gate, fault injection, seccomp allowlist generator
+fuzz/         six libFuzzer targets (request path, filehandle decode, TOML config,
+              record-stream reassembly, v4 attrs, local ObjId parse) with checked-in
+              seed corpora (fuzz/seed/) and dictionaries (fuzz/dict/); grown corpora
+              stay machine-local under fuzz/corpus/
+scripts/      ci.sh (one-stop build matrix + gates), fuzz.sh (seeded/nightly runs,
+              corpus minimization), one-click acceptance (loopback and VM), pinned
+              tool fetchers, bench gate, fault injection, format/tidy/coverage,
+              seccomp allowlist generator
 packaging/    systemd unit
 config/       example configuration
 docs/         design, protocol research and deployment docs
@@ -187,16 +192,20 @@ existing clone.
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
-ctest --test-dir build            # unit + integration tests (~120 tests, < 1 min)
+ctest --test-dir build            # ~200 unit/integration cases in lnfs_tests, plus
+                                  # per-target fuzz regress and the errmap drift gate
+scripts/ci.sh                     # the full matrix: GCC/Clang × Debug/Release ×
+                                  # ASAN+UBSAN × TSAN × epoll × fuzz smoke + lint gates
 ```
 
 Build options:
 
 | Option | Values | Purpose |
 |--------|--------|---------|
-| `LNFS_SANITIZE` | `address`, `thread` | sanitizer builds (both part of the regular sweep) |
+| `LNFS_SANITIZE` | `address`, `thread` | sanitizer builds (both legs of `scripts/ci.sh`) |
 | `LNFS_RING` | `auto` (default), `uring`, `epoll` | default ring backend; `epoll` forces the fallback path |
-| `LNFS_BUILD_FUZZ` | `ON` | libFuzzer targets (clang only): `./build/fuzz_handle_request fuzz/corpus` |
+| `LNFS_BUILD_FUZZ` | `ON` | libFuzzer targets (clang only); driven by `scripts/fuzz.sh` |
+| `LNFS_ENABLE_BENCH_GATE` | `ON` | registers `scripts/bench_gate.sh` as a ctest test (Release builds) |
 
 Benchmarks (design 02 §2.8 three layers):
 
@@ -330,9 +339,10 @@ Test layers (development plan §9):
 | Layer | How |
 |-------|-----|
 | Runtime | fake-ring timing tests, ASAN + TSAN builds, EINTR/short-read injection |
-| XDR / request path | round-trip tests; libFuzzer over the whole request path (120 s seeded run per PR, 1 h nightly with a growing corpus) |
+| XDR / request path | round-trip tests; libFuzzer over six parse boundaries — `scripts/fuzz.sh smoke` (120 s seeded, per change, also part of `ci.sh`) and `scripts/fuzz.sh nightly` (1 h); seeds are checked in, grown corpora stay machine-local (`fuzz.sh minimize` compacts them) |
 | Backend contract | handle stability, 100k-entry cookie stability, write stability levels + sticky fsync EIO, v4.2 sparse/copy/clone |
-| Error mapping | the v3 whitelist test is **generated from the research document** (`scripts/gen_errmap_cases.py`), so doc/code drift fails the test; v4 rows checked against RFC tables |
+| Error mapping | the v3 whitelist test is **generated from the research document** (`scripts/gen_errmap_cases.py`); doc/code drift fails ctest (`errmap_check`); v4 rows checked against RFC tables |
+| Lint / coverage | `scripts/format_check.sh` (clang-format gate, part of `ci.sh`), `scripts/tidy.sh` (clang-tidy, bugprone/performance/concurrency), `scripts/coverage.sh` (llvm-cov report) |
 | Performance | three-layer benchmark gate against `tools/bench/baseline.txt` |
 | Conformance | cthon04, fsx, pynfs (4.1) on real kernel mounts via `accept_m*_vm.sh`; overnight fsx and the full pynfs suite as soak runs |
 | v3/v4 consistency | dual-mount comparisons and mixed-version writes |
@@ -343,10 +353,13 @@ Acceptance is fully scripted, one pair per protocol generation:
 (NFSv4.1/4.2 with locks, reclaim, courtesy) run without root — a userspace NFS client
 drives a real server over loopback, byte-verified against the backing tree, Release +
 ASAN — while the matching `accept_m2_vm.sh`/`accept_m6_vm.sh` run real kernel mounts
-on a root machine. The whole suite is driven from these scripts — build-matrix
-sweeps (GCC/Clang, ASAN, TSAN, epoll ring), per-change regressions, and the long runs
-(24h fuzz, overnight fsx, weekly fault injection) are all invocable locally or from
-any scheduler of your choice; the repository does not carry hosted CI pipelines.
+on a root machine. `scripts/ci.sh` is the one-stop driver: the build-matrix sweep
+(GCC/Clang, ASAN, TSAN, epoll ring, fuzz regress) plus the errmap and format gates as
+the per-change run, and `ci.sh nightly` adds the bench floor gate and a 1 h fuzz run.
+The long soaks (24h fuzz via `fuzz.sh`, overnight fsx, weekly `fault_inject.sh`) are
+invocable locally or from any scheduler of your choice; the repository does not carry
+hosted CI pipelines. External suites are fetched at pinned commits
+(`scripts/fetch_{cthon,fsx,pynfs}.sh`; `LNFS_FETCH_HEAD=1` bumps a pin).
 
 ## Project status and roadmap
 

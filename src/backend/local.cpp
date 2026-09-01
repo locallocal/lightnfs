@@ -21,6 +21,7 @@
 #include <limits>
 #include <vector>
 
+#include "backend/fault.hpp"
 #include "runtime/io.hpp"
 #include "runtime/offload_pool.hpp"
 #include "util/log.hpp"
@@ -856,6 +857,23 @@ rt::Task<Result<OpenPtr>> LocalObject::open(const Cred&, OpenFlags flags) {
   co_return OpenPtr(std::make_shared<LocalOpenState>(*opened, writable));
 }
 
+namespace {
+// Fault injection (plan doc 10 §7.1): per-kind budgets live in backend/fault.{hpp,cpp} so
+// both the env-driven weekly run (scripts/fault_inject.sh) and unit tests can arm them.
+bool take_fsync_fault() { return fault::take(fault::Kind::kFsyncEio); }
+// Injected data-write failure, or 0 to proceed with the real write.
+int take_write_fault() {
+  if (fault::take(fault::Kind::kWriteEnospc)) return -ENOSPC;
+  if (fault::take(fault::Kind::kWriteEdquot)) return -EDQUOT;
+  return 0;
+}
+// Slow-disk simulation: sleeps on the reactor without blocking the thread.
+rt::Task<void> maybe_slow_io() {
+  if (fault::take(fault::Kind::kSlowIo))
+    co_await rt::sleep_for(std::chrono::milliseconds(fault::slow_ms()));
+}
+}  // namespace
+
 rt::Task<Result<uint32_t>> LocalObject::read(OpenCtx ctx, uint64_t off,
                                              std::span<std::byte> out, bool& eof) {
   if (type() == FType::kDir) co_return Err(errno_from(EISDIR));
@@ -880,7 +898,8 @@ rt::Task<Result<uint32_t>> LocalObject::read(OpenCtx ctx, uint64_t off,
     ref = std::move(*got);
     fd = ref->fd;
   }
-  int n = co_await rt::uring_read(fd, out, off);
+  co_await maybe_slow_io();
+  int n = fault::take(fault::Kind::kReadEio) ? -EIO : co_await rt::uring_read(fd, out, off);
   if (n < 0) co_return Err(errno_from_neg(n));
   if (out.empty()) {  // zero-length read: only a size probe can answer eof
     auto attr = co_await getattr();
@@ -1299,28 +1318,6 @@ rt::Task<Result<void>> LocalObject::link(const Cred& cred, Object& file,
   });
 }
 
-namespace {
-// Fault injection for the weekly fault-injection run (development plan §9 "故障注入":
-// fsync EIO).  LNFS_FAULT_FSYNC_EIO=N makes the first N fsync/fdatasync calls of the
-// process fail with EIO — exercising the sticky-poison contract end to end without a
-// faulty disk.  Unset in production; read once.
-std::atomic<int>& fsync_faults_left() {
-  static std::atomic<int> left = [] {
-    const char* v = std::getenv("LNFS_FAULT_FSYNC_EIO");
-    return v ? std::atoi(v) : 0;
-  }();
-  return left;
-}
-bool take_fsync_fault() {
-  auto& left = fsync_faults_left();
-  int cur = left.load(std::memory_order_relaxed);
-  while (cur > 0) {
-    if (left.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed)) return true;
-  }
-  return false;
-}
-}  // namespace
-
 rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
                                               std::span<const std::byte> in,
                                               Stability stability) {
@@ -1348,9 +1345,15 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
     ref = std::move(*got);
     fd = ref->fd;
   }
+  co_await maybe_slow_io();
   size_t done = 0;
   while (done < in.size()) {
-    int n = co_await rt::uring_write(fd, in.subspan(done), off + done);
+    // A short-write fault really writes 1 byte, exercising the continuation loop.
+    int n = take_write_fault();
+    if (n == 0)
+      n = co_await rt::uring_write(
+          fd, fault::take(fault::Kind::kShortWrite) ? in.subspan(done, 1) : in.subspan(done),
+          off + done);
     if (n < 0) co_return Err(errno_from_neg(n));
     if (n == 0) co_return Err(errno_from(EIO));
     done += static_cast<size_t>(n);
@@ -1389,11 +1392,19 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
     vec.push_back(v);
     total += v.iov_len;
   }
+  co_await maybe_slow_io();
   size_t done = 0;
   size_t idx = 0;
   while (done < total) {
-    int n = co_await rt::uring_writev(fd, vec.data() + idx,
-                                      static_cast<int>(vec.size() - idx), off + done);
+    int n = take_write_fault();
+    if (n == 0 && fault::take(fault::Kind::kShortWrite)) {
+      // A short-write fault really writes 1 byte, exercising the iovec advance below.
+      n = co_await rt::uring_write(
+          fd, std::span(static_cast<const std::byte*>(vec[idx].iov_base), 1), off + done);
+    } else if (n == 0) {
+      n = co_await rt::uring_writev(fd, vec.data() + idx,
+                                    static_cast<int>(vec.size() - idx), off + done);
+    }
     if (n < 0) co_return Err(errno_from_neg(n));
     if (n == 0) co_return Err(errno_from(EIO));
     done += static_cast<size_t>(n);

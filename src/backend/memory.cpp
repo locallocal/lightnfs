@@ -294,6 +294,8 @@ class MemoryBackend::MemoryObject final : public Object {
     if (!allowed || (!allowed->has(Access::kModify) && ctx.cred.uid != node_->attr.uid))
       co_return Err(allowed ? errno_from(EACCES) : allowed.error());
     std::lock_guard lock(backend_.mu_);
+    if (uint64_t cap = backend_.max_filesize_; cap && off + in.size() > cap)
+      co_return Err(errno_from(EFBIG));
     if (off + in.size() > node_->data.size()) node_->data.resize(off + in.size());
     std::copy(in.begin(), in.end(), node_->data.begin() + static_cast<size_t>(off));
     node_->attr.size = node_->data.size();
@@ -325,6 +327,8 @@ class MemoryBackend::MemoryObject final : public Object {
     auto gate = co_await io_gate(ctx, /*write=*/true);
     if (!gate) co_return Err(gate.error());
     std::lock_guard lock(backend_.mu_);
+    if (uint64_t cap = backend_.max_filesize_; cap && off + len > cap)
+      co_return Err(errno_from(EFBIG));
     if (off + len > node_->data.size()) {
       node_->data.resize(static_cast<size_t>(off + len));
       touch();

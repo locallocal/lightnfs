@@ -1,0 +1,14 @@
+[server]
+port = 2041
+state_dir = "/var/lib/lightnfs"
+max_request_size = "2MiB"
+
+[[export]]
+patd = "loaal"
+fsid = 9
+clients = ["10.0.0.0/8", "::1/128"]
+squash = "root"
+readonly = true
+[export.local]
+handles = "fallback"
+fd_cache = 32

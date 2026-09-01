@@ -1,0 +1,7 @@
+# Record-marking fragment headers: last-fragment bit + interesting lengths.
+last_len4="\x80\x00\x00\x04"
+mid_len4="\x00\x00\x00\x04"
+last_len0="\x80\x00\x00\x00"
+mid_len0="\x00\x00\x00\x00"
+last_big="\x80\x00\x10\x00"
+oversize="\x80\xff\xff\xff"

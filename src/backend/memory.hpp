@@ -18,7 +18,14 @@ class MemoryBackend final : public Backend {
   explicit MemoryBackend(uint64_t fsid = 1);
 
   Caps caps() const override;
-  FsLimits limits() const override { return {}; }
+  FsLimits limits() const override {
+    FsLimits l{};
+    if (max_filesize_) l.max_filesize = max_filesize_;
+    return l;
+  }
+  // Test fidelity knob (plan doc 10 §7.1): a real fs bounds file size (kernel EFBIG on
+  // write/allocate past it); engine boundary tests set a small bound here. 0 = unbounded.
+  void set_max_filesize(uint64_t bytes) { max_filesize_ = bytes; }
   uint64_t fsid() const override { return fsid_; }
   rt::Task<Result<ObjPtr>> root() override;
   rt::Task<Result<ObjPtr>> resolve(const ObjId&) override;
@@ -55,6 +62,7 @@ class MemoryBackend final : public Backend {
   void erase_child(const std::shared_ptr<Node>& parent, std::string_view name);
 
   uint64_t fsid_;
+  uint64_t max_filesize_ = 0;
   mutable std::mutex mu_;
   std::atomic<uint64_t> resolve_calls_{0};
   uint64_t next_id_ = 2;

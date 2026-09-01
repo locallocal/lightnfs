@@ -1,0 +1,9 @@
+[server]
+port = 2041
+
+[[export]]
+p = 0
+cl=e
+[export.loc=l]
+= "fallbac8k"
+fd_cach = 32

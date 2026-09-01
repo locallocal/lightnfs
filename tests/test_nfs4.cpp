@@ -2252,3 +2252,83 @@ TEST(Nfs4, CopyChunksLargeFiles) {
   EXPECT_EQ(status, 0u);
   EXPECT_STREQ(at_boundary, big.substr((8u << 20) - 2, 4));
 }
+
+// ---- plan doc 10 §7.1: v4.2 boundary cases --------------------------------------------
+
+TEST(Nfs4, V42SameFileCopyIncludingOverlap) {
+  V4Fixture f;
+  f.minor = 2;
+  f.establish_session();
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "self.bin", 3, 0, "owner-self", 0, encode_empty_fattr);
+  ASSERT_TRUE(o.status == 0);
+  ASSERT_TRUE(do_write(f, o.fh, o.stateid, 0, "abcdefghij", 2) == 0);
+
+  // Same filehandle on both sides: the engine must take the object lock once (the
+  // src->oid == dst->oid branch) instead of deadlocking on a second acquisition.
+  auto r = do_copy(f, o.fh, o.stateid, o.fh, o.stateid, 0, 10, 4);
+  EXPECT_EQ(r.status, 0u);
+  EXPECT_EQ(r.count, 4u);
+  EXPECT_STREQ(do_read(f, o.fh, o.stateid, 0, 64), "abcdefghijabcd");
+
+  // Overlapping ranges within one file: src [0,6) onto dst [3,9).  The backend stages
+  // the source range before writing, so the result is the memmove outcome.
+  r = do_copy(f, o.fh, o.stateid, o.fh, o.stateid, 0, 3, 6);
+  EXPECT_EQ(r.status, 0u);
+  EXPECT_EQ(r.count, 6u);
+  EXPECT_STREQ(do_read(f, o.fh, o.stateid, 0, 64), "abcabcdefjabcd");
+
+  // ca_count == 0 with the same file: source EOF is read under the single lock.
+  r = do_copy(f, o.fh, o.stateid, o.fh, o.stateid, 10, 14, 0);
+  EXPECT_EQ(r.status, 0u);
+  EXPECT_EQ(r.count, 4u);
+  EXPECT_STREQ(do_read(f, o.fh, o.stateid, 0, 64), "abcabcdefjabcdabcd");
+  EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+}
+
+TEST(Nfs4, V42DeallocateBeyondEof) {
+  V4Fixture f;
+  f.minor = 2;
+  f.establish_session();
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "punch.bin", 3, 0, "owner-p", 0, encode_empty_fattr);
+  ASSERT_TRUE(o.status == 0);
+  ASSERT_TRUE(do_write(f, o.fh, o.stateid, 0, "0123456789", 2) == 0);
+
+  // Wholly beyond EOF: success, size unchanged, content untouched (fallocate
+  // PUNCH_HOLE|KEEP_SIZE semantics).
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kDeallocate, 20, 5), 0u);
+  EXPECT_EQ(file_size(f, o.fh), 10u);
+  EXPECT_STREQ(do_read(f, o.fh, o.stateid, 0, 64), "0123456789");
+
+  // Straddling EOF: zeroes only up to EOF, never grows the file.
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kDeallocate, 8, 10), 0u);
+  EXPECT_EQ(file_size(f, o.fh), 10u);
+  EXPECT_STREQ(do_read(f, o.fh, o.stateid, 0, 64), std::string("01234567\0\0", 10));
+
+  // Deallocate starting exactly at EOF: a no-op, not an error.
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kDeallocate, 10, 1), 0u);
+  EXPECT_EQ(file_size(f, o.fh), 10u);
+  EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+}
+
+TEST(Nfs4, V42MaxFilesizeBoundary) {
+  V4Fixture f;
+  f.memory->set_max_filesize(64);
+  f.minor = 2;
+  f.establish_session();
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "capped.bin", 3, 0, "owner-cap", 0, encode_empty_fattr);
+  ASSERT_TRUE(o.status == 0);
+
+  // Ending exactly at max_filesize is fine; one byte past it is FBIG.
+  EXPECT_EQ(do_write(f, o.fh, o.stateid, 60, "abcd", 2), 0u);
+  EXPECT_EQ(file_size(f, o.fh), 64u);
+  EXPECT_EQ(do_write(f, o.fh, o.stateid, 60, "abcde", 2), stv(Status::kFbig));
+  EXPECT_EQ(file_size(f, o.fh), 64u);
+
+  // ALLOCATE obeys the same bound.
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kAllocate, 0, 64), 0u);
+  EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kAllocate, 60, 10), stv(Status::kFbig));
+  EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+}

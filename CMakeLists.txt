@@ -63,6 +63,7 @@ endif()
 # ---- core library ----
 add_library(lnfs_core STATIC
   src/backend/api.cpp
+  src/backend/fault.cpp
   src/backend/local.cpp
   src/backend/memory.cpp
   src/core/boot_epoch.cpp
@@ -163,6 +164,9 @@ add_executable(lnfs_tests
   tests/test_state.cpp
   tests/test_lock_mgr.cpp
   tests/test_ctl.cpp
+  tests/test_metrics.cpp
+  tests/test_rpcbind.cpp
+  tests/test_fault.cpp
   tests/test_tls.cpp
 )
 target_link_libraries(lnfs_tests PRIVATE lnfs_core)
@@ -177,18 +181,45 @@ add_test(NAME lnfs_tests COMMAND lnfs_tests)
 add_executable(lnfs_accept_client tests/accept_client.cpp)
 target_link_libraries(lnfs_accept_client PRIVATE lnfs_core)
 
-# ---- fuzz ----
-if(LNFS_BUILD_FUZZ)
-  add_executable(fuzz_handle_request fuzz/fuzz_handle_request.cpp)
-  target_compile_options(fuzz_handle_request PRIVATE -fsanitize=fuzzer,address)
-  target_link_options(fuzz_handle_request PRIVATE -fsanitize=fuzzer,address)
-  target_link_libraries(fuzz_handle_request PRIVATE lnfs_core)
-else()
-  # regression driver: runs corpus files through the same entry without libFuzzer
-  add_executable(fuzz_regress fuzz/fuzz_handle_request.cpp fuzz/regress_main.cpp)
-  target_compile_definitions(fuzz_regress PRIVATE LNFS_FUZZ_REGRESS=1)
-  target_link_libraries(fuzz_regress PRIVATE lnfs_core)
-  add_test(NAME fuzz_regress COMMAND fuzz_regress)
+# ---- fuzz (plan doc 10 §7.2) ----
+# One target per parse boundary; scripts/fuzz.sh drives the libFuzzer builds (seed
+# corpora in fuzz/seed/<target>/ are checked in, grown corpora in fuzz/corpus/ are
+# machine-local).  Without LNFS_BUILD_FUZZ each target gets a regress binary that
+# replays the seeds (plus the local corpus when present) under ctest.
+set(LNFS_FUZZ_TARGETS handle_request file_handle config record_stream v4_attrs
+    objid_local)
+foreach(t ${LNFS_FUZZ_TARGETS})
+  if(LNFS_BUILD_FUZZ)
+    add_executable(fuzz_${t} fuzz/fuzz_${t}.cpp)
+    target_compile_options(fuzz_${t} PRIVATE -fsanitize=fuzzer,address)
+    target_link_options(fuzz_${t} PRIVATE -fsanitize=fuzzer,address)
+    target_link_libraries(fuzz_${t} PRIVATE lnfs_core)
+  else()
+    add_executable(fuzz_regress_${t} fuzz/fuzz_${t}.cpp fuzz/regress_main.cpp)
+    target_compile_definitions(fuzz_regress_${t} PRIVATE LNFS_FUZZ_REGRESS=1)
+    target_link_libraries(fuzz_regress_${t} PRIVATE lnfs_core)
+    add_test(NAME fuzz_regress_${t}
+             COMMAND fuzz_regress_${t} ${CMAKE_SOURCE_DIR}/fuzz/seed/${t}
+                     ${CMAKE_SOURCE_DIR}/fuzz/corpus/${t})
+  endif()
+endforeach()
+
+# Doc/code drift gate (plan doc 10 §7.3): the generated v3 errmap whitelist must match
+# docs/nfsv3/08-errors.md §8.2.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+  add_test(NAME errmap_check
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen_errmap_cases.py
+                   --check
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
+# Benchmark floor gate: opt-in because it needs a Release build and quiet machine
+# (scripts/ci.sh nightly runs it; see scripts/bench_gate.sh).
+option(LNFS_ENABLE_BENCH_GATE "register scripts/bench_gate.sh as a ctest test" OFF)
+if(LNFS_ENABLE_BENCH_GATE)
+  add_test(NAME bench_gate
+           COMMAND ${CMAKE_SOURCE_DIR}/scripts/bench_gate.sh ${CMAKE_BINARY_DIR})
 endif()
 
 # ---- install (packaging scripts stage via `cmake --install` + DESTDIR, plan doc 10 §4.5) ----

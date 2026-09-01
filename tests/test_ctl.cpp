@@ -15,10 +15,14 @@
 #include <filesystem>
 #include <thread>
 
+#include "backend/local.hpp"
 #include "backend/memory.hpp"
 #include "core/config.hpp"
+#include "obs/metrics.hpp"
+#include "rpc/drc.hpp"
 #include "runtime/runtime.hpp"
 #include "server/ctl.hpp"
+#include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
 #include "util/log.hpp"
 
@@ -308,4 +312,187 @@ TEST(Ctl, ConnRegistryListAndKill) {
   EXPECT_FALSE(transport::ConnRegistry::instance().kill(id));  // id gone
   close(sv[0]);
   close(sv[1]);
+}
+
+// ---- plan doc 10 §7.1: the remaining ctl command surface + metrics HTTP contract ----
+
+namespace {
+
+template <class T>
+T run_task(rt::Runtime& runtime, rt::Task<T> task) {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::optional<T> result;
+  rt::spawn([](rt::Task<T> work, std::mutex* mu, std::condition_variable* cv,
+               std::optional<T>* out) -> rt::Task<void> {
+    auto value = co_await std::move(work);
+    {
+      std::lock_guard lock(*mu);
+      out->emplace(std::move(value));
+      cv->notify_one();
+    }
+  }(std::move(task), &mu, &cv, &result),
+            runtime.reactor(0));
+  std::unique_lock lock(mu);
+  cv.wait(lock, [&] { return result.has_value(); });
+  return std::move(*result);
+}
+
+}  // namespace
+
+TEST(Ctl, MetricsDumpErrorsAndConnsCommands) {
+  server::CtlDeps deps{};
+  // `metrics` answers the same exposition the HTTP endpoint serves.
+  auto metrics = server::CtlServer::answer(deps, "metrics");
+  EXPECT_TRUE(metrics.find("lightnfs_rpc_garbage_total") != std::string::npos);
+  // dump-errors in both formats.
+  EXPECT_TRUE(server::CtlServer::answer(deps, "dump-errors").find("total_errors=") !=
+              std::string::npos);
+  EXPECT_TRUE(server::CtlServer::answer(deps, "dump-errors --json")
+                  .find("\"total_errors\":") != std::string::npos);
+
+  // conns rendering + kill-conn success/not-found through the command surface.
+  int sv[2];
+  ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  transport::Peer peer{};
+  uint64_t id = transport::ConnRegistry::instance().add(sv[0], peer);
+  auto conns = server::CtlServer::answer(deps, "conns");
+  EXPECT_TRUE(conns.find(std::format("id={}", id)) != std::string::npos);
+  auto conns_json = server::CtlServer::answer(deps, "conns --json");
+  EXPECT_TRUE(conns_json.find(std::format("\"id\":{}", id)) != std::string::npos);
+  auto killed = server::CtlServer::answer(deps, std::format("kill-conn {}", id));
+  EXPECT_TRUE(killed.find("shut down") != std::string::npos);
+  char b;
+  EXPECT_EQ(read(sv[1], &b, 1), 0);  // the shutdown really reached the socket
+  transport::ConnRegistry::instance().remove(id);
+  EXPECT_TRUE(server::CtlServer::answer(deps, std::format("kill-conn {}", id))
+                  .find("not found") != std::string::npos);
+  EXPECT_TRUE(server::CtlServer::answer(deps, std::format("kill-conn {} --json", id))
+                  .find("\"killed\":false") != std::string::npos);
+  close(sv[0]);
+  close(sv[1]);
+}
+
+TEST(Ctl, FdcacheAndClearPoisonCommands) {
+  char tmpl[] = "/tmp/lnfs-ctlfd-XXXXXX";
+  std::string dir = mkdtemp(tmpl);
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  {
+    // A table with only a memory export: both commands answer "no local exports".
+    core::ExportTable mem_only;
+    core::ExportConfig mcfg;
+    mcfg.path = "/export/mem";
+    mcfg.fsid = 71;
+    mcfg.clients = {"127.0.0.0/8"};
+    ASSERT_TRUE(mem_only.add(mcfg, std::make_unique<backend::MemoryBackend>(71)).has_value());
+    server::CtlDeps mem_deps{};
+    mem_deps.exports = &mem_only;
+    EXPECT_STREQ(server::CtlServer::answer(mem_deps, "fdcache"), "no local exports\n");
+    EXPECT_STREQ(server::CtlServer::answer(mem_deps, "clear-poison"), "no local exports\n");
+
+    // A local export: stats render per export, flush and clear-poison count real work.
+    auto made = backend::LocalBackend::create({.path = dir, .fsid = 72});
+    ASSERT_TRUE(made.has_value());
+    auto* local = made->get();
+    core::ExportTable exports;
+    core::ExportConfig cfg;
+    cfg.path = "/export/data";
+    cfg.fsid = 72;
+    cfg.clients = {"127.0.0.0/8"};
+    ASSERT_TRUE(exports.add(cfg, std::move(*made)).has_value());
+    server::CtlDeps deps{};
+    deps.exports = &exports;
+
+    auto stats = server::CtlServer::answer(deps, "fdcache");
+    EXPECT_TRUE(stats.find("export=/export/data") != std::string::npos);
+    EXPECT_TRUE(server::CtlServer::answer(deps, "fdcache --json")
+                    .find("\"export\":\"/export/data\"") != std::string::npos);
+    EXPECT_TRUE(server::CtlServer::answer(deps, "fdcache flush").find("flushed") !=
+                std::string::npos);
+
+    auto root = run_task(runtime, local->root());
+    ASSERT_TRUE(root.has_value());
+    local->poison((*root)->id());
+    EXPECT_STREQ(server::CtlServer::answer(deps, "clear-poison"),
+                 "cleared 1 poison marks\n");
+    EXPECT_STREQ(server::CtlServer::answer(deps, "clear-poison --json"),
+                 "{\"cleared\":0}\n");
+  }
+  runtime.stop_and_join();
+  std::filesystem::remove_all(dir);
+}
+
+TEST(Ctl, AnswerAsyncStateExpireAndDrcFlush) {
+  char tmpl[] = "/tmp/lnfs-ctlstate-XXXXXX";
+  std::string dir = mkdtemp(tmpl);
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  {
+    state::StateMgr mgr({.boot_epoch = 9, .state_dir = dir});
+    rpc::Drc drc({});
+    server::CtlDeps deps{};
+    deps.state = &mgr;
+    deps.drc = &drc;
+
+    auto state = run_task(runtime, server::CtlServer::answer_async(deps, "state"));
+    EXPECT_TRUE(state.find("clients=0") != std::string::npos);
+    EXPECT_TRUE(state.find("lock_owners=0") != std::string::npos);
+    auto state_json =
+        run_task(runtime, server::CtlServer::answer_async(deps, "state --json"));
+    EXPECT_TRUE(state_json.find("\"clients\":0") != std::string::npos);
+
+    EXPECT_TRUE(run_task(runtime,
+                         server::CtlServer::answer_async(deps, "expire-client zz"))
+                    .find("bad clientid") != std::string::npos);
+    EXPECT_TRUE(run_task(runtime,
+                         server::CtlServer::answer_async(deps, "expire-client 0x99"))
+                    .find("nfs4 status") != std::string::npos);
+
+    EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(deps, "drc flush")),
+                 "flushed 0 drc entries\n");
+    EXPECT_TRUE(run_task(runtime,
+                         server::CtlServer::answer_async(deps, "drc flush --json"))
+                    .find("\"flushed\":0") != std::string::npos);
+
+    // Null deps degrade like the sync surface.
+    server::CtlDeps none{};
+    EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(none, "state")),
+                 "v4 disabled\n");
+    EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(none, "drc flush")),
+                 "drc disabled\n");
+    // Unknown async commands fall through to the sync answer.
+    EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(none, "ping")),
+                 "pong\n");
+  }
+  runtime.stop_and_join();
+  std::filesystem::remove_all(dir);
+}
+
+TEST(Ctl, MetricsHttpHeadersAndBodyContract) {
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  auto ep = server::MetricsHttp::create(0, "127.0.0.1", {});
+  ASSERT_TRUE(ep.has_value());
+  rt::spawn((*ep)->run(), runtime.reactor(0));
+  int fd = connect_metrics((*ep)->port());
+  ASSERT_TRUE(fd >= 0);
+  auto response = http_get(fd);
+  close(fd);
+  ASSERT_TRUE(response.starts_with("HTTP/1.0 200 OK\r\n"));
+  EXPECT_TRUE(response.find("Content-Type: text/plain; version=0.0.4\r\n") !=
+              std::string::npos);
+  auto split = response.find("\r\n\r\n");
+  ASSERT_TRUE(split != std::string::npos);
+  std::string body = response.substr(split + 4);
+  // Content-Length matches the actual body, and the body is the Prometheus exposition.
+  auto cl_pos = response.find("Content-Length: ");
+  ASSERT_TRUE(cl_pos != std::string::npos);
+  EXPECT_EQ(static_cast<size_t>(std::stoull(response.substr(cl_pos + 16))), body.size());
+  EXPECT_TRUE(body.starts_with("# TYPE lightnfs_v3_calls_total counter"));
+  EXPECT_TRUE(body.find("lightnfs_rpc_garbage_total") != std::string::npos);
+  // Invalid bind address is rejected up front, not at first use.
+  EXPECT_FALSE(server::MetricsHttp::create(0, "not-an-ip", {}).has_value());
+  (*ep)->request_stop();
+  runtime.stop_and_join();
 }
