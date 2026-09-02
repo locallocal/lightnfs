@@ -19,7 +19,7 @@ const Bitmap& supported_attrs() {
                         kNumlinks, kOwner, kOwnerGroup, kRawdev, kSpaceAvail, kSpaceFree,
                         kSpaceTotal, kSpaceUsed, kTimeAccess, kTimeDelta, kTimeMetadata,
                         kTimeModify, kMountedOnFileid, kTimeAccessSet,
-                        kTimeModifySet, kSuppattrExclCreat})
+                        kTimeModifySet, kSuppattrExclCreat, kChangeAttrType})
       b.set(id);
     return b;
   }();
@@ -118,6 +118,14 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
   if (ok(kMountedOnFileid))
     vals.u64(src.mounted_on_fileid ? src.mounted_on_fileid : a.fileid);
   if (ok(kSuppattrExclCreat)) settable_attrs().encode(vals);
+  // change_attr_type (RFC 7862 §12.2.3): the kNativeChange consumer (plan doc 10
+  // §5.3).  A storage version counter is MONOTONIC_INCR; the ctime synthesis of
+  // design 05 §5.6 is TIME_METADATA; the pseudo-fs change is the boot epoch, which
+  // only ever grows.
+  if (ok(kChangeAttrType))
+    vals.u32(!src.fs ? kChangeTypeMonotonicIncr
+             : fs.native_change ? kChangeTypeMonotonicIncr
+                                : kChangeTypeTimeMetadata);
 
   patch_be32(len_gap, static_cast<uint32_t>(enc.size() - vals_start));
 }

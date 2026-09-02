@@ -87,3 +87,26 @@ handles = "auto"
 fd_cache = 4096
 readdir_enrich = true
 # identity = "check"   # check (default) | strict (faccessat2 confirm) | setfsuid (root only)
+
+# GlusterFS export (plan doc 10 §5.3): the tree lives in the volume, `path` is only the
+# name clients mount.  libgfapi.so.0 is loaded at runtime (glusterfs-common / libgfapi0);
+# every libgfapi call runs on the offload pool, so offload_threads bounds throughput.
+# [[export]]
+# path = "/gluster"
+# backend = "gluster"
+# fsid = 2
+# clients = ["192.168.0.0/24"]
+# squash = "none"          # identities pass through to the bricks (kNativeAccess)
+# readonly = false
+#
+# [export.gluster]
+# volume = "vol0"
+# servers = "gs1,gs2:24007"   # volfile servers, tried in order; host[:port] or [v6]:port
+# subdir = "/exports/a"       # export root inside the volume (default "/")
+# transport = "tcp"           # tcp | rdma | unix
+# log_file = ""               # libgfapi log; empty = its default (often unwritable unprivileged)
+# log_level = 4               # gluster levels 0..9 (4 = ERROR, 7 = INFO)
+# fd_cache = 1024             # anonymous-IO glfd cache and object-handle cache capacity
+# readdir_enrich = true       # xreaddirplus with stat + handle (READDIRPLUS without lookups)
+# jukebox = true              # transport errors → JUKEBOX/DELAY (client retries); false → EIO
+# native_locks = true         # push v4 byte-range locks into the volume (posix-locks)

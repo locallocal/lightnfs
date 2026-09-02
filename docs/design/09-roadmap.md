@@ -40,7 +40,7 @@
 
 - ✅ v4.2 低成本特性：SEEK/ALLOCATE/DEALLOCATE、同步同服 COPY、CLONE（宣告 minorversion=2）——开发计划 §8.1
 - 读委托 + 回传通道发送侧（nfsv4/05 §5.6 阶段 2）
-- 第二后端启动（Lustre 或 GlusterFS，按 06 分册映射表实现）——**接口冻结的真实检验**
+- ✅ 第二后端启动（GlusterFS/libgfapi，按 06 分册映射表实现，2026-09-03）——**接口冻结的真实检验**：接口零改动跑通（仅两处可选扩展），plan doc 10 §5.3
 - 可选：NLM/NSM（若出现 v3 锁刚需，按 nfsv3/06 §6.6 选项 2）
 
 ## 长期观察项（不承诺）
@@ -61,10 +61,11 @@
   目录委托 Linux 长期默认关闭（05 §5.5 → NOTSUPP）；pNFS 是决策 D8 的明确非目标
   （07 §7.4 = "零成本合规"，layout 类回 NOTSUPP）。读委托 + 回传通道已在 M8/§5.2 交付，
   这三项在其上再评估。
-- 多网关一致性：**前提未变，仍不做**。依赖 kNativeChange + kByteLocks 后端
-  （05 分册 5.6/5.8 已定义边界）；本地后端有 kNativeChange（STATX_CHANGE_COOKIE）但
-  `native_locks()` 返回空——kByteLocks 需要一个下沉原生锁的集群后端（Lustre flock /
-  gluster posix-locks），随第二后端启动时才具备真实检验条件。
+- 多网关一致性：**锁这一半已具备，change 这一半仍缺**。gluster 后端提供
+  `native_locks()`（kByteLocks，posix-locks xlator 下推，状态层已接线）但无原生 change
+  计数（`change` 仍为 ctime 合成，`change_attr_type = TIME_METADATA`）；本地后端反之。
+  两位同时具备的后端（Lustre：changelog/版本 + flock）出现前，多网关同挂一个导出仍是
+  文档级限制（v4 open/deny 状态也仍是网关本地）。
 
 ## 风险登记
 

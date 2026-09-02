@@ -14,6 +14,7 @@ struct State {
     static constexpr const char* kEnv[] = {
         "LNFS_FAULT_FSYNC_EIO",   "LNFS_FAULT_WRITE_ENOSPC", "LNFS_FAULT_WRITE_EDQUOT",
         "LNFS_FAULT_READ_EIO",    "LNFS_FAULT_SHORT_WRITE",  "LNFS_FAULT_SLOW_IO",
+        "LNFS_FAULT_JUKEBOX",
     };
     for (int i = 0; i < static_cast<int>(Kind::kCount); ++i) {
       const char* v = std::getenv(kEnv[i]);

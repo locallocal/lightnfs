@@ -143,6 +143,10 @@ rt::Task<Result<uint64_t>> Object::copy_range(OpenCtx, Object&, OpenCtx, uint64_
   return unsupported<uint64_t>();
 }
 
+rt::Task<Result<void>> LockMgr::release(Object& obj, const LockOwnerId& owner) {
+  return unlock(obj, owner, LockRange{0, UINT64_MAX});
+}
+
 rt::Task<Result<void>> Backend::start() { co_return Result<void>{}; }
 rt::Task<Result<void>> Backend::stop() { co_return Result<void>{}; }
 

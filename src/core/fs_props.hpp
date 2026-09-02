@@ -14,6 +14,13 @@ struct FsProps {
   bool link_support = false;
   bool symlink_support = false;
   bool case_insensitive = false;
+  // kNativeChange: the change attribute is a storage version counter (v4.2
+  // change_attr_type = MONOTONIC_INCR); otherwise it is synthesized from ctime
+  // (TIME_METADATA) and multi-gateway deployments are a documented limitation (05 §5.6).
+  bool native_change = false;
+  // kNativeAccess: the backend's access()/open() are authoritative (storage-side ACLs
+  // under the caller's identity); the engines skip their own pre-flight checks.
+  bool native_access = false;
   // Fixed for every backend this server fronts (design 05): one root, names kept as
   // given, long names rejected rather than truncated, chown needs privilege, times are
   // settable.

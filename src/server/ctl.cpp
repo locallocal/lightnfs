@@ -15,6 +15,7 @@
 #include <sstream>
 #include <vector>
 
+#include "backend/gluster.hpp"
 #include "backend/local.hpp"
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
@@ -204,6 +205,11 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     bool any = false;
     if (deps.exports) {
       for (const auto& entry : deps.exports->entries()) {
+        if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
+          any = true;
+          total += g->flush_fd_cache();
+          continue;
+        }
         auto* local = dynamic_cast<backend::LocalBackend*>(entry->backend.get());
         if (!local) continue;
         any = true;
@@ -211,7 +217,7 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
       }
     }
     if (json) return std::format("{{\"flushed\":{}}}\n", total);
-    return any ? std::format("flushed {} cached fds\n", total) : "no local exports\n";
+    return any ? std::format("flushed {} cached fds\n", total) : "no local/gluster exports\n";
   }
   if (cmd.name() == "fdcache") {
     std::string out;
@@ -219,6 +225,26 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     size_t emitted = 0;
     if (deps.exports) {
       for (const auto& entry : deps.exports->entries()) {
+        if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
+          auto s = g->stats();
+          if (json) {
+            out += std::format(
+                "{}{{\"export\":\"{}\",\"backend\":\"gluster\",\"hits\":{},\"misses\":{},"
+                "\"upgrades\":{},\"evictions\":{},\"entries\":{},\"obj_hits\":{},"
+                "\"obj_misses\":{},\"obj_entries\":{},\"jukebox\":{},\"lock_fds\":{}}}",
+                emitted ? "," : "", json_escape(entry->path), s.fd_hits, s.fd_misses,
+                s.fd_upgrades, s.fd_evictions, s.fd_entries, s.obj_hits, s.obj_misses,
+                s.obj_entries, s.jukebox, s.lock_fds);
+          } else {
+            out += std::format(
+                "export={} backend=gluster hits={} misses={} upgrades={} evictions={} "
+                "entries={} obj_hits={} obj_misses={} obj_entries={} jukebox={} lock_fds={}\n",
+                entry->path, s.fd_hits, s.fd_misses, s.fd_upgrades, s.fd_evictions,
+                s.fd_entries, s.obj_hits, s.obj_misses, s.obj_entries, s.jukebox, s.lock_fds);
+          }
+          ++emitted;
+          continue;
+        }
         auto* local = dynamic_cast<backend::LocalBackend*>(entry->backend.get());
         if (!local) continue;
         auto s = local->fd_cache_stats();
@@ -241,7 +267,7 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
       }
     }
     if (json) return out + "]\n";
-    return out.empty() ? "no local exports\n" : out;
+    return out.empty() ? "no local/gluster exports\n" : out;
   }
   if (cmd.name() == "clear-poison") {
     // Sticky fsync-EIO marks (design 06 §6.2) previously survived until restart
@@ -250,6 +276,11 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     bool any = false;
     if (deps.exports) {
       for (const auto& entry : deps.exports->entries()) {
+        if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
+          any = true;
+          total += g->clear_poison();
+          continue;
+        }
         auto* local = dynamic_cast<backend::LocalBackend*>(entry->backend.get());
         if (!local) continue;
         any = true;
@@ -257,7 +288,7 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
       }
     }
     if (json) return std::format("{{\"cleared\":{}}}\n", total);
-    return any ? std::format("cleared {} poison marks\n", total) : "no local exports\n";
+    return any ? std::format("cleared {} poison marks\n", total) : "no local/gluster exports\n";
   }
   return json ? "{\"error\":\"unknown command\"}\n" : kHelp;
 }

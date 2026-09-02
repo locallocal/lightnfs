@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "backend/fault.hpp"
+#include "backend/gluster.hpp"
 #include "runtime/io.hpp"
 #include "runtime/offload_pool.hpp"
 #include "util/log.hpp"
@@ -358,9 +359,9 @@ class LocalBackend::PathCache {
 
 // Per-OPEN data fd (design 05 §5.5, plan doc 10 §5.1): returned by
 // LocalObject::open, held by the v4 state layer for the life of the open state, and
-// handed back per IO via OpenCtx.open.  Only the local backend ever produces a
-// non-null OpenState (memory stays EOPNOTSUPP), so the static_cast at the IO sites
-// cannot cross backends.
+// handed back per IO via OpenCtx.open.  An OpenState only ever comes back to the
+// backend whose open() produced it (the gluster backend has its own, memory stays
+// EOPNOTSUPP), so the static_cast at the IO sites cannot cross backends.
 class LocalOpenState final : public OpenState {
  public:
   LocalOpenState(int fd, bool writable) : fd_(fd), writable_(writable) {}
@@ -899,6 +900,7 @@ rt::Task<Result<uint32_t>> LocalObject::read(OpenCtx ctx, uint64_t off,
     fd = ref->fd;
   }
   co_await maybe_slow_io();
+  if (fault::take(fault::Kind::kJukebox)) co_return Err(Errno::kJukebox);
   int n = fault::take(fault::Kind::kReadEio) ? -EIO : co_await rt::uring_read(fd, out, off);
   if (n < 0) co_return Err(errno_from_neg(n));
   if (out.empty()) {  // zero-length read: only a size probe can answer eof
@@ -1346,6 +1348,7 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
     fd = ref->fd;
   }
   co_await maybe_slow_io();
+  if (fault::take(fault::Kind::kJukebox)) co_return Err(Errno::kJukebox);
   size_t done = 0;
   while (done < in.size()) {
     // A short-write fault really writes 1 byte, exercising the continuation loop.
@@ -1393,6 +1396,7 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off,
     total += v.iov_len;
   }
   co_await maybe_slow_io();
+  if (fault::take(fault::Kind::kJukebox)) co_return Err(Errno::kJukebox);
   size_t done = 0;
   size_t idx = 0;
   while (done < total) {
@@ -1663,6 +1667,7 @@ std::unique_ptr<Backend> make_local(const BackendConfig& cfg) {
 void register_builtin_backends() {
   static const bool once = [] {
     register_backend({"local", kBackendApiVersion, make_local});
+    register_gluster_backend();
     return true;
   }();
   (void)once;

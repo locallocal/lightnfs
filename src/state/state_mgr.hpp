@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -174,6 +175,17 @@ class StateMgr {
     uint32_t shards = 16;
     // Read delegations (plan doc 10 §5.2); [protocol] delegations kill switch.
     bool delegations = true;
+    // Native byte-range locks (design 05 §5.8, plan doc 10 §5.3): for exports whose
+    // backend has native_locks() (kByteLocks), every LOCK/LOCKU/LOCKT is pushed to
+    // the backend as well, so gateways sharing the storage conflict with each other.
+    // `manager` answers the export's lock manager (null: gateway table only);
+    // `resolve` materializes the object the manager works on.  Unset = single gateway.
+    struct NativeLocks {
+      std::function<backend::LockMgr*(uint32_t fsid)> manager;
+      std::function<rt::Task<Result<backend::ObjPtr>>(uint32_t fsid,
+                                                       const backend::ObjId& oid)>
+          resolve;
+    } native_locks;
   };
 
   explicit StateMgr(Config cfg);
@@ -376,6 +388,10 @@ class StateMgr {
     uint64_t share_denied = 0, open_merges = 0;
     size_t lock_states = 0, lock_segments = 0, lock_owners = 0;
     uint64_t lock_denied = 0;
+    // Native lock push (plan doc 10 §5.3): refusals by the backend (another
+    // gateway holds it) and push failures (backend error; the LOCK answers DELAY /
+    // SERVERFAULT and the gateway grant is undone).
+    uint64_t native_lock_denied = 0, native_lock_errors = 0;
     // Delegations + backchannel (plan doc 10 §5.2).
     size_t delegs = 0;
     uint64_t deleg_grants = 0, deleg_recalls = 0, deleg_returns = 0, deleg_revokes = 0;
@@ -446,6 +462,16 @@ class StateMgr {
     std::string owner;
   };
   std::optional<LockOwnerRec> find_lock_owner(const backend::LockOwnerId& id);
+  // Native lock push helpers (design 05 §5.8): the export's backend lock manager, the
+  // object it needs, one LOCK pushed (DENIED/DELAY/… on refusal), errno → nfsstat4.
+  backend::LockMgr* native_lock_mgr(uint32_t fsid) const;
+  rt::Task<Result<backend::ObjPtr>> native_lock_object(uint32_t fsid,
+                                                      const backend::ObjId& oid);
+  rt::Task<LockResult> push_native_lock(backend::LockMgr& native, uint32_t fsid,
+                                        const backend::ObjId& oid,
+                                        const backend::LockOwnerId& lowner,
+                                        backend::LockRange range, bool exclusive);
+  static uint32_t native_lock_status(Errno error);
   void remember_lock_owner(const backend::LockOwnerId& id, std::shared_ptr<ClientRec> client,
                            std::string owner);
 
@@ -483,7 +509,7 @@ class StateMgr {
       file_count_{0}, courtesy_count_{0};
   std::atomic<uint64_t> lease_expirations_{0}, reclaim_conflict_{0},
       reclaim_timeout_{0}, reclaim_forced_{0}, share_denied_{0}, open_merges_{0},
-      lock_denied_{0};
+      lock_denied_{0}, native_lock_denied_{0}, native_lock_errors_{0};
   std::atomic<int64_t> lock_count_{0};
 
   // ---- read delegations + backchannel (plan doc 10 §5.2) ----

@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <set>
 
+#include "backend/fault.hpp"
 #include "backend/memory.hpp"
 #include "core/config.hpp"
 #include "core/errmap.hpp"
@@ -2331,4 +2332,35 @@ TEST(Nfs4, V42MaxFilesizeBoundary) {
   EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kAllocate, 0, 64), 0u);
   EXPECT_EQ(do_alloc(f, o.fh, o.stateid, Op::kAllocate, 60, 10), stv(Status::kFbig));
   EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+}
+
+// kJukebox end to end on v4 (plan doc 10 §5.3): the backend's "try again later" is
+// NFS4ERR_DELAY on the op; the client's retry (a new slot sequence) succeeds once the
+// backend is ready.
+TEST(Nfs4, JukeboxIsDelayAndRetrySucceeds) {
+  V4Fixture f;
+  f.establish_session();
+  auto file_fh = f.path_fh({"export", "data", "hello"});
+  ASSERT_TRUE(!file_fh.empty());
+  auto read_anon = [&]() {
+    xdr::XdrEnc r(f.pool);
+    r.u32(static_cast<uint32_t>(Op::kPutfh));
+    r.opaque(file_fh);
+    r.u32(static_cast<uint32_t>(Op::kRead));
+    nfsv4::Stateid anon{};
+    anon.encode(r);
+    r.u64(0);
+    r.u32(64);
+    return f.parse(f.compound_raw(f.session_body(2, r.take())));
+  };
+  backend::fault::arm(backend::fault::Kind::kJukebox, 1);
+  auto delayed = read_anon();
+  EXPECT_EQ(delayed.status, stv(Status::kDelay));
+  auto ok = read_anon();  // next slot sequence: a retry, not a replay
+  ASSERT_TRUE(ok.status == 0);
+  V4Fixture::expect_op(ok.dec, Op::kSequence, 0);
+  (void)ok.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(ok.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(ok.dec, Op::kRead, 0);
+  backend::fault::clear();
 }

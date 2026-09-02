@@ -333,7 +333,7 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 （OFFLOAD_STATUS/OFFLOAD_CANCEL/CB_OFFLOAD）留待有真实需求时基于现有回传通道
 实现（发送侧已具备）。
 
-### 5.3 中期（另一条线：第二后端）
+### 5.3 中期（另一条线：第二后端） ✅ 已完成（2026-09-03；GlusterFS/libgfapi）
 
 09 册定义的"接口冻结真实检验"。启动前先落两笔利息：
 
@@ -343,6 +343,50 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
   （Lustre HSM 正需要它）、`kCaseInsensitive` 只有消费端。第二后端会真实用到
   NativeChange/Jukebox，先把链路打通。
 - `OpenCtx`（`api.hpp:150-153`）现在恒为空壳（见 §5.1 的 `open()`）。
+
+**利息已付（能力位链路）**：
+
+| 位 | 生产端 | 消费端 |
+|---|---|---|
+| `kNativeAccess` | gluster（`glfs_h_access` 在调用者 fsuid/fsgid/groups 下由砖块 posix-acl 判定） | v4 OPEN 跳过网关侧 `access()` 预检，直接由后端 `open()` 权威判定（省一次集群往返；契约：置位后端的 `open()` 不得以 EOPNOTSUPP 降级）；`core::FsProps::native_access` |
+| `kNativeChange` | local（STATX_CHANGE_COOKIE，原有） | v4.2 属性 `change_attr_type`(79)：置位 → MONOTONIC_INCR，否则 TIME_METADATA（ctime 合成），伪根 → MONOTONIC_INCR（boot epoch）；`FsProps::native_change`；启动日志 `backend traits` |
+| `kByteLocks` / `LockMgr` | gluster `GlusterLockMgr`（`glfs_posix_lock` + `glfs_fd_set_lkowner`，每 (文件, lock-owner) 一个 glfd） | 状态层 `StateMgr::Config::native_locks` 钩子（main 用 ExportTable 接线）：LOCK 先网关表授予再下推，后端拒绝（EAGAIN）→ 回滚网关授予到此前覆盖、回 DENIED（冲突段取自后端 `test()`，持有者未知 → clientid 0）；后端错误 → DELAY/SERVERFAULT 且不授予；LOCKU 镜像解锁；CLOSE/FREE_STATEID/过期经 `unlink_state` 调新增的 `LockMgr::release()`；LOCKT 本地无冲突时探测后端（同 owner 已覆盖区间时不探测——探测无法区分自身锁）。指标 `lightnfs_v4_native_lock_{denied,errors}_total` |
+| `kJukebox` | gluster（ENOTCONN/ETIMEDOUT/ENET*/EHOST* 传输类错误 → `kJukebox`，`jukebox=false` 时回 EIO）；memory/local 经故障注入 `LNFS_FAULT_JUKEBOX=N`（`fault::Kind::kJukebox`） | 既有 errmap：v3 READ/WRITE → JUKEBOX（08 册 §8.2 白名单仅此两处，且二者不进 DRC，故无"缓存了 JUKEBOX"问题），v4 任意 op → DELAY；引擎级测试 `Nfs3.JukeboxReachesTheWireAndRetrySucceeds` / `Nfs4.JukeboxIsDelayAndRetrySucceeds` |
+| `kCaseInsensitive` | 仍无生产者（local/gluster 均大小写敏感；留给未来后端） | 原有 |
+| `OpenCtx` / `OpenState` | 第二个真实生产者 `GlusterOpenState`（每 OPEN 一个 glfd，以调用者身份打开） | 原有 IO 站点；`static_cast` 不跨后端的前提改为"OpenState 只回到产生它的后端" |
+
+**GlusterFS 后端**（`backend/gluster.{hpp,cpp}`，`backend/gfapi.{hpp,cpp}`）：06 册
+§6.6 映射表逐项落地，见该节。要点：
+
+- **运行时加载 libgfapi**（`dlopen("libgfapi.so.0")` + `dlvsym` 版本符号，47 个入口填一张
+  函数表），无构建期依赖、构建矩阵不变；`scripts/check_gfapi_abi.sh` 在有
+  `glusterfs/api` 头文件的主机上把函数表与真实声明逐一 static_assert（已对 GlusterFS 11
+  头文件验证通过；CI 步骤在无头文件时跳过）。
+- ObjId = 标记字节 + 16 字节 GFID（`kStableHandles`）；`resolve` = `glfs_h_create_from_handle`
+  经分片 LRU 对象句柄缓存；匿名 IO 走每对象 glfd 缓存（读→写升级，以网关身份打开，
+  门禁 = 原生 `access()` + v3 属主放宽）；readdir = `glfs_h_opendir` + `glfs_xreaddirplus_r`
+  (STAT|HANDLE)，d_off 作 cookie；v4.2：`glfs_lseek(SEEK_DATA/HOLE)`/`glfs_fallocate`/
+  `glfs_discard` → kSparseOps，`glfs_copy_file_range`（pread/pwrite 回落）→ kCopyRange，
+  无 CLONE；EXCLUSIVE 创建 verifier 存 atime/mtime（与 local 同布局）；fsync 失败粘性
+  poison 同 06 §6.2；`start()` 才连接集群（配置加载不阻塞），`stop()` 释放全部句柄后
+  `glfs_fini`。配置 `[export.gluster] volume/servers/subdir/transport/log_file/log_level/
+  fd_cache/readdir_enrich/jukebox/native_locks`；`BackendFactory::virtual_path`
+  让 `path` 只作挂载名（配置校验不再 stat 本机目录）。
+- 全部 libgfapi 调用在 offload 池（`kHeavy` 归 init/fsync/fallocate/copy 类），身份用
+  `glfs_setfsuid/gid/groups` 在 offload 线程逐调用设置并复位（Ganesha 同法）。
+- **测试**：`tests/gfapi_fake.{hpp,cpp}` 在本地目录上实现同一张函数表（线程局部
+  fsuid、16 字节句柄含世代号、xstat 所有权、按 lk-owner 键的 posix 锁表、可注入的
+  传输错误），`tests/test_gluster.cpp` 11 个用例跑完 05 §5.9 检查表（P1/P2/ESTALE、
+  命名空间、EXCLUSIVE 重放、cookie 分页+富化、匿名/open-state IO、粘性 commit、
+  v4.2、原生 access 身份、jukebox 映射、原生锁、配置工厂、停/起与句柄零泄漏）；
+  fuzz 目标 `objid_gluster`（句柄解析边界）。真实 libgfapi 11.2 在本机以
+  `LD_LIBRARY_PATH` 加载通过（连接失败路径干净）；真实集群验收脚本
+  `scripts/accept_gluster.sh`（需要目标环境：本仓库开发机无 root、无 glusterd）。
+- **文档边界**：多网关一致性现在有了原生锁下推，但 gluster 无原生 change 计数
+  （`change` 仍为 ctime 合成，`change_attr_type = TIME_METADATA`）——跨网关的
+  CTO 依赖 ctime 精度；v4 open/deny 状态仍是网关本地（05 §5.6 口径不变，只是锁这一半
+  补齐）。锁下推的 LOCKT 探测无法辨认自身持有的锁（见上表）；被删除文件上残留的
+  lock glfd 在后端 stop 时统一关闭（`lightnfs_gluster_lock_fds` 可见）。
 
 ### 5.4 长期观察（维持 09 册口径，补充新证据）
 
@@ -479,7 +523,7 @@ re-verify）、TOML 解析器、record_stream 分片重组（FakeRing 按输入�
 | v1.3 | 可观测性 + 运维 | §3 全部；§4.1 第一步热重载 + §4.2 ctl 扩展 | p99 可从 Prometheus 算出；reload 不中断 IO 的验收用例 |
 | v1.4 | 协议短板 | §5.1（READ_PLUS、cookieverf、xattr 应答语义、open()） | pynfs 对应组通过；稀疏读基准 |
 | v2.0 | 委托 + 回传通道 | §5.2；穿插 §6 重构 | CB_RECALL/CB_NOTIFY_LOCK 真实客户端验收；委托削减 GETATTR 的量化 |
-| v2.x | 第二后端 | §5.3，先补能力位链路 | 09 册"接口冻结检验"的 DoD |
+| v2.x ✅ | 第二后端 | §5.3，先补能力位链路 | 09 册"接口冻结检验"的 DoD：接口零改动（仅加可选 `LockMgr::release()` + `BackendFactory::virtual_path`）跑通 GlusterFS；真实集群验收待目标环境（`scripts/accept_gluster.sh`） |
 
 测试与工程化（§7）不单列阶段，按"谁改到谁补齐"原则摊入各阶段，v1.1 优先补
 fuzz 扩面与故障注入钩子。

@@ -719,6 +719,19 @@ rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from
   }
   if (rec->type == StateType::kLock) {
     locks_.release_owner(key, rec->lowner);  // plain mutex table: no shard lock held
+    if (backend::LockMgr* native = native_lock_mgr(rec->fsid)) {
+      // Drop the owner's native locks too (CLOSE / FREE_STATEID / expiry).  A file
+      // that is already gone cannot be resolved; its descriptor is closed when the
+      // backend stops (the locks die with the inode anyway).
+      auto obj = co_await native_lock_object(rec->fsid, rec->oid);
+      Result<void> released = obj ? co_await native->release(**obj, rec->lowner)
+                                  : Result<void>(Err(obj.error()));
+      if (!released) {
+        native_lock_errors_.fetch_add(1, std::memory_order_relaxed);
+        LNFS_WARN("native lock release failed (fsid {}): {}", rec->fsid,
+                  errno_name(released.error()));
+      }
+    }
     lock_count_.fetch_sub(1, std::memory_order_relaxed);
     // The freed ranges may unblock waiters (plan doc 10 §5.2): CB_NOTIFY_LOCK them.
     notify_lock_waiters(key);
@@ -1582,6 +1595,13 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
     co_return out;
   }
 
+  // The owner's coverage before this grant: restored if the native push refuses.
+  backend::LockMgr* native = native_lock_mgr(args.fsid);
+  std::vector<LockSeg> before;
+  if (native)
+    for (const auto& seg : locks_.segments(key))
+      if (same_owner(seg.owner, lowner)) before.push_back(seg);
+
   // Arbitrate; a conflict held by a courtesy client reclaims it first (07 §7.4).
   for (int attempt = 0;; ++attempt) {
     auto conflict = locks_.lock(key, lowner, range, args.exclusive);
@@ -1605,6 +1625,21 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
       out.denied.owner = holder->owner;
     }
     co_return out;
+  }
+  // Native push (design 05 §5.8, plan doc 10 §5.3): the backend's lock manager sees
+  // the same grant, so a gateway sharing the storage conflicts with this one.  A
+  // refusal undoes the gateway grant (previous coverage restored) and answers like a
+  // local conflict; a backend error answers DELAY/SERVERFAULT with nothing granted.
+  if (native) {
+    auto pushed = co_await push_native_lock(*native, args.fsid, args.oid, lowner, range,
+                                            args.exclusive);
+    if (pushed.status != 0) {
+      locks_.release_owner(key, lowner);
+      for (const auto& seg : before)
+        (void)locks_.lock(key, lowner, GatewayLockMgr::to_range(seg.start, seg.end),
+                          seg.exclusive);
+      co_return pushed;
+    }
   }
   remember_lock_owner(lowner, client, owner_bytes);
 
@@ -1675,7 +1710,7 @@ rt::Task<StateMgr::LockResult> StateMgr::lockt(uint64_t clientid, uint32_t fsid,
   FileKey key{fsid, oid};
   for (int attempt = 0;; ++attempt) {
     auto conflict = locks_.test(key, &lowner, {offset, length}, exclusive);
-    if (!conflict) co_return out;
+    if (!conflict) break;
     auto holder = find_lock_owner(conflict->owner);
     if (holder && holder->client->courtesy.load(std::memory_order_relaxed) && attempt < 8) {
       (void)co_await expire_client_impl(holder->client->clientid, kReasonConflict);
@@ -1691,6 +1726,95 @@ rt::Task<StateMgr::LockResult> StateMgr::lockt(uint64_t clientid, uint32_t fsid,
     }
     co_return out;
   }
+  // No local conflict: ask the backend about other gateways (F_GETLK-style probe).
+  // The probe cannot tell the asker's own locks from foreign ones, so it is skipped
+  // while this owner already covers part of the range — the gateway table has
+  // answered for that case.
+  backend::LockMgr* native = native_lock_mgr(fsid);
+  if (!native) co_return out;
+  uint64_t end = GatewayLockMgr::range_end({offset, length});
+  for (const auto& seg : locks_.segments(key))
+    if (same_owner(seg.owner, lowner) && seg.start < end && offset < seg.end) co_return out;
+  auto obj = co_await native_lock_object(fsid, oid);
+  if (!obj) {
+    out.status = native_lock_status(obj.error());
+    co_return out;
+  }
+  auto probe = co_await native->test(**obj, {offset, length}, exclusive);
+  if (!probe) {
+    native_lock_errors_.fetch_add(1, std::memory_order_relaxed);
+    out.status = native_lock_status(probe.error());
+    co_return out;
+  }
+  if (*probe) {
+    out.status = as_u32(Status::kDenied);
+    out.denied.offset = (*probe)->range.offset;
+    out.denied.length = (*probe)->range.length;
+    out.denied.exclusive = (*probe)->exclusive;
+    if ((*probe)->owner.len > 0)
+      if (auto holder = find_lock_owner((*probe)->owner)) {
+        out.denied.clientid = holder->client->clientid;
+        out.denied.owner = holder->owner;
+      }
+  }
+  co_return out;
+}
+
+backend::LockMgr* StateMgr::native_lock_mgr(uint32_t fsid) const {
+  return cfg_.native_locks.manager ? cfg_.native_locks.manager(fsid) : nullptr;
+}
+
+rt::Task<Result<backend::ObjPtr>> StateMgr::native_lock_object(uint32_t fsid,
+                                                              const backend::ObjId& oid) {
+  if (!cfg_.native_locks.resolve) co_return Err(errno_from(ENODEV));
+  co_return co_await cfg_.native_locks.resolve(fsid, oid);
+}
+
+uint32_t StateMgr::native_lock_status(Errno error) {
+  if (error == Errno::kJukebox || error == errno_from(ENOTCONN) ||
+      error == errno_from(ETIMEDOUT) || error == errno_from(EAGAIN))
+    return as_u32(Status::kDelay);
+  if (error == errno_from(ESTALE) || error == errno_from(ENOENT))
+    return as_u32(Status::kStale);
+  return as_u32(Status::kServerfault);
+}
+
+rt::Task<StateMgr::LockResult> StateMgr::push_native_lock(
+    backend::LockMgr& native, uint32_t fsid, const backend::ObjId& oid,
+    const backend::LockOwnerId& lowner, backend::LockRange range, bool exclusive) {
+  LockResult out;
+  auto obj = co_await native_lock_object(fsid, oid);
+  if (!obj) {
+    native_lock_errors_.fetch_add(1, std::memory_order_relaxed);
+    out.status = native_lock_status(obj.error());
+    co_return out;
+  }
+  auto granted = co_await native.lock(**obj, lowner, range, exclusive, false);
+  if (granted) co_return out;
+  if (granted.error() != errno_from(EAGAIN)) {
+    native_lock_errors_.fetch_add(1, std::memory_order_relaxed);
+    out.status = native_lock_status(granted.error());
+    co_return out;
+  }
+  // Refused by the storage: someone (typically another gateway) holds it.
+  native_lock_denied_.fetch_add(1, std::memory_order_relaxed);
+  lock_denied_.fetch_add(1, std::memory_order_relaxed);
+  out.status = as_u32(Status::kDenied);
+  out.denied.offset = range.offset;
+  out.denied.length = range.length;
+  out.denied.exclusive = exclusive;
+  auto conflict = co_await native.test(**obj, range, exclusive);
+  if (conflict && *conflict) {
+    out.denied.offset = (*conflict)->range.offset;
+    out.denied.length = (*conflict)->range.length;
+    out.denied.exclusive = (*conflict)->exclusive;
+    if ((*conflict)->owner.len > 0)
+      if (auto holder = find_lock_owner((*conflict)->owner)) {
+        out.denied.clientid = holder->client->clientid;
+        out.denied.owner = holder->owner;
+      }
+  }
+  co_return out;
 }
 
 rt::Task<uint32_t> StateMgr::locku(const Stateid& sid, uint64_t clientid, uint64_t offset,
@@ -1711,6 +1835,18 @@ rt::Task<uint32_t> StateMgr::locku(const Stateid& sid, uint64_t clientid, uint64
   if (sid.seqid != 0 && sid.seqid < rec->seqid) co_return as_u32(Status::kOldStateid);
   if (sid.seqid != 0 && sid.seqid > rec->seqid) co_return as_u32(Status::kBadStateid);
   locks_.unlock(FileKey{rec->fsid, rec->oid}, rec->lowner, {offset, length});
+  if (backend::LockMgr* native = native_lock_mgr(rec->fsid)) {
+    // Mirror the release into the storage.  A failure leaves the native lock until
+    // the owner's descriptor is closed (CLOSE / expiry); the gateway view is already
+    // unlocked, so the client is not told to retry a range it no longer holds.
+    auto obj = co_await native_lock_object(rec->fsid, rec->oid);
+    Result<void> released = obj ? co_await native->unlock(**obj, rec->lowner, {offset, length})
+                                : Result<void>(Err(obj.error()));
+    if (!released) {
+      native_lock_errors_.fetch_add(1, std::memory_order_relaxed);
+      LNFS_WARN("native unlock failed (fsid {}): {}", rec->fsid, errno_name(released.error()));
+    }
+  }
   {
     FileShard& shard = file_shard(FileKey{rec->fsid, rec->oid});
     auto lock = co_await shard.mu.lock();  // serializes seqid bumps with LOCK
@@ -1927,6 +2063,8 @@ StateMgr::Stats StateMgr::stats() const {
     out.lock_owners = lock_owners_.size();
   }
   out.lock_denied = lock_denied_.load(std::memory_order_relaxed);
+  out.native_lock_denied = native_lock_denied_.load(std::memory_order_relaxed);
+  out.native_lock_errors = native_lock_errors_.load(std::memory_order_relaxed);
   out.delegs = nonneg(deleg_count_);
   out.deleg_grants = deleg_grants_.load(std::memory_order_relaxed);
   out.deleg_recalls = deleg_recalls_.load(std::memory_order_relaxed);

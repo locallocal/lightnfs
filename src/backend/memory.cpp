@@ -1,5 +1,7 @@
 #include "backend/memory.hpp"
 
+#include "backend/fault.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -100,6 +102,8 @@ class MemoryBackend::MemoryObject final : public Object {
     auto allowed = co_await access(ctx.cred, Access::kRead);
     if (!allowed || (!allowed->has(Access::kRead) && ctx.cred.uid != node_->attr.uid))
       co_return Err(allowed ? errno_from(EACCES) : allowed.error());
+    // Fault injection (plan doc 10 §7.1): the JUKEBOX path end to end without an HSM.
+    if (fault::take(fault::Kind::kJukebox)) co_return Err(Errno::kJukebox);
     std::lock_guard lock(backend_.mu_);
     size_t pos = static_cast<size_t>(std::min<uint64_t>(off, node_->data.size()));
     size_t n = std::min(out.size(), node_->data.size() - pos);
@@ -293,6 +297,7 @@ class MemoryBackend::MemoryObject final : public Object {
     auto allowed = co_await access(ctx.cred, Access::kModify);
     if (!allowed || (!allowed->has(Access::kModify) && ctx.cred.uid != node_->attr.uid))
       co_return Err(allowed ? errno_from(EACCES) : allowed.error());
+    if (fault::take(fault::Kind::kJukebox)) co_return Err(Errno::kJukebox);
     std::lock_guard lock(backend_.mu_);
     if (uint64_t cap = backend_.max_filesize_; cap && off + in.size() > cap)
       co_return Err(errno_from(EFBIG));
@@ -415,7 +420,7 @@ Caps MemoryBackend::caps() const {
   Caps out;
   return out.set(Cap::kSymlink).set(Cap::kHardlink).set(Cap::kMknod)
       .set(Cap::kStableHandles).set(Cap::kSparseOps).set(Cap::kCopyRange)
-      .set(Cap::kCloneRange);
+      .set(Cap::kCloneRange).set(Cap::kJukebox);  // kJukebox: via fault injection
 }
 
 Timespec MemoryBackend::now() { return Timespec{tick_++, 0}; }

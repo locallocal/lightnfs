@@ -184,7 +184,10 @@ struct OpenCtx {                       // IO 调用的第一参数
 独立数据 fd（读 O_RDONLY / 写 O_RDWR），read/write/seek 优先走它（open 时定权限的
 POSIX 语义，免 fd 缓存往返）；打不开时降级返回 EOPNOTSUPP，引擎继续走匿名路径，
 行为与之前一致。同 owner 合并升级（读→读写）时状态层保留原句柄，写路径检测到句柄
-不可写自动回落 fd 缓存。memory 后端维持 EOPNOTSUPP。
+不可写自动回落 fd 缓存。memory 后端维持 EOPNOTSUPP。**第二个生产者**（2026-09-03，
+plan doc 10 §5.3）：gluster 的 `GlusterOpenState` 持每 OPEN 一个 glfd（`glfs_h_open`
+以调用者身份打开）；kNativeAccess 后端的 `open()` 不做 EOPNOTSUPP 降级——EACCES 就是
+OPEN 的答案，v4 引擎据此跳过网关侧 `access()` 预检。
 - v4 引擎把 OPEN→`open()` 的 OpenPtr 存入状态表，CLOSE 时释放（shared_ptr 归零 → 后端资源回收）；同一文件多次 OPEN 合并由状态层负责，后端只见 open/close 配对。
 - `OpenFlags`：read/write/create(3 模式)/truncate；EXCLUSIVE 创建的 verifier 由 `create(..., ExclVerf*)` 传入，后端负责持久化到 atime/mtime 并在重放时比对（语义 nfsv3/04 §8——两版协议共用此实现）。
 
@@ -192,6 +195,9 @@ POSIX 语义，免 fd 缓存往返）；打不开时降级返回 EOPNOTSUPP，�
 
 - kNativeChange 后端：`Attr::change` 来自存储原生计数（statx `STATX_CHANGE_COOKIE`、Lustre 版本号、gluster 无 → 不置位）。
 - 无此能力时 **core 合成**：`change = ctime.sec*1e9 + ctime.nsec`，并在网关内对活跃对象维护"最近一次本网关修改后的单调递增修正"（防同 ns 双改）。多网关同挂一个后端时合成 change 不可靠——文档级限制，多网关部署要求 kNativeChange 后端。
+- **消费端（2026-09-03）**：v4.2 属性 `change_attr_type`(79) 据此位宣告 MONOTONIC_INCR
+  （原生计数）或 TIME_METADATA（ctime 合成）；`core::FsProps::native_change` 是引擎侧
+  的读取点。gluster 后端不置位（无原生计数）。
 
 ## 5.7 readdir cookie 契约（后端必须满足）
 
@@ -211,6 +217,13 @@ public:
 ```
 
 v1：网关内 LockMgr（07 分册）实现同一接口，单网关正确；`native_locks()` 有值时状态层改用后端实现（Lustre flock 语义、gluster posix-locks xlator）。接口先行，切换点唯一。
+
+**实现（2026-09-03，plan doc 10 §5.3）**：接口新增一个可选操作
+`release(Object&, const LockOwnerId&)`（默认 = 全区间 `unlock`；gluster 覆写为关闭该
+owner 的 glfd）。状态层不是"改用"而是"叠加"：网关表继续负责 stateid/本地冲突/courtesy
+回收/CB_NOTIFY_LOCK，`StateMgr::Config::native_locks` 钩子把每次 LOCK/LOCKU/LOCKT
+额外下推——后端拒绝（EAGAIN）则回滚网关授予并回 DENIED，后端错误回 DELAY/SERVERFAULT。
+第一个真实实现是 `GlusterLockMgr`（`glfs_posix_lock` + `glfs_fd_set_lkowner`）。
 
 ## 5.9 语义契约汇总（后端实现者检查表）
 
