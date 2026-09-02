@@ -248,6 +248,10 @@ class LockMgr {
   virtual rt::Task<Result<void>> lock(Object&, const LockOwnerId&, LockRange, bool, bool) = 0;
   virtual rt::Task<Result<void>> unlock(Object&, const LockOwnerId&, LockRange) = 0;
   virtual rt::Task<Result<std::optional<LockConflict>>> test(Object&, LockRange, bool) = 0;
+  // Drops everything `owner` holds on the object (CLOSE / stateid free / client
+  // expiry).  Default: a full-range unlock; backends that pin a descriptor per owner
+  // (gluster) override to close it.
+  virtual rt::Task<Result<void>> release(Object&, const LockOwnerId&);
 };
 using LockMgrRef = std::reference_wrapper<LockMgr>;
 
@@ -276,6 +280,10 @@ struct BackendFactory {
   std::string name;
   uint32_t api_version = kBackendApiVersion;
   std::unique_ptr<Backend> (*make)(const BackendConfig&) = nullptr;
+  // The export `path` is only the name clients mount, not a directory on this host
+  // (cluster backends: the tree lives in the volume) — config validation skips the
+  // local stat() for these.
+  bool virtual_path = false;
 };
 
 void register_backend(BackendFactory factory);

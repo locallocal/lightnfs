@@ -83,20 +83,36 @@ v1 默认模式 1；接口上不体现差异（都在后端内部）。
 
 结论：接口无缺口；Lustre 特有优化（statahead、组锁）可全部藏在后端内。
 
-## 6.6 映射验证：GlusterFS 后端（未来）
+## 6.6 映射验证：GlusterFS 后端 ✅ 已实现（2026-09-03，plan doc 10 §5.3）
 
-| Backend API | libgfapi 映射 | 备注 |
+| Backend API | libgfapi 映射（实现） | 备注 |
 |-------------|--------------|------|
-| Backend::start | `glfs_new/glfs_init`（offload） | 每导出一个 glfs_t |
-| ObjId | GFID（16B UUID） | `glfs_h_create_from_handle` 正是 handle-based API（Ganesha 同款） |
-| resolve | `glfs_h_create_from_handle` → `glfs_object*` | ObjPtr 持有 glfs_object |
-| lookup/creat/… | `glfs_h_lookupat/glfs_h_creat/...` 全套 h_* API | 与 Object 接口一一对应 |
-| open/IO | `glfs_h_open` → glfd；匿名 IO：`glfs_h_anonymous_open` 或内部 glfd 缓存 | libgfapi 是阻塞库 → 全部 offload；未来可用 glfs_*_async 族改造 |
-| readdir | `glfs_opendir + glfs_readdirplus_r`，d_off 作 cookie | DHT 的 d_off 稳定性已被 Ganesha 验证 |
-| change | 无原生 → 不置 kNativeChange | 多网关部署受 5.6 限制 |
-| locks | posix-locks xlator 经 glfs_posix_lock → kByteLocks 可置 | — |
+| Backend::start/stop | `glfs_new` + `glfs_set_volfile_server`(每个 server) + `glfs_set_logging` + `glfs_init`，再 `glfs_h_lookupat(NULL, subdir)` 取导出根（offload kHeavy）；stop 先关锁 glfd/fd 缓存/对象缓存再 `glfs_fini` | 每导出一个 glfs_t；工厂构造不连接，`start()` 才连（配置加载不阻塞于集群） |
+| ObjId | 标记字节 `3` + 16B GFID（`glfs_h_extract_handle`） → kStableHandles | 17B；`GlusterBackend::gfid_from_oid` 是解析边界（fuzz 目标 `objid_gluster`） |
+| resolve | `glfs_h_create_from_handle` → `glfs_object*`，前置分片 LRU 对象句柄缓存（容量 = fd_cache） | ENOENT/ESTALE/EINVAL → ESTALE；ObjPtr 共享 `ObjHandle`（最后一个用户 `glfs_h_close`） |
+| lookup/creat/… | `glfs_h_lookupat/h_creat/h_mkdir/h_mknod/h_symlink/h_unlink/h_rename/h_link/h_readlink/h_setattrs/h_truncate/h_stat/h_statfs` | `..` 在导出根钳到根；unlink/rmdir 先 lookup 定类型（`glfs_h_unlink` 对目录也会 rmdir，REMOVE 目录须回 EISDIR）；创建后若砖块 umask 改了 mode 则补一次 setattrs |
+| 身份 | `glfs_setfsuid/setfsgid/setfsgroups` 在 offload 线程逐调用设置、调用后复位 | 砖块 posix-acl 判定 → **kNativeAccess**：`access()` = 每个所需 POSIX 模式一次 `glfs_h_access`（最多 3 次） |
+| open/IO | v4 OPEN：`glfs_h_open` 以调用者身份 → `GlusterOpenState`（EACCES 即 OPEN 的答案，不降级）；匿名 IO：每对象 glfd 缓存（读→写升级、LRU 驱逐、以网关身份打开，门禁 = 原生 access + v3 属主放宽）；`glfs_pread/pwritev`，kDataSync/kFileSync → `glfs_fdatasync/fsync`；commit = fdatasync，失败粘性 poison（§6.2） | 全部 offload；数据路径 kLight，同步/分配/拷贝 kHeavy |
+| readdir | `glfs_h_opendir` + `glfs_seekdir(cookie)` + `glfs_xreaddirplus_r(STAT\|HANDLE)`，d_off 作 cookie；每页一个目录 glfd | 富化：attr 取 xstat 的 stat，oid 取 xstat 对象的 GFID（对象随 `glfs_free(xstat)` 释放） |
+| change | 无原生 → 不置 kNativeChange，`change = ctime` 合成（05 §5.6）；v4.2 `change_attr_type = TIME_METADATA` | 多网关部署的 CTO 依赖 ctime 精度（文档限制） |
+| v4.2 | `glfs_lseek(SEEK_DATA/HOLE)` / `glfs_fallocate(0)` / `glfs_discard` → kSparseOps；`glfs_copy_file_range`（EXDEV/EOPNOTSUPP/ENOSYS/EINVAL 回落 pread/pwrite）→ kCopyRange | 无 CLONE |
+| locks | `GlusterLockMgr`：每 (文件, lock-owner) 一个 glfd（网关身份 O_RDWR，EACCES 回落 O_RDONLY）+ `glfs_fd_set_lkowner`，`glfs_posix_lock(F_SETLK)`；冲突 EAGAIN；`test()` 用探测 owner 的 F_GETLK；`release()` 全量解锁并关 glfd → **kByteLocks**，`native_locks()` 交给状态层下推（07 册 / plan doc 10 §5.3） | `native_locks=false` 关闭 |
+| jukebox | ENOTCONN/ETIMEDOUT/ENETDOWN/ENETUNREACH/EHOSTUNREACH/EHOSTDOWN → `kJukebox`（v3 JUKEBOX / v4 DELAY）→ **kJukebox** | 砖块重连/仲裁丢失期间客户端重试而非报错；`jukebox=false` 时回 EIO |
 
-结论：接口无缺口；唯一摩擦点是 libgfapi 阻塞调用——offload 池并发度成为该后端吞吐上限，这正是 `offload()` 抽象存在的理由（后端内部可自带专属线程池，接口不变）。
+**绑定方式**：`backend/gfapi.hpp` 定义一张 47 项函数表（签名取自 GlusterFS 11 的
+`glfs.h`/`glfs-handles.h`，不透明结构体按真名在全局命名空间声明），`gfapi.cpp` 在
+`start()` 时 `dlopen("libgfapi.so.0")` + `dlvsym`（默认版本 `GFAPI_x.y`，回落 `dlsym`）填表
+——二进制无构建期 GlusterFS 依赖；`scripts/check_gfapi_abi.sh` 在有头文件的主机上把每
+个成员与真实声明做编译期比对（已对 11.2 头文件通过）。测试用 `tests/gfapi_fake.cpp`
+在本地目录上实现同一张表（线程局部 fsuid、带世代号的 16B 句柄、xstat 所有权、按
+lk-owner 键的 posix 锁表、可注入传输错误），`tests/test_gluster.cpp` 由此把整条后端
+逻辑跑在 ctest 里；真实集群验收 = `scripts/accept_gluster.sh`。
+
+结论（验证后）：接口无缺口——唯一改动是两处可选扩展：`LockMgr::release(Object&, owner)`
+（默认全区间 unlock；gluster 覆写为关 glfd）与 `BackendFactory::virtual_path`（集群后端
+的 `path` 只是挂载名）。摩擦点确如预期是 libgfapi 阻塞调用：offload 池并发度 =
+该后端吞吐上限（`[server] offload_threads` 是它的主要调优旋钮）；`glfs_*_async` 族改造
+留作后续。
 
 ## 6.7 后端选择与配置（示例）
 
@@ -112,7 +128,25 @@ readonly  = false
 fd_cache  = 4096
 identity  = "check"               # check|setfsuid
 
+# GlusterFS（已实现，plan doc 10 §5.3）：path 只是客户端挂载名，树在卷里
+[[export]]
+path      = "/gluster"
+backend   = "gluster"
+fsid      = 2
+clients   = ["192.168.0.0/24"]
+squash    = "none"                # 身份透传给砖块鉴权（kNativeAccess）
+[export.gluster]
+volume         = "vol0"
+servers        = "gs1,gs2:24007"  # volfile 服务器，逗号分隔，可 host:port / [v6]:port
+subdir         = "/exports/a"     # 卷内导出根，默认 "/"
+# transport    = "tcp"            # tcp | rdma | unix
+# log_file     = "/var/log/lightnfs/gfapi.log"   # 空 = libgfapi 默认（非 root 通常不可写）
+# log_level    = 4                # gluster 日志级别 0..9（4 = ERROR，7 = INFO）
+# fd_cache     = 1024             # 匿名 IO glfd 缓存 / 对象句柄缓存容量
+# readdir_enrich = true           # xreaddirplus 带 stat + 句柄（READDIRPLUS 免逐项 lookup）
+# jukebox      = true             # 传输类错误 → JUKEBOX/DELAY（false → EIO）
+# native_locks = true             # glfs_posix_lock 下推（多网关锁一致性）
+
 # 未来：
-# backend = "gluster";  [export.gluster] volfile_server="gs1"; volume="vol0"
 # backend = "lustre";   [export.lustre]  mount="/mnt/lustre"
 ```

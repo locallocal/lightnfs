@@ -72,6 +72,7 @@ sudo systemctl enable --now lightnfs
 | 来源白名单 | `[[export]] clients` | CIDR 列表，收敛到受信网段 |
 | 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none` |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
+| 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` | `local`（本机目录树）或 `gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名） |
 | 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |
 | 传输加密 | `[tls] mode` / `cert` / `key` / `ca` / `client_cert` | RPC-over-TLS（RFC 9289）：off/optional/required + 证书；改动需重启 |
 | 租约 | `[protocol] lease` | v4.1 租约（默认 90s） |
@@ -156,9 +157,18 @@ sudo systemctl enable --now lightnfs
 - **句柄稳定性**：`handles="auto"` 在无 `CAP_DAC_READ_SEARCH` 且文件系统无 STATX_BTIME
   （如 tmpfs）时，句柄不跨重启稳定——生产用 `CAP_DAC_READ_SEARCH` + 内核句柄，或
   `handles="kernel"` 强制（启动即校验，不满足则拒绝启动）。
-- **单机网关**：状态在进程内存 + `state_dir` 名单；不做多网关状态共享（后端原生锁接口
-  `native_locks()` 已定型，留待 Lustre/Gluster 后端切换）。同一后端目录**不要**同时由
-  多个 lightnfsd 网关导出：即便内核提供原生 change cookie（`Cap::kNativeChange`，需
-  STATX_CHANGE_COOKIE；否则由 ctime 合成、仅本网关内可靠），v4 open/deny/字节锁状态
-  也只存在于各网关进程内、互不可见，旁路写同样绕过它们。多网关一致性需具备原生
-  change/锁下推的集群后端（06 分册）。
+- **单机网关**：状态在进程内存 + `state_dir` 名单；不做多网关状态共享。`local` 导出
+  **不要**同时由多个 lightnfsd 网关导出：即便内核提供原生 change cookie
+  （`Cap::kNativeChange`，需 STATX_CHANGE_COOKIE；否则由 ctime 合成、仅本网关内可靠），
+  v4 open/deny/字节锁状态也只存在于各网关进程内、互不可见，旁路写同样绕过它们。
+  `gluster` 导出把 v4 字节锁下推到卷（posix-locks，`native_locks = true`），多网关之间
+  的 LOCK/LOCKT 会互相看见并拒绝；但 change 仍是 ctime 合成（`change_attr_type =
+  TIME_METADATA`），open/deny 状态仍是网关本地——跨网关部署时按此边界评估
+  （启动日志 `export … backend traits:` 打印每个导出的这些位）。
+- **GlusterFS 后端**：libgfapi 是阻塞库，全部调用走 offload 池，`[server]
+  offload_threads` 是该后端的吞吐上限旋钮；砖块重连/仲裁丢失期间的传输类错误映射为
+  JUKEBOX（v3）/DELAY（v4），客户端重试而非报错（`lightnfs_gluster_jukebox_total`，
+  `jukebox = false` 改回 EIO）。身份以 `glfs_setfsuid/gid/groups` 透传，权限由砖块
+  判定（`squash = "none"` 时客户端 uid 直达卷；卷侧 `server.root-squash` 会影响以
+  网关身份打开的匿名 IO 描述符与锁描述符）。`lightnfs-ctl fdcache` 对 gluster 导出
+  显示 glfd/对象缓存/jukebox/锁描述符计数；`clear-poison` 同样适用。

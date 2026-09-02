@@ -21,7 +21,11 @@ inline constexpr uint32_t kSupportedAttrs = 0, kType = 1, kFhExpireType = 2, kCh
     kRawdev = 41, kSpaceAvail = 42, kSpaceFree = 43, kSpaceTotal = 44, kSpaceUsed = 45,
     kTimeAccess = 47, kTimeAccessSet = 48, kTimeDelta = 51, kTimeMetadata = 52,
     kTimeModify = 53, kTimeModifySet = 54, kMountedOnFileid = 55,
-    kSuppattrExclCreat = 75;
+    kSuppattrExclCreat = 75, kChangeAttrType = 79;
+// change_attr_type values (RFC 7862 §12.2.3).
+inline constexpr uint32_t kChangeTypeMonotonicIncr = 0, kChangeTypeVersionCounter = 1,
+    kChangeTypeVersionCounterNoPnfs = 2, kChangeTypeTimeMetadata = 3,
+    kChangeTypeUndefined = 4;
 }
 
 const Bitmap& supported_attrs();

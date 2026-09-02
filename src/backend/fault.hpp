@@ -18,6 +18,8 @@ enum class Kind : int {
   kReadEio,       // data read fails EIO                 (LNFS_FAULT_READ_EIO=N)
   kShortWrite,    // data write completes only 1 byte    (LNFS_FAULT_SHORT_WRITE=N)
   kSlowIo,        // data op sleeps slow_ms() first      (LNFS_FAULT_SLOW_IO=N)
+  kJukebox,       // data op answers kJukebox (v3 JUKEBOX / v4 DELAY): the HSM/cluster
+                  // "try again later" path end to end   (LNFS_FAULT_JUKEBOX=N)
   kCount,
 };
 

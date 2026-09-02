@@ -13,6 +13,8 @@ FsProps fs_props(const backend::Backend& backend) {
   out.link_support = caps.has(backend::Cap::kHardlink);
   out.symlink_support = caps.has(backend::Cap::kSymlink);
   out.case_insensitive = caps.has(backend::Cap::kCaseInsensitive);
+  out.native_change = caps.has(backend::Cap::kNativeChange);
+  out.native_access = caps.has(backend::Cap::kNativeAccess);
   return out;
 }
 

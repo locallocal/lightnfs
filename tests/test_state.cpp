@@ -11,9 +11,11 @@
 #include <condition_variable>
 #include <filesystem>
 #include <cstring>
+#include <format>
 #include <mutex>
 #include <thread>
 
+#include "backend/memory.hpp"
 #include "runtime/io.hpp"
 #include "runtime/runtime.hpp"
 #include "state/state_mgr.hpp"
@@ -793,4 +795,149 @@ TEST(StateMgr, GraceDecoupledFromLeaseAndOperatorEnd) {
   EXPECT_TRUE(mgr.end_grace());
   EXPECT_FALSE(mgr.in_grace());
   EXPECT_FALSE(mgr.end_grace());  // second call: nothing left to end
+}
+
+namespace {
+
+// A backend lock manager for the native push path (design 05 §5.8, plan doc 10
+// §5.3): records every call, refuses lock() when told to and answers test() with a
+// configurable conflict — what a gateway sees when another gateway holds the range.
+struct FakeNativeLocks final : backend::LockMgr {
+  std::vector<std::string> calls;
+  Errno fail = Errno::kOk;                          // lock() outcome when != kOk
+  std::optional<backend::LockConflict> conflict{};  // test() answer
+
+  rt::Task<Result<void>> lock(backend::Object&, const backend::LockOwnerId&,
+                              backend::LockRange r, bool exclusive, bool) override {
+    calls.push_back(std::format("lock {} {} {}", r.offset, r.length, exclusive ? 1 : 0));
+    if (fail != Errno::kOk) co_return Err(fail);
+    co_return Result<void>{};
+  }
+  rt::Task<Result<void>> unlock(backend::Object&, const backend::LockOwnerId&,
+                                backend::LockRange r) override {
+    calls.push_back(std::format("unlock {} {}", r.offset, r.length));
+    co_return Result<void>{};
+  }
+  rt::Task<Result<std::optional<backend::LockConflict>>> test(backend::Object&,
+                                                              backend::LockRange,
+                                                              bool) override {
+    calls.push_back("test");
+    co_return conflict;
+  }
+  rt::Task<Result<void>> release(backend::Object&, const backend::LockOwnerId&) override {
+    calls.push_back("release");
+    co_return Result<void>{};
+  }
+};
+
+}  // namespace
+
+TEST(StateMgr, NativeLockPushRollbackAndRelease) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  FakeNativeLocks native;
+  backend::MemoryBackend memory(1);
+  state::StateMgr::Config cfg{.boot_epoch = 5, .state_dir = dir.path, .lease_seconds = 1,
+                              .courtesy_multiplier = 1};
+  cfg.native_locks.manager = [&](uint32_t fsid) -> backend::LockMgr* {
+    return fsid == 1 ? &native : nullptr;
+  };
+  cfg.native_locks.resolve = [&](uint32_t, const backend::ObjId&)
+      -> rt::Task<Result<backend::ObjPtr>> { co_return co_await memory.root(); };
+  state::StateMgr mgr(cfg);
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(mgr, "client-a", 1);
+    auto b = co_await connect(mgr, "client-b", 2);
+    auto oa = co_await mgr.open(open_args(a.clientid, 1, "oa", state::kShareBoth, 0), nullptr);
+    auto ob = co_await mgr.open(open_args(b.clientid, 1, "ob", state::kShareBoth, 0), nullptr);
+    EXPECT_EQ(oa.status, kOk);
+    EXPECT_EQ(ob.status, kOk);
+    state::FileKey key{1, oid_of(1)};
+
+    // Granted locally and pushed to the storage with the same range/type.
+    state::StateMgr::LockArgs la;
+    la.clientid = a.clientid;
+    la.fsid = 1;
+    la.oid = oid_of(1);
+    la.exclusive = true;
+    la.offset = 0;
+    la.length = 100;
+    la.new_owner = true;
+    la.open_stateid = oa.stateid;
+    la.owner = "proc-a";
+    auto l1 = co_await mgr.lock(la);
+    EXPECT_EQ(l1.status, kOk);
+    EXPECT_EQ(native.calls.size(), 1u);
+    EXPECT_STREQ(native.calls.back(), "lock 0 100 1");
+
+    // The storage refuses an extension (another gateway holds [50,75)): DENIED with
+    // the storage's conflict (holder unknown → clientid 0), and the gateway grant is
+    // rolled back to the previous coverage, [0,100) exactly.
+    native.fail = errno_from(EAGAIN);
+    native.conflict = backend::LockConflict{{}, {50, 25}, true};
+    la.new_owner = false;
+    la.lock_stateid = l1.stateid;
+    la.offset = 50;
+    la.length = 200;
+    auto denied = co_await mgr.lock(la);
+    EXPECT_EQ(denied.status, st4(nfsv4::Status::kDenied));
+    EXPECT_EQ(denied.denied.offset, 50u);
+    EXPECT_EQ(denied.denied.length, 25u);
+    EXPECT_TRUE(denied.denied.exclusive);
+    EXPECT_EQ(denied.denied.clientid, 0u);
+    EXPECT_TRUE(denied.denied.owner.empty());
+    auto segs = mgr.lock_table().segments(key);
+    EXPECT_EQ(segs.size(), 1u);
+    if (!segs.empty()) {
+      EXPECT_EQ(segs[0].start, 0u);
+      EXPECT_EQ(segs[0].end, 100u);
+    }
+    EXPECT_EQ(mgr.stats().native_lock_denied, 1u);
+    EXPECT_EQ(mgr.stats().lock_states, 1u);
+    // A new owner refused by the storage mints no stateid.
+    state::StateMgr::LockArgs lb = la;
+    lb.clientid = b.clientid;
+    lb.new_owner = true;
+    lb.open_stateid = ob.stateid;
+    lb.owner = "proc-b";
+    lb.offset = 500;
+    lb.length = 10;
+    EXPECT_EQ((co_await mgr.lock(lb)).status, st4(nfsv4::Status::kDenied));
+    EXPECT_EQ(mgr.stats().lock_states, 1u);
+    EXPECT_EQ(mgr.lock_table().segments(key).size(), 1u);
+    // Storage trouble answers DELAY and grants nothing.
+    native.fail = Errno::kJukebox;
+    EXPECT_EQ((co_await mgr.lock(lb)).status, st4(nfsv4::Status::kDelay));
+    EXPECT_EQ(mgr.stats().native_lock_errors, 1u);
+    EXPECT_EQ(mgr.lock_table().segments(key).size(), 1u);
+    native.fail = Errno::kOk;
+
+    // LOCKT: no local conflict → the storage is probed; a probe that reports a
+    // holder is DENIED with that range.  An owner already covering part of the range
+    // is answered by the gateway table alone (the probe cannot tell own locks apart).
+    native.conflict = backend::LockConflict{{}, {700, 5}, false};
+    auto t1 = co_await mgr.lockt(b.clientid, 1, oid_of(1), "proc-b", true, 700, 10);
+    EXPECT_EQ(t1.status, st4(nfsv4::Status::kDenied));
+    EXPECT_EQ(t1.denied.offset, 700u);
+    EXPECT_EQ(t1.denied.length, 5u);
+    EXPECT_STREQ(native.calls.back(), "test");
+    size_t before = native.calls.size();
+    auto t2 = co_await mgr.lockt(a.clientid, 1, oid_of(1), "proc-a", true, 10, 10);
+    EXPECT_EQ(t2.status, kOk);
+    EXPECT_EQ(native.calls.size(), before);
+    native.conflict.reset();
+    auto t3 = co_await mgr.lockt(b.clientid, 1, oid_of(1), "proc-b", false, 900, 10);
+    EXPECT_EQ(t3.status, kOk);
+    EXPECT_STREQ(native.calls.back(), "test");
+
+    // LOCKU mirrors the release; CLOSE drops the owner's locks in the storage too.
+    nfsv4::Stateid out{};
+    EXPECT_EQ(co_await mgr.locku(l1.stateid, a.clientid, 0, 50, &out), kOk);
+    EXPECT_STREQ(native.calls.back(), "unlock 0 50");
+    EXPECT_EQ(co_await mgr.close_state(oa.stateid, a.clientid, &out), kOk);
+    EXPECT_STREQ(native.calls.back(), "release");
+    EXPECT_EQ(mgr.lock_table().segments(key).size(), 0u);
+  });
+  runtime.stop_and_join();
 }

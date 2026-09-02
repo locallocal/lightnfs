@@ -4,7 +4,9 @@
 
 #include <array>
 
+#include "backend/fault.hpp"
 #include "backend/memory.hpp"
+#include "rpc/drc.hpp"
 #include "core/config.hpp"
 #include "core/errmap.hpp"
 #include "core/file_handle.hpp"
@@ -308,4 +310,39 @@ TEST(Nfs3, ReaddirVerifierRoundTripAndChangeDetection) {
   list(0, {}, &status, &last_cookie, &verf2);  // restart recovers with a fresh verifier
   EXPECT_EQ(status, 0u);
   EXPECT_FALSE(verf2 == verf);
+}
+
+// kJukebox end to end (plan doc 10 §5.3): a backend "try again later" reaches the
+// wire as NFS3ERR_JUKEBOX on READ (one of the two procedures the 08 §8.2 whitelist
+// admits it on; both are idempotent and never DRC-cached, so a retransmission always
+// re-executes) and the retry succeeds once the backend is ready.
+TEST(Nfs3, JukeboxReachesTheWireAndRetrySucceeds) {
+  NfsFixture f;
+  rpc::Drc drc({.ttl = std::chrono::milliseconds(60000), .max_memory = 1 << 20});
+  f.engine.set_drc(&drc);
+  xdr::XdrEnc lookarg(f.pool);
+  nfsv3::Diropargs{f.root_fh, "hello"}.encode(lookarg);
+  auto reply = f.request((uint32_t)nfsv3::Proc::kLookup, lookarg.take());
+  auto result = f.result(reply);
+  EXPECT_EQ(*result.u32(), (uint32_t)nfsv3::Status::kOk);
+  auto file_fh = *result.opaque(64);
+  nfsv3::FileHandle file{{file_fh.begin(), file_fh.end()}};
+
+  backend::fault::arm(backend::fault::Kind::kJukebox, 1);
+  xdr::XdrEnc readarg(f.pool);
+  nfsv3::ReadArgs{file, 0, 64}.encode(readarg);
+  reply = f.request((uint32_t)nfsv3::Proc::kRead, readarg.take());
+  result = f.result(reply);
+  EXPECT_EQ(*result.u32(), (uint32_t)nfsv3::Status::kJukebox);
+  EXPECT_TRUE(*result.boolean());  // post-op attrs still follow (WCC for the retry)
+  EXPECT_EQ(drc.stats().inserts, 0u);
+
+  // Same xid, same args: re-executed, not replayed.
+  xdr::XdrEnc again(f.pool);
+  nfsv3::ReadArgs{file, 0, 64}.encode(again);
+  reply = f.request((uint32_t)nfsv3::Proc::kRead, again.take());
+  result = f.result(reply);
+  EXPECT_EQ(*result.u32(), (uint32_t)nfsv3::Status::kOk);
+  EXPECT_EQ(drc.stats().replays, 0u);
+  backend::fault::clear();
 }

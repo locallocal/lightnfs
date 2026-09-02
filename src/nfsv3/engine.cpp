@@ -180,7 +180,9 @@ rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rp
       error = std::current_exception();
     }
     // A reply was produced -> cache it; otherwise (exception, GARBAGE_ARGS path) drop
-    // the claim so a waiting retransmission re-executes instead of hanging.
+    // the claim so a waiting retransmission re-executes instead of hanging.  (JUKEBOX
+    // never meets the cache: the 08 §8.2 whitelist admits it on READ/WRITE only, and
+    // those idempotent procedures are not in drc_cached().)
     if (!error && !cap.empty()) co_await drc_->complete(key, std::move(cap));
     else co_await drc_->abort(key);
     if (error) std::rethrow_exception(error);

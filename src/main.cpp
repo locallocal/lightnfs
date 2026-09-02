@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "backend/gluster.hpp"
 #include "backend/local.hpp"
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
@@ -137,6 +138,15 @@ bool start_backends(lnfs::rt::Runtime& runtime, lnfs::core::ExportTable& exports
     LNFS_INFO("export {} v4.2 capabilities: seek/allocate={} copy={} clone={}", entry->path,
               caps.has(lnfs::backend::Cap::kSparseOps), caps.has(lnfs::backend::Cap::kCopyRange),
               caps.has(lnfs::backend::Cap::kCloneRange));
+    // The half-wired bits of plan doc 10 §5.3, now consumed: native change counter
+    // (change_attr_type), storage-side access, native byte locks, jukebox.
+    LNFS_INFO("export {} backend traits: stable-handles={} native-change={} "
+              "native-access={} native-locks={} jukebox={}",
+              entry->path, caps.has(lnfs::backend::Cap::kStableHandles),
+              caps.has(lnfs::backend::Cap::kNativeChange),
+              caps.has(lnfs::backend::Cap::kNativeAccess),
+              entry->backend->native_locks().has_value(),
+              caps.has(lnfs::backend::Cap::kJukebox));
   }
   return true;
 }
@@ -172,7 +182,25 @@ struct ProtocolStack {
                .courtesy_multiplier = cfg.courtesy_multiplier,
                .max_io = cfg.max_request_size,
                .shards = cfg.state_shards,
-               .delegations = cfg.delegations}) {
+               .delegations = cfg.delegations,
+               // Native byte-range locks (plan doc 10 §5.3): exports whose backend
+               // has native_locks() get every LOCK/LOCKU/LOCKT mirrored into storage.
+               .native_locks = {
+                   .manager =
+                       [exports = core.exports.get()](uint32_t fsid) -> lnfs::backend::LockMgr* {
+                         const auto* entry = exports->by_fsid(fsid);
+                         if (!entry) return nullptr;
+                         auto native = entry->backend->native_locks();
+                         return native ? &native->get() : nullptr;
+                       },
+                   .resolve =
+                       [exports = core.exports.get()](uint32_t fsid,
+                                                      const lnfs::backend::ObjId& oid)
+                           -> lnfs::rt::Task<lnfs::Result<lnfs::backend::ObjPtr>> {
+                         const auto* entry = exports->by_fsid(fsid);
+                         if (!entry) co_return lnfs::Err(lnfs::errno_from(ESTALE));
+                         co_return co_await entry->backend->resolve(oid);
+                       }}}) {
     nfs3.set_write_verifier(lnfs::core::verifier_from_epoch(core.epoch));
     nfs3.set_drc(&drc);
     nfs3.register_with(dispatcher);
@@ -230,13 +258,15 @@ void register_metrics_providers(ProtocolStack& stack, lnfs::core::ExportTable& e
         // Delegations + backchannel (plan doc 10 §5.2).
         "lightnfs_v4_delegations {}\nlightnfs_v4_deleg_grants_total {}\n"
         "lightnfs_v4_deleg_recalls_total {}\nlightnfs_v4_deleg_returns_total {}\n"
-        "lightnfs_v4_deleg_revokes_total {}\nlightnfs_v4_cb_lock_notifies_total {}\n",
+        "lightnfs_v4_deleg_revokes_total {}\nlightnfs_v4_cb_lock_notifies_total {}\n"
+        // Native lock push (plan doc 10 §5.3).
+        "lightnfs_v4_native_lock_denied_total {}\nlightnfs_v4_native_lock_errors_total {}\n",
         s.clients, s.sessions, s.opens, s.seq_new, s.seq_replay, s.seq_misordered,
         s.seq_waits, s.grace ? 1 : 0, s.grace_remaining, s.files, s.courtesy,
         s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout, s.reclaim_forced,
         s.share_denied, s.open_merges, s.lock_states, s.lock_segments, s.lock_owners,
         s.lock_denied, s.delegs, s.deleg_grants, s.deleg_recalls, s.deleg_returns,
-        s.deleg_revokes, s.cb_lock_notifies);
+        s.deleg_revokes, s.cb_lock_notifies, s.native_lock_denied, s.native_lock_errors);
   });
   lnfs::obs::register_text_provider([&exports](std::string& out) {
     for (const auto& entry : exports.entries()) {
@@ -250,6 +280,24 @@ void register_metrics_providers(ProtocolStack& stack, lnfs::core::ExportTable& e
           "lightnfs_export_write_ops_total{{{0}}} {4}\n",
           labels, em.read_bytes.load(), em.write_bytes.load(), em.read_ops.load(),
           em.write_ops.load());
+      // Gluster backend caches + jukebox/lock-descriptor counters (plan doc 10 §5.3).
+      if (auto* g = dynamic_cast<lnfs::backend::GlusterBackend*>(entry->backend.get())) {
+        auto s = g->stats();
+        out += std::format(
+            "lightnfs_gluster_fdcache_hits_total{{{0}}} {1}\n"
+            "lightnfs_gluster_fdcache_misses_total{{{0}}} {2}\n"
+            "lightnfs_gluster_fdcache_upgrades_total{{{0}}} {3}\n"
+            "lightnfs_gluster_fdcache_evictions_total{{{0}}} {4}\n"
+            "lightnfs_gluster_fdcache_entries{{{0}}} {5}\n"
+            "lightnfs_gluster_objcache_hits_total{{{0}}} {6}\n"
+            "lightnfs_gluster_objcache_misses_total{{{0}}} {7}\n"
+            "lightnfs_gluster_objcache_entries{{{0}}} {8}\n"
+            "lightnfs_gluster_jukebox_total{{{0}}} {9}\n"
+            "lightnfs_gluster_lock_fds{{{0}}} {10}\n",
+            labels, s.fd_hits, s.fd_misses, s.fd_upgrades, s.fd_evictions, s.fd_entries,
+            s.obj_hits, s.obj_misses, s.obj_entries, s.jukebox, s.lock_fds);
+        continue;
+      }
       // Local-backend fd/resolve cache counters (previously ctl text only, §3.5).
       auto* local = dynamic_cast<lnfs::backend::LocalBackend*>(entry->backend.get());
       if (!local) continue;

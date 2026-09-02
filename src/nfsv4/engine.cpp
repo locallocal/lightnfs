@@ -1726,7 +1726,11 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   }
   auto mapped = exports_.squash_cred(ctx.cred, *exp);
   auto cred = mapped.view();
-  if (!created_new) {  // POSIX permission check for the requested modes
+  // POSIX permission check for the requested modes.  kNativeAccess backends (plan
+  // doc 10 §5.3) authorize the open() below themselves under the caller's identity
+  // (storage-side ACLs, no EOPNOTSUPP degrade), so the pre-flight — one more storage
+  // round trip — is skipped for them.
+  if (!created_new && !exp->backend->caps().has(backend::Cap::kNativeAccess)) {
     backend::AccessMask want;
     if (access & state::kShareRead) want.set(backend::Access::kRead);
     if (access & state::kShareWrite) want.set(backend::Access::kModify);

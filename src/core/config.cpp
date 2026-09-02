@@ -439,10 +439,13 @@ Result<void> validate_config(const Config& config) {
     if (exp.fsid == 0 || exp.path.empty() || !fsids.insert(exp.fsid).second ||
         !paths.insert(exp.path).second)
       return Err(errno_from(EINVAL));
-    struct stat st {};
-    if (stat(exp.path.c_str(), &st) < 0) return Err(errno_from(errno));
-    if (!S_ISDIR(st.st_mode)) return Err(errno_from(ENOTDIR));
-    if (!backend::find_backend(exp.backend)) return Err(errno_from(ENODEV));
+    const auto* factory = backend::find_backend(exp.backend);
+    if (!factory) return Err(errno_from(ENODEV));
+    if (!factory->virtual_path) {  // cluster backends: the path is a mount name only
+      struct stat st {};
+      if (stat(exp.path.c_str(), &st) < 0) return Err(errno_from(errno));
+      if (!S_ISDIR(st.st_mode)) return Err(errno_from(ENOTDIR));
+    }
     if (exp.clients.empty()) return Err(errno_from(EINVAL));
     for (const auto& client : exp.clients)
       if (!Cidr::parse(client)) return Err(errno_from(EINVAL));

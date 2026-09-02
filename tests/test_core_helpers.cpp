@@ -13,6 +13,9 @@
 #include "core/mutate.hpp"
 #include "core/names.hpp"
 #include "core/obj_lock.hpp"
+#include "nfsv4/attrs.hpp"
+#include "runtime/buffer.hpp"
+#include "xdr/xdr.hpp"
 
 using namespace lnfs;
 using core::NameCheck;
@@ -100,4 +103,42 @@ TEST(CoreMutate, ChangeSampleDefaults) {
   sample.after = attr;
   EXPECT_EQ(sample.change_before(), 42u);
   EXPECT_EQ(sample.change_after(), 43u);
+}
+
+// kNativeChange consumer (plan doc 10 §5.3): the v4.2 change_attr_type attribute
+// tells the client how to interpret `change` — a storage version counter or the
+// ctime synthesis of design 05 §5.6.
+TEST(CoreFsProps, NativeBitsFeedChangeAttrType) {
+  backend::MemoryBackend mem(7);
+  core::FsProps fs = core::fs_props(mem);
+  EXPECT_EQ(fs.native_change, mem.caps().has(backend::Cap::kNativeChange));
+  EXPECT_EQ(fs.native_access, mem.caps().has(backend::Cap::kNativeAccess));
+  EXPECT_FALSE(fs.native_change);
+  EXPECT_TRUE(nfsv4::supported_attrs().test(nfsv4::attr::kChangeAttrType));
+
+  auto change_type = [&](const core::FsProps* props) -> uint32_t {
+    rt::BufferPool pool;
+    xdr::XdrEnc enc(pool);
+    backend::Attr a{};
+    nfsv4::Bitmap want;
+    want.set(nfsv4::attr::kChangeAttrType);
+    nfsv4::AttrSource src;
+    src.attr = &a;
+    src.fsid = props ? 7 : 0;
+    src.fs = props;
+    nfsv4::encode_fattr(enc, want, src);
+    auto chain = enc.take();
+    xdr::XdrDec dec(chain);
+    auto mask = nfsv4::Bitmap::decode(dec);
+    if (!mask || !mask->test(nfsv4::attr::kChangeAttrType)) return 0xffffffffu;
+    auto vals = dec.opaque(64);
+    if (!vals) return 0xffffffffu;
+    xdr::XdrDec v(*vals);
+    auto value = v.u32();
+    return value ? *value : 0xffffffffu;
+  };
+  EXPECT_EQ(change_type(&fs), nfsv4::attr::kChangeTypeTimeMetadata);
+  fs.native_change = true;
+  EXPECT_EQ(change_type(&fs), nfsv4::attr::kChangeTypeMonotonicIncr);
+  EXPECT_EQ(change_type(nullptr), nfsv4::attr::kChangeTypeMonotonicIncr);  // pseudo-fs
 }
