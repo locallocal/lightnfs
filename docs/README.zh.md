@@ -70,7 +70,8 @@
 |------|------|------|
 | `local` | 已交付 | 导出一棵目录树。有 `CAP_DAC_READ_SEARCH` 时用内核句柄（`name_to_handle_at`/`open_by_handle_at`），否则走路径兜底；分片 fd 缓存、读→写升级；粘性 fsync-EIO；内核 ≥ 6.6 用 `STATX_CHANGE_COOKIE` 作 change 属性；三种身份执行模式（`check`/`strict`/`setfsuid`）；运行时探测稀疏/拷贝/clone 支持。 |
 | `memory` | 仅测试/基准 | 确定性内存树，供引擎测试与全链路基准使用。 |
-| Lustre / GlusterFS | 接口已验证，未实现 | Backend API v1 按两者的映射表评审通过（设计 06）；实现等待目标环境。 |
+| `gluster` | 已交付（fake 测试；真实集群验收待目标环境） | libgfapi 卷，运行时 `dlopen`（无构建期依赖）；GFID 句柄、砖块侧鉴权（kNativeAccess）、原生字节锁下推（kByteLocks）、传输错误 → JUKEBOX/DELAY。`scripts/accept_gluster.sh` 对真实卷跑验收。 |
+| `lustre` | 已交付（fake 测试；真实挂载验收待目标环境） | 在本地后端之上替换三处接缝：FID 句柄（`FILEID_LUSTRE` 导出句柄，经 `<mount>/.lustre/fid` 打开回来，跨重启稳定、无需 CAP_DAC_READ_SEARCH）、HSM 感知的数据打开（已释放文件触发 RESTORE 并回 JUKEBOX/DELAY，不阻塞工作线程）、条带大小驱动的 `pref_read/pref_write`、OFD 锁实现的原生字节锁（`-o flock` 挂载时由 MDS 全局仲裁）。直接用 ioctl 对内核客户端说话，无 liblustreapi 依赖；`scripts/accept_lustre.sh` 对真实挂载跑验收。 |
 
 ### 运维
 

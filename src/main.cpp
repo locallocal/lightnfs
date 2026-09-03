@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "backend/gluster.hpp"
+#include "backend/lustre.hpp"
 #include "backend/local.hpp"
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
@@ -297,6 +298,17 @@ void register_metrics_providers(ProtocolStack& stack, lnfs::core::ExportTable& e
             labels, s.fd_hits, s.fd_misses, s.fd_upgrades, s.fd_evictions, s.fd_entries,
             s.obj_hits, s.obj_misses, s.obj_entries, s.jukebox, s.lock_fds);
         continue;
+      }
+      // Lustre extras (design 06 §6.5): HSM gate + native lock descriptors; the fd /
+      // resolve cache counters below are inherited from the local backend.
+      if (auto* l = dynamic_cast<lnfs::backend::LustreBackend*>(entry->backend.get())) {
+        auto s = l->stats();
+        out += std::format(
+            "lightnfs_lustre_jukebox_total{{{0}}} {1}\n"
+            "lightnfs_lustre_hsm_checks_total{{{0}}} {2}\n"
+            "lightnfs_lustre_hsm_restores_total{{{0}}} {3}\n"
+            "lightnfs_lustre_lock_fds{{{0}}} {4}\n",
+            labels, s.jukebox, s.hsm_checks, s.hsm_restores, s.lock_fds);
       }
       // Local-backend fd/resolve cache counters (previously ctl text only, §3.5).
       auto* local = dynamic_cast<lnfs::backend::LocalBackend*>(entry->backend.get());

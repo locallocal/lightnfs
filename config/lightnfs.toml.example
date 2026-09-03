@@ -110,3 +110,22 @@ readdir_enrich = true
 # readdir_enrich = true       # xreaddirplus with stat + handle (READDIRPLUS without lookups)
 # jukebox = true              # transport errors → JUKEBOX/DELAY (client retries); false → EIO
 # native_locks = true         # push v4 byte-range locks into the volume (posix-locks)
+
+# Lustre export (design 06 §6.5): `path` is a directory inside a Lustre client mount.
+# Filehandles are FIDs (opened back through <mount>/.lustre/fid, no CAP_DAC_READ_SEARCH
+# needed); IO, caches and identity modes are the local backend's.  No liblustreapi is
+# required — the backend talks to the kernel client with ioctls.
+# [[export]]
+# path = "/mnt/lustre/projects"
+# backend = "lustre"
+# fsid = 3
+# clients = ["10.0.0.0/8"]
+# squash = "none"
+#
+# [export.lustre]
+# mount = "/mnt/lustre"       # Lustre mount root; default: detected (walk up while st_dev matches)
+# fd_cache = 4096             # data-fd / O_PATH resolve cache capacity (same knob as local)
+# identity = "check"          # check | strict | setfsuid (root only; MDS-side authorization)
+# readdir_enrich = true       # READDIRPLUS attrs + FID handles without per-entry lookups
+# hsm = true                  # HSM-released files: kick RESTORE, answer JUKEBOX/DELAY (false: block inline)
+# native_locks = true         # v4 byte-range locks as OFD fcntl locks (MDS-coherent with `-o flock`)

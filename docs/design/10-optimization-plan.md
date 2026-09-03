@@ -388,6 +388,33 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
   补齐）。锁下推的 LOCKT 探测无法辨认自身持有的锁（见上表）；被删除文件上残留的
   lock glfd 在后端 stop 时统一关闭（`lightnfs_gluster_lock_fds` 可见）。
 
+**第三后端：Lustre ✅ 已完成（2026-09-04）**（`backend/lustre.{hpp,cpp}`，
+`backend/llapi.{hpp,cpp}`；06 册 §6.5 映射表逐项落地）。要点：
+
+- **结构**：Lustre 挂载即 POSIX 树，所以 `LustreBackend : LocalBackend`——本地后端去掉
+  `final`，开放 `oid_from_fd` / `open_oid` 两个虚函数与受保护的缓存/能力位成员；IO、
+  命名空间、fd/O_PATH 缓存、poison、身份模式零复制继承。`LocalObject::open` 现在把
+  `kJukebox` 原样透传（其余错误仍降级为 EOPNOTSUPP），v4 OPEN 已释放文件 → DELAY。
+- **FID 句柄**（标记字节 4 + 16B `lu_fid`，`objid_lustre` fuzz 目标）：编码取
+  `name_to_handle_at` 的 FILEID_LUSTRE 句柄（回落 `LL_IOC_PATH2FID`），解析走
+  `<mount>/.lustre/fid/<fid>`——无需 CAP_DAC_READ_SEARCH 即得跨重启稳定句柄，这是
+  本地后端在非特权部署下做不到的。挂载根自动探测（同 st_dev 上溯）或 `mount=`。
+- **能力位**：kStableHandles、kByteLocks（`LustreLockMgr`：每 (文件, owner) 一个 fd +
+  `F_OFD_SETLK/GETLK`，`-o flock` 时 MDS 仲裁；状态层下推链路与 gluster 共用）、
+  kJukebox（HSM：数据 fd 打开后 `LL_IOC_HSM_STATE_GET`，HS_RELEASED → 一次
+  `LL_IOC_HSM_REQUEST(RESTORE)` + kJukebox，不把 offload/io_uring 线程挂在隐式 restore
+  上）；不置 kNativeChange（ctime 合成；`LL_IOC_DATA_VERSION` 每条带一次 OST 往返且只
+  覆盖数据）。`pref_read/pref_write` 取导出根默认条带（`lustre.lov`，含复合布局）。
+- **绑定**：直接 ioctl 内核客户端，uapi 常量抄自 `lustre_user.h`，**无 liblustreapi
+  依赖**；`scripts/check_llapi_abi.sh` 有头文件时 static_assert（CI 接入，无头文件跳过）。
+- **测试**：`tests/llapi_fake.cpp`（FID = inode+btime 派生 + O_PATH 钉住，`/proc` 重开；
+  HSM/restore/条带旋钮）+ `tests/test_lustre.cpp` 10 例；指标
+  `lightnfs_lustre_{jukebox,hsm_checks,hsm_restores}_total` / `lightnfs_lustre_lock_fds`；
+  `lightnfs-ctl fdcache/clear-poison` 经 LocalBackend 分支直接适用；真实挂载验收
+  `scripts/accept_lustre.sh`（本开发机无 Lustre，待目标环境）。
+- **文档边界**：多网关一致性仍缺原生 change（09 册口径更新）；已缓存描述符的文件被
+  释放时后续 IO 阻塞在 restore 上（门禁只在打开时刻）；OFD 探测不报告持有者。
+
 ### 5.4 长期观察（维持 09 册口径，补充新证据）
 
 - **RPC-over-TLS（RFC 9289）✅ 已落地**（2026-09-01）：AUTH_SYS-only 曾是最大的部署边界，

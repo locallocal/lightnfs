@@ -75,6 +75,9 @@ run_step "clang-format check" "$repo/scripts/format_check.sh"
 # libgfapi signature drift (plan doc 10 §5.3): the gluster backend loads the library
 # at runtime, so this is the only build-time check; skips where the headers are absent.
 run_step "gfapi ABI check" "$repo/scripts/check_gfapi_abi.sh"
+# Lustre uapi drift (design 06 §6.5): the lustre backend speaks ioctls to the kernel
+# client directly; skips where lustre_user.h is absent.
+run_step "llapi ABI check" "$repo/scripts/check_llapi_abi.sh"
 
 if [[ $mode == nightly ]]; then
   run_step "bench floor gate" "$repo/scripts/bench_gate.sh" "$repo/build-rel"

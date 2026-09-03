@@ -69,19 +69,40 @@ class FdCache {          // 分片 LRU：ObjId → {fd, refcnt, last_use}
 
 v1 默认模式 1；接口上不体现差异（都在后端内部）。
 
-## 6.5 映射验证：Lustre 后端（未来）
+## 6.5 映射验证：Lustre 后端 ✅ 已实现（2026-09-04）
 
-| Backend API | Lustre 映射 | 备注 |
-|-------------|------------|------|
-| ObjId | FID（`lustre_fid` 16B，集群持久唯一） | `llapi_fid2path`/`llapi_open_by_fid`——比本地 fhandle 更干净 |
-| resolve | `llapi_open_by_fid` | P1/P2 天然满足 |
-| IO | POSIX 挂载点上的 uring pread/pwrite | 大条带顺序 IO 直通 |
-| change | Lustre changelog/版本 → kNativeChange | 多网关一致性可用 |
-| statfs/limits | `llapi_obd_statfs`；条带感知的 pref_read/pref_write | FSINFO 通告条带对齐值 |
-| native_locks | flock 语义经 MDS 全局一致 → kByteLocks 可置 | 多网关锁下沉的第一个真实用户 |
-| kJukebox | HSM released 文件 → kJukebox | READ 触发 restore 返回 kJukebox |
+Lustre 客户端挂载就是一棵 POSIX 树，因此 **`LustreBackend : LocalBackend`**：本地后端去掉
+`final`，开放三处虚函数接缝——句柄编解码 `oid_from_fd`、按句柄打开 `open_oid`、以及经由
+后者的数据 fd 门禁；IO、命名空间操作、fd/O_PATH 缓存、粘性 poison、身份模式全部继承，
+无重复代码。
 
-结论：接口无缺口；Lustre 特有优化（statahead、组锁）可全部藏在后端内。
+| Backend API | Lustre 映射（实现） | 备注 |
+|-------------|--------------|------|
+| ObjId | 标记字节 `4` + 16B FID（`lu_fid` seq/oid/ver，取自 `name_to_handle_at` 返回的 FILEID_LUSTRE 句柄前 16B；回落 `LL_IOC_PATH2FID`）→ **kStableHandles** | 17B；`LustreBackend::fid_from_oid` 是解析边界（fuzz 目标 `objid_lustre`）；FID_ZERO 视为 ESTALE |
+| resolve | `openat(<mount>/.lustre/fid/0xseq:0xoid:0xver)`（`llapi_open_by_fid` 的机制），**不需要 CAP_DAC_READ_SEARCH**；ENOENT/EINVAL → ESTALE | 挂载根沿父目录上溯到 st_dev 变化处自动探测，或 `mount=` 指定（bind mount 场景）；启动时对根 FID 做一次往返，失败即拒绝启动 |
+| IO | 继承本地：io_uring pread/pwrite/writev，分片 fd 缓存（读→写升级），commit = fdatasync + 粘性 poison | 大条带顺序 IO 直通 |
+| change | ctime 合成（05 §5.6），**不置 kNativeChange** | 时间戳由 MDT 签发，跨网关一致；`LL_IOC_DATA_VERSION` 每条带一次 OST 往返且只覆盖数据，不上 GETATTR 路径 |
+| statfs/limits | `fstatvfs`（Lustre 聚合 OST）；`pref_read/pref_write` = 导出根默认条带大小（`lustre.lov` xattr：V1/V3 直接取，复合布局取首组件），钳到 [4K, max_read/max_write] | FSINFO 通告条带对齐值 |
+| native_locks | `LustreLockMgr`：每 (文件, lock-owner) 一个 fd + `F_OFD_SETLK/F_OFD_GETLK`；`-o flock` 挂载时由 MDS 全局仲裁 → **kByteLocks**，`native_locks()` 交给状态层下推（07 册 / plan doc 10 §5.3 同一条链路） | `localflock` 或非 Lustre 文件系统上仅主机内有效；`test()` 用新 fd 探测（OFD 不报告持有者，owner 置空 = "别人"）；`release()` 全区间解锁并关 fd；`native_locks=false` 关闭 |
+| kJukebox | 数据 fd 打开后 `LL_IOC_HSM_STATE_GET`：HS_RELEASED → 若无进行中动作则 `LL_IOC_HSM_REQUEST(RESTORE)` 一次，返回 `kJukebox`（v3 JUKEBOX / v4 DELAY；v4 OPEN 也回 DELAY 而非降级为匿名路径）→ **kJukebox** | 避免 offload / io_uring 工作线程阻塞在内核隐式 restore 上；只门禁常规文件；无 HSM 的客户端（ENOTTY）不门禁；`hsm=false` 关闭 |
+| 身份 | 继承 `identity = check \| strict \| setfsuid` | Lustre 在 MDS 侧按 fsuid 判权，root 网关宜用 setfsuid |
+
+**绑定方式**：`backend/llapi.{hpp,cpp}` 直接对内核客户端说话——ioctl 号、结构体布局与常量
+抄自 `linux/lustre/lustre_user.h`（稳定 uapi），**无 liblustreapi 构建/运行依赖**；
+`scripts/check_llapi_abi.sh` 在有该头文件的主机上把每个常量与结构体尺寸 static_assert
+（本开发机无 Lustre，CI 步骤在无头文件时跳过）。`llapi::Ops` 是唯一的内核接触面：
+`tests/llapi_fake.cpp` 在本地目录上实现它（FID 由 inode+btime 派生并用 O_PATH fd 钉住，
+open_by_fid 经 `/proc/self/fd` 重开——重命名后仍可解析、删除后 ENOENT，与真实语义一致；
+HSM 状态/restore/条带大小是测试旋钮），`tests/test_lustre.cpp` 10 个用例跑 05 §5.9 检查表
+（句柄 P1/P2/ESTALE、跨重启与重命名、readdir 富化携带 FID、匿名/open-state IO、HSM
+released → JUKEBOX → restore 后可读、原生锁、条带 → limits、挂载根探测与拒绝路径、
+配置工厂——真实内核绑定在本机 tmp 目录上被正确拒绝）。真实挂载验收 =
+`scripts/accept_lustre.sh`。
+
+结论（验证后）：接口仍无缺口；第三个后端带来的唯一结构改动是本地后端的可继承化
+（两个虚函数 + 受保护的缓存/能力位成员）。边界：change 非原生（跨网关 CTO 依赖 MDT
+时间戳精度）；描述符已在 fd 缓存中的文件被释放时，后续 IO 仍像原生客户端一样阻塞在
+restore 上（门禁只在打开时刻）；OFD 锁的探测无法辨认持有者身份。
 
 ## 6.6 映射验证：GlusterFS 后端 ✅ 已实现（2026-09-03，plan doc 10 §5.3）
 
@@ -147,6 +168,18 @@ subdir         = "/exports/a"     # 卷内导出根，默认 "/"
 # jukebox      = true             # 传输类错误 → JUKEBOX/DELAY（false → EIO）
 # native_locks = true             # glfs_posix_lock 下推（多网关锁一致性）
 
-# 未来：
-# backend = "lustre";   [export.lustre]  mount="/mnt/lustre"
+# Lustre（已实现，06 §6.5）：path 是 Lustre 客户端挂载内的目录
+[[export]]
+path      = "/mnt/lustre/projects"
+backend   = "lustre"
+fsid      = 3
+clients   = ["10.0.0.0/8"]
+squash    = "none"
+[export.lustre]
+mount          = "/mnt/lustre"    # 挂载根，默认自动探测（沿父目录上溯到 st_dev 变化处）
+# fd_cache     = 4096             # 数据 fd / O_PATH 解析缓存容量（同 local）
+# identity     = "check"          # check | strict | setfsuid（需 root；鉴权交给 MDS）
+# readdir_enrich = true
+# hsm          = true             # 已释放文件：提交 RESTORE 并回 JUKEBOX/DELAY（false = 内核隐式 restore，阻塞）
+# native_locks = true             # v4 字节锁 → OFD fcntl 锁（-o flock 挂载时 MDS 全局仲裁）
 ```

@@ -23,6 +23,7 @@
 
 #include "backend/fault.hpp"
 #include "backend/gluster.hpp"
+#include "backend/lustre.hpp"
 #include "runtime/io.hpp"
 #include "runtime/offload_pool.hpp"
 #include "util/log.hpp"
@@ -429,7 +430,7 @@ LocalBackend::LocalBackend(Config cfg, int root_fd, int mount_fd)
 #endif
 }
 
-Result<std::unique_ptr<LocalBackend>> LocalBackend::create(Config cfg) {
+Result<std::pair<int, int>> LocalBackend::open_roots(const Config& cfg) {
   if (cfg.path.empty() || cfg.fsid == 0) return Err(errno_from(EINVAL));
   int root = ::open(cfg.path.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
   if (root < 0) return Err(errno_from(errno));
@@ -439,6 +440,11 @@ Result<std::unique_ptr<LocalBackend>> LocalBackend::create(Config cfg) {
     ::close(root);
     return Err(errno_from(e));
   }
+  return std::pair{root, mount};
+}
+
+Result<std::unique_ptr<LocalBackend>> LocalBackend::create(Config cfg) {
+  auto [root, mount] = LNFS_TRY(open_roots(cfg));
   auto out = std::unique_ptr<LocalBackend>(new LocalBackend(std::move(cfg), root, mount));
 
   // Probe kernel file handles once. Auto mode falls back explicitly and does not advertise
@@ -853,8 +859,12 @@ rt::Task<Result<OpenPtr>> LocalObject::open(const Cred&, OpenFlags flags) {
       [this, writable] { return backend_.open_oid(id(), writable ? O_RDWR : O_RDONLY); });
   // Degrade rather than fail: EOPNOTSUPP means "no backend open state" to the engine,
   // so IO keeps going through the fd cache and reports errors at IO time as before —
-  // the OPEN itself must not start failing where it used to succeed.
-  if (!opened) co_return Err(errno_from(EOPNOTSUPP));
+  // the OPEN itself must not start failing where it used to succeed.  The one error
+  // that passes through is kJukebox (Lustre HSM: the file is released and a restore
+  // was just kicked) — OPEN → DELAY is the right answer, and the client retries.
+  if (!opened)
+    co_return Err(opened.error() == Errno::kJukebox ? Errno::kJukebox
+                                                     : errno_from(EOPNOTSUPP));
   co_return OpenPtr(std::make_shared<LocalOpenState>(*opened, writable));
 }
 
@@ -1668,6 +1678,7 @@ void register_builtin_backends() {
   static const bool once = [] {
     register_backend({"local", kBackendApiVersion, make_local});
     register_gluster_backend();
+    register_lustre_backend();
     return true;
   }();
   (void)once;
