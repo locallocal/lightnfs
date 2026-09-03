@@ -72,7 +72,7 @@ sudo systemctl enable --now lightnfs
 | 来源白名单 | `[[export]] clients` | CIDR 列表，收敛到受信网段 |
 | 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none` |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
-| 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` | `local`（本机目录树）或 `gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名） |
+| 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` / `[export.lustre]` | `local`（本机目录树）、`gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名）或 `lustre`（Lustre 客户端挂载内的目录：`mount`（默认自动探测）/`hsm`/`native_locks`/`identity`/`fd_cache`；非 Lustre 挂载启动即拒，写明 statfs magic 不符） |
 | 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |
 | 传输加密 | `[tls] mode` / `cert` / `key` / `ca` / `client_cert` | RPC-over-TLS（RFC 9289）：off/optional/required + 证书；改动需重启 |
 | 租约 | `[protocol] lease` | v4.1 租约（默认 90s） |
@@ -172,3 +172,16 @@ sudo systemctl enable --now lightnfs
   判定（`squash = "none"` 时客户端 uid 直达卷；卷侧 `server.root-squash` 会影响以
   网关身份打开的匿名 IO 描述符与锁描述符）。`lightnfs-ctl fdcache` 对 gluster 导出
   显示 glfd/对象缓存/jukebox/锁描述符计数；`clear-poison` 同样适用。
+- **Lustre 后端**：文件句柄是 FID，经 `<mount>/.lustre/fid` 打开——网关进程**不需要**
+  `CAP_DAC_READ_SEARCH` 即可获得跨重启稳定的句柄（本地后端在无该能力时只能走路径兜底）。
+  客户端挂载建议 `-o flock`：`native_locks = true` 时 v4 字节锁以 OFD fcntl 锁下推，
+  由 MDS 在网关之间与原生客户端之间仲裁（`localflock` 只在本机内有效，此时应关掉
+  `native_locks` 以免误判无冲突）。HSM 环境下 `hsm = true`（默认）：读写/截断已释放
+  文件不会把 offload/io_uring 工作线程挂在隐式 restore 上，而是提交一次 RESTORE 请求并
+  回 JUKEBOX（v3）/DELAY（v4）由客户端重试（`lightnfs_lustre_jukebox_total` /
+  `lightnfs_lustre_hsm_restores_total`）；描述符已在 fd 缓存中的文件被释放时，后续 IO
+  仍像原生客户端一样阻塞在 restore 上（门禁只在打开时刻）。change 仍是 ctime 合成
+  （MDT 发时间戳，跨网关一致，但 `change_attr_type = TIME_METADATA`）。`identity =
+  "setfsuid"`（需 root）把鉴权交给 MDS。`lightnfs-ctl fdcache`/`clear-poison` 与本地
+  后端相同；无 liblustreapi 依赖，`scripts/check_llapi_abi.sh` 在有 `lustre_user.h` 的
+  主机上校验 ioctl 常量。

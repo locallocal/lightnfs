@@ -64,7 +64,9 @@
 - 多网关一致性：**锁这一半已具备，change 这一半仍缺**。gluster 后端提供
   `native_locks()`（kByteLocks，posix-locks xlator 下推，状态层已接线）但无原生 change
   计数（`change` 仍为 ctime 合成，`change_attr_type = TIME_METADATA`）；本地后端反之。
-  两位同时具备的后端（Lustre：changelog/版本 + flock）出现前，多网关同挂一个导出仍是
+  Lustre 后端（2026-09-04）补上了第二个 kByteLocks 生产者（OFD 锁经 MDS 仲裁），但 change
+  同样是 ctime 合成（MDT 时间戳，跨网关一致；`LL_IOC_DATA_VERSION` 只覆盖数据且每条带一次
+  OST 往返，未上 GETATTR 路径）。两位同时具备的后端出现前，多网关同挂一个导出仍是
   文档级限制（v4 open/deny 状态也仍是网关本地）。
 
 ## 风险登记

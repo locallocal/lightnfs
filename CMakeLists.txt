@@ -66,7 +66,9 @@ add_library(lnfs_core STATIC
   src/backend/fault.cpp
   src/backend/gfapi.cpp
   src/backend/gluster.cpp
+  src/backend/llapi.cpp
   src/backend/local.cpp
+  src/backend/lustre.cpp
   src/backend/memory.cpp
   src/core/boot_epoch.cpp
   src/core/config.cpp
@@ -160,6 +162,8 @@ add_executable(lnfs_tests
   tests/test_backend.cpp
   tests/gfapi_fake.cpp
   tests/test_gluster.cpp
+  tests/llapi_fake.cpp
+  tests/test_lustre.cpp
   tests/test_core_helpers.cpp
   tests/test_backend_write.cpp
   tests/test_nfs3.cpp
@@ -191,7 +195,7 @@ target_link_libraries(lnfs_accept_client PRIVATE lnfs_core)
 # machine-local).  Without LNFS_BUILD_FUZZ each target gets a regress binary that
 # replays the seeds (plus the local corpus when present) under ctest.
 set(LNFS_FUZZ_TARGETS handle_request file_handle config record_stream v4_attrs
-    objid_local objid_gluster)
+    objid_local objid_gluster objid_lustre)
 foreach(t ${LNFS_FUZZ_TARGETS})
   if(LNFS_BUILD_FUZZ)
     add_executable(fuzz_${t} fuzz/fuzz_${t}.cpp)

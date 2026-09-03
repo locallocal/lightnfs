@@ -5,6 +5,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <utility>
 
 #include "backend/api.hpp"
 
@@ -12,7 +14,11 @@ namespace lnfs::backend {
 
 class LocalObject;
 
-class LocalBackend final : public Backend {
+// POSIX-mount backend.  Not final: the Lustre backend (backend/lustre.hpp) is this
+// backend with the handle codec, the handle open and the data-fd gate swapped for
+// FID / HSM-aware versions — every other path (IO, namespace ops, caches, identity)
+// is shared verbatim.
+class LocalBackend : public Backend {
  public:
   enum class HandleMode { kAuto, kKernel, kFallback };
   enum class Identity { kCheck, kStrict, kSetFsuid };
@@ -70,15 +76,23 @@ class LocalBackend final : public Backend {
 
   // Handle-content parser + open. Public because handle bytes are client-controlled and
   // this is the parse boundary fuzz targets exercise directly (plan doc 10 §7.2).
-  Result<int> open_oid(const ObjId& oid, int flags);
+  // Virtual: flavours (Lustre) open by FID instead of by kernel file handle; the fd
+  // cache and every data-fd site go through this one entry.
+  virtual Result<int> open_oid(const ObjId& oid, int flags);
 
- private:
+ protected:
   friend class LocalObject;
   class FdCache;
   class PathCache;
 
+  // Takes ownership of both descriptors: root_fd is O_PATH on the export root,
+  // mount_fd is an O_RDONLY directory fd used by open_by_handle_at / O_TMPFILE probes.
   LocalBackend(Config cfg, int root_fd, int mount_fd);
-  Result<ObjId> oid_from_fd(int fd, std::string_view relative, bool remember = true);
+  // Opens the two root descriptors for `cfg.path` (EINVAL for empty path / zero fsid).
+  static Result<std::pair<int, int>> open_roots(const Config& cfg);
+  // Handle codec: the ObjId of an object given an O_PATH fd (fallback mode remembers
+  // the relative path).  Virtual for the same reason as open_oid.
+  virtual Result<ObjId> oid_from_fd(int fd, std::string_view relative, bool remember = true);
   Result<ObjPtr> object_from_fd(int fd, std::string relative, bool remember = true);
   Result<Attr> attr_from_fd(int fd) const;
   Result<DirPage> readdir_sync(const LocalObject& dir, int fd, std::mutex& dents_mu,
@@ -101,7 +115,10 @@ class LocalBackend final : public Backend {
   Caps caps_;
   FsLimits limits_;
   ObjId root_oid_{};
+  std::unique_ptr<FdCache> fd_cache_;
+  std::unique_ptr<PathCache> path_cache_;
 
+ private:
   std::mutex path_mu_;
   std::unordered_map<ObjId, std::string, ObjIdHash> fallback_paths_;
   std::atomic<uint64_t> fallback_evictions_{0};
@@ -118,8 +135,6 @@ class LocalBackend final : public Backend {
   std::mutex generation_mu_;
   std::unordered_map<InodeKey, uint32_t, InodeKeyHash> fallback_generations_;
   uint32_t next_fallback_generation_ = 1;
-  std::unique_ptr<FdCache> fd_cache_;
-  std::unique_ptr<PathCache> path_cache_;
 
   mutable std::mutex poison_mu_;
   std::unordered_set<ObjId, ObjIdHash> poisoned_;
@@ -172,6 +187,8 @@ class LocalObject final : public Object {
                                uint64_t dst_off, uint64_t len) override;
   rt::Task<Result<uint64_t>> copy_range(OpenCtx, Object& dst, OpenCtx, uint64_t src_off,
                                         uint64_t dst_off, uint64_t len) override;
+
+  const LocalBackend& backend() const { return backend_; }
 
  private:
   friend class LocalBackend;
