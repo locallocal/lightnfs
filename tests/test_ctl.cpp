@@ -379,7 +379,7 @@ TEST(Ctl, FdcacheAndClearPoisonCommands) {
   rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
   runtime.start();
   {
-    // A table with only a memory export: both commands answer "no local/gluster exports".
+    // A table with only a memory export: both commands answer "no local/gluster/cephfs exports".
     core::ExportTable mem_only;
     core::ExportConfig mcfg;
     mcfg.path = "/export/mem";
@@ -388,8 +388,8 @@ TEST(Ctl, FdcacheAndClearPoisonCommands) {
     ASSERT_TRUE(mem_only.add(mcfg, std::make_unique<backend::MemoryBackend>(71)).has_value());
     server::CtlDeps mem_deps{};
     mem_deps.exports = &mem_only;
-    EXPECT_STREQ(server::CtlServer::answer(mem_deps, "fdcache"), "no local/gluster exports\n");
-    EXPECT_STREQ(server::CtlServer::answer(mem_deps, "clear-poison"), "no local/gluster exports\n");
+    EXPECT_STREQ(server::CtlServer::answer(mem_deps, "fdcache"), "no local/gluster/cephfs exports\n");
+    EXPECT_STREQ(server::CtlServer::answer(mem_deps, "clear-poison"), "no local/gluster/cephfs exports\n");
 
     // A local export: stats render per export, flush and clear-poison count real work.
     auto made = backend::LocalBackend::create({.path = dir, .fsid = 72});

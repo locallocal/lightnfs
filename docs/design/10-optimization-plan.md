@@ -349,10 +349,10 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 | 位 | 生产端 | 消费端 |
 |---|---|---|
 | `kNativeAccess` | gluster（`glfs_h_access` 在调用者 fsuid/fsgid/groups 下由砖块 posix-acl 判定） | v4 OPEN 跳过网关侧 `access()` 预检，直接由后端 `open()` 权威判定（省一次集群往返；契约：置位后端的 `open()` 不得以 EOPNOTSUPP 降级）；`core::FsProps::native_access` |
-| `kNativeChange` | local（STATX_CHANGE_COOKIE，原有） | v4.2 属性 `change_attr_type`(79)：置位 → MONOTONIC_INCR，否则 TIME_METADATA（ctime 合成），伪根 → MONOTONIC_INCR（boot epoch）；`FsProps::native_change`；启动日志 `backend traits` |
-| `kByteLocks` / `LockMgr` | gluster `GlusterLockMgr`（`glfs_posix_lock` + `glfs_fd_set_lkowner`，每 (文件, lock-owner) 一个 glfd） | 状态层 `StateMgr::Config::native_locks` 钩子（main 用 ExportTable 接线）：LOCK 先网关表授予再下推，后端拒绝（EAGAIN）→ 回滚网关授予到此前覆盖、回 DENIED（冲突段取自后端 `test()`，持有者未知 → clientid 0）；后端错误 → DELAY/SERVERFAULT 且不授予；LOCKU 镜像解锁；CLOSE/FREE_STATEID/过期经 `unlink_state` 调新增的 `LockMgr::release()`；LOCKT 本地无冲突时探测后端（同 owner 已覆盖区间时不探测——探测无法区分自身锁）。指标 `lightnfs_v4_native_lock_{denied,errors}_total` |
-| `kJukebox` | gluster（ENOTCONN/ETIMEDOUT/ENET*/EHOST* 传输类错误 → `kJukebox`，`jukebox=false` 时回 EIO）；memory/local 经故障注入 `LNFS_FAULT_JUKEBOX=N`（`fault::Kind::kJukebox`） | 既有 errmap：v3 READ/WRITE → JUKEBOX（08 册 §8.2 白名单仅此两处，且二者不进 DRC，故无"缓存了 JUKEBOX"问题），v4 任意 op → DELAY；引擎级测试 `Nfs3.JukeboxReachesTheWireAndRetrySucceeds` / `Nfs4.JukeboxIsDelayAndRetrySucceeds` |
-| `kCaseInsensitive` | 仍无生产者（local/gluster 均大小写敏感；留给未来后端） | 原有 |
+| `kNativeChange` | local（STATX_CHANGE_COOKIE，原有）；cephfs（`stx_version`，MDS change attribute，2026-09-04） | v4.2 属性 `change_attr_type`(79)：置位 → MONOTONIC_INCR，否则 TIME_METADATA（ctime 合成），伪根 → MONOTONIC_INCR（boot epoch）；`FsProps::native_change`；启动日志 `backend traits` |
+| `kByteLocks` / `LockMgr` | gluster `GlusterLockMgr`（`glfs_posix_lock` + `glfs_fd_set_lkowner`，每 (文件, lock-owner) 一个 glfd）；lustre `LustreLockMgr`（OFD）；cephfs `CephLockMgr`（`ceph_ll_setlk`，每 (文件, owner) 一个 Fh） | 状态层 `StateMgr::Config::native_locks` 钩子（main 用 ExportTable 接线）：LOCK 先网关表授予再下推，后端拒绝（EAGAIN）→ 回滚网关授予到此前覆盖、回 DENIED（冲突段取自后端 `test()`，持有者未知 → clientid 0）；后端错误 → DELAY/SERVERFAULT 且不授予；LOCKU 镜像解锁；CLOSE/FREE_STATEID/过期经 `unlink_state` 调新增的 `LockMgr::release()`；LOCKT 本地无冲突时探测后端（同 owner 已覆盖区间时不探测——探测无法区分自身锁）。指标 `lightnfs_v4_native_lock_{denied,errors}_total` |
+| `kJukebox` | gluster/cephfs（ENOTCONN/ETIMEDOUT/ENET*/EHOST* 传输类错误 → `kJukebox`，`jukebox=false` 时回 EIO；cephfs 的 EBLOCKLISTED 例外为硬 EIO）；lustre（HSM 已释放文件）；memory/local 经故障注入 `LNFS_FAULT_JUKEBOX=N`（`fault::Kind::kJukebox`） | 既有 errmap：v3 READ/WRITE → JUKEBOX（08 册 §8.2 白名单仅此两处，且二者不进 DRC，故无"缓存了 JUKEBOX"问题），v4 任意 op → DELAY；引擎级测试 `Nfs3.JukeboxReachesTheWireAndRetrySucceeds` / `Nfs4.JukeboxIsDelayAndRetrySucceeds` |
+| `kCaseInsensitive` | 仍无生产者（local/gluster/lustre/cephfs 均大小写敏感；留给未来后端） | 原有 |
 | `OpenCtx` / `OpenState` | 第二个真实生产者 `GlusterOpenState`（每 OPEN 一个 glfd，以调用者身份打开） | 原有 IO 站点；`static_cast` 不跨后端的前提改为"OpenState 只回到产生它的后端" |
 
 **GlusterFS 后端**（`backend/gluster.{hpp,cpp}`，`backend/gfapi.{hpp,cpp}`）：06 册
@@ -415,6 +415,37 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 - **文档边界**：多网关一致性仍缺原生 change（09 册口径更新）；已缓存描述符的文件被
   释放时后续 IO 阻塞在 restore 上（门禁只在打开时刻）；OFD 探测不报告持有者。
 
+**第四后端：CephFS ✅ 已完成（2026-09-04）**（`backend/cephfs.{hpp,cpp}`，
+`backend/cephapi.{hpp,cpp}`；06 册 §6.8 映射表逐项落地）。要点：
+
+- **为什么是它**：09 册的多网关一致性需要"kNativeChange + kByteLocks 同时具备"的后端——
+  gluster 有锁无 change，lustre 亦然，local 反之。CephFS 两者都有：`stx_version` 是 MDS
+  的 change attribute（数据/元数据变更都递增，跨客户端一致 → `change_attr_type =
+  MONOTONIC_INCR`），fcntl 锁由 MDS 全局仲裁（`ceph_ll_setlk/getlk`）。
+- **结构**：与 gluster 同构（运行时 `dlopen("libcephfs.so.2")` 填 46 项函数表、inode 句柄缓存
+  + 匿名 IO Fh 缓存、每 OPEN 一个 Fh、每 (文件, owner) 一个锁 Fh、粘性 poison、offload 全
+  覆盖）；身份不是线程局部 fsuid 而是每次调用一个 `UserPerm`；错误码全为负返回值。
+- **句柄**：标记字节 5 + 8B ino + 8B snapid（`vinodeno_t`，snapid 取 `stx_dev`），Ceph 不复用
+  inode 号故无需世代号；`resolve` = `ceph_ll_lookup_vino`（MDS lookup_ino）；readdirplus 的
+  ObjId 直接来自 statx，不取 Inode 引用。fuzz 目标 `objid_cephfs`。
+- **能力位**：kStableHandles、kNativeChange、kByteLocks、kJukebox（传输类错误；EBLOCKLISTED
+  = 会话被列入黑名单 → 硬 EIO + `lightnfs_cephfs_blocklisted_total`，重试无意义）、kSparseOps
+  （Ceph 无 extent 图：SEEK 为 RFC 7862 最小实现）、kCopyRange（网关内 read/write 循环，
+  libcephfs 无 copy_file_range）。**不置 kNativeAccess**（无 `ceph_ll_access`；ACCESS 走
+  `Object::access` 的 mode 位默认实现，OPEN/变更仍由库以调用者身份判定）。
+- **绑定与测试**：`scripts/check_cephapi_abi.sh`（C++ 比对每个成员签名，C 单元核对
+  `vinodeno_t`/`ceph_statx` 布局；已对 Ceph 20.2.0 头文件通过，CI 无头文件时跳过）；
+  `tests/cephapi_fake.cpp`（UserPerm 身份、永不复用的合成 ino、stx_version 计数、随 Fh 关闭
+  释放的锁表、可注入 ENOTCONN/EBLOCKLISTED）+ `tests/test_cephfs.cpp` 12 例（含原生 change
+  计数、黑名单映射）；指标 `lightnfs_cephfs_{fdcache,objcache}_*` /
+  `lightnfs_cephfs_{jukebox,blocklisted}_total` / `lightnfs_cephfs_lock_fds`；`lightnfs-ctl
+  fdcache/clear-poison` 已接线；真实集群验收 `scripts/accept_cephfs.sh`（校验启动日志
+  `native-change=true native-locks=true`；本开发机无 Ceph，待目标环境）。
+- **接口冻结再检验**：零改动——gluster 期加入的 `LockMgr::release()` 与
+  `BackendFactory::virtual_path` 直接复用。
+- **文档边界**：ACCESS 只看 mode 位（POSIX ACL 仅在库的 OPEN/变更判定里生效）；copy_range
+  吃 offload 线程；v4 open/deny 状态仍是网关本地。
+
 ### 5.4 长期观察（维持 09 册口径，补充新证据）
 
 - **RPC-over-TLS（RFC 9289）✅ 已落地**（2026-09-01）：AUTH_SYS-only 曾是最大的部署边界，
@@ -429,8 +460,9 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 - NLM/NSM（v3 锁）：按需；
 - pNFS flexfiles、写/目录委托：前提未变（写委托需 CB_GETATTR + 单写者工作负载证据；pNFS 为
   决策 D8 非目标）；
-- 多网关一致性：依赖 kNativeChange + kByteLocks 后端（见 §5.3；本地后端无 `native_locks()`，
-  需集群后端才具备真实检验条件）。
+- 多网关一致性：依赖 kNativeChange + kByteLocks 后端（见 §5.3）。CephFS 后端（2026-09-04）
+  是第一个两位同时具备的后端；真实的多网关检验待目标集群（`scripts/accept_cephfs.sh`
+  先跑单网关验收）。v4 open/deny 状态仍是网关本地。
 
 ---
 

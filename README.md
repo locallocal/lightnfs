@@ -82,13 +82,14 @@ be auditable and testable in userspace. lightnfs targets exactly that gap:
 | `local` | shipped | Exports a directory tree. Kernel file handles (`name_to_handle_at`/`open_by_handle_at`) when `CAP_DAC_READ_SEARCH` is available, a path-based fallback otherwise; sharded fd cache with read→write upgrade; sticky fsync-EIO poisoning; `STATX_CHANGE_COOKIE` change attribute on kernels ≥ 6.6; three identity-enforcement modes (`check`, `strict`, `setfsuid`); runtime probe of sparse/copy/clone support. |
 | `memory` | test/bench only | Deterministic in-memory tree used by the engine tests and the full-path benchmark. |
 | `gluster` | shipped (fake-tested; real-cluster acceptance pending a target environment) | GlusterFS volumes over libgfapi, loaded at runtime (`dlopen`, no build dependency). GFID handles (stable across restarts); storage-side authorization under the caller's identity (`kNativeAccess`); per-object glfd + object-handle caches; `xreaddirplus` cookies; sparse/copy ops; native byte-range locks pushed from the v4 state layer (`kByteLocks`, multi-gateway lock coherence); transport errors surface as JUKEBOX/DELAY so clients retry through brick reconnects. `scripts/accept_gluster.sh` runs the acceptance client against a real volume. |
+| `cephfs` | shipped (fake-tested; real-cluster acceptance pending a target environment) | CephFS over libcephfs, loaded at runtime (`dlopen`, no build dependency). The first backend with **both halves of multi-gateway coherence**: the MDS change attribute (`stx_version` → `kNativeChange`, `change_attr_type = MONOTONIC_INCR`) and MDS-arbitrated byte-range locks pushed from the v4 state layer (`kByteLocks`). `vinodeno` handles (inode number + snapid, never reused); a `UserPerm` per call carries the caller's identity; per-object Fh + inode-handle caches; readdirplus cookies with attributes and handles straight from the statx; sparse ops; transport errors surface as JUKEBOX/DELAY, a blocklisted session as a counted hard EIO. `scripts/check_cephapi_abi.sh` verifies the binding against the installed headers; `scripts/accept_cephfs.sh` runs the acceptance client against a real cluster. |
 | `lustre` | shipped (fake-tested; real-mount acceptance pending a target environment) | A Lustre client mount, built on the local backend with three seams swapped: FID filehandles (`FILEID_LUSTRE` export handle, opened back through `<mount>/.lustre/fid` — stable across restarts, no `CAP_DAC_READ_SEARCH`), HSM-aware data opens (released files kick `LL_IOC_HSM_REQUEST` RESTORE and answer JUKEBOX/DELAY instead of blocking a worker on the implicit restore), stripe-sized `pref_read`/`pref_write` from the export root's layout, and OFD-lock native byte-range locks (`kByteLocks`, MDS-arbitrated with `-o flock`). Talks to the kernel client with ioctls — no liblustreapi at build or run time (`scripts/check_llapi_abi.sh` verifies the uapi constants where the header exists). `scripts/accept_lustre.sh` runs the acceptance client against a real mount. |
 
 ### Operations
 
 - TOML configuration with `--check-config` validation; exports with CIDR client lists,
   `root`/`all`/`none` squash, read-only flag, per-backend sub-table (`[export.local]`,
-  `[export.gluster]`, `[export.lustre]`).
+  `[export.gluster]`, `[export.lustre]`, `[export.cephfs]`).
 - `lightnfs-ctl` over a unix socket (ping, metrics, error log dump, DRC and fd-cache
   stats, v4 state table dump, forced client expiry) and `lightnfs-fh` (file-handle
   decoder with HMAC verification).
@@ -121,7 +122,7 @@ never depend on each other — all shared semantics live in the core.
  │                locks, leases, grace) + LockMgr              │
  ├────────────────────────────────────────────────────────────┤
  │ L5 backend     protocol-neutral async object API            │
- │   backend_local │ backend_lustre │ backend_gluster │ memory  │
+ │  backend_local │ backend_lustre │ backend_gluster │ backend_cephfs │ memory │
  └────────────────────────────────────────────────────────────┘
    cross-cutting: runtime (coroutines, reactors, io_uring/epoll, offload pool,
                   timers), xdr, util, obs (logs, metrics)
@@ -159,8 +160,8 @@ src/
   nfsv3/      v3 engine and wire types
   nfsv4/      v4.1/4.2 engine, attributes, wire types
   mountd/     MOUNTv3
-  backend/    backend API, local, lustre (FID/HSM over the local core), gluster (libgfapi)
-              and memory backends
+  backend/    backend API, local, lustre (FID/HSM over the local core), gluster (libgfapi),
+              cephfs (libcephfs) and memory backends
   obs/        metrics, error log
   main.cpp    lightnfsd
 tools/        lightnfs-ctl (admin CLI + the three-layer benchmarks under

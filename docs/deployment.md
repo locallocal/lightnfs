@@ -72,7 +72,7 @@ sudo systemctl enable --now lightnfs
 | 来源白名单 | `[[export]] clients` | CIDR 列表，收敛到受信网段 |
 | 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none` |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
-| 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` / `[export.lustre]` | `local`（本机目录树）、`gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名）或 `lustre`（Lustre 客户端挂载内的目录：`mount`（默认自动探测）/`hsm`/`native_locks`/`identity`/`fd_cache`；非 Lustre 挂载启动即拒，写明 statfs magic 不符） |
+| 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` / `[export.lustre]` / `[export.cephfs]` | `local`（本机目录树）、`gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名）或 `lustre`（Lustre 客户端挂载内的目录：`mount`（默认自动探测）/`hsm`/`native_locks`/`identity`/`fd_cache`；非 Lustre 挂载启动即拒，写明 statfs magic 不符）或 `cephfs`（libcephfs 挂载：`conf`/`id`/`keyring`/`mon_host`/`fs_name`/`subdir`/`options`；运行时加载 `libcephfs.so.2`，缺库启动失败并写明；`path` 只是挂载名） |
 | 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |
 | 传输加密 | `[tls] mode` / `cert` / `key` / `ca` / `client_cert` | RPC-over-TLS（RFC 9289）：off/optional/required + 证书；改动需重启 |
 | 租约 | `[protocol] lease` | v4.1 租约（默认 90s） |
@@ -172,6 +172,17 @@ sudo systemctl enable --now lightnfs
   判定（`squash = "none"` 时客户端 uid 直达卷；卷侧 `server.root-squash` 会影响以
   网关身份打开的匿名 IO 描述符与锁描述符）。`lightnfs-ctl fdcache` 对 gluster 导出
   显示 glfd/对象缓存/jukebox/锁描述符计数；`clear-poison` 同样适用。
+- **CephFS 后端**：唯一同时具备原生 change（`stx_version`，`change_attr_type =
+  MONOTONIC_INCR`）与原生字节锁（`ceph_ll_setlk`，MDS 全局仲裁）的后端——多网关同挂一个
+  cephfs 导出时，CTO 与 LOCK/LOCKT 都能跨网关看见（v4 open/deny 状态仍是网关本地）。
+  身份作为每次调用的 `UserPerm` 交给 libcephfs（`squash = "none"` 时客户端 uid 直达 MDS；
+  客户端密钥的 MDS caps 需允许该 subdir 且不限制 uid/gid），ACCESS 则由网关按 mode 位回答
+  （POSIX ACL 只在 OPEN/变更判定里生效）。libcephfs 是阻塞库，全部调用走 offload 池；
+  MDS failover / OSD 重连期间的传输类错误映射为 JUKEBOX（v3）/DELAY（v4）
+  （`lightnfs_cephfs_jukebox_total`），会话被列入黑名单（EBLOCKLISTED）则是硬 EIO 并计数
+  `lightnfs_cephfs_blocklisted_total`——出现即需重启网关重连。`lightnfs-ctl fdcache` 对
+  cephfs 导出显示 Fh/inode 缓存/jukebox/黑名单/锁句柄计数；`clear-poison` 同样适用；
+  `scripts/check_cephapi_abi.sh` 在有 `cephfs/libcephfs.h` 的主机上校验绑定签名与结构布局。
 - **Lustre 后端**：文件句柄是 FID，经 `<mount>/.lustre/fid` 打开——网关进程**不需要**
   `CAP_DAC_READ_SEARCH` 即可获得跨重启稳定的句柄（本地后端在无该能力时只能走路径兜底）。
   客户端挂载建议 `-o flock`：`native_locks = true` 时 v4 字节锁以 OFD fcntl 锁下推，

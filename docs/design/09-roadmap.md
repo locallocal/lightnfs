@@ -61,13 +61,16 @@
   目录委托 Linux 长期默认关闭（05 §5.5 → NOTSUPP）；pNFS 是决策 D8 的明确非目标
   （07 §7.4 = "零成本合规"，layout 类回 NOTSUPP）。读委托 + 回传通道已在 M8/§5.2 交付，
   这三项在其上再评估。
-- 多网关一致性：**锁这一半已具备，change 这一半仍缺**。gluster 后端提供
+- 多网关一致性：**两位同时具备的后端已出现（CephFS，2026-09-04）**——`stx_version` 是 MDS
+  的 change attribute（`change_attr_type = MONOTONIC_INCR`），fcntl 锁由 MDS 全局仲裁
+  （`CephLockMgr`）；真实多网关检验待目标集群（`scripts/accept_cephfs.sh`）。其余后端
+  仍是"各具一半"：gluster 后端提供
   `native_locks()`（kByteLocks，posix-locks xlator 下推，状态层已接线）但无原生 change
   计数（`change` 仍为 ctime 合成，`change_attr_type = TIME_METADATA`）；本地后端反之。
   Lustre 后端（2026-09-04）补上了第二个 kByteLocks 生产者（OFD 锁经 MDS 仲裁），但 change
   同样是 ctime 合成（MDT 时间戳，跨网关一致；`LL_IOC_DATA_VERSION` 只覆盖数据且每条带一次
-  OST 往返，未上 GETATTR 路径）。两位同时具备的后端出现前，多网关同挂一个导出仍是
-  文档级限制（v4 open/deny 状态也仍是网关本地）。
+  OST 往返，未上 GETATTR 路径）。非 CephFS 后端多网关同挂一个导出仍是文档级限制；
+  v4 open/deny 状态在所有后端上都仍是网关本地。
 
 ## 风险登记
 
