@@ -569,7 +569,7 @@ re-verify）、TOML 解析器、record_stream 分片重组（FakeRing 按输入�
 - 外部依赖固定 commit ✅：`fetch_{cthon,fsx,pynfs}.sh` 按钉定 SHA 浅取
   （GitHub 镜像优先 + 上游回退），`LNFS_FETCH_HEAD=1` 用于升 pin。
 - 孤儿清理 ✅：`gen_dataset.sh` 删除（其 M1 数据集验收入口已随发布清理移除）；
-  `docs/test-report.md` 的 `pynfs_m4_expected.txt` 悬空引用改为注明随 M4 脚本移除。
+  `docs/performance/test-report.md` 的 `pynfs_m4_expected.txt` 悬空引用改为注明随 M4 脚本移除。
 - lint ✅：`scripts/format_check.sh`（clang-format 门禁，`--fix` 可就地改写，工具
   缺失时跳过）；clang-tidy 评估通过并接入——`.clang-tidy`
   （bugprone/performance/concurrency，无风格噪声）+ `scripts/tidy.sh`；覆盖率评估
