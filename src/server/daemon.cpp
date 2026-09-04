@@ -1,0 +1,295 @@
+#include "server/daemon.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <cstdio>
+#include <format>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <utility>
+
+#include "core/boot_epoch.hpp"
+#include "core/config.hpp"
+#include "obs/errlog.hpp"
+#include "obs/metrics.hpp"
+#include "runtime/runtime.hpp"
+#include "server/frontend.hpp"
+#include "server/metrics_providers.hpp"
+#include "server/protocol_stack.hpp"
+#include "util/log.hpp"
+
+namespace lnfs::server {
+namespace {
+
+// ---- phase 1: configuration ---------------------------------------------------------
+
+// Parse + validate the TOML. nullopt after logging the reason.
+std::optional<core::Config> load_validated_config(const std::string& path) {
+  auto config = core::load_config(path);
+  if (!config) {
+    LNFS_ERROR("cannot load config {}: {}", path, errno_name(config.error()));
+    return std::nullopt;
+  }
+  if (auto ok = core::validate_config(*config); !ok) {
+    LNFS_ERROR("invalid config {}: {}", path, errno_name(ok.error()));
+    return std::nullopt;
+  }
+  return std::move(*config);
+}
+
+void apply_log_level(const core::ServerConfig& cfg) {
+  set_log_level(cfg.log_level == "debug"   ? LogLevel::kDebug
+                : cfg.log_level == "warn"  ? LogLevel::kWarn
+                : cfg.log_level == "error" ? LogLevel::kError
+                                           : LogLevel::kInfo);
+}
+
+// Slow-request log threshold + error-sampling ring size (plan doc 10 §3.6/§3.7); both
+// hot-reloadable, so this runs at startup and on every reload.
+void apply_observability(const core::ServerConfig& cfg) {
+  obs::set_slow_request_threshold_us(static_cast<uint64_t>(cfg.slow_request_ms) * 1000);
+  obs::set_error_ring_capacity(cfg.error_ring);
+}
+
+// Per-client (v4 clientid) token buckets; hot-reloadable.
+void apply_client_qos(ProtocolStack& stack, const core::ServerConfig& cfg) {
+  if (stack.nfs4)
+    stack.nfs4->configure_client_qos(cfg.client_read_bps, cfg.client_write_bps, cfg.client_iops);
+}
+
+// ---- phase 2: durable identity ------------------------------------------------------
+
+std::optional<CoreState> build_core_state(core::Config&& config) {
+  const std::string state_dir = config.server.state_dir;
+  auto exports = core::ExportTable::build(std::move(config));
+  if (!exports) {
+    LNFS_ERROR("cannot initialize exports: {}", errno_name(exports.error()));
+    return std::nullopt;
+  }
+  auto key = core::FileHandleCodec::load_or_create(state_dir);
+  if (!key) {
+    LNFS_ERROR("cannot load file-handle key: {}", errno_name(key.error()));
+    return std::nullopt;
+  }
+  auto epoch = core::bump_boot_epoch(state_dir);
+  if (!epoch) {
+    LNFS_ERROR("cannot persist boot epoch: {}", errno_name(epoch.error()));
+    return std::nullopt;
+  }
+  CoreState core{std::move(*exports), std::move(*key), *epoch};
+  core.key.bind(*core.exports);
+  return core;
+}
+
+// ---- phase 3: runtime + backends ----------------------------------------------------
+
+rt::Runtime::Config runtime_config(const core::ServerConfig& cfg) {
+  return {.reactors = cfg.reactors,
+          .offload_threads = cfg.offload_threads,
+          .offload_heavy_threads = cfg.offload_heavy_threads,
+          .offload_queue_cap = cfg.offload_queue_cap,
+          .ring = cfg.ring,
+          .ring_sqpoll = cfg.ring_sqpoll};
+}
+
+// Runs a backend lifecycle coroutine on `reactor` and blocks the calling (main) thread
+// until it completes — start()/stop() are the only backend calls made off-reactor.
+Result<void> run_on_reactor(rt::Reactor& reactor, rt::Task<Result<void>> task) {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false;
+  Result<void> result;
+  rt::spawn(
+      [](rt::Task<Result<void>> work, std::mutex* mu, std::condition_variable* cv,
+         bool* done, Result<void>* result) -> rt::Task<void> {
+        *result = co_await std::move(work);
+        {
+          std::lock_guard lock(*mu);
+          *done = true;
+          cv->notify_one();  // under the lock: the waiter cannot destroy cv first
+        }
+      }(std::move(task), &mu, &cv, &done, &result),
+      reactor);
+  std::unique_lock lock(mu);
+  cv.wait(lock, [&] { return done; });
+  return result;
+}
+
+// One line per export for the v4.2 probe and the capability bits the engines consume
+// (plan doc 10 §5.3): native change counter, storage-side access, native locks, jukebox.
+void log_backend_traits(const core::ExportEntry& entry) {
+  auto caps = entry.backend->caps();
+  LNFS_INFO("export {} v4.2 capabilities: seek/allocate={} copy={} clone={}", entry.path,
+            caps.has(backend::Cap::kSparseOps), caps.has(backend::Cap::kCopyRange),
+            caps.has(backend::Cap::kCloneRange));
+  LNFS_INFO("export {} backend traits: stable-handles={} native-change={} "
+            "native-access={} native-locks={} jukebox={}",
+            entry.path, caps.has(backend::Cap::kStableHandles),
+            caps.has(backend::Cap::kNativeChange), caps.has(backend::Cap::kNativeAccess),
+            entry.backend->native_locks().has_value(), caps.has(backend::Cap::kJukebox));
+}
+
+// Start every backend on reactor 0 (cluster backends connect here).
+bool start_backends(rt::Runtime& runtime, core::ExportTable& exports) {
+  for (const auto& entry : exports.entries()) {
+    auto started = run_on_reactor(runtime.reactor(0), entry->backend->start());
+    if (!started) {
+      LNFS_ERROR("backend {} failed to start: {}", entry->path, errno_name(started.error()));
+      return false;
+    }
+    log_backend_traits(*entry);
+  }
+  return true;
+}
+
+void stop_backends(rt::Runtime& runtime, core::ExportTable& exports) {
+  for (const auto& entry : exports.entries())
+    (void)run_on_reactor(runtime.reactor(0), entry->backend->stop());
+}
+
+// ---- hot reload (plan doc 10 §4.1, step 1) -----------------------------------------
+
+// Topology/runtime keys stay fixed until restart; name what a reload ignored.
+std::string restart_required_report(const core::ServerConfig& fresh,
+                                    const core::ServerConfig& running) {
+  std::string report;
+  if (fresh.port != running.port || fresh.mount_port != running.mount_port ||
+      fresh.bind != running.bind)
+    report += "listen address/ports changed: restart required\n";
+  if (fresh.reactors != running.reactors || fresh.offload_threads != running.offload_threads)
+    report += "thread topology changed: restart required\n";
+  if (fresh.state_dir != running.state_dir || fresh.enable_v4 != running.enable_v4 ||
+      fresh.lease_seconds != running.lease_seconds ||
+      fresh.state_shards != running.state_shards)
+    report += "state_dir/v4/lease/shards changed: restart required\n";
+  if (fresh.metrics_port != running.metrics_port || fresh.metrics_bind != running.metrics_bind)
+    report += "metrics endpoint changed: restart required\n";
+  return report;
+}
+
+// Re-parses the config file and applies the non-topology subset — log level,
+// slow-request threshold, error ring, per-export client allowlists + QoS, per-client
+// QoS.  Serialized by construction: SIGHUP applies on the main wait loop, `ctl reload`
+// on the ctl reactor; both funnel through this one function and concurrent invocations
+// are harmless (last writer wins on independent knobs).  Returns the ctl report text.
+std::string reload_config(const std::string& config_path, const core::ServerConfig& running,
+                          CoreState& core, ProtocolStack& stack) {
+  auto fresh = load_validated_config(config_path);
+  if (!fresh) return "reload failed: config invalid (details in the log)\n";
+  std::string report;
+  const auto& sc = fresh->server;
+  if (sc.log_level != running.log_level) {
+    apply_log_level(sc);
+    report += std::format("log_level -> {}\n", sc.log_level);
+  }
+  apply_observability(sc);
+  apply_client_qos(stack, sc);
+  report += core.exports->reload_dynamic(*fresh);
+  report += restart_required_report(sc, running);
+  LNFS_INFO("configuration reloaded from {}", config_path);
+  return report.empty() ? "nothing to apply\n" : report;
+}
+
+// ---- signals -----------------------------------------------------------------------
+
+volatile std::sig_atomic_t g_stopping = 0;
+volatile std::sig_atomic_t g_reload_requested = 0;
+void on_stop_signal(int) { g_stopping = 1; }
+void on_sighup(int) { g_reload_requested = 1; }
+
+// Blocks the main thread until SIGINT/SIGTERM; SIGHUP runs `on_reload` here.
+void wait_for_shutdown_signal(const std::function<void()>& on_reload) {
+  std::signal(SIGINT, on_stop_signal);
+  std::signal(SIGTERM, on_stop_signal);
+  std::signal(SIGHUP, on_sighup);
+  while (!g_stopping) {
+    if (g_reload_requested) {
+      g_reload_requested = 0;
+      on_reload();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
+// One log line for a SIGHUP reload: the multi-line ctl report folded onto one line.
+void log_reload_report(std::string report) {
+  while (!report.empty() && report.back() == '\n') report.pop_back();
+  std::replace(report.begin(), report.end(), '\n', ';');
+  LNFS_INFO("reload (SIGHUP): {}", report);
+}
+
+}  // namespace
+
+int check_config(const std::string& config_path) {
+  auto config = load_validated_config(config_path);
+  if (!config) return 1;
+  // Also constructs the backends so per-backend keys ([export.local] identity, ...)
+  // are validated exactly as a real startup would.
+  auto exports = core::ExportTable::build(std::move(*config));
+  if (!exports) {
+    LNFS_ERROR("invalid config {}: {}", config_path, errno_name(exports.error()));
+    return 1;
+  }
+  std::printf("configuration is valid\n");
+  return 0;
+}
+
+int run_server(const std::string& config_path) {
+  // 1. configuration
+  auto config = load_validated_config(config_path);
+  if (!config) return 1;
+  const core::ServerConfig server_cfg = config->server;
+  apply_log_level(server_cfg);
+
+  // 2. durable identity: export table, handle HMAC key, boot epoch
+  auto core = build_core_state(std::move(*config));
+  if (!core) return 1;
+  init_async_logging({.file = server_cfg.log_file,
+                      .rotate_size = server_cfg.log_rotate_size,
+                      .rotate_keep = server_cfg.log_rotate_keep});
+
+  // 3. runtime + backends
+  rt::Runtime runtime(runtime_config(server_cfg));
+  runtime.start();
+  if (!start_backends(runtime, *core->exports)) {
+    runtime.stop_and_join();
+    return 1;
+  }
+
+  // 4. protocol engines, metrics providers, observability + QoS knobs
+  ProtocolStack stack(server_cfg, *core);
+  if (server_cfg.enable_v4) stack.enable_v4(server_cfg, *core, runtime);
+  register_metrics_providers(
+      {.drc = stack.drc, .state = stack.state, .exports = *core->exports, .runtime = runtime});
+  apply_observability(server_cfg);
+  apply_client_qos(stack, server_cfg);
+
+  // 5. frontend (listeners, ctl with reload/drain, metrics endpoint, rpcbind)
+  auto do_reload = [config_path, server_cfg, &core, &stack]() -> std::string {
+    return reload_config(config_path, server_cfg, *core, stack);
+  };
+  auto frontend = Frontend::start(server_cfg, runtime, stack, *core, do_reload);
+  if (!frontend) {
+    runtime.stop_and_join();
+    return 1;
+  }
+  LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={}", LIGHTNFS_VERSION,
+            frontend->nfs->port(), frontend->mount->port(), core->exports->entries().size());
+
+  wait_for_shutdown_signal([&] { log_reload_report(do_reload()); });
+
+  // mirror-image shutdown: lease scanner → frontend → backends → runtime → logging
+  stack.lease_stop.store(true);
+  frontend->stop(server_cfg);
+  stop_backends(runtime, *core->exports);
+  runtime.stop_and_join();
+  LNFS_INFO("lightnfs stopped");
+  shutdown_async_logging();
+  return 0;
+}
+
+}  // namespace lnfs::server
