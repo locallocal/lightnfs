@@ -161,8 +161,9 @@ src/
   nfsv3/      v3 engine and wire types
   nfsv4/      v4.1/4.2 engine, attributes, wire types
   mountd/     MOUNTv3
-  backend/    backend API, local, lustre (FID/HSM over the local core), gluster (libgfapi),
-              cephfs (libcephfs) and memory backends
+  backend/    backend API, registry and fault-injection hooks; one subdirectory per
+              backend: local/, memory/, gluster/ (+ libgfapi binding), lustre/ (FID/HSM
+              over the local core, + ioctl uapi binding), cephfs/ (+ libcephfs binding)
   obs/        metrics, error log
   main.cpp    lightnfsd
 tools/        lightnfs-ctl (admin CLI + the three-layer benchmarks under

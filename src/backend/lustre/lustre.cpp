@@ -1,4 +1,4 @@
-#include "backend/lustre.hpp"
+#include "backend/lustre/lustre.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>

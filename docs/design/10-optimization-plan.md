@@ -34,7 +34,7 @@
 
 `core/config.cpp:352-362` 对 `backend == "local"` 特判、绕过后端工厂注册表，只读
 `fd_cache` 与 `handles` 两个键；而完整解析 `identity`、`readdir_enrich` 的
-`make_local()`（`backend/local.cpp:1222-1240`）只有走 `find_backend()` 才会执行。
+`make_local()`（`backend/local/local.cpp:1222-1240`）只有走 `find_backend()` 才会执行。
 后果：`config/lightnfs.toml.example` 里示范的 `identity = "strict"/"setfsuid"` 与
 `readdir_enrich` **在 lightnfsd 里完全不生效**，设计 06 §6.4 的身份执行模式
 （`local.cpp:602-673` 已实现）在生产路径不可达。
@@ -57,7 +57,7 @@
 
 ### 1.3 P0：fd cache 无硬上限，可耗尽进程 fd ✅ 已修复
 
-`backend/local.cpp:127-137` 的淘汰循环在"全片条目都在使用中"时 `break`，缓存越过
+`backend/local/local.cpp:127-137` 的淘汰循环在"全片条目都在使用中"时 `break`，缓存越过
 容量继续增长；高并发下 fd 数可突破 RLIMIT_NOFILE，且没有"超容量"计数暴露。
 另外淘汰本身是持分片锁的 O(N) 全表扫描（默认每片 256 条），插入路径 O(N²)。
 
@@ -359,7 +359,7 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 | `kCaseInsensitive` | 仍无生产者（local/gluster/lustre/cephfs 均大小写敏感；留给未来后端） | 原有 |
 | `OpenCtx` / `OpenState` | 第二个真实生产者 `GlusterOpenState`（每 OPEN 一个 glfd，以调用者身份打开） | 原有 IO 站点；`static_cast` 不跨后端的前提改为"OpenState 只回到产生它的后端" |
 
-**GlusterFS 后端**（`backend/gluster.{hpp,cpp}`，`backend/gfapi.{hpp,cpp}`）：06 册
+**GlusterFS 后端**（`backend/gluster/gluster.{hpp,cpp}`，`backend/gluster/gfapi.{hpp,cpp}`）：06 册
 §6.6 映射表逐项落地，见该节。要点：
 
 - **运行时加载 libgfapi**（`dlopen("libgfapi.so.0")` + `dlvsym` 版本符号，47 个入口填一张
@@ -392,8 +392,8 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
   补齐）。锁下推的 LOCKT 探测无法辨认自身持有的锁（见上表）；被删除文件上残留的
   lock glfd 在后端 stop 时统一关闭（`lightnfs_gluster_lock_fds` 可见）。
 
-**第三后端：Lustre ✅ 已完成（2026-09-04）**（`backend/lustre.{hpp,cpp}`，
-`backend/llapi.{hpp,cpp}`；06 册 §6.5 映射表逐项落地）。要点：
+**第三后端：Lustre ✅ 已完成（2026-09-04）**（`backend/lustre/lustre.{hpp,cpp}`，
+`backend/lustre/llapi.{hpp,cpp}`；06 册 §6.5 映射表逐项落地）。要点：
 
 - **结构**：Lustre 挂载即 POSIX 树，所以 `LustreBackend : LocalBackend`——本地后端去掉
   `final`，开放 `oid_from_fd` / `open_oid` 两个虚函数与受保护的缓存/能力位成员；IO、
@@ -419,8 +419,8 @@ setup flags 恒为 0（`uring_ring.cpp:46`），先进特性一个未用，而"�
 - **文档边界**：多网关一致性仍缺原生 change（09 册口径更新）；已缓存描述符的文件被
   释放时后续 IO 阻塞在 restore 上（门禁只在打开时刻）；OFD 探测不报告持有者。
 
-**第四后端：CephFS ✅ 已完成（2026-09-04）**（`backend/cephfs.{hpp,cpp}`，
-`backend/cephapi.{hpp,cpp}`；06 册 §6.8 映射表逐项落地）。要点：
+**第四后端：CephFS ✅ 已完成（2026-09-04）**（`backend/cephfs/cephfs.{hpp,cpp}`，
+`backend/cephfs/cephapi.{hpp,cpp}`；06 册 §6.8 映射表逐项落地）。要点：
 
 - **为什么是它**：09 册的多网关一致性需要"kNativeChange + kByteLocks 同时具备"的后端——
   gluster 有锁无 change，lustre 亦然，local 反之。CephFS 两者都有：`stx_version` 是 MDS

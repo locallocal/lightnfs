@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-// The opaque types are declared in the global namespace by backend/cephapi.hpp; the
+// The opaque types are declared in the global namespace by backend/cephfs/cephapi.hpp; the
 // fake defines them.
 struct ceph_mount_info {
   std::string id;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks backend/cephapi.hpp against the installed libcephfs headers (design 06 §6.8,
+# Checks backend/cephfs/cephapi.hpp against the installed libcephfs headers (design 06 §6.8,
 # plan doc 10 §5.3): every function-pointer member of cephapi::Api must have exactly
 # the type of the corresponding libcephfs declaration, and the two structs the
 # backend defines itself (ceph_statx, vinodeno_t) must have the real layout.  The
@@ -21,14 +21,14 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 # Every member name listed in the Api struct becomes one static check.
-MEMBERS=$(grep -oE '\(\*(ceph_[a-z_0-9]+)\)' src/backend/cephapi.hpp | tr -d '(*)' | sort -u)
+MEMBERS=$(grep -oE '\(\*(ceph_[a-z_0-9]+)\)' src/backend/cephfs/cephapi.hpp | tr -d '(*)' | sort -u)
 {
   # The real header first: its include guard suppresses cephapi.hpp's own
   # ceph_statx / vinodeno_t definitions, so the member types below are compared
   # against the genuine declarations (vinodeno_t stays incomplete under C++, which
   # is fine for a by-value parameter in a function *type*).
   echo '#include <cephfs/libcephfs.h>'
-  echo '#include "backend/cephapi.hpp"'
+  echo '#include "backend/cephfs/cephapi.hpp"'
   echo '#include <type_traits>'
   echo 'using lnfs::backend::cephapi::Api;'
   # Initialising a member-typed pointer from the real function is the strict check:
@@ -66,7 +66,7 @@ MEMBERS=$(grep -oE '\(\*(ceph_[a-z_0-9]+)\)' src/backend/cephapi.hpp | tr -d '(*
   echo 'CHECK(CEPH_NOSNAP == (uint64_t)-2);  /* cephapi::kNoSnap; C-only macro */'
   echo 'int (*p)(struct ceph_mount_info *, vinodeno_t, Inode **) = ceph_ll_lookup_vino;'
   echo 'struct lnfs_statx {'
-  sed -n '/^struct ceph_statx {/,/^};/p' src/backend/cephapi.hpp | sed '1d;$d' | sed 's|//.*||'
+  sed -n '/^struct ceph_statx {/,/^};/p' src/backend/cephfs/cephapi.hpp | sed '1d;$d' | sed 's|//.*||'
   echo '};'
   for f in stx_mask stx_blksize stx_nlink stx_uid stx_gid stx_mode stx_ino stx_size stx_blocks \
            stx_dev stx_rdev stx_atime stx_ctime stx_mtime stx_btime stx_version; do

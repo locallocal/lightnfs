@@ -91,7 +91,7 @@ Lustre 客户端挂载就是一棵 POSIX 树，因此 **`LustreBackend : LocalBa
 | kJukebox | 数据 fd 打开后 `LL_IOC_HSM_STATE_GET`：HS_RELEASED → 若无进行中动作则 `LL_IOC_HSM_REQUEST(RESTORE)` 一次，返回 `kJukebox`（v3 JUKEBOX / v4 DELAY；v4 OPEN 也回 DELAY 而非降级为匿名路径）→ **kJukebox** | 避免 offload / io_uring 工作线程阻塞在内核隐式 restore 上；只门禁常规文件；无 HSM 的客户端（ENOTTY）不门禁；`hsm=false` 关闭 |
 | 身份 | 继承 `identity = check \| strict \| setfsuid` | Lustre 在 MDS 侧按 fsuid 判权，root 网关宜用 setfsuid |
 
-**绑定方式**：`backend/llapi.{hpp,cpp}` 直接对内核客户端说话——ioctl 号、结构体布局与常量
+**绑定方式**：`backend/lustre/llapi.{hpp,cpp}` 直接对内核客户端说话——ioctl 号、结构体布局与常量
 抄自 `linux/lustre/lustre_user.h`（稳定 uapi），**无 liblustreapi 构建/运行依赖**；
 `scripts/check_llapi_abi.sh` 在有该头文件的主机上把每个常量与结构体尺寸 static_assert
 （本开发机无 Lustre，CI 步骤在无头文件时跳过）。`llapi::Ops` 是唯一的内核接触面：
@@ -124,7 +124,7 @@ restore 上（门禁只在打开时刻）；OFD 锁的探测无法辨认持有�
 | locks | `GlusterLockMgr`：每 (文件, lock-owner) 一个 glfd（网关身份 O_RDWR，EACCES 回落 O_RDONLY）+ `glfs_fd_set_lkowner`，`glfs_posix_lock(F_SETLK)`；冲突 EAGAIN；`test()` 用探测 owner 的 F_GETLK；`release()` 全量解锁并关 glfd → **kByteLocks**，`native_locks()` 交给状态层下推（07 册 / plan doc 10 §5.3） | `native_locks=false` 关闭 |
 | jukebox | ENOTCONN/ETIMEDOUT/ENETDOWN/ENETUNREACH/EHOSTUNREACH/EHOSTDOWN → `kJukebox`（v3 JUKEBOX / v4 DELAY）→ **kJukebox** | 砖块重连/仲裁丢失期间客户端重试而非报错；`jukebox=false` 时回 EIO |
 
-**绑定方式**：`backend/gfapi.hpp` 定义一张 47 项函数表（签名取自 GlusterFS 11 的
+**绑定方式**：`backend/gluster/gfapi.hpp` 定义一张 47 项函数表（签名取自 GlusterFS 11 的
 `glfs.h`/`glfs-handles.h`，不透明结构体按真名在全局命名空间声明），`gfapi.cpp` 在
 `start()` 时 `dlopen("libgfapi.so.0")` + `dlvsym`（默认版本 `GFAPI_x.y`，回落 `dlsym`）填表
 ——二进制无构建期 GlusterFS 依赖；`scripts/check_gfapi_abi.sh` 在有头文件的主机上把每
@@ -232,7 +232,7 @@ mount          = "/mnt/lustre"    # 挂载根，默认自动探测（沿父目�
 | locks | `CephLockMgr`：每 (文件, lock-owner) 一个 Fh（网关身份 O_RDWR，EACCES 回落 O_RDONLY），`ceph_ll_setlk(fh, flock, owner64, sleep=0)`，owner64 = LockOwnerId 字节的 FNV-1a；冲突 EAGAIN/EWOULDBLOCK；`test()` 用 owner 0 的探测 Fh 走 `ceph_ll_getlk`；`release()` 全量解锁并关 Fh（Ceph 关 Fh 即释放其锁） → **kByteLocks**，`native_locks()` 交给状态层下推 | MDS 全局仲裁：多网关与原生客户端之间互相看见；`native_locks=false` 关闭 |
 | jukebox | ENOTCONN/ETIMEDOUT/ENETDOWN/ENETUNREACH/EHOSTUNREACH/EHOSTDOWN → `kJukebox`（v3 JUKEBOX / v4 DELAY）→ **kJukebox**；EBLOCKLISTED（ESHUTDOWN，会话被列入黑名单）→ **硬 EIO** + `blocklisted` 计数（重试无意义，需重启网关） | MDS failover / OSD 重连期间客户端重试而非报错；`jukebox=false` 时回 EIO |
 
-**绑定方式**：`backend/cephapi.hpp` 定义一张 46 项函数表（签名取自 Ceph 20 的
+**绑定方式**：`backend/cephfs/cephapi.hpp` 定义一张 46 项函数表（签名取自 Ceph 20 的
 `cephfs/libcephfs.h` / `cephfs/ceph_ll_client.h`，不透明类型按真名在全局命名空间声明；
 `ceph_statx` 与 `vinodeno_t` 在真头文件的 include guard 下自带完整定义），`cephapi.cpp`
 在 `start()` 时 `dlopen("libcephfs.so.2")` + `dlsym`（libcephfs 无符号版本）填表——二进制

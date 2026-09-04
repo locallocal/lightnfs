@@ -18,7 +18,7 @@
 #include <mutex>
 #include <set>
 
-#include "backend/cephfs.hpp"
+#include "backend/cephfs/cephfs.hpp"
 #include "backend/fault.hpp"
 #include "cephapi_fake.hpp"
 #include "runtime/runtime.hpp"

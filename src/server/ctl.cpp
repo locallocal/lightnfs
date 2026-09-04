@@ -15,9 +15,9 @@
 #include <sstream>
 #include <vector>
 
-#include "backend/cephfs.hpp"
-#include "backend/gluster.hpp"
-#include "backend/local.hpp"
+#include "backend/cephfs/cephfs.hpp"
+#include "backend/gluster/gluster.hpp"
+#include "backend/local/local.hpp"
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"

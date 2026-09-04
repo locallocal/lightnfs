@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks backend/llapi.cpp's copy of the Lustre uapi (ioctl numbers, struct sizes,
+# Checks backend/lustre/llapi.cpp's copy of the Lustre uapi (ioctl numbers, struct sizes,
 # constants) against the installed linux/lustre/lustre_user.h (design 06 §6.5).  The
 # backend talks to the kernel client directly, so this is the only place a uapi drift
 # would be caught at build time.

@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-// The opaque types are declared in the global namespace by backend/gfapi.hpp; the
+// The opaque types are declared in the global namespace by backend/gluster/gfapi.hpp; the
 // fake defines them.
 struct glfs {
   std::string root;

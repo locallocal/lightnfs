@@ -18,7 +18,7 @@
 #include <mutex>
 #include <optional>
 
-#include "backend/local.hpp"
+#include "backend/local/local.hpp"
 #include "runtime/runtime.hpp"
 
 using namespace lnfs;

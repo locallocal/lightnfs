@@ -15,7 +15,7 @@
 #include <string>
 
 #include "backend/fault.hpp"
-#include "backend/local.hpp"
+#include "backend/local/local.hpp"
 #include "mini_test.hpp"
 #include "runtime/runtime.hpp"
 #include "util/errno.hpp"

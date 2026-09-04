@@ -12,7 +12,7 @@
 #include <cstring>
 #include <memory>
 
-#include "backend/memory.hpp"
+#include "backend/memory/memory.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
 #include "util/log.hpp"

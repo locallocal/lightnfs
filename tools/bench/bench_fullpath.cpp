@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "backend/memory.hpp"
+#include "backend/memory/memory.hpp"
 #include "tools/bench/bench_main.hpp"
 #include "tools/bench/bench_util.hpp"
 #include "core/config.hpp"

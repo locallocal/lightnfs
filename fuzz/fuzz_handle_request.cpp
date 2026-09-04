@@ -14,7 +14,7 @@
 #include <filesystem>
 #include <vector>
 
-#include "backend/memory.hpp"
+#include "backend/memory/memory.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
 #include "core/obj_lock.hpp"

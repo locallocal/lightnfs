@@ -14,7 +14,7 @@ namespace lnfs::backend {
 
 class LocalObject;
 
-// POSIX-mount backend.  Not final: the Lustre backend (backend/lustre.hpp) is this
+// POSIX-mount backend.  Not final: the Lustre backend (backend/lustre/lustre.hpp) is this
 // backend with the handle codec, the handle open and the data-fd gate swapped for
 // FID / HSM-aware versions — every other path (IO, namespace ops, caches, identity)
 // is shared verbatim.

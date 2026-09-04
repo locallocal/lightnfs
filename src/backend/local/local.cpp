@@ -1,4 +1,4 @@
-#include "backend/local.hpp"
+#include "backend/local/local.hpp"
 
 #include <fcntl.h>
 #include <linux/fs.h>
@@ -22,9 +22,9 @@
 #include <vector>
 
 #include "backend/fault.hpp"
-#include "backend/gluster.hpp"
-#include "backend/lustre.hpp"
-#include "backend/cephfs.hpp"
+#include "backend/gluster/gluster.hpp"
+#include "backend/lustre/lustre.hpp"
+#include "backend/cephfs/cephfs.hpp"
 #include "runtime/io.hpp"
 #include "runtime/offload_pool.hpp"
 #include "util/log.hpp"

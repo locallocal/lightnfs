@@ -1,5 +1,5 @@
 #pragma once
-// In-process stand-in for the Lustre kernel client (backend/llapi.hpp) so
+// In-process stand-in for the Lustre kernel client (backend/lustre/llapi.hpp) so
 // tests/test_lustre.cpp runs the whole Lustre backend on a plain directory: FIDs are
 // derived from (inode, birth time) and pinned by an O_PATH descriptor so that
 // open_by_fid works without .lustre/fid (reopen through /proc — what the real
@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "backend/llapi.hpp"
+#include "backend/lustre/llapi.hpp"
 
 namespace lnfs::testing {
 

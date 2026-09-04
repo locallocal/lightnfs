@@ -10,8 +10,8 @@
 #include <unordered_set>
 #include <unistd.h>
 
-#include "backend/memory.hpp"
-#include "backend/local.hpp"
+#include "backend/memory/memory.hpp"
+#include "backend/local/local.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
 #include "core/readdir.hpp"
