@@ -19,19 +19,12 @@
 
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
-#include "core/file_handle.hpp"
-#include "core/obj_lock.hpp"
-#include "mountd/mount3.hpp"
-#include "core/pseudofs.hpp"
-#include "nfsv3/engine.hpp"
-#include "nfsv4/engine.hpp"
-#include "state/state_mgr.hpp"
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
-#include "rpc/drc.hpp"
 #include "runtime/runtime.hpp"
 #include "server/ctl.hpp"
 #include "server/metrics_providers.hpp"
+#include "server/protocol_stack.hpp"
 #include "server/rpcbind.hpp"
 #include "transport/listener.hpp"
 #include "util/log.hpp"
@@ -94,12 +87,8 @@ void apply_log_level(const lnfs::core::ServerConfig& cfg) {
                           : lnfs::LogLevel::kInfo);
 }
 
-// Durable identity: export table, handle HMAC key (bound to the exports), boot epoch.
-struct CoreState {
-  std::unique_ptr<lnfs::core::ExportTable> exports;
-  lnfs::core::FileHandleCodec key;
-  uint64_t epoch = 0;
-};
+using lnfs::server::CoreState;
+using lnfs::server::ProtocolStack;
 
 std::optional<CoreState> build_core_state(lnfs::core::Config&& config) {
   const std::string state_dir = config.server.state_dir;
@@ -153,78 +142,6 @@ void stop_backends(lnfs::rt::Runtime& runtime, lnfs::core::ExportTable& exports)
   for (const auto& entry : exports.entries())
     (void)run_backend_hook(runtime.reactor(0), entry->backend->stop());
 }
-
-// Protocol engines and their shared state, wired onto one dispatcher. Members are
-// declared in dependency order; everything lives until run_server returns.
-struct ProtocolStack {
-  lnfs::rpc::Dispatcher dispatcher;
-  lnfs::core::ObjLockRegistry locks;
-  lnfs::rpc::Drc drc;
-  lnfs::nfsv3::Engine nfs3;
-  lnfs::mountd::Mount3 mount;
-  // v4.1 stack (phase 3): pseudo-fs namespace + session state + COMPOUND engine.
-  lnfs::core::PseudoFs pseudofs;
-  lnfs::state::StateMgr state;
-  std::optional<lnfs::nfsv4::Engine> nfs4;
-  std::atomic<bool> lease_stop{false};
-
-  ProtocolStack(const lnfs::core::ServerConfig& cfg, CoreState& core)
-      : drc({.ttl = std::chrono::milliseconds(cfg.drc_ttl_ms), .max_memory = cfg.drc_mem}),
-        nfs3(*core.exports, core.key, locks),
-        mount(*core.exports, core.key),
-        pseudofs(*core.exports, core.epoch),
-        state({.boot_epoch = core.epoch,
-               .state_dir = cfg.state_dir,
-               .lease_seconds = cfg.lease_seconds,
-               .grace_seconds = cfg.grace_seconds,
-               .courtesy_multiplier = cfg.courtesy_multiplier,
-               .max_io = cfg.max_request_size,
-               .shards = cfg.state_shards,
-               .delegations = cfg.delegations,
-               // Native byte-range locks (plan doc 10 §5.3): exports whose backend
-               // has native_locks() get every LOCK/LOCKU/LOCKT mirrored into storage.
-               .native_locks = {
-                   .manager =
-                       [exports = core.exports.get()](uint32_t fsid) -> lnfs::backend::LockMgr* {
-                         const auto* entry = exports->by_fsid(fsid);
-                         if (!entry) return nullptr;
-                         auto native = entry->backend->native_locks();
-                         return native ? &native->get() : nullptr;
-                       },
-                   .resolve =
-                       [exports = core.exports.get()](uint32_t fsid,
-                                                      const lnfs::backend::ObjId& oid)
-                           -> lnfs::rt::Task<lnfs::Result<lnfs::backend::ObjPtr>> {
-                         const auto* entry = exports->by_fsid(fsid);
-                         if (!entry) co_return lnfs::Err(lnfs::errno_from(ESTALE));
-                         co_return co_await entry->backend->resolve(oid);
-                       }}}) {
-    nfs3.set_write_verifier(lnfs::core::verifier_from_epoch(core.epoch));
-    nfs3.set_drc(&drc);
-    nfs3.register_with(dispatcher);
-    mount.register_with(dispatcher);
-  }
-
-  // Grace list + COMPOUND engine + the lease scanner coroutine (07 §7.4: expiry →
-  // courtesy → conflict/timeout reclaim) on reactor 0.
-  void enable_v4(const lnfs::core::ServerConfig& cfg, CoreState& core,
-                 lnfs::rt::Runtime& runtime) {
-    state.load_grace_list();
-    // RFC 8881 §2.10.4 identity: default derives from hostname + state_dir so two
-    // distinct lightnfs instances never look like trunking paths of one server.
-    char host[256] = "lightnfs";
-    (void)::gethostname(host, sizeof host - 1);
-    std::string derived = std::string(host) + ":" + cfg.state_dir;
-    nfs4.emplace(*core.exports, core.key, locks, pseudofs, state,
-                 cfg.server_owner.empty() ? derived : cfg.server_owner,
-                 cfg.server_scope.empty() ? derived : cfg.server_scope);
-    nfs4->register_with(dispatcher);
-    // Off reactor 0 (plan doc 10 §2.6): the auxiliary tasks used to pile onto the
-    // same reactor the (old, single) accept loop lived on.
-    lnfs::rt::spawn(state.run_lease_scanner(&lease_stop),
-                    runtime.reactor(runtime.reactor_count() - 1));
-  }
-};
 
 // North side: NFS/MOUNT listeners, ctl socket, optional metrics HTTP, rpcbind
 // registration. ctl/metrics failures degrade with a warning; listener failure aborts.
