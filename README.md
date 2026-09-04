@@ -411,3 +411,6 @@ pending a target cluster and v4 open/deny state stays per gateway.
 - Protocol research: [docs/nfsv3/](docs/nfsv3/README.md), [docs/nfsv4/](docs/nfsv4/README.md)
 - Operations: [deployment guide](docs/deployment.md),
   [security checklist](docs/security-checklist.md)
+- Performance and test evidence: [docs/performance/](docs/performance/test-report.md) —
+  conformance runs (cthon / pynfs / fsx), the three-layer benchmark numbers against
+  `tools/bench/baseline.txt`, unit/fuzz/backend test coverage

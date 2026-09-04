@@ -369,3 +369,5 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
   后端接口、后端实现、状态管理、配置/可观测性、路线图、v1 后优化/功能落地记录
 - 协议调研：[nfsv3/](nfsv3/README.md)、[nfsv4/](nfsv4/README.md)
 - 运维：[部署指南](deployment.md)、[安全清单](security-checklist.md)
+- 性能与测试证据：[performance/](performance/test-report.md)——协议一致性（cthon / pynfs /
+  fsx）、三层基准对照 `tools/bench/baseline.txt` 的数据、单测/fuzz/后端测试覆盖
