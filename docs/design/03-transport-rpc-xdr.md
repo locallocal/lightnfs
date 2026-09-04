@@ -15,7 +15,7 @@ Task<void> accept_loop(Reactor& r, int listen_fd) {
 ```
 
 - 内核在各 reactor 的 SO_REUSEPORT 套接字间负载均衡，没有单点 accept 串行化、没有跨 reactor 移交（plan doc 10 §2.3 改造；原设计是单 accept 线程轮转指派）。连接总数/per-peer 上限仍是全局共享计数。
-- 2049（NFS v3+v4 共口）与 MOUNT 端口（默认 20048）两组 listener；`[server] bind` 指定监听地址（空 = 双栈全接口）。rpcbind 只做**注册**（`server/rpcbind.cpp`，`[server] rpcbind = true`），不内嵌 portmap 服务（配置键 `builtin_portmap` 被解析但没有实现，保留为占位）。
+- 2049（NFS v3+v4 共口）与 MOUNT 端口（默认 20048）两组 listener，由 `server/frontend.cpp` 的 `Frontend::start` 连同 TLS 上下文、ctl 套接字、metrics 端点与 rpcbind 注册一起装配；`[server] bind` 指定监听地址（空 = 双栈全接口）。rpcbind 只做**注册**（`server/rpcbind.cpp`，`[server] rpcbind = true`），不内嵌 portmap 服务（配置键 `builtin_portmap` 被解析但没有实现，保留为占位）。
 - 连接数上限（默认 4096），超限 accept 后立即关闭并计数告警。
 - per-peer 连接数限制（防单客户端耗尽）。
 
