@@ -89,7 +89,7 @@ src/
   mountd/     mount3.cpp
   core/       boot_epoch.cpp config.cpp errmap.cpp file_handle.cpp fs_props.cpp mutate.cpp names.cpp obj_lock.cpp pseudofs.cpp readdir.cpp
   state/      lock_mgr.cpp state_mgr.cpp
-  server/     ctl.cpp rpcbind.cpp
+  server/     ctl.cpp metrics_providers.cpp rpcbind.cpp
   backend/    api.cpp fault.cpp            （接口、注册表、故障注入钩子；每个后端一个子目录）
     local/    local.cpp                    本地 POSIX 后端
     memory/   memory.cpp                   测试/基准用内存后端
@@ -102,4 +102,4 @@ src/
 
 与最初规划的差异：v3/v4 引擎目录名为 `nfsv3/`、`nfsv4/`（不是 engine3/4）；所有后端同在
 `backend/` 下按后端分子目录（`gfapi`/`llapi`/`cephapi` 是各自的运行时绑定层，`fault` 是故障注入钩子）；
-rpcbind 注册与 ctl 管理面在 `server/`；配置解析在 `core/config.cpp`。
+rpcbind 注册、ctl 管理面与 Prometheus 文本提供者（DRC / v4 状态表 / 每导出与后端缓存 / runtime 各组）在 `server/`，`main.cpp` 只做装配；配置解析在 `core/config.cpp`。

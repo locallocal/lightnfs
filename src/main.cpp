@@ -4,7 +4,6 @@
 #include <ccmd.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -18,10 +17,6 @@
 #include <thread>
 #include <vector>
 
-#include "backend/gluster/gluster.hpp"
-#include "backend/lustre/lustre.hpp"
-#include "backend/cephfs/cephfs.hpp"
-#include "backend/local/local.hpp"
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
@@ -36,6 +31,7 @@
 #include "rpc/drc.hpp"
 #include "runtime/runtime.hpp"
 #include "server/ctl.hpp"
+#include "server/metrics_providers.hpp"
 #include "server/rpcbind.hpp"
 #include "transport/listener.hpp"
 #include "util/log.hpp"
@@ -230,126 +226,6 @@ struct ProtocolStack {
   }
 };
 
-// Prometheus text groups for the DRC, the v4 state tables, per-export data-path
-// counters, and the local-backend fd caches (design 08 §8.3, plan doc 10 §3).
-void register_metrics_providers(ProtocolStack& stack, lnfs::core::ExportTable& exports) {
-  lnfs::obs::register_text_provider([&drc = stack.drc](std::string& out) {
-    auto s = drc.stats();
-    out += std::format(
-        "lightnfs_drc_inserts_total {}\nlightnfs_drc_replays_total {}\n"
-        "lightnfs_drc_waits_total {}\nlightnfs_drc_evictions_total {}\n"
-        "lightnfs_drc_entries {}\nlightnfs_drc_bytes {}\n",
-        s.inserts, s.replays, s.waits, s.evictions, s.entries, s.bytes);
-  });
-  lnfs::obs::register_text_provider([&state = stack.state](std::string& out) {
-    auto s = state.stats();
-    out += std::format(
-        "lightnfs_v4_clients {}\nlightnfs_v4_sessions {}\nlightnfs_v4_opens {}\n"
-        "lightnfs_v4_seq_new_total {}\nlightnfs_v4_seq_replay_total {}\n"
-        "lightnfs_v4_seq_misordered_total {}\nlightnfs_v4_seq_waits_total {}\n"
-        "lightnfs_v4_in_grace {}\nlightnfs_v4_grace_remaining_seconds {}\n"
-        "lightnfs_v4_files_with_state {}\nlightnfs_v4_courtesy_clients {}\n"
-        "lightnfs_v4_lease_expirations_total {}\n"
-        "lightnfs_v4_reclaims_total{{reason=\"conflict\"}} {}\n"
-        "lightnfs_v4_reclaims_total{{reason=\"timeout\"}} {}\n"
-        "lightnfs_v4_reclaims_total{{reason=\"forced\"}} {}\n"
-        "lightnfs_v4_share_denied_total {}\nlightnfs_v4_open_merges_total {}\n"
-        // Lock-state gauges promised by deployment.md (plan doc 10 §3.4).
-        "lightnfs_v4_lock_states {}\nlightnfs_v4_lock_segments {}\n"
-        "lightnfs_v4_lock_owners {}\nlightnfs_v4_lock_denied_total {}\n"
-        // Delegations + backchannel (plan doc 10 §5.2).
-        "lightnfs_v4_delegations {}\nlightnfs_v4_deleg_grants_total {}\n"
-        "lightnfs_v4_deleg_recalls_total {}\nlightnfs_v4_deleg_returns_total {}\n"
-        "lightnfs_v4_deleg_revokes_total {}\nlightnfs_v4_cb_lock_notifies_total {}\n"
-        // Native lock push (plan doc 10 §5.3).
-        "lightnfs_v4_native_lock_denied_total {}\nlightnfs_v4_native_lock_errors_total {}\n",
-        s.clients, s.sessions, s.opens, s.seq_new, s.seq_replay, s.seq_misordered,
-        s.seq_waits, s.grace ? 1 : 0, s.grace_remaining, s.files, s.courtesy,
-        s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout, s.reclaim_forced,
-        s.share_denied, s.open_merges, s.lock_states, s.lock_segments, s.lock_owners,
-        s.lock_denied, s.delegs, s.deleg_grants, s.deleg_recalls, s.deleg_returns,
-        s.deleg_revokes, s.cb_lock_notifies, s.native_lock_denied, s.native_lock_errors);
-  });
-  lnfs::obs::register_text_provider([&exports](std::string& out) {
-    for (const auto& entry : exports.entries()) {
-      std::string labels =
-          std::format("export=\"{}\",fsid=\"{}\"", entry->path, entry->fsid);
-      const auto& em = entry->metrics;
-      out += std::format(
-          "lightnfs_export_read_bytes_total{{{0}}} {1}\n"
-          "lightnfs_export_write_bytes_total{{{0}}} {2}\n"
-          "lightnfs_export_read_ops_total{{{0}}} {3}\n"
-          "lightnfs_export_write_ops_total{{{0}}} {4}\n",
-          labels, em.read_bytes.load(), em.write_bytes.load(), em.read_ops.load(),
-          em.write_ops.load());
-      // Gluster backend caches + jukebox/lock-descriptor counters (plan doc 10 §5.3).
-      if (auto* g = dynamic_cast<lnfs::backend::GlusterBackend*>(entry->backend.get())) {
-        auto s = g->stats();
-        out += std::format(
-            "lightnfs_gluster_fdcache_hits_total{{{0}}} {1}\n"
-            "lightnfs_gluster_fdcache_misses_total{{{0}}} {2}\n"
-            "lightnfs_gluster_fdcache_upgrades_total{{{0}}} {3}\n"
-            "lightnfs_gluster_fdcache_evictions_total{{{0}}} {4}\n"
-            "lightnfs_gluster_fdcache_entries{{{0}}} {5}\n"
-            "lightnfs_gluster_objcache_hits_total{{{0}}} {6}\n"
-            "lightnfs_gluster_objcache_misses_total{{{0}}} {7}\n"
-            "lightnfs_gluster_objcache_entries{{{0}}} {8}\n"
-            "lightnfs_gluster_jukebox_total{{{0}}} {9}\n"
-            "lightnfs_gluster_lock_fds{{{0}}} {10}\n",
-            labels, s.fd_hits, s.fd_misses, s.fd_upgrades, s.fd_evictions, s.fd_entries,
-            s.obj_hits, s.obj_misses, s.obj_entries, s.jukebox, s.lock_fds);
-        continue;
-      }
-      // CephFS backend caches + jukebox/blocklist/lock-handle counters (06 §6.8).
-      if (auto* c = dynamic_cast<lnfs::backend::CephBackend*>(entry->backend.get())) {
-        auto s = c->stats();
-        out += std::format(
-            "lightnfs_cephfs_fdcache_hits_total{{{0}}} {1}\n"
-            "lightnfs_cephfs_fdcache_misses_total{{{0}}} {2}\n"
-            "lightnfs_cephfs_fdcache_upgrades_total{{{0}}} {3}\n"
-            "lightnfs_cephfs_fdcache_evictions_total{{{0}}} {4}\n"
-            "lightnfs_cephfs_fdcache_entries{{{0}}} {5}\n"
-            "lightnfs_cephfs_objcache_hits_total{{{0}}} {6}\n"
-            "lightnfs_cephfs_objcache_misses_total{{{0}}} {7}\n"
-            "lightnfs_cephfs_objcache_entries{{{0}}} {8}\n"
-            "lightnfs_cephfs_jukebox_total{{{0}}} {9}\n"
-            "lightnfs_cephfs_blocklisted_total{{{0}}} {10}\n"
-            "lightnfs_cephfs_lock_fds{{{0}}} {11}\n",
-            labels, s.fd_hits, s.fd_misses, s.fd_upgrades, s.fd_evictions, s.fd_entries,
-            s.obj_hits, s.obj_misses, s.obj_entries, s.jukebox, s.blocklisted, s.lock_fds);
-        continue;
-      }
-      // Lustre extras (design 06 §6.5): HSM gate + native lock descriptors; the fd /
-      // resolve cache counters below are inherited from the local backend.
-      if (auto* l = dynamic_cast<lnfs::backend::LustreBackend*>(entry->backend.get())) {
-        auto s = l->stats();
-        out += std::format(
-            "lightnfs_lustre_jukebox_total{{{0}}} {1}\n"
-            "lightnfs_lustre_hsm_checks_total{{{0}}} {2}\n"
-            "lightnfs_lustre_hsm_restores_total{{{0}}} {3}\n"
-            "lightnfs_lustre_lock_fds{{{0}}} {4}\n",
-            labels, s.jukebox, s.hsm_checks, s.hsm_restores, s.lock_fds);
-      }
-      // Local-backend fd/resolve cache counters (previously ctl text only, §3.5).
-      auto* local = dynamic_cast<lnfs::backend::LocalBackend*>(entry->backend.get());
-      if (!local) continue;
-      auto s = local->fd_cache_stats();
-      out += std::format(
-          "lightnfs_fdcache_hits_total{{{0}}} {1}\n"
-          "lightnfs_fdcache_misses_total{{{0}}} {2}\n"
-          "lightnfs_fdcache_upgrades_total{{{0}}} {3}\n"
-          "lightnfs_fdcache_evictions_total{{{0}}} {4}\n"
-          "lightnfs_fdcache_overflows_total{{{0}}} {5}\n"
-          "lightnfs_fdcache_entries{{{0}}} {6}\n"
-          "lightnfs_fdcache_path_hits_total{{{0}}} {7}\n"
-          "lightnfs_fdcache_path_misses_total{{{0}}} {8}\n"
-          "lightnfs_fdcache_path_entries{{{0}}} {9}\n",
-          labels, s.hits, s.misses, s.upgrades, s.evictions, s.overflows, s.entries,
-          s.path_hits, s.path_misses, s.path_entries);
-    }
-  });
-}
-
 // North side: NFS/MOUNT listeners, ctl socket, optional metrics HTTP, rpcbind
 // registration. ctl/metrics failures degrade with a warning; listener failure aborts.
 struct Frontend {
@@ -540,36 +416,13 @@ int run_server(const std::string& config_path, bool check_only) {
 
   ProtocolStack stack(server_cfg, *core);
   if (server_cfg.enable_v4) stack.enable_v4(server_cfg, *core, runtime);
-  register_metrics_providers(stack, *core->exports);
+  // Prometheus text groups beyond the engines' own counters (server/metrics_providers).
+  lnfs::server::register_metrics_providers(
+      {.drc = stack.drc, .state = stack.state, .exports = *core->exports, .runtime = runtime});
   // Slow-request log + error-sampling ring sizing (plan doc 10 §3.6/§3.7).
   lnfs::obs::set_slow_request_threshold_us(
       static_cast<uint64_t>(server_cfg.slow_request_ms) * 1000);
   lnfs::obs::set_error_ring_capacity(server_cfg.error_ring);
-  // Runtime-layer metrics (plan doc 10 §2.5/§3.5, design 08 §8.3): offload queue depth,
-  // per-class throughput, and the reactor loop busy-period histogram.
-  lnfs::obs::register_text_provider([&runtime](std::string& out) {
-    auto s = runtime.offload().stats();
-    static constexpr const char* kCls[] = {"light", "heavy"};
-    for (int c = 0; c < lnfs::rt::kOffloadClasses; ++c) {
-      out += std::format(
-          "lightnfs_offload_queue_depth{{class=\"{}\"}} {}\n"
-          "lightnfs_offload_submitted_total{{class=\"{}\"}} {}\n"
-          "lightnfs_offload_completed_total{{class=\"{}\"}} {}\n"
-          "lightnfs_offload_admission_deferred_total{{class=\"{}\"}} {}\n",
-          kCls[c], s.depth[c], kCls[c], s.submitted[c], kCls[c], s.completed[c],
-          kCls[c], s.deferred[c]);
-    }
-    std::array<uint64_t, lnfs::rt::Reactor::kLoopBuckets> agg{};
-    uint64_t sum_us = 0;
-    for (size_t i = 0; i < runtime.reactor_count(); ++i) {
-      auto ls = runtime.reactor(i).loop_stats();
-      for (size_t b = 0; b < agg.size(); ++b) agg[b] += ls.buckets[b];
-      sum_us += ls.sum_us;
-    }
-    out += "# TYPE lightnfs_reactor_loop_duration_seconds histogram\n";
-    lnfs::obs::append_histogram(out, "lightnfs_reactor_loop_duration_seconds", "",
-                                lnfs::rt::Reactor::kLoopBoundsUs, agg, sum_us);
-  });
 
   if (server_cfg.enable_v4 && stack.nfs4)
     stack.nfs4->configure_client_qos(server_cfg.client_read_bps,

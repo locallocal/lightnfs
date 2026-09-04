@@ -92,6 +92,7 @@ add_library(lnfs_core STATIC
   src/mountd/mount3.cpp
   src/server/rpcbind.cpp
   src/server/ctl.cpp
+  src/server/metrics_providers.cpp
   src/runtime/reactor.cpp
   src/runtime/uring_ring.cpp
   src/runtime/epoll_ring.cpp
