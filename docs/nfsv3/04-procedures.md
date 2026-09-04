@@ -77,7 +77,7 @@ resfail: post_op_attr dir_attributes;
 ```
 
 - 单分量查找；`.` 返回目录自身，`..` 返回父目录（挂载点根的 `..` 惯例返回自身或 NFS3ERR_ACCES，视导出策略）。
-- **不跨文件系统**：若 name 是挂载点，传统服务器返回其下层目录本身的句柄（fsid 不同暴露给客户端时行为由实现决定；Linux 服务器有 crossmnt 选项）。lightnfs 单文件系统导出可不管。
+- **不跨文件系统**：若 name 是挂载点，传统服务器返回其下层目录本身的句柄（fsid 不同暴露给客户端时行为由实现决定；Linux 服务器有 crossmnt 选项）。lightnfs 每个 `[[export]]` 自带 fsid 与后端，导出之间不互相嵌套、不跨挂载点（v4 由伪根拼接），故 LOOKUP 内不做 crossmnt。
 - dir 不是目录 → NFS3ERR_NOTDIR。name 不存在 → NFS3ERR_NOENT。
 - 权限：需要 dir 的执行（搜索）权限。
 - 这是路径解析的原语，性能关键；返回两份属性是为了同时刷新子对象和目录的缓存。
@@ -218,7 +218,7 @@ resok/resfail: 同 CREATE
 
 - type 只允许 CHR/BLK/SOCK/FIFO；REG/DIR/LNK → NFS3ERR_BADTYPE。
 - 建设备文件通常要求 root（且未被 squash），否则 NFS3ERR_PERM/ACCES。
-- 不支持 → NFS3ERR_NOTSUPP。lightnfs 若定位轻量，可以合法地不支持本过程（返回 NOTSUPP），但 FIFO/SOCK 支持成本很低。
+- 不支持 → NFS3ERR_NOTSUPP。**lightnfs 已实现 MKNOD**（`proc_mknod`），以后端能力位 `Cap::kMknod` 决定是否回 NOTSUPP（本地/gluster/lustre/cephfs 后端均置位）。
 
 ## 12. REMOVE — 删除文件（unlink）
 

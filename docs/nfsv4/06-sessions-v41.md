@@ -87,9 +87,9 @@ lightnfs：支持 SP4_NONE 即可起步。
 ## 6.7 最小合规实现清单（4.1 服务器）
 
 1. EXCHANGE_ID / CREATE_SESSION / DESTROY_SESSION / DESTROY_CLIENTID / BIND_CONN_TO_SESSION；
-2. SEQUENCE：槽表、seqid 三分支、应答缓存（cachethis）、续租、status_flags 常置 0；
+2. SEQUENCE：槽表、seqid 三分支、应答缓存（cachethis）、续租、status_flags 基本置 0（lightnfs 在客户端持有委托而回传通道断开时置 SEQ4_STATUS_CB_PATH_DOWN）；
 3. RECLAIM_COMPLETE（哪怕只是记个标志）；
 4. FREE_STATEID / TEST_STATEID（客户端恢复路径会用）；
-5. 回传通道可以宣告支持但从不发回调（不发委托就用不上）；SET_SSV、GET_DIR_DELEGATION、pNFS 系列全部 NFS4ERR_NOTSUPP。
+5. 回传通道可以宣告支持但从不发回调（不发委托就用不上）——lightnfs 已超出这个下限：回传通道真实使用（CB_RECALL 召回读委托、CB_NOTIFY_LOCK 提示锁等待者），委托只授予绑定了回传通道的会话；SET_SSV、GET_DIR_DELEGATION、pNFS 系列全部 NFS4ERR_NOTSUPP。
 
 这套骨架 + 04 分册的状态模型，就是"能让 Linux 客户端以 vers=4.1 稳定挂载使用"的完整下限。

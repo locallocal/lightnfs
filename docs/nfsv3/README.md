@@ -19,7 +19,7 @@
 1. [协议概述与体系结构](01-overview.md) —— NFSv3 的定位、设计目标、与 v2/v4 的对比、协议栈全景
 2. [ONC RPC 与 XDR 基础](02-rpc-xdr.md) —— RPC 消息格式、认证、传输层、XDR 编码规则
 3. [基本数据类型与结构](03-data-types.md) —— 文件句柄、fattr3、sattr3、WCC、常量定义
-4. [NFSv3 的 21 个过程详解](04-procedures.md) —— 每个过程的参数、结果、语义与实现注意点
+4. [NFSv3 的 22 个过程详解](04-procedures.md) —— 每个过程的参数、结果、语义与实现注意点
 5. [MOUNT 协议](05-mount-protocol.md) —— 挂载流程、导出管理、安全模型
 6. [NLM 与 NSM（文件锁）](06-nlm-nsm.md) —— 锁协议、宽限期、崩溃恢复
 7. [缓存与一致性模型](07-caching-consistency.md) —— close-to-open、WCC、属性缓存、写回与 COMMIT

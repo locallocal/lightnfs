@@ -35,7 +35,7 @@ struct SessionRec {
 };
 
 struct StateRec {                      // other = {boot_epoch(4B)|type(1B)|counter(7B)}
-    StateType     type;                // kOpen | kLock | kDeleg(预留) | kLayout(预留)
+    StateType     type;                // kOpen | kLock | kDeleg（读委托，plan doc 10 §5.2）
     uint32_t      seqid;               // stateid 版本
     ClientRef     client;
     ObjId         obj;
@@ -45,7 +45,7 @@ struct StateRec {                      // other = {boot_epoch(4B)|type(1B)|count
     LockOwner     lowner; StateRef parent_open;    // 区间在 LockMgr 表内
 };
 
-struct FileStateRec {                  // 冲突裁决：share reservation × 字节锁 ×（未来）委托
+struct FileStateRec {                  // 冲突裁决：share reservation × 字节锁 × 读委托（冲突即 CB_RECALL）
     SmallVec<StateRef, 4> opens;
     LockSet               locks;
 };
@@ -104,23 +104,23 @@ state_dir/
                                # 客户端状态全清/过期回收后延迟删除
 ```
 
-- 启动：epoch++ → 读 clients/ 名单 → 进入 grace（时长 = lease_time，默认 90s）。
+- 启动：epoch++ → 读 clients/ 名单 → 进入 grace（`[protocol] grace`，`auto` = lease 90s；可设更短加快恢复）。
 - grace 内：OPEN(CLAIM_PREVIOUS)/LOCK(reclaim) 仅接受名单内客户端（否则 RECLAIM_BAD）；普通新建状态操作 → GRACE；纯读操作（GETATTR/READ with 特殊 stateid）放行（实现选择：宽松放行读，兼容 v3 混布）。
 - 提前结束：名单内客户端全部 RECLAIM_COMPLETE → 立即出 grace。
 - v3 请求不受 grace 影响（v3 无状态）；同一后端同时被 v3/v4 客户端写时，grace 期间 v3 写与 v4 reclaim 锁理论上可竞争——v1 接受（不做 NLM，v3 侧本就无锁语义），文档明示。
 
 ## 7.6 字节锁表（网关内 LockMgr）
 
-实现 05 分册 5.8 的接口（v1 唯一实现者）：
+实现 05 分册 5.8 的接口（`state::GatewayLockMgr`，四个实现者之一；其余三个是 gluster/lustre/cephfs 的原生锁管理器）：
 
-- per-ObjId 区间树（boost::icl 风格的手写 interval map）；POSIX 合并/拆分语义；
-- 非阻塞语义：冲突即返回 DENIED + 冲突者（v4 LOCK 不做服务器端排队，nfsv4/04 §4.5）；CB_NOTIFY_LOCK 留待委托阶段一并做；
+- 以 `{fsid, ObjId}` 为键、每文件一个有序区间列表（分片 + 普通互斥，纯表操作无 IO）；POSIX 合并/拆分语义；
+- 非阻塞语义：冲突即返回 DENIED + 冲突者（v4 LOCK 不做服务器端排队，nfsv4/04 §4.5）；被拒者登记为等待者，区间释放时经回传通道发 CB_NOTIFY_LOCK（已实现，7.7）；
 - 死锁检测不做（非阻塞锁无死锁）；
-- `native_locks()` 存在的后端（未来 Lustre/Gluster）：StateMgr 改持后端 LockMgr，本表退化为 owner 簿记。
+- `native_locks()` 存在的后端（gluster/lustre/cephfs）：**叠加**而非替换——本表仍负责 stateid/本地冲突/courtesy 回收/CB_NOTIFY_LOCK，`StateMgr::Config::native_locks` 钩子把每次 LOCK/LOCKU/LOCKT 额外下推到后端；后端拒绝（EAGAIN）则回滚网关授予并回 DENIED，后端错误回 DELAY/SERVERFAULT（plan doc 10 §5.3 能力位表）。
 
-## 7.7 回传通道（占位）
+## 7.7 回传通道与读委托
 
-v1 不发委托 → 回传通道仅在 CREATE_SESSION 协商中应答（接受客户端参数、SEQ4_STATUS 不置 CB_PATH_DOWN、永不发 CB_COMPOUND）。`SessionRec.back` 与 `bound_conns` 的结构已按可用设计，委托阶段（路线图 M8）只加发送侧。
+v1 发布时不发委托：回传通道仅在 CREATE_SESSION 协商中应答、永不发 CB_COMPOUND；`SessionRec.back` 与 `bound_conns` 的结构已按可用设计，委托阶段只加发送侧——下文即该阶段的落地。
 
 **实现更新（2026-08-28，plan doc 10 §5.2）**：发送侧已落地——CREATE_SESSION 的
 CONN_BACK_CHAN / BIND_CONN_TO_SESSION(BACK/BOTH) 绑定连接为回传通道

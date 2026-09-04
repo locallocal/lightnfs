@@ -1,8 +1,9 @@
 # lightnfs
 
 **Linux 用户态 NFS 网关。** `lightnfsd` 北向同时服务 NFSv3 与 NFSv4.1/4.2，南向对接可插拔
-存储后端（v1 交付本地 POSIX 文件系统后端；接口已按 Lustre / GlusterFS 映射表评审）。
-单进程 C++20 协程全异步，运行在 io_uring reactor 之上（epoll 兜底），不依赖内核 NFS 服务。
+存储后端——本地 POSIX 文件系统、GlusterFS（libgfapi）、Lustre、CephFS（libcephfs），四者共用
+一个随首个后端定型、其后三个集群后端零改动接入的后端接口。单进程 C++20 协程全异步，运行在
+io_uring reactor 之上（epoll 兜底），不依赖内核 NFS 服务。
 
 [English README](../README.md)
 
@@ -71,12 +72,14 @@
 | `local` | 已交付 | 导出一棵目录树。有 `CAP_DAC_READ_SEARCH` 时用内核句柄（`name_to_handle_at`/`open_by_handle_at`），否则走路径兜底；分片 fd 缓存、读→写升级；粘性 fsync-EIO；内核 ≥ 6.6 用 `STATX_CHANGE_COOKIE` 作 change 属性；三种身份执行模式（`check`/`strict`/`setfsuid`）；运行时探测稀疏/拷贝/clone 支持。 |
 | `memory` | 仅测试/基准 | 确定性内存树，供引擎测试与全链路基准使用。 |
 | `gluster` | 已交付（fake 测试；真实集群验收待目标环境） | libgfapi 卷，运行时 `dlopen`（无构建期依赖）；GFID 句柄、砖块侧鉴权（kNativeAccess）、原生字节锁下推（kByteLocks）、传输错误 → JUKEBOX/DELAY。`scripts/accept_gluster.sh` 对真实卷跑验收。 |
+| `cephfs` | 已交付（fake 测试；真实集群验收待目标环境） | libcephfs 挂载，运行时 `dlopen`（无构建期依赖）。第一个**同时具备多网关一致性两个前提**的后端：MDS change attribute（`stx_version` → kNativeChange，`change_attr_type = MONOTONIC_INCR`）与 MDS 全局仲裁的字节锁（kByteLocks，由 v4 状态层下推）。`vinodeno` 句柄（inode 号 + snapid，永不复用）；每次调用一个 `UserPerm` 携带调用者身份；每对象 Fh + inode 句柄缓存；readdirplus 的属性与句柄直接取自 statx；稀疏操作；传输错误 → JUKEBOX/DELAY，会话被列入黑名单则计数并回硬 EIO。`scripts/check_cephapi_abi.sh` 对已安装头文件校验绑定；`scripts/accept_cephfs.sh` 对真实集群跑验收。 |
 | `lustre` | 已交付（fake 测试；真实挂载验收待目标环境） | 在本地后端之上替换三处接缝：FID 句柄（`FILEID_LUSTRE` 导出句柄，经 `<mount>/.lustre/fid` 打开回来，跨重启稳定、无需 CAP_DAC_READ_SEARCH）、HSM 感知的数据打开（已释放文件触发 RESTORE 并回 JUKEBOX/DELAY，不阻塞工作线程）、条带大小驱动的 `pref_read/pref_write`、OFD 锁实现的原生字节锁（`-o flock` 挂载时由 MDS 全局仲裁）。直接用 ioctl 对内核客户端说话，无 liblustreapi 依赖；`scripts/accept_lustre.sh` 对真实挂载跑验收。 |
 
 ### 运维
 
 - TOML 配置，`--check-config` 校验；导出支持 CIDR 客户端列表、`root`/`all`/`none`
-  squash、只读标志、后端子表。
+  squash、只读标志、后端子表（`[export.local]`、`[export.gluster]`、`[export.lustre]`、
+  `[export.cephfs]`）。
 - `lightnfs-ctl`（unix socket：ping、metrics、错误日志、DRC 与 fd 缓存统计、v4 状态表、
   强制客户端过期）与 `lightnfs-fh`（句柄解码 + HMAC 校验）。
 - HTTP Prometheus 文本指标，结构化日志，每请求摘要。
@@ -106,7 +109,7 @@
  │                宽限期）+ LockMgr                              │
  ├────────────────────────────────────────────────────────────┤
  │ L5 backend     协议无关的异步对象接口                          │
- │                backend_local  │  backend_memory  │  （…）    │
+ │  backend_local │ backend_lustre │ backend_gluster │ backend_cephfs │ memory │
  └────────────────────────────────────────────────────────────┘
    横切：runtime（协程、reactor、io_uring/epoll、offload 池、定时器）、xdr、util、
          obs（日志、指标）
@@ -139,14 +142,16 @@ src/
   nfsv3/      v3 引擎与线上类型
   nfsv4/      v4.1/4.2 引擎、属性、线上类型
   mountd/     MOUNTv3
-  backend/    后端接口、local 与 memory 后端
+  backend/    后端接口、local、lustre（本地核心之上的 FID/HSM）、gluster（libgfapi）、
+              cephfs（libcephfs）与 memory 后端
   obs/        指标、错误日志
   main.cpp    lightnfsd
 tools/        lightnfs-ctl（管理 CLI + tools/bench/ 下的三层基准与基线）、lightnfs-fh
 tests/        单测/集成测试（迷你测试框架、fake ring）与用户态验收客户端
-fuzz/         六个 libFuzzer 目标（请求路径、filehandle 解码、TOML 配置、record
-              stream 重组、v4 attrs、local ObjId 解析），种子语料（fuzz/seed/）与
-              字典（fuzz/dict/）入库，增长语料留在本机 fuzz/corpus/
+fuzz/         九个 libFuzzer 目标（请求路径、filehandle 解码、TOML 配置、record
+              stream 重组、v4 attrs、local/gluster/lustre/cephfs 四种 ObjId 解析），
+              种子语料（fuzz/seed/）与字典（fuzz/dict/）入库，增长语料留在本机
+              fuzz/corpus/
 scripts/      ci.sh（一站式构建矩阵 + 门禁）、fuzz.sh（种子/过夜跑、语料最小化）、
               一键验收（回环与 VM）、钉定版本的工具获取、基准门禁、故障注入、
               format/tidy/coverage、seccomp 白名单生成
@@ -168,7 +173,7 @@ docs/         设计、协议调研与部署文档
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
-ctest --test-dir build            # lnfs_tests 约 200 项用例，另有各 fuzz 目标的
+ctest --test-dir build            # lnfs_tests 约 250 项用例，另有各 fuzz 目标的
                                   # regress 回放与 errmap 漂移门禁
 scripts/ci.sh                     # 完整矩阵：GCC/Clang × Debug/Release × ASAN+UBSAN
                                   # × TSAN × epoll × fuzz smoke + lint 门禁
@@ -274,7 +279,7 @@ lightnfs-ctl ping
 lightnfs-ctl metrics                 # 与 Prometheus 端点相同的文本
 lightnfs-ctl dump-errors             # 最近错误日志环
 lightnfs-ctl drc                     # 重复请求缓存统计
-lightnfs-ctl fdcache                 # local 后端 fd 缓存统计
+lightnfs-ctl fdcache                 # fd / 句柄缓存统计（local、gluster、cephfs 导出）
 lightnfs-ctl state                   # v4 客户端/会话/open/锁、宽限期状态
 lightnfs-ctl expire-client 0x500000001   # 强制回收某客户端状态
 lightnfs-fh --key /etc/lightnfs/hmac.key <hex-handle>   # 解码并校验句柄
@@ -303,12 +308,12 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 
 ## 测试
 
-测试层次（开发计划 §9）：
+测试层次：
 
 | 层 | 手段 |
 |----|------|
 | 运行时 | fake ring 时序测试、ASAN + TSAN 构建、EINTR/短读注入 |
-| XDR / 请求路径 | round-trip 测试；六个解析边界的 libFuzzer——`scripts/fuzz.sh smoke`（每次改动 120s 种子跑，也在 `ci.sh` 内）与 `scripts/fuzz.sh nightly`（1h）；种子入库，增长语料留在本机（`fuzz.sh minimize` 压缩） |
+| XDR / 请求路径 | round-trip 测试；九个解析边界的 libFuzzer——`scripts/fuzz.sh smoke`（每次改动 120s 种子跑，也在 `ci.sh` 内）与 `scripts/fuzz.sh nightly`（1h）；种子入库，增长语料留在本机（`fuzz.sh minimize` 压缩） |
 | 后端契约 | 句柄稳定性、10 万项 cookie 稳定性、写稳定级 + 粘性 fsync EIO、v4.2 稀疏/拷贝/clone |
 | 错误映射 | v3 白名单测试**由调研文档生成**（`scripts/gen_errmap_cases.py`），文档/代码漂移令 ctest（`errmap_check`）失败；v4 行对照 RFC 表 |
 | lint / 覆盖率 | `scripts/format_check.sh`（clang-format 门禁，`ci.sh` 内）、`scripts/tidy.sh`（clang-tidy：bugprone/performance/concurrency）、`scripts/coverage.sh`（llvm-cov 报告） |
@@ -339,11 +344,12 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
 | 3 | M5 | NFSv4.1 只读：会话、伪根、客户端/会话状态 |
 | 4 | M6 | NFSv4.1 读写：open 状态机全量、租约、courtesy、宽限期/reclaim |
 | 5 | M7 | 字节区间锁、SECINFO、错误白名单复查、安全加固——**v1 发布候选** |
-| 6 | M8 | **已完成：** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE、COPY、CLONE；测试基建。**按需触发：** 第二后端（Lustre/GlusterFS）、读委托 + 回传通道、NLM/NSM |
+| 6 | M8 | **已完成：** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE、COPY、CLONE；READ_PLUS；读委托 + 回传通道；GlusterFS / Lustre / CephFS 后端（含原生锁下推）；测试基建（fuzz、故障注入、CI 矩阵）。**按需触发：** NLM/NSM |
 
 长期观察项：**RPC-over-TLS（RFC 9289）已实现**（`[tls]`）。仍不承诺——写/目录委托
-（需 CB_GETATTR 与单写者工作负载证据）、pNFS flexfiles MDS（决策 D8 的明确非目标）、
-基于原生 change 与锁的多网关一致性（需下沉原生锁的集群后端）。
+（需 CB_GETATTR 与单写者工作负载证据）、pNFS flexfiles MDS（决策 D8 的明确非目标）。
+多网关一致性的两个前提（原生 change + 原生字节锁）已由 CephFS 后端同时提供，但真实
+多网关验证待目标集群，且 v4 open/deny 状态仍是网关本地。
 
 ## 已知限制
 
@@ -351,7 +357,7 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
   RFC 9289）或外部隧道。
 - 无 NLM/NSM：v3 客户端没有字节锁，同一导出上 v3 写不受 v4 share 预留或锁约束
   （文档化边界）。
-- 无写/目录委托、无 pNFS、无异步或跨服 COPY、无 READ_PLUS/xattr。
+- 仅读委托（无写/目录委托）、无 pNFS、无异步或跨服 COPY、无 xattr（相关 op 回 NOTSUPP）。
 - 单网关：v4 状态在进程内存 + 磁盘 reclaim 名单；网关间不共享状态。
 - `handles = "auto"` 兜底模式下句柄稳定性取决于文件系统（已文档化；生产用
   `CAP_DAC_READ_SEARCH` + 内核句柄）。
@@ -359,6 +365,6 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
 ## 文档索引
 
 - 设计：[design/](design/README.md)——架构、运行时/并发、传输/RPC/XDR、NFS 核心、
-  后端接口、后端映射、状态管理、配置/可观测性、路线图
+  后端接口、后端实现、状态管理、配置/可观测性、路线图、v1 后优化/功能落地记录
 - 协议调研：[nfsv3/](nfsv3/README.md)、[nfsv4/](nfsv4/README.md)
 - 运维：[部署指南](deployment.md)、[安全清单](security-checklist.md)

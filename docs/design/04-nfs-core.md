@@ -3,11 +3,11 @@
 ## 4.1 结构总览
 
 ```
-engine3 (21 procs + mountd)      engine4 (COMPOUND 解释器 + ops)
+nfsv3 (22 procs) + mountd        nfsv4 (COMPOUND 解释器 + op_*)
         │                                 │
         └────────────┬────────────────────┘
                      ▼
-              core::NfsCore（协议无关语义中枢）
+              core/（协议无关语义中枢，一组头文件级组件而非单个类）
    导出表 / 句柄编解码 / Cred+权限 / ObjLockRegistry /
    属性采样(WCC & change_info 统一实现) / verifier / 游标簿记
                      ▼
@@ -18,34 +18,29 @@ engine3 (21 procs + mountd)      engine4 (COMPOUND 解释器 + ops)
 
 ## 4.2 core 的关键服务
 
+最初设计为一个 `NfsCore` 类 + `OpCtx` 上下文；实现落地为 `core/` 下一组独立组件，
+引擎持有它们的引用（每请求上下文是 `transport::ConnCtx` + 引擎内的局部结构，v4 的
+逐 op 计时在 `CompoundCtx::OpSpan`）：
+
 ```cpp
 namespace lnfs::core {
-
-struct OpCtx {                  // 每请求上下文，引擎构造
-    Cred            cred;
-    const ExportEntry* exp;     // 已通过 IP/flavor 校验的导出
-    CancelToken     cancel;
-    Obs::Span       trace;
+// 句柄 ↔ 对象（core/file_handle.hpp）
+class FileHandleCodec {            // SipHash-2-4 HMAC，密钥 state_dir/hmac.key
+    Result<Decoded> decode(span fh, peer);      // 校验 HMAC / 导出 / 来源 IP → {ExportEntry&, ObjId}
+    Result<Decoded> decode_v4(span fh, peer);   // 伪根 fsid=0 分支
+    FhBuf           encode(const ExportEntry&, const ObjId&);
+    Inspect         inspect(span fh);           // lightnfs-fh 工具用
 };
-
-class NfsCore {
-    // 句柄 ↔ 对象
-    Result<ResolvedObj> decode_fh(std::span<const std::byte> fh);   // 校验 HMAC/导出，返回 {Backend&, ObjId}
-    FhBuf               encode_fh(const ExportEntry&, const ObjId&);
-
-    // 原子采样模板（v3 WCC 与 v4 change_info 的唯一实现点）
-    template <class F>  // F: Task<Result<T>>(Backend&)
-    Task<Result<Mutated<T>>> mutate(OpCtx&, const ObjId& primary,
-                                    std::optional<ObjId> secondary, F&& op);
-    // Mutated<T> = { PreAttr before[, before2]; T value; Attr after[, after2]; }
-
-    Task<Result<Attr>>  getattr(OpCtx&, const ResolvedObj&);        // 共享锁下采样
-    Task<Result<AccessMask>> access(OpCtx&, const ResolvedObj&, AccessMask want);
-
-    WriteVerf boot_verf() const;   // 全局 write verifier（boot epoch）
-};
-
-} // namespace lnfs::core
+// 原子采样（core/mutate.hpp，plan doc 10 §6.1）：v3 WCC 与 v4 change_info 的唯一实现点
+class MutateGuard;                 // precheck(readonly→名字) → enter(squash→排序取锁→before) → finish(after)
+struct ChangeSample;               // before/after 的 {change, mtime, ctime, size} 采样
+// 名字校验（core/names.hpp）：check_component / valid_component / valid_utf8
+// caps/limits → 协议属性（core/fs_props.hpp）：fs_props()
+// per-object 锁（core/obj_lock.hpp）：ObjLockRegistry::get(fsid, oid)
+// 导出表 / squash（core/config.hpp）：ExportTable::{find, check_client, squash_cred}
+// write verifier / stateid epoch（core/boot_epoch.hpp）：boot_epoch()
+// 权限（backend/api.hpp）：Object::access() 默认实现 = getattr + mode 位；kNativeAccess 后端覆写
+}
 ```
 
 - `mutate()` 封装 02 分册 2.5 的"exclusive 锁 → before → 后端 op → after"模板，双目录（RENAME/LINK）传 secondary，按 ObjId 排序取锁。实现落地为 `core::MutateGuard`（`src/core/mutate.hpp`，plan doc 10 §6.1）：precheck（readonly → 名字校验）→ enter（squash → 排序取锁 → before 采样）→ finish（after 采样），v3/v4 引擎只做编码。
@@ -67,9 +62,9 @@ class NfsCore {
 
 ## 4.4 v3 引擎
 
-- 21 个过程 = 21 个 `Task<void> proc_xxx(OpCtx&, XdrDec&, XdrEnc&)`；查表分发。
+- 22 个过程（含 NULL）由一张 `Proc` 索引的成员函数指针表分发（plan doc 10 §6.6），签名 `Task<void> proc_xxx(ConnCtx&, RpcCall&, const rpc::Cred&, Capture*)`；READDIR/READDIRPLUS 与 FSSTAT/FSINFO/PATHCONF 各共用一个处理器。
 - 全部过程实现（nfsv3 分册 04），要点：
-  - READDIR/READDIRPLUS 共用 core 游标簿记 + 后端 `readdir()`（cookie 语义契约见 05 分册 5.7）；cookieverf 恒 0（后端保证 cookie 稳定）。
+  - READDIR/READDIRPLUS 共用 core 游标簿记 + 后端 `readdir()`（cookie 语义契约见 05 分册 5.7）；cookieverf = 目录 change 属性，cookie≠0 时校验，不符回 BAD_COOKIE 让客户端从头重列（plan doc 10 §5.1；原设计"恒 0"已弃）。
   - WRITE：stable 三档直通后端 `write()+commit()`；verifier 用 `boot_verf()`。
   - CREATE EXCLUSIVE：verifier 存 atime/mtime（后端 `setattr` 原子带入），语义按 nfsv3/04 §8。
   - 失败分支尽量带 post_op_attr/WCC（core `mutate` 失败路径同样采样 after）。
@@ -78,8 +73,8 @@ class NfsCore {
 ## 4.5 v4 引擎
 
 ```cpp
-// engine4/compound.cpp
-Task<void> V4Engine::dispatch(ConnCtx& conn, RpcCall& call) {
+// nfsv4/engine.cpp（单文件：COMPOUND 解释器 + 全部 op_* 成员函数）
+Task<void> Engine::dispatch(ConnCtx& conn, RpcCall& call) {
     CompoundCtx c{ .cfh = {}, .sfh = {}, .minor = args.minorversion, ... };
     if (args.minorversion == 0) return encode_error(MINOR_VERS_MISMATCH);   // 决策 D5
     // SEQUENCE 前置校验（会话/槽/重放，07 分册）……重放命中直接回缓存
@@ -91,8 +86,8 @@ Task<void> V4Engine::dispatch(ConnCtx& conn, RpcCall& call) {
 }
 ```
 
-- 每操作一个 `ops/op_xxx.cpp`，签名统一 `Task<nfsstat4>(CompoundCtx&, ArgView, XdrEnc&)`；CFH/SFH 在 `CompoundCtx` 中。
-- 实现集 = nfsv4 分册 11.4 的骨架清单 1–4 组；其余 NOTSUPP。属性层 = `attr_id → {getter, setter?, encoder}` 注册表（nfsv4/11.5），getter 从 core `Attr` 结构取值。
+- 每操作一个 `op_xxx` 成员函数（同在 `nfsv4/engine.cpp`），签名统一 `Task<nfsstat4>(CompoundCtx&, ArgView, XdrEnc&)`；CFH/SFH 在 `CompoundCtx` 中。
+- 实现集 = nfsv4 分册 11.4 的骨架清单 1–5 组全部：会话/状态/IO/目录写/锁，加读委托（DELEGRETURN、回传通道 CB_RECALL/CB_NOTIFY_LOCK，07 分册 7.7）与 v4.2 的 SEEK/ALLOCATE/DEALLOCATE/COPY/CLONE/READ_PLUS（宣告 minorversion=2）；其余 NOTSUPP（RFC 8276 的 xattr op 72–75 在 minor 2 回 NOTSUPP、minor 1 回 OP_ILLEGAL）。属性层 = `attr_id → {getter, setter?, encoder}` 注册表（`nfsv4/attrs.cpp`），getter 从 core `Attr`/`FsProps` 取值。
 - OPEN：claim NULL/FH/PREVIOUS；share reservation 检查在 StateMgr（07 分册）；创建路径复用 core `mutate` + 后端 `open(CREATE)`。
 - READ/WRITE stateid 校验顺序：特殊 stateid → 状态表查询 → 模式检查（OPENMODE）→ 落到与 v3 相同的后端 IO 调用。
 - 应答大小预算：`XdrEnc` 带 `limit`；READDIR 按剩余预算截断，超限操作回 REP_TOO_BIG（nfsv4/11.4）。
@@ -128,4 +123,4 @@ nfsstat4 to_v4(Errno e, OpId op);    // 同上（RFC 8881 §15.2 表）
 | readdir cookie 空间 | core 游标簿记 + 后端契约 |
 | errno 映射 | core::errmap（两张白名单表） |
 
-CI 中跑同一 fsx/cthon 负载分别以 vers=3 与 vers=4.1 挂载，对比后端观察到的调用序列与最终文件状态一致。
+VM 验收脚本（`scripts/accept_m2_vm.sh` vers=3、`accept_m6_vm.sh` vers=4.2）跑同一 fsx/cthon 负载，加上回环脚本里的 v3/v4 双挂载对比与混合版本写，验证最终文件状态一致（`scripts/ci.sh` 本身不跑 fsx/cthon）。

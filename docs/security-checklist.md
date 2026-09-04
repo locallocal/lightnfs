@@ -1,7 +1,7 @@
 # 安全加固清单落地记录（08 分册 §8.5）
 
-阶段 2 交付 1–4、6 项（开发计划 §4.5）；5（grace reclaim）随阶段 4、7（最小特权/seccomp）与
-8（部署文档收尾）随阶段 5 交付。每项列出实现点与验证手段，作为发布前 checklist 的底稿。
+08 分册 §8.5 的 8 项全部落地（v1 发布，2026-08），其后追加 RPC-over-TLS 一节。每项列出
+实现点与验证手段，作为发布前 checklist；实现点以当前源码为准（文件名已按实际布局核对）。
 
 ## 1. 记录/字段长度上限逐处校验 + fuzz 全入口 ✅
 
@@ -38,7 +38,9 @@ fuzz：`fuzz/fuzz_handle_request.cpp` 直喂 `Dispatcher::handle_request`，阶�
 - `ExportTable::squash_cred`（`core/config.cpp`）是唯一映射点：root/all→anon uid/gid，
   组列表清空；引擎每过程在进入后端前调用一次，后端只见映射后的 `Cred`。
 - 身份执行（06 §6.4）：模式 1 权限位自查（默认）/`identity="strict"`（faccessat2+fsuid
-  复核）/`identity="setfsuid"`（offload 线程切 fsuid，内核权威判定）。
+  复核）/`identity="setfsuid"`（offload 线程切 fsuid，内核权威判定）。集群后端把映射后的
+  `Cred` 原样交给存储侧判定：gluster 经 `glfs_setfsuid/gid/groups`，cephfs 经每次调用的
+  `UserPerm`；lustre 与 local 同一套模式。
 
 ## 6. 资源上限全部有默认值且可配 ✅
 
@@ -111,7 +113,7 @@ fuzz：`fuzz/fuzz_handle_request.cpp` 直喂 `Dispatcher::handle_request`，阶�
 
 ---
 
-## 复查记录：错误白名单全覆盖（阶段 5，08 §8.5 隐含 + 开发计划 §7）
+## 复查记录：错误白名单全覆盖（08 §8.5 隐含）
 
 - v3：`v3_error_allowed` 逐过程对照 nfsv3 研究分册 08 §8.2（RFC 1813）复查——CREATE 族收敛为
   RFC 行（去掉早期多余的 INVAL/NOTSUPP），MKDIR 增 MLINK（目录链接数上限）、REMOVE/RMDIR 增

@@ -8,7 +8,7 @@
 |------|------|----------|
 | Boost.Asio awaitable | 成熟、生态好 | 文件 IO 支持弱（io_uring 集成不完整）、缓冲区所有权模型与零拷贝路径别扭、拖入 Boost 依赖 |
 | Seastar | shard-per-core 性能极致 | 框架侵入性极强（自带内存分配/网络栈），后端库（libgfapi 等阻塞库）难以共存 |
-| **自研薄运行时** | 完全掌控缓冲区生命周期与 uring 提交；代码量可控（~2k 行）；后续可换实现 | 需要自己写对、自己测（用成熟模式抄，风险可控） |
+| **自研薄运行时** | 完全掌控缓冲区生命周期与 uring 提交；代码量可控（`src/runtime/` 现约 3k 行）；后续可换实现 | 需要自己写对、自己测（用成熟模式抄，风险可控） |
 
 自研范围刻意压到最小：`Task<T>`、reactor（io_uring/epoll）、offload 池、少量同步原语、定时器。**不做**：泛化 executor 概念、work-stealing、通用 channel 库。
 
@@ -34,14 +34,21 @@ Reactor& current_reactor();
 Task<int>     uring_read (int fd, std::span<std::byte> buf, uint64_t off);
 Task<int>     uring_write(int fd, std::span<const std::byte> buf, uint64_t off);
 Task<int>     uring_fsync(int fd, bool datasync);
+Task<int>     uring_writev(int fd, std::span<const iovec> iov, uint64_t off);
 Task<int>     uring_recv (int fd, std::span<std::byte> buf);
 Task<int>     uring_sendv(int fd, std::span<const iovec> iov);
-Task<int>     uring_accept(int listen_fd, sockaddr_storage& peer);
-Task<Statx>   uring_statx(int dirfd, const char* path, int flags, unsigned mask);
+Task<int>     uring_accept(int listen_fd, sockaddr* peer, socklen_t* len);
+Task<int>     uring_statx(int dirfd, const char* path, int flags, unsigned mask, struct statx* out);
 Task<int>     uring_openat(int dirfd, const char* path, int flags, mode_t mode);
+Task<int>     uring_close(int fd);
+Task<int>     uring_cancel_fd(int fd);
+// （示意签名；以 runtime/io.hpp 为准）
 
-// 无 uring 原语或第三方阻塞库：切到 offload 池执行，完成后切回原 reactor
-template <class F> Task<std::invoke_result_t<F>> offload(F&& fn);
+// 无 uring 原语或第三方阻塞库：切到 offload 池执行，完成后切回原 reactor。
+// 两个作业类（kLight 默认 / kHeavy = fsync、fallocate、copy 一类），各有线程配额与
+// 队列上限（[server] offload_heavy_threads / offload_queue_cap，plan doc 10 §2.5）
+enum class OffloadClass { kLight, kHeavy };
+template <class F> Task<std::invoke_result_t<F>> offload(F fn, OffloadClass cls = OffloadClass::kLight);
 
 // 定时与超时
 Task<void> sleep_for(std::chrono::nanoseconds d);
@@ -53,7 +60,7 @@ template <class T> Task<std::optional<T>> with_timeout(Task<T> t, std::chrono::n
 约定：
 
 - `Task<T>` 惰性启动、单消费者、在 await 者所在 reactor 恢复；`offload()` 是**唯一**跨线程点，其恢复必定回到发起 reactor —— 由此，除显式分片结构外，业务代码可当单线程写。
-- 协程帧分配：promise 定制 `operator new` 走 per-reactor slab 池（高频小对象，避免全局 malloc 争用）。这是性能项，接口不变，v1 可先用默认分配。
+- 协程帧分配：promise 定制 `operator new` 走线程局部按大小分级的空闲链表（`runtime/frame_alloc.hpp`，64B 粒度到 4KB，跨线程释放只迁移槽位），避免全局 malloc 争用——已落地（plan doc 10 §2.4）。
 - 异常策略：运行时内部不用异常表达 IO 错误（负 errno）；业务层用 `Result<T>`；协程内未捕获异常终止进程前打印任务链（fail-fast，宁崩不静默错）。
 
 ## 2.3 Reactor
@@ -68,7 +75,7 @@ class Reactor {
 ```
 
 - 每 CQE 携带 `user_data = 等待协程句柄`，完成即 `resume`——经典 proactor。
-- epoll 兜底实现（老内核）：同一接口，socket 走 readiness + 非阻塞调用，文件 IO 全部 offload。构建时二选一，接口不漏实现细节。
+- epoll 兜底实现（老内核）：同一接口（`RingOps`），socket 走 readiness + 非阻塞调用，文件 IO 全部 offload。两种 ring 总是同时编译，运行时按 `[server] ring = auto|uring|epoll` 探测/指定（CMake `LNFS_RING` 只改默认探测顺序）。
 - reactor 间通信仅两种：`spawn_on(reactor, task)` 与 `remote_wakeups_`；不做任意跨线程 await。
 
 ## 2.4 同步原语（协程版）
@@ -94,10 +101,10 @@ class Semaphore;            // offload 池容量、每连接在途请求数
 v3 WCC 与 v4 change_info 要求"before/after 原子采样"（调研分册 nfsv3/07、nfsv4/03）：
 
 ```cpp
-// core/objlock.hpp — 以 ObjId 为粒度的读写锁注册表（分片 + 引用计数，空锁即回收）
+// core/obj_lock.hpp — 以 (fsid, ObjId) 为粒度的读写锁注册表（64 分片 + weak_ptr，空锁即回收）
 class ObjLockRegistry {
-    Task<SharedLock> shared(const ObjId&);   // READ/GETATTR…
-    Task<Lock>       exclusive(const ObjId&); // WRITE/SETATTR/目录修改…
+    std::shared_ptr<rt::AsyncSharedMutex> get(uint32_t fsid, const ObjId&);
+    // 调用方：get(fsid, oid)->lock_shared()（READ/GETATTR…）或 ->lock()（WRITE/SETATTR/目录修改…）
 };
 ```
 
@@ -115,10 +122,10 @@ class ObjLockRegistry {
 
 - `Buffer`：引用计数的定长块（64KiB 级）+ `BufferChain`；接收侧 record_stream 直接组链，XDR 解码器在链上游走（大 opaque 字段返回链内 span，**不拷贝**）。
 - 发送侧：应答头编码进小 buffer，READ 数据独立大 buffer（uring pread 直写），`writev` 拼接——READ 全路径零拷贝（详见 03 分册 3.6）。
-- 池化：per-reactor 空闲链表，大小分级（4K/64K/1M）；水位限制总内存（配置 `buffer_pool_max`）。
+- 池化：每监听器一个 `BufferPool`——大小分级 4K/64K/128K/256K/1M，线程局部 magazine（每类 16 块）之上是带锁的全局空闲链表，水位 `max_free_bytes` 内置 64MiB（无配置键；`lightnfs_buffer_pool_free_bytes{listener}` 可观测）。
 
 ## 2.8 测试策略
 
 - 运行时单测不依赖真实 uring：`Reactor` 之下抽一层 `RingOps` 供 fake 注入（时序穿插、注入 EINTR/短读）。
-- 压测基准：echo 服务器（传输层）、null-RPC（L2）、伪后端（L4 以上全链路，后端零延迟）——三层基准锁定各层开销预算。
-- TSAN/ASAN 全量跑单测；协程生命周期错误（悬垂 frame、双恢复）用 debug 模式的 frame 哨兵检测。
+- 压测基准：echo 服务器（传输层）、null-RPC（L2）、伪后端（L4 以上全链路，memory 后端零延迟）——三层基准锁定各层开销预算；随 `lightnfs-ctl bench echo|nullrpc|fullpath` 交付，`scripts/bench_gate.sh` 对照 `tools/bench/baseline.txt` 做地板门禁。
+- TSAN/ASAN 全量跑单测（`scripts/ci.sh` 矩阵）；协程生命周期错误（悬垂 frame、双恢复）依赖 sanitizer 构建捕获，没有单独的 frame 哨兵机制。

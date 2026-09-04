@@ -6,8 +6,12 @@
 长期观察项，本册给出 v1.x → v2 的具体工作清单，每项均附代码证据（文件:行号）。
 
 审查范围：`src/` 全部子系统、`tools/`、`tests/`、`fuzz/`、`scripts/`、设计文档与实现
-的一致性。全仓库显式 TODO 仅 1 条（`src/runtime/io.hpp:97`，with_timeout 不取消败方
+的一致性。全仓库显式 TODO 仅 1 条（`src/runtime/io.hpp:101`，with_timeout 不取消败方
 定时器），因此本册同时承担"隐性待办登记"的职责。
+
+**状态（2026-09-04）**：本册全部条目均已落地（各节标题带 ✅ 与日期，落地说明写在该节
+末尾）。本册保留为实现记录，也是源码注释里 "plan doc 10 §x" 引用的落点；新的工作项
+请在 [09-roadmap](09-roadmap.md) 的长期观察项下登记，不再追加到本册。
 
 ## 目录
 
@@ -573,16 +577,17 @@ re-verify）、TOML 解析器、record_stream 分片重组（FakeRing 按输入�
 
 ---
 
-## 8. 分阶段执行建议
+## 8. 落地记录（原"分阶段执行建议"）
 
-| 阶段 | 主题 | 内容 | 验收 |
+| 阶段 | 主题 | 内容 | 落地 |
 |---|---|---|---|
-| v1.1 | 缺陷修复 | §1 全部（P0 一周内、P1 一月内），每项带回归测试 | TSAN/ASAN 全绿；新增回归全过 |
-| v1.2 | 热路径性能 | §2.1–§2.4（resolve 缓存、post 快路径、uring flags、writev/编码拷贝、buffer pool） | `bench fullpath` 与 fio（vers=3/4.2）对 baseline 的提升入库为新 baseline |
-| v1.3 | 可观测性 + 运维 | §3 全部；§4.1 第一步热重载 + §4.2 ctl 扩展 | p99 可从 Prometheus 算出；reload 不中断 IO 的验收用例 |
-| v1.4 | 协议短板 | §5.1（READ_PLUS、cookieverf、xattr 应答语义、open()） | pynfs 对应组通过；稀疏读基准 |
-| v2.0 | 委托 + 回传通道 | §5.2；穿插 §6 重构 | CB_RECALL/CB_NOTIFY_LOCK 真实客户端验收；委托削减 GETATTR 的量化 |
-| v2.x ✅ | 第二后端 | §5.3，先补能力位链路 | 09 册"接口冻结检验"的 DoD：接口零改动（仅加可选 `LockMgr::release()` + `BackendFactory::virtual_path`）跑通 GlusterFS；真实集群验收待目标环境（`scripts/accept_gluster.sh`） |
+| v1.1 ✅ | 缺陷修复 | §1 全部，每项带回归测试 | 2026-08-27（PR #32/#33）；TSAN/ASAN 全绿 |
+| v1.2 ✅ | 热路径性能 | §2.1–§2.6 | 2026-08-27/28（PR #34–#36）；新 baseline 入库 `tools/bench/baseline.txt` |
+| v1.3 ✅ | 可观测性 + 运维 | §3 全部；§4 热重载第一步 + ctl 扩展 + QoS + 打包 | 2026-08-28（PR #37/#38）；导出动态增删（§4.1 第二步）仍未做 |
+| v1.4 ✅ | 协议短板 | §5.1（READ_PLUS、cookieverf、xattr 应答语义、open()） | 2026-08-28（PR #39） |
+| v2.0 ✅ | 委托 + 回传通道 | §5.2 + §6 重构 | 2026-08-28 / 08-31（PR #40/#41） |
+| v2.x ✅ | 集群后端 | §5.3：能力位链路 + GlusterFS → Lustre → CephFS | 2026-09-03/04（PR #44–#46）；接口零改动（仅可选 `LockMgr::release()` + `BackendFactory::virtual_path`）；真实集群/挂载验收待目标环境（`scripts/accept_{gluster,lustre,cephfs}.sh`） |
+| — ✅ | 测试与工程化 | §7（fuzz 扩面、故障注入、CI 矩阵、覆盖率）；RPC-over-TLS（§5.4） | 2026-09-01/02（PR #42/#43） |
 
-测试与工程化（§7）不单列阶段，按"谁改到谁补齐"原则摊入各阶段，v1.1 优先补
-fuzz 扩面与故障注入钩子。
+未落地而留在 09 册长期观察项的：导出动态增删、写/目录委托、pNFS、NLM/NSM、多网关的真实
+验证。

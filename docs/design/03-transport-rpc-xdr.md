@@ -5,17 +5,17 @@
 ## 3.1 监听与连接
 
 ```cpp
-// transport/listener.cpp
-Task<void> listener_main(int port, ReactorPool& pool) {
+// transport/listener.cpp — 每 reactor 一个 SO_REUSEPORT 监听套接字与各自的 accept 循环
+Task<void> accept_loop(Reactor& r, int listen_fd) {
     for (;;) {
-        auto [fd, peer] = co_await rt::uring_accept(listen_fd_, ...);
-        auto& r = pool.next();                    // 轮转指派 reactor
-        rt::spawn(connection_main(fd, peer), r);  // 每连接一个主协程
+        int fd = co_await rt::uring_accept(listen_fd, ...);
+        rt::spawn(connection_main(fd, peer), r);  // 连接在被 accept 的 reactor 上服务
     }
 }
 ```
 
-- 2049（NFS v3+v4 共口）与 MOUNT 端口（默认 20048）两个 listener；portmap 内嵌可选（`--builtin-portmap`，仅注册自己的程序）。
+- 内核在各 reactor 的 SO_REUSEPORT 套接字间负载均衡，没有单点 accept 串行化、没有跨 reactor 移交（plan doc 10 §2.3 改造；原设计是单 accept 线程轮转指派）。连接总数/per-peer 上限仍是全局共享计数。
+- 2049（NFS v3+v4 共口）与 MOUNT 端口（默认 20048）两组 listener；`[server] bind` 指定监听地址（空 = 双栈全接口）。rpcbind 只做**注册**（`server/rpcbind.cpp`，`[server] rpcbind = true`），不内嵌 portmap 服务（配置键 `builtin_portmap` 被解析但没有实现，保留为占位）。
 - 连接数上限（默认 4096），超限 accept 后立即关闭并计数告警。
 - per-peer 连接数限制（防单客户端耗尽）。
 
@@ -37,7 +37,7 @@ class RecordStream {  // 一条 TCP 连接上的 RPC 记录读写
 ```cpp
 Task<void> connection_main(int fd, Peer peer) {
     ConnCtx ctx{...};                          // peer、cancel token、v4 会话绑定表
-    Semaphore inflight{cfg.max_inflight};      // v3 路径的并发上限
+    Semaphore inflight{cfg.max_inflight_per_conn};  // v3 路径的并发上限（[limits] inflight_per_conn）
     for (;;) {
         auto rec = co_await ctx.rs.read_record();
         if (!rec) break;
@@ -62,10 +62,9 @@ Task<void> handle_request(ConnCtx& ctx, BufferChain rec, Semaphore& s) {
       case 100003:
         if      (call->vers == 3) co_await v3_engine.dispatch(ctx, *call);
         else if (call->vers == 4) co_await v4_engine.dispatch(ctx, *call);
-        else    reply_prog_mismatch(3, 4);      // low=3, high=4
+        else    reply_prog_mismatch(lo, hi);    // 版本范围来自已注册程序表
       case 100005: co_await mountd.dispatch(ctx, *call);      // vers==3
-      case 100000: co_await portmap.dispatch(ctx, *call);     // 可选
-      default:     reply_prog_unavail();
+      default:     reply_prog_unavail();                      // 无内嵌 portmap
     }
 }
 ```
@@ -97,7 +96,8 @@ Result<Cred> authenticate(const RpcCall&, const ExportEntry&);  // AUTH_NONE/AUT
 // xdr/xdr.hpp — 面向缓冲链的游标式编解码
 class XdrDec {
     Result<uint32_t>  u32();  Result<uint64_t> u64();
-    Result<std::span<const std::byte>> opaque(uint32_t max);  // 引用输入链，零拷贝
+    Result<std::span<const std::byte>> opaque(uint32_t max);  // 字段在单块内时引用输入链，跨块则聚合到解码器暂存
+    Result<SmallVec<std::span<const std::byte>>> opaque_spans(uint32_t max); // 跨块也零拷贝：返回分段（WRITE 路径）
     Result<std::string_view>           string(uint32_t max);
     // 越界/超 max 一律 Err(kGarbage)
 };
@@ -111,7 +111,7 @@ class XdrEnc {
 
 - v3/v4 消息结构体（`nfs3_types.hpp` / `nfs4_types.hpp`）手写 + 以 RFC .x 文件为注释对照；每类型 `encode/decode` 配对 round-trip 单测 + fuzz 目标（libFuzzer 直喂 `handle_request` 输入）。
 - READ 零拷贝路径：引擎先编码头部（含 opaque 长度字段），`attach()` 挂数据 buffer，`write_record` 用 writev 发送——数据从 uring pread 到 socket 无一次 memcpy。
-- WRITE 零拷贝路径：解码时 `opaque()` 返回接收链内 span，后端 `pwritev` 直接引用（buffer 引用计数保活到写完成）。
+- WRITE 零拷贝路径：解码时 `opaque_spans()` 返回接收链内的分段 span，引擎以 `std::span<const iovec>` 交给后端的向量化 `write()`（本地后端 `IORING_OP_WRITEV`），跨接收块的负载不再拼平（plan doc 10 §2.4）；buffer 引用计数保活到写完成。
 
 ## 3.7 DRC（v3 专用，放在 RPC 层与引擎之间）
 
@@ -133,4 +133,4 @@ class Drc {   // Sharded；key = {peer_addr, xid, prog, vers, proc, args_checksu
 ## 3.8 MOUNTv3 与 portmap
 
 - mountd：NULL/MNT/EXPORT 全实现，DUMP/UMNT/UMNTALL 为兼容空实现（nfsv3 分册 05 的建议）；MNT 成功返回根句柄 + `[AUTH_SYS]`。
-- portmap：仅在 `--builtin-portmap` 时启用，实现 v2 GETPORT/DUMP 的只读子集，注册表硬编码为自身服务。默认路径是注册到系统 rpcbind（libtirpc 或直发 SET 调用）。
+- portmap：不内嵌。`server/rpcbind.cpp` 在启动/退出时向系统 rpcbind 直发 SET/UNSET（UDP，无 libtirpc 依赖），`[server] rpcbind = false` 关闭（纯 v4 部署，或 v3 客户端用 `port=/mountport=` 直连）。
