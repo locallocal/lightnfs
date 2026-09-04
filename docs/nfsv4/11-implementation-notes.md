@@ -80,7 +80,7 @@ file_state:     fh → { opens[], locks[], deleg?, 冲突裁决入口 }
 
 ## 11.7 建议里程碑（接 v3 分册 9.9 的 M1–M4 之后；已全部交付）
 
-M5–M8 全部实现并经 pynfs/cthon 验收，现行状态与日期见 design/09-roadmap.md 阶段 3–6；
+M5–M8 全部实现并经 pynfs/cthon 验收，现行状态见 README"项目状态"；
 M8 之外还落地了 READ_PLUS、cookieverf 语义化、RPC-over-TLS 与三个集群后端。
 
 1. **M5 v4.1 只读**：COMPOUND 解释器 + 11.4 第 1 组操作 + 会话层 + bitmap 属性最小集 + 伪根。验收：`mount -o vers=4.1,ro` 后 `ls -lR`/`cat` 正常，pynfs 会话组通过。

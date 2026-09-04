@@ -14,7 +14,7 @@ Task<void> accept_loop(Reactor& r, int listen_fd) {
 }
 ```
 
-- 内核在各 reactor 的 SO_REUSEPORT 套接字间负载均衡，没有单点 accept 串行化、没有跨 reactor 移交（plan doc 10 §2.3 改造；原设计是单 accept 线程轮转指派）。连接总数/per-peer 上限仍是全局共享计数。
+- 内核在各 reactor 的 SO_REUSEPORT 套接字间负载均衡，没有单点 accept 串行化、没有跨 reactor 移交（原设计是单 accept 线程轮转指派）。连接总数/per-peer 上限仍是全局共享计数。
 - 2049（NFS v3+v4 共口）与 MOUNT 端口（默认 20048）两组 listener，由 `server/frontend.cpp` 的 `Frontend::start` 连同 TLS 上下文、ctl 套接字、metrics 端点与 rpcbind 注册一起装配；`[server] bind` 指定监听地址（空 = 双栈全接口）。rpcbind 只做**注册**（`server/rpcbind.cpp`，`[server] rpcbind = true`），不内嵌 portmap 服务（配置键 `builtin_portmap` 被解析但没有实现，保留为占位）。
 - 连接数上限（默认 4096），超限 accept 后立即关闭并计数告警。
 - per-peer 连接数限制（防单客户端耗尽）。
@@ -85,7 +85,7 @@ Result<Cred> authenticate(const RpcCall&, const ExportEntry&);  // AUTH_NONE/AUT
 
 - AUTH_SYS 解析 + 按导出配置 squash（root_squash/all_squash → anon uid/gid）在**此处一次完成**，引擎与后端只见映射后的 `Cred`。
 - flavor 插槽：`Authenticator` 接口注册表，未来挂 RPCSEC_GSS 通道属性，接口位置预留、v1 只有两个实现。
-  **RPC-over-TLS（RFC 9289）已落地**（plan doc 10 §5.4）：它是传输绑定而非 auth flavor——
+  **RPC-over-TLS（RFC 9289）已落地**：它是传输绑定而非 auth flavor——
   AUTH_TLS(7) 只在 NULL 过程上探测触发 STARTTLS，握手后 `transport::TlsConn` 就在同一连接上
   加密收发，不经 `Authenticator`；`AuthFlavor` 仍只有 NONE/SYS 两个真实身份实现。
 - MOUNT/NFS 层导出 IP 校验也在此层入口做（`ExportTable::check_client(peer, export)`），v4 伪根除外（允许任意来源浏览伪根、进导出时校验）。
@@ -111,7 +111,7 @@ class XdrEnc {
 
 - v3/v4 消息结构体（`nfs3_types.hpp` / `nfs4_types.hpp`）手写 + 以 RFC .x 文件为注释对照；每类型 `encode/decode` 配对 round-trip 单测 + fuzz 目标（libFuzzer 直喂 `handle_request` 输入）。
 - READ 零拷贝路径：引擎先编码头部（含 opaque 长度字段），`attach()` 挂数据 buffer，`write_record` 用 writev 发送——数据从 uring pread 到 socket 无一次 memcpy。
-- WRITE 零拷贝路径：解码时 `opaque_spans()` 返回接收链内的分段 span，引擎以 `std::span<const iovec>` 交给后端的向量化 `write()`（本地后端 `IORING_OP_WRITEV`），跨接收块的负载不再拼平（plan doc 10 §2.4）；buffer 引用计数保活到写完成。
+- WRITE 零拷贝路径：解码时 `opaque_spans()` 返回接收链内的分段 span，引擎以 `std::span<const iovec>` 交给后端的向量化 `write()`（本地后端 `IORING_OP_WRITEV`），跨接收块的负载不再拼平；buffer 引用计数保活到写完成。
 
 ## 3.7 DRC（v3 专用，放在 RPC 层与引擎之间）
 

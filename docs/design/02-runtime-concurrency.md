@@ -46,7 +46,7 @@ Task<int>     uring_cancel_fd(int fd);
 
 // 无 uring 原语或第三方阻塞库：切到 offload 池执行，完成后切回原 reactor。
 // 两个作业类（kLight 默认 / kHeavy = fsync、fallocate、copy 一类），各有线程配额与
-// 队列上限（[server] offload_heavy_threads / offload_queue_cap，plan doc 10 §2.5）
+// 队列上限（[server] offload_heavy_threads / offload_queue_cap）
 enum class OffloadClass { kLight, kHeavy };
 template <class F> Task<std::invoke_result_t<F>> offload(F fn, OffloadClass cls = OffloadClass::kLight);
 
@@ -60,7 +60,7 @@ template <class T> Task<std::optional<T>> with_timeout(Task<T> t, std::chrono::n
 约定：
 
 - `Task<T>` 惰性启动、单消费者、在 await 者所在 reactor 恢复；`offload()` 是**唯一**跨线程点，其恢复必定回到发起 reactor —— 由此，除显式分片结构外，业务代码可当单线程写。
-- 协程帧分配：promise 定制 `operator new` 走线程局部按大小分级的空闲链表（`runtime/frame_alloc.hpp`，64B 粒度到 4KB，跨线程释放只迁移槽位），避免全局 malloc 争用——已落地（plan doc 10 §2.4）。
+- 协程帧分配：promise 定制 `operator new` 走线程局部按大小分级的空闲链表（`runtime/frame_alloc.hpp`，64B 粒度到 4KB，跨线程释放只迁移槽位），避免全局 malloc 争用——已落地。
 - 异常策略：运行时内部不用异常表达 IO 错误（负 errno）；业务层用 `Result<T>`；协程内未捕获异常终止进程前打印任务链（fail-fast，宁崩不静默错）。
 
 ## 2.3 Reactor

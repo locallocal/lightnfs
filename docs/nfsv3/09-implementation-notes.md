@@ -87,7 +87,7 @@ lightnfs 若定位为"导出本地目录"，推荐 **方案 A + open_by_handle_a
 - **模糊测试**：对 XDR 解码器做 fuzz（AFL/libFuzzer 直喂消息字节），解码器是最大攻击面。
 - **性能基线**：fio 顺序/随机大小块读写、mdtest/smallfile 元数据操作；对比同机 Linux knfsd 得出差距数量级。
 
-## 9.9 建议的实现里程碑（已全部交付，现行状态见 design/09-roadmap.md）
+## 9.9 建议的实现里程碑（已全部交付，现行状态见 README"项目状态"）
 
 M1–M3 全部实现；M4 的可选项已决定：MKNOD **已实现**、NFSv4（4.1/4.2）**已实现**、
 NLM 锁**不做**（`-o nolock` 定位，见 06 分册）、RPCSEC_GSS **不做**（通道加密改由

@@ -370,8 +370,7 @@ hosted CI pipelines. External suites are fetched at pinned commits
 
 ## Project status and roadmap
 
-Development followed the roadmap in [docs/design/09-roadmap.md](docs/design/09-roadmap.md)
-in phases, each closed by an acceptance run:
+Development proceeded in phases, each closed by an acceptance run:
 
 | Phase | Milestone | Content |
 |-------|-----------|---------|
@@ -407,7 +406,7 @@ pending a target cluster and v4 open/deny state stays per gateway.
 
 - Design: [docs/design/](docs/design/README.md) — architecture, runtime/concurrency,
   transport/RPC/XDR, NFS core, backend API, backend implementations, state management,
-  configuration/observability, roadmap, post-v1 optimization/feature record
+  configuration/observability
 - Protocol research: [docs/nfsv3/](docs/nfsv3/README.md), [docs/nfsv4/](docs/nfsv4/README.md)
 - Operations: [deployment guide](docs/deployment.md),
   [security checklist](docs/security-checklist.md)

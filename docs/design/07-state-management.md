@@ -35,7 +35,7 @@ struct SessionRec {
 };
 
 struct StateRec {                      // other = {boot_epoch(4B)|type(1B)|counter(7B)}
-    StateType     type;                // kOpen | kLock | kDeleg（读委托，plan doc 10 §5.2）
+    StateType     type;                // kOpen | kLock | kDeleg（读委托）
     uint32_t      seqid;               // stateid 版本
     ClientRef     client;
     ObjId         obj;
@@ -116,18 +116,20 @@ state_dir/
 - 以 `{fsid, ObjId}` 为键、每文件一个有序区间列表（分片 + 普通互斥，纯表操作无 IO）；POSIX 合并/拆分语义；
 - 非阻塞语义：冲突即返回 DENIED + 冲突者（v4 LOCK 不做服务器端排队，nfsv4/04 §4.5）；被拒者登记为等待者，区间释放时经回传通道发 CB_NOTIFY_LOCK（已实现，7.7）；
 - 死锁检测不做（非阻塞锁无死锁）；
-- `native_locks()` 存在的后端（gluster/lustre/cephfs）：**叠加**而非替换——本表仍负责 stateid/本地冲突/courtesy 回收/CB_NOTIFY_LOCK，`StateMgr::Config::native_locks` 钩子把每次 LOCK/LOCKU/LOCKT 额外下推到后端；后端拒绝（EAGAIN）则回滚网关授予并回 DENIED，后端错误回 DELAY/SERVERFAULT（plan doc 10 §5.3 能力位表）。
+- `native_locks()` 存在的后端（gluster/lustre/cephfs）：**叠加**而非替换——本表仍负责 stateid/本地冲突/courtesy 回收/CB_NOTIFY_LOCK，`StateMgr::Config::native_locks` 钩子把每次 LOCK/LOCKU/LOCKT 额外下推到后端；后端拒绝（EAGAIN）则回滚网关授予并回 DENIED，后端错误回 DELAY/SERVERFAULT。
 
 ## 7.7 回传通道与读委托
 
 v1 发布时不发委托：回传通道仅在 CREATE_SESSION 协商中应答、永不发 CB_COMPOUND；`SessionRec.back` 与 `bound_conns` 的结构已按可用设计，委托阶段只加发送侧——下文即该阶段的落地。
 
-**实现更新（2026-08-28，plan doc 10 §5.2）**：发送侧已落地——CREATE_SESSION 的
+**实现更新（2026-08-28）**：发送侧已落地——CREATE_SESSION 的
 CONN_BACK_CHAN / BIND_CONN_TO_SESSION(BACK/BOTH) 绑定连接为回传通道
 （`transport::CbChannel`），服务器经其发 CB_COMPOUND{CB_SEQUENCE, CB_RECALL /
 CB_NOTIFY_LOCK}（单 cb slot 串行、卡死一个租约判通道 down）；SEQ4_STATUS 在持有
-可召回状态且无活通道时置 CB_PATH_DOWN。读委托为 `StateType::kDeleg`：授予/冲突
-召回/DELEGRETURN/超时吊销见 plan doc 10 §5.2 的落地说明。
+可召回状态且无活通道时置 CB_PATH_DOWN。读委托为 `StateType::kDeleg`：只授予绑定了回传通道的会话（`[protocol] delegations` 可关）；
+写打开、SETATTR、REMOVE/RENAME、匿名写等冲突操作触发 CB_RECALL 并回 DELAY，客户端
+DELEGRETURN（或 CLAIM_DELEG_CUR_FH 转正）后重试；租约期内不归还由租约扫描器吊销
+（`lightnfs_v4_deleg_revokes_total`）。CLAIM_DELEGATE_PREV 不支持——委托随重启消亡。
 
 ## 7.8 观测点
 

@@ -31,7 +31,7 @@ class FileHandleCodec {            // SipHash-2-4 HMAC，密钥 state_dir/hmac.k
     FhBuf           encode(const ExportEntry&, const ObjId&);
     Inspect         inspect(span fh);           // lightnfs-fh 工具用
 };
-// 原子采样（core/mutate.hpp，plan doc 10 §6.1）：v3 WCC 与 v4 change_info 的唯一实现点
+// 原子采样（core/mutate.hpp）：v3 WCC 与 v4 change_info 的唯一实现点
 class MutateGuard;                 // precheck(readonly→名字) → enter(squash→排序取锁→before) → finish(after)
 struct ChangeSample;               // before/after 的 {change, mtime, ctime, size} 采样
 // 名字校验（core/names.hpp）：check_component / valid_component / valid_utf8
@@ -43,7 +43,7 @@ struct ChangeSample;               // before/after 的 {change, mtime, ctime, si
 }
 ```
 
-- `mutate()` 封装 02 分册 2.5 的"exclusive 锁 → before → 后端 op → after"模板，双目录（RENAME/LINK）传 secondary，按 ObjId 排序取锁。实现落地为 `core::MutateGuard`（`src/core/mutate.hpp`，plan doc 10 §6.1）：precheck（readonly → 名字校验）→ enter（squash → 排序取锁 → before 采样）→ finish（after 采样），v3/v4 引擎只做编码。
+- `mutate()` 封装 02 分册 2.5 的"exclusive 锁 → before → 后端 op → after"模板，双目录（RENAME/LINK）传 secondary，按 ObjId 排序取锁。实现落地为 `core::MutateGuard`（`src/core/mutate.hpp`）：precheck（readonly → 名字校验）→ enter（squash → 排序取锁 → before 采样）→ finish（after 采样），v3/v4 引擎只做编码。
 - 权限模型：core 在后端操作前做**协议层检查**（导出只读→ROFS、squash 后的 uid 对 mode 位的快速判定、属主放宽惯例 nfsv3/04 §6），后端返回的 EACCES/EPERM 仍是最终权威（Lustre/Gluster 有服务端 ACL）。ACCESS 过程直接问后端 `access()`（能力位支持时）或用协议层判定兜底。
 
 ## 4.3 文件句柄（两版通用，决策 D3）
@@ -62,9 +62,9 @@ struct ChangeSample;               // before/after 的 {change, mtime, ctime, si
 
 ## 4.4 v3 引擎
 
-- 22 个过程（含 NULL）由一张 `Proc` 索引的成员函数指针表分发（plan doc 10 §6.6），签名 `Task<void> proc_xxx(ConnCtx&, RpcCall&, const rpc::Cred&, Capture*)`；READDIR/READDIRPLUS 与 FSSTAT/FSINFO/PATHCONF 各共用一个处理器。
+- 22 个过程（含 NULL）由一张 `Proc` 索引的成员函数指针表分发，签名 `Task<void> proc_xxx(ConnCtx&, RpcCall&, const rpc::Cred&, Capture*)`；READDIR/READDIRPLUS 与 FSSTAT/FSINFO/PATHCONF 各共用一个处理器。
 - 全部过程实现（nfsv3 分册 04），要点：
-  - READDIR/READDIRPLUS 共用 core 游标簿记 + 后端 `readdir()`（cookie 语义契约见 05 分册 5.7）；cookieverf = 目录 change 属性，cookie≠0 时校验，不符回 BAD_COOKIE 让客户端从头重列（plan doc 10 §5.1；原设计"恒 0"已弃）。
+  - READDIR/READDIRPLUS 共用 core 游标簿记 + 后端 `readdir()`（cookie 语义契约见 05 分册 5.7）；cookieverf = 目录 change 属性，cookie≠0 时校验，不符回 BAD_COOKIE 让客户端从头重列（原设计"恒 0"已弃）。
   - WRITE：stable 三档直通后端 `write()+commit()`；verifier 用 `boot_verf()`。
   - CREATE EXCLUSIVE：verifier 存 atime/mtime（后端 `setattr` 原子带入），语义按 nfsv3/04 §8。
   - 失败分支尽量带 post_op_attr/WCC（core `mutate` 失败路径同样采样 after）。

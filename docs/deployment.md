@@ -40,7 +40,7 @@ lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面�
   的 strace 生成，运行时若变更需复核；v4.2 用到的 `lseek`/`fallocate`/`copy_file_range`/
   `ioctl(FICLONERANGE)` 与探测用 `openat(O_TMPFILE)` 均在 `@system-service` 内，无需额外放行）。
 
-打包安装（plan doc 10 §4.5）：`packaging/make_tarball.sh` 产出
+打包安装：`packaging/make_tarball.sh` 产出
 `packaging/dist/lightnfs-<ver>-linux-<arch>.tar.gz`（/usr/local 布局）、
 `packaging/make_deb.sh` 产出 .deb（dpkg-deb，装到 /usr 与 /etc/lightnfs）、
 `packaging/make_rpm.sh` 产出 .rpm（需 rpmbuild）。三者共享同一 CMake install
@@ -97,7 +97,7 @@ sudo systemctl enable --now lightnfs
   不可逆）、`grace-end`（提前结束 grace）。所有命令加 `--json` 输出机器可读 JSON。
   另有本地子命令 `lightnfs-ctl bench <echo|nullrpc|fullpath>`——三层基准（02 分册
   §2.8），自起进程内栈压测，不经 ctl 套接字、不涉运行中的服务。
-- **热重载**（SIGHUP 或 `lightnfs-ctl reload`，plan doc 10 §4.1 第一步）：重新解析
+- **热重载**（SIGHUP 或 `lightnfs-ctl reload`）：重新解析
   配置文件并应用非拓扑子集——日志级别、slow_request_ms、error_ring、每导出 clients
   白名单与 QoS 速率、[limits] client_*。导出增删、监听地址/端口、线程拓扑、
   state_dir/lease 等改动会在 reload 报告中标注 restart required，不会带病生效。
@@ -144,7 +144,7 @@ sudo systemctl enable --now lightnfs
 - **READDIR cookie 校验**：cookieverf 取目录 change 属性——分页期间目录被改，客户端
   收到 BAD_COOKIE（v3）/NOT_SAME（v4）并自动从头重新列目录，不再静默漏项/重复。
   高频变更的大目录列举可能因此重启多次（正确性换代价，Linux 客户端自动处理）。
-- **读委托 + 回传通道**（plan doc 10 §5.2）：会话绑定回传通道（CREATE_SESSION 的
+- **读委托 + 回传通道**：会话绑定回传通道（CREATE_SESSION 的
   CONN_BACK_CHAN 或 BIND_CONN_TO_SESSION BACK/BOTH）后，只读 OPEN 可获读委托——
   客户端本地缓存/打开不再逐次询问服务器，GETATTR 风暴显著削减。写打开、SETATTR、
   REMOVE/RENAME、匿名写等冲突操作触发 CB_RECALL 并回 DELAY，客户端 DELEGRETURN

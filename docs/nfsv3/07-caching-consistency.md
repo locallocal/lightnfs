@@ -76,7 +76,7 @@ CTO 靠 mtime 比较。若文件系统时间戳粒度粗（如 1 秒），同一
 
 目录遍历期间目录被修改（增删项）时：
 
-- 已删除项对应的 cookie 再来续读——服务器可容忍（跳到下一项），返回 NFS3ERR_BAD_COOKIE 则迫使客户端整目录重列。**lightnfs 选择后者**：cookieverf = 目录 change 属性，分页期间目录被改即回 BAD_COOKIE（v4 回 NOT_SAME），客户端从 cookie 0 重列换取"不重复、不漏项"的强保证（plan doc 10 §5.1）。
+- 已删除项对应的 cookie 再来续读——服务器可容忍（跳到下一项），返回 NFS3ERR_BAD_COOKIE 则迫使客户端整目录重列。**lightnfs 选择后者**：cookieverf = 目录 change 属性，分页期间目录被改即回 BAD_COOKIE（v4 回 NOT_SAME），客户端从 cookie 0 重列换取"不重复、不漏项"的强保证。
 - 遍历中新增/删除的项"看到或看不到"都合法（与本地 readdir 相同的弱保证），但**不得重复、不得漏掉未被修改的项**。
 - 稳定 cookie 设计（如 hash 链位置、B 树键序号）优于"数组下标"设计（删除会位移导致漏项/重项）。
 

@@ -4,10 +4,10 @@
 
 单一 TOML 文件（`/etc/lightnfs/lightnfs.toml`），启动读取；v1 发布时不做热重载，导出表变更需重启——现状见下方实现更新。
 
-**实现更新（2026-08-28，plan doc 10 §4.1 第一步；代码在 `server/daemon.cpp` 的
+**实现更新（2026-08-28；代码在 `server/daemon.cpp` 的
 `reload_config`）**：SIGHUP / `lightnfs-ctl reload` 现在热重载非拓扑子集——日志级别、slow_request_ms、error_ring、每导出 clients CIDR
-与 QoS 速率、per-client QoS。导出增删（拓扑）仍需重启，前置条件（PseudoFs 可重建、
-导出表并发保护）见 plan doc 10 §4.1 第二步。`grace` 已与 `lease` 解绑（`auto` = lease）。
+与 QoS 速率、per-client QoS。导出增删（拓扑）仍需重启，前置条件是 PseudoFs 可重建与
+导出表并发保护，尚未做。`grace` 已与 `lease` 解绑（`auto` = lease）。
 
 全部键与默认值以 `config/lightnfs.toml.example`（逐键注释）和 `core/config.hpp` 为准；摘要：
 
@@ -81,7 +81,7 @@ rsize/wsize/dtpref 不是配置项：由后端 `FsLimits`（05 分册）推导�
 
 SLI 建议：READ/WRITE p99、GETATTR p99、错误率、grace 时长。
 
-**实现（2026-08-28，plan doc 10 §3）**：时延直方图为固定桶（100µs–5s，Prometheus
+**实现（2026-08-28）**：时延直方图为固定桶（100µs–5s，Prometheus
 histogram 语义）；v4 按 op 展开 calls/errors/duration，另有整 COMPOUND 直方图；
 per-export 维度落地为带 `{export,fsid}` 标签的数据面计数（read/write bytes+ops、
 fd 缓存）；runtime 组含 offload 队列深度、buffer 池水位、reactor 循环忙时直方图。
