@@ -35,7 +35,7 @@
 //                      (EBLOCKLISTED = ESHUTDOWN) is permanent → EIO + counter
 //
 // libcephfs is a blocking library: every call runs on the offload pool (02 §2.2);
-// the binding is a runtime-loaded function table (backend/cephapi.hpp), so the
+// the binding is a runtime-loaded function table (backend/cephfs/cephapi.hpp), so the
 // binary has no build-time Ceph dependency and the tests drive the same code through
 // an in-process fake.
 
@@ -48,7 +48,7 @@
 #include <vector>
 
 #include "backend/api.hpp"
-#include "backend/cephapi.hpp"
+#include "backend/cephfs/cephapi.hpp"
 
 namespace lnfs::backend {
 

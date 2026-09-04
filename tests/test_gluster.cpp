@@ -19,7 +19,7 @@
 #include <set>
 
 #include "backend/fault.hpp"
-#include "backend/gluster.hpp"
+#include "backend/gluster/gluster.hpp"
 #include "gfapi_fake.hpp"
 #include "runtime/runtime.hpp"
 

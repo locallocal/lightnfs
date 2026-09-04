@@ -90,11 +90,16 @@ src/
   core/       boot_epoch.cpp config.cpp errmap.cpp file_handle.cpp fs_props.cpp mutate.cpp names.cpp obj_lock.cpp pseudofs.cpp readdir.cpp
   state/      lock_mgr.cpp state_mgr.cpp
   server/     ctl.cpp rpcbind.cpp
-  backend/    api.cpp cephapi.cpp cephfs.cpp fault.cpp gfapi.cpp gluster.cpp llapi.cpp local.cpp lustre.cpp memory.cpp
+  backend/    api.cpp fault.cpp            （接口、注册表、故障注入钩子；每个后端一个子目录）
+    local/    local.cpp                    本地 POSIX 后端
+    memory/   memory.cpp                   测试/基准用内存后端
+    gluster/  gluster.cpp gfapi.cpp        GlusterFS 后端 + libgfapi 运行时绑定
+    lustre/   lustre.cpp llapi.cpp         Lustre 后端（继承 local）+ ioctl uapi 绑定
+    cephfs/   cephfs.cpp cephapi.cpp       CephFS 后端 + libcephfs 运行时绑定
   obs/        errlog.cpp metrics.cpp
   main.cpp    lightnfsd 入口（ccmd 命令行：--config / --check-config）
 ```
 
 与最初规划的差异：v3/v4 引擎目录名为 `nfsv3/`、`nfsv4/`（不是 engine3/4）；所有后端同在
-`backend/`（`gfapi`/`llapi`/`cephapi` 是各自的运行时绑定层，`fault` 是故障注入钩子）；
+`backend/` 下按后端分子目录（`gfapi`/`llapi`/`cephapi` 是各自的运行时绑定层，`fault` 是故障注入钩子）；
 rpcbind 注册与 ctl 管理面在 `server/`；配置解析在 `core/config.cpp`。

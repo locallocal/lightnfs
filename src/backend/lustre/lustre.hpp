@@ -22,7 +22,7 @@
 //   kJukebox       = HSM: a data-fd open on a RELEASED file kicks LL_IOC_HSM_REQUEST
 //                    (RESTORE) and answers kJukebox (v3 JUKEBOX / v4 DELAY) instead of
 //                    parking an offload worker on the implicit restore
-// The kernel binding is backend/llapi.hpp (ioctls + .lustre/fid; no liblustreapi);
+// The kernel binding is backend/lustre/llapi.hpp (ioctls + .lustre/fid; no liblustreapi);
 // tests run the same code on a plain directory through tests/llapi_fake.cpp.
 
 #include <fcntl.h>
@@ -31,8 +31,8 @@
 #include <mutex>
 #include <unordered_map>
 
-#include "backend/llapi.hpp"
-#include "backend/local.hpp"
+#include "backend/lustre/llapi.hpp"
+#include "backend/local/local.hpp"
 
 namespace lnfs::backend {
 

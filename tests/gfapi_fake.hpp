@@ -1,5 +1,5 @@
 #pragma once
-// In-process stand-in for libgfapi (plan doc 10 §5.3): serves the backend/gfapi.hpp
+// In-process stand-in for libgfapi (plan doc 10 §5.3): serves the backend/gluster/gfapi.hpp
 // function table over a local directory so tests/test_gluster.cpp exercises the
 // whole GlusterFS backend — handle codec, object/glfd caches, identity plumbing,
 // readdir cookies, IO/commit, v4.2 ops, native locks, jukebox mapping — under ctest
@@ -12,7 +12,7 @@
 #include <memory>
 #include <string>
 
-#include "backend/gfapi.hpp"
+#include "backend/gluster/gfapi.hpp"
 
 namespace lnfs::testing {
 

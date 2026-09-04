@@ -30,7 +30,7 @@ fuzz：`fuzz/fuzz_handle_request.cpp` 直喂 `Dispatcher::handle_request`，阶�
 - 协议层（engine）：`valid_component`（空名、`/`、NUL 拒绝；LOOKUP 允许 `.`/`..`）与
   `valid_new_name`（创建族额外拒 `.`/`..`）——`nfsv3/engine.cpp`。
 - 后端层：`LocalBackend::valid_name` 复查 + 所有路径操作 `O_NOFOLLOW`/`*at` 单分量执行，
-  导出根 `..` 钳制——`backend/local.cpp`；MemoryBackend 同样复查。
+  导出根 `..` 钳制——`backend/local/local.cpp`；MemoryBackend 同样复查。
 - 验证：`accept_client walk` 空参数写过程→GARBAGE_ARGS；后端契约单测。
 
 ## 4. squash 在 auth 层单点完成 ✅

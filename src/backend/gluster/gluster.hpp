@@ -25,7 +25,7 @@
 //                      instead of failing during brick reconnect / quorum loss
 //
 // libgfapi is a blocking library: every call runs on the offload pool (02 §2.2); the
-// binding is a runtime-loaded function table (backend/gfapi.hpp), so the binary has
+// binding is a runtime-loaded function table (backend/gluster/gfapi.hpp), so the binary has
 // no build-time GlusterFS dependency and the tests drive the same code through an
 // in-process fake.
 
@@ -37,7 +37,7 @@
 #include <vector>
 
 #include "backend/api.hpp"
-#include "backend/gfapi.hpp"
+#include "backend/gluster/gfapi.hpp"
 
 namespace lnfs::backend {
 

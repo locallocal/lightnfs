@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks backend/gfapi.hpp against the installed GlusterFS headers (plan doc 10
+# Checks backend/gluster/gfapi.hpp against the installed GlusterFS headers (plan doc 10
 # §5.3): every function-pointer member of gfapi::Api must have exactly the type of
 # the corresponding libgfapi declaration.  The backend loads the library at runtime,
 # so this is the only place a signature drift would be caught at build time.
@@ -19,11 +19,11 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 # Every member name listed in the Api struct becomes one static_assert.
-MEMBERS=$(grep -oE '\(\*(glfs_[a-z_]+)\)' src/backend/gfapi.hpp | tr -d '(*)' | sort -u)
+MEMBERS=$(grep -oE '\(\*(glfs_[a-z_]+)\)' src/backend/gluster/gfapi.hpp | tr -d '(*)' | sort -u)
 {
   echo '#include <glusterfs/api/glfs.h>'
   echo '#include <glusterfs/api/glfs-handles.h>'
-  echo '#include "backend/gfapi.hpp"'
+  echo '#include "backend/gluster/gfapi.hpp"'
   echo '#include <type_traits>'
   echo 'using lnfs::backend::gfapi::Api;'
   # Initialising a member-typed pointer from the real function is the strict check:

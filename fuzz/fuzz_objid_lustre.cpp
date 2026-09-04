@@ -10,7 +10,7 @@
 #include <cstring>
 #include <span>
 
-#include "backend/lustre.hpp"
+#include "backend/lustre/lustre.hpp"
 
 using namespace lnfs;
 

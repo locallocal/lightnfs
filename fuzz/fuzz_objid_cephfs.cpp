@@ -9,7 +9,7 @@
 #include <cstring>
 #include <span>
 
-#include "backend/cephfs.hpp"
+#include "backend/cephfs/cephfs.hpp"
 
 using namespace lnfs;
 

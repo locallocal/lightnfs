@@ -1,5 +1,5 @@
 #pragma once
-// In-process stand-in for libcephfs (plan doc 10 §5.3): serves the backend/cephapi.hpp
+// In-process stand-in for libcephfs (plan doc 10 §5.3): serves the backend/cephfs/cephapi.hpp
 // function table over a local directory so tests/test_cephfs.cpp exercises the whole
 // CephFS backend — handle codec, inode/Fh caches, identity plumbing, readdir cookies,
 // IO/commit, v4.2 ops, native change counter, native locks, jukebox mapping — under
@@ -14,7 +14,7 @@
 #include <memory>
 #include <string>
 
-#include "backend/cephapi.hpp"
+#include "backend/cephfs/cephapi.hpp"
 
 namespace lnfs::testing {
 

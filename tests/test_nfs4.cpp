@@ -14,7 +14,7 @@
 #include <set>
 
 #include "backend/fault.hpp"
-#include "backend/memory.hpp"
+#include "backend/memory/memory.hpp"
 #include "core/config.hpp"
 #include "core/errmap.hpp"
 #include "core/file_handle.hpp"

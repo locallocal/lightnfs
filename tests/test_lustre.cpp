@@ -20,7 +20,7 @@
 #include <set>
 
 #include "backend/fault.hpp"
-#include "backend/lustre.hpp"
+#include "backend/lustre/lustre.hpp"
 #include "llapi_fake.hpp"
 #include "runtime/runtime.hpp"
 

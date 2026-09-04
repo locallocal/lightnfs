@@ -18,10 +18,10 @@
 #include <thread>
 #include <vector>
 
-#include "backend/gluster.hpp"
-#include "backend/lustre.hpp"
-#include "backend/cephfs.hpp"
-#include "backend/local.hpp"
+#include "backend/gluster/gluster.hpp"
+#include "backend/lustre/lustre.hpp"
+#include "backend/cephfs/cephfs.hpp"
+#include "backend/local/local.hpp"
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
 #include "core/file_handle.hpp"

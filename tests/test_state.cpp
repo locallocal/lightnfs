@@ -15,7 +15,7 @@
 #include <mutex>
 #include <thread>
 
-#include "backend/memory.hpp"
+#include "backend/memory/memory.hpp"
 #include "runtime/io.hpp"
 #include "runtime/runtime.hpp"
 #include "state/state_mgr.hpp"

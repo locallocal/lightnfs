@@ -15,8 +15,8 @@
 #include <filesystem>
 #include <thread>
 
-#include "backend/local.hpp"
-#include "backend/memory.hpp"
+#include "backend/local/local.hpp"
+#include "backend/memory/memory.hpp"
 #include "core/config.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"

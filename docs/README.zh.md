@@ -142,8 +142,9 @@ src/
   nfsv3/      v3 引擎与线上类型
   nfsv4/      v4.1/4.2 引擎、属性、线上类型
   mountd/     MOUNTv3
-  backend/    后端接口、local、lustre（本地核心之上的 FID/HSM）、gluster（libgfapi）、
-              cephfs（libcephfs）与 memory 后端
+  backend/    后端接口、注册表与故障注入钩子；每个后端一个子目录：local/、memory/、
+              gluster/（含 libgfapi 绑定）、lustre/（本地核心之上的 FID/HSM，含 ioctl
+              uapi 绑定）、cephfs/（含 libcephfs 绑定）
   obs/        指标、错误日志
   main.cpp    lightnfsd
 tools/        lightnfs-ctl（管理 CLI + tools/bench/ 下的三层基准与基线）、lightnfs-fh

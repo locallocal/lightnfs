@@ -63,15 +63,15 @@ endif()
 # ---- core library ----
 add_library(lnfs_core STATIC
   src/backend/api.cpp
-  src/backend/cephapi.cpp
-  src/backend/cephfs.cpp
+  src/backend/cephfs/cephapi.cpp
+  src/backend/cephfs/cephfs.cpp
   src/backend/fault.cpp
-  src/backend/gfapi.cpp
-  src/backend/gluster.cpp
-  src/backend/llapi.cpp
-  src/backend/local.cpp
-  src/backend/lustre.cpp
-  src/backend/memory.cpp
+  src/backend/gluster/gfapi.cpp
+  src/backend/gluster/gluster.cpp
+  src/backend/lustre/llapi.cpp
+  src/backend/local/local.cpp
+  src/backend/lustre/lustre.cpp
+  src/backend/memory/memory.cpp
   src/core/boot_epoch.cpp
   src/core/config.cpp
   src/core/file_handle.cpp
@@ -114,7 +114,7 @@ add_library(lnfs_core STATIC
 )
 target_include_directories(lnfs_core PUBLIC src ${LIBURING_INCLUDE_DIR})
 target_link_libraries(lnfs_core PUBLIC ${LIBURING_LIBRARY} Threads::Threads
-  spdlog::spdlog ${CMAKE_DL_LIBS})  # dl: runtime-loaded libgfapi / libcephfs (backend/gfapi.cpp, cephapi.cpp)
+  spdlog::spdlog ${CMAKE_DL_LIBS})  # dl: runtime-loaded libgfapi / libcephfs (backend/gluster/gfapi.cpp, backend/cephfs/cephapi.cpp)
 target_compile_definitions(lnfs_core PUBLIC LIGHTNFS_VERSION="${PROJECT_VERSION}")
 if(LNFS_RING STREQUAL "epoll")
   target_compile_definitions(lnfs_core PUBLIC LNFS_DEFAULT_RING_EPOLL=1)

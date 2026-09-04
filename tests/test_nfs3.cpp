@@ -5,7 +5,7 @@
 #include <array>
 
 #include "backend/fault.hpp"
-#include "backend/memory.hpp"
+#include "backend/memory/memory.hpp"
 #include "rpc/drc.hpp"
 #include "core/config.hpp"
 #include "core/errmap.hpp"
