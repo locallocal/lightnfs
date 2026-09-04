@@ -87,6 +87,8 @@ EXCLUSIVE 重放、匿名/open-state IO、粘性 commit、v4.2、身份透传、
 
 ## 4. 三层基准（02 分册 §2.8）
 
+工具用法、参数与门禁规则见 [benchmarks.md](benchmarks.md)。
+
 基线（`tools/bench/baseline.txt`，单 reactor、4 连接、32 流水线、io_uring、本机 Release）：
 
 | 层 | 基准 | 基线 rps | 近期实测（2026-08-23） |

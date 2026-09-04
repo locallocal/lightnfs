@@ -221,6 +221,7 @@ Benchmarks (design 02 §2.8 three layers):
 ./build/lightnfs-ctl bench nullrpc  1 4 20000 32      # L2: null RPC (gate: ≥100k rps single reactor)
 ./build/lightnfs-ctl bench fullpath 1 4 20000 32 read # L4: full NFS path over the memory backend
 scripts/bench_gate.sh                       # all three against tools/bench/baseline.txt
+                                            # (usage guide: docs/performance/benchmarks.md)
 ```
 
 ## Configuration
@@ -410,6 +411,7 @@ pending a target cluster and v4 open/deny state stays per gateway.
 - Protocol research: [docs/nfsv3/](docs/nfsv3/README.md), [docs/nfsv4/](docs/nfsv4/README.md)
 - Operations: [deployment guide](docs/deployment.md),
   [security checklist](docs/security-checklist.md)
-- Performance and test evidence: [docs/performance/](docs/performance/test-report.md) —
-  conformance runs (cthon / pynfs / fsx), the three-layer benchmark numbers against
-  `tools/bench/baseline.txt`, unit/fuzz/backend test coverage
+- Performance: [benchmark tool guide](docs/performance/benchmarks.md) (`lightnfs-ctl bench`,
+  `scripts/bench_gate.sh`, baseline policy, real-mount fio guidance) and the
+  [test report](docs/performance/test-report.md) — conformance runs (cthon / pynfs / fsx),
+  benchmark numbers against `tools/bench/baseline.txt`, unit/fuzz/backend test coverage

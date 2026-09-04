@@ -127,5 +127,5 @@ class ObjLockRegistry {
 ## 2.8 测试策略
 
 - 运行时单测不依赖真实 uring：`Reactor` 之下抽一层 `RingOps` 供 fake 注入（时序穿插、注入 EINTR/短读）。
-- 压测基准：echo 服务器（传输层）、null-RPC（L2）、伪后端（L4 以上全链路，memory 后端零延迟）——三层基准锁定各层开销预算；随 `lightnfs-ctl bench echo|nullrpc|fullpath` 交付，`scripts/bench_gate.sh` 对照 `tools/bench/baseline.txt` 做地板门禁。
+- 压测基准：echo 服务器（传输层）、null-RPC（L2）、伪后端（L4 以上全链路，memory 后端零延迟）——三层基准锁定各层开销预算；随 `lightnfs-ctl bench echo|nullrpc|fullpath` 交付，`scripts/bench_gate.sh` 对照 `tools/bench/baseline.txt` 做地板门禁（用法见 [performance/benchmarks.md](../performance/benchmarks.md)）。
 - TSAN/ASAN 全量跑单测（`scripts/ci.sh` 矩阵）；协程生命周期错误（悬垂 frame、双恢复）依赖 sanitizer 构建捕获，没有单独的 frame 哨兵机制。
