@@ -22,11 +22,9 @@
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "runtime/runtime.hpp"
-#include "server/ctl.hpp"
+#include "server/frontend.hpp"
 #include "server/metrics_providers.hpp"
 #include "server/protocol_stack.hpp"
-#include "server/rpcbind.hpp"
-#include "transport/listener.hpp"
 #include "util/log.hpp"
 
 namespace {
@@ -143,145 +141,6 @@ void stop_backends(lnfs::rt::Runtime& runtime, lnfs::core::ExportTable& exports)
     (void)run_backend_hook(runtime.reactor(0), entry->backend->stop());
 }
 
-// North side: NFS/MOUNT listeners, ctl socket, optional metrics HTTP, rpcbind
-// registration. ctl/metrics failures degrade with a warning; listener failure aborts.
-struct Frontend {
-  std::unique_ptr<lnfs::transport::Listener> nfs, mount;
-  std::unique_ptr<lnfs::server::CtlServer> ctl;        // null when unavailable
-  std::unique_ptr<lnfs::server::MetricsHttp> metrics;  // null when disabled/unavailable
-  // RPC-over-TLS (RFC 9289): process-global server context (null when tls = off); it
-  // outlives every connection served by the listeners below.
-  std::unique_ptr<lnfs::transport::TlsContext> tls;
-  // `ctl drain` state (plan doc 10 §4.2): heap-owned so Frontend stays movable while
-  // CtlDeps keeps a stable pointer.
-  std::shared_ptr<std::atomic<bool>> draining = std::make_shared<std::atomic<bool>>(false);
-};
-
-std::optional<Frontend> start_frontend(const lnfs::core::ServerConfig& cfg,
-                                       lnfs::rt::Runtime& runtime, ProtocolStack& stack,
-                                       CoreState& core,
-                                       std::function<std::string()> reload) {
-  lnfs::transport::TransportConfig transport_cfg;
-  transport_cfg.max_request_size = cfg.max_request_size;
-  transport_cfg.max_inflight_per_conn = cfg.inflight_per_conn;
-  transport_cfg.max_connections = cfg.max_connections;
-  transport_cfg.per_peer_limit = cfg.per_peer_limit;
-
-  // RPC-over-TLS (RFC 9289, plan doc 10 §5.4): build the server context before the
-  // listeners so both the NFS and MOUNT ports offer STARTTLS.  A cert/key error aborts
-  // startup (config validation already checked the mode and file presence).
-  std::unique_ptr<lnfs::transport::TlsContext> tls_ctx;
-  if (cfg.tls_mode != "off") {
-    lnfs::transport::TlsConfig tls_cfg;
-    tls_cfg.policy = cfg.tls_mode == "required" ? lnfs::transport::TlsPolicy::kRequired
-                                                : lnfs::transport::TlsPolicy::kOptional;
-    tls_cfg.cert = cfg.tls_cert;
-    tls_cfg.key = cfg.tls_key;
-    tls_cfg.ca = cfg.tls_ca;
-    tls_cfg.require_client_cert = cfg.tls_require_client_cert;
-    auto ctx = lnfs::transport::TlsContext::create(tls_cfg);
-    if (!ctx) {
-      LNFS_ERROR("cannot initialize TLS ({} mode): {}", cfg.tls_mode,
-                 lnfs::errno_name(ctx.error()));
-      return std::nullopt;
-    }
-    tls_ctx = std::move(*ctx);
-    transport_cfg.tls = tls_ctx.get();
-    transport_cfg.tls_policy = tls_cfg.policy;
-    LNFS_INFO("RPC-over-TLS enabled (mode={}, mutual={})", cfg.tls_mode,
-              cfg.tls_require_client_cert);
-  }
-
-  auto nfs_listener = lnfs::transport::Listener::create(cfg.port, transport_cfg,
-                                                        stack.dispatcher, runtime, cfg.bind);
-  auto mount_listener = lnfs::transport::Listener::create(
-      cfg.mount_port, transport_cfg, stack.dispatcher, runtime, cfg.bind);
-  if (!nfs_listener || !mount_listener) {
-    LNFS_ERROR("cannot create listeners: nfs={} mount={}",
-               nfs_listener ? "ok" : lnfs::errno_name(nfs_listener.error()),
-               mount_listener ? "ok" : lnfs::errno_name(mount_listener.error()));
-    return std::nullopt;
-  }
-  Frontend fe{std::move(*nfs_listener), std::move(*mount_listener), nullptr, nullptr,
-              std::move(tls_ctx)};
-  fe.nfs->start();    // per-reactor REUSEPORT accept loops (plan doc 10 §2.3)
-  fe.mount->start();
-  // Buffer-pool watermark (plan doc 10 §3.5); the listeners are heap-allocated and
-  // outlive every metrics scrape (frontend stops before run_server returns).
-  lnfs::obs::register_text_provider(
-      [nfs = fe.nfs.get(), mount = fe.mount.get()](std::string& out) {
-        out += std::format(
-            "lightnfs_buffer_pool_free_bytes{{listener=\"nfs\"}} {}\n"
-            "lightnfs_buffer_pool_free_bytes{{listener=\"mount\"}} {}\n",
-            nfs->pool().free_bytes(), mount->pool().free_bytes());
-      });
-
-  std::string ctl_path =
-      cfg.ctl_socket.empty() ? cfg.state_dir + "/ctl.sock" : cfg.ctl_socket;
-  // `drain` stops the accept loops but keeps serving established connections — the
-  // graceful way off a load balancer (plan doc 10 §4.2).  Irreversible until restart.
-  auto drain = [nfs = fe.nfs.get(), mount = fe.mount.get(),
-                draining = fe.draining]() -> std::string {
-    if (draining->exchange(true, std::memory_order_relaxed))
-      return "already draining\n";
-    nfs->request_stop();
-    mount->request_stop();
-    LNFS_INFO("draining: accept loops stopped, serving existing connections only");
-    return "draining: no new connections will be accepted\n";
-  };
-  auto ctl = lnfs::server::CtlServer::create(
-      ctl_path, {.exports = core.exports.get(),
-                 .drc = &stack.drc,
-                 .state = &stack.state,
-                 .reload = std::move(reload),
-                 .drain = std::move(drain),
-                 .draining = fe.draining.get(),
-                 .started = std::chrono::steady_clock::now()});
-  if (ctl) {
-    fe.ctl = std::move(*ctl);
-    lnfs::rt::spawn(fe.ctl->run(), runtime.reactor(1 % runtime.reactor_count()));
-  } else {
-    LNFS_WARN("ctl socket unavailable at {}: {}", ctl_path, lnfs::errno_name(ctl.error()));
-  }
-
-  if (cfg.metrics_port != 0) {
-    std::vector<lnfs::core::Cidr> allow;
-    for (const auto& text : cfg.metrics_allow) {
-      auto cidr = lnfs::core::Cidr::parse(text);  // validated at config load
-      if (cidr) allow.push_back(std::move(*cidr));
-    }
-    auto metrics = lnfs::server::MetricsHttp::create(cfg.metrics_port, cfg.metrics_bind,
-                                                     std::move(allow));
-    if (metrics) {
-      fe.metrics = std::move(*metrics);
-      lnfs::rt::spawn(fe.metrics->run(), runtime.reactor(2 % runtime.reactor_count()));
-    } else {
-      LNFS_WARN("metrics endpoint {}:{} unavailable", cfg.metrics_bind, cfg.metrics_port);
-    }
-  }
-
-  if (cfg.rpcbind) {
-    auto nfs_reg = lnfs::server::rpcbind_set(lnfs::nfsv3::kProgram, lnfs::nfsv3::kVersion,
-                                             fe.nfs->port());
-    auto mount_reg = lnfs::server::rpcbind_set(lnfs::mountd::kProgram,
-                                               lnfs::mountd::kVersion, fe.mount->port());
-    if (!nfs_reg || !mount_reg)
-      LNFS_WARN("rpcbind registration unavailable; use explicit port/mountport options");
-  }
-  return fe;
-}
-
-void stop_frontend(const lnfs::core::ServerConfig& cfg, Frontend& fe) {
-  fe.nfs->request_stop();
-  fe.mount->request_stop();
-  if (fe.ctl) fe.ctl->request_stop();
-  if (fe.metrics) fe.metrics->request_stop();
-  if (cfg.rpcbind) {
-    (void)lnfs::server::rpcbind_unset(lnfs::nfsv3::kProgram, lnfs::nfsv3::kVersion);
-    (void)lnfs::server::rpcbind_unset(lnfs::mountd::kProgram, lnfs::mountd::kVersion);
-  }
-}
-
 void wait_for_shutdown_signal(const std::function<void()>& on_reload) {
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
@@ -385,7 +244,7 @@ int run_server(const std::string& config_path, bool check_only) {
     return report.empty() ? "nothing to apply\n" : report;
   };
 
-  auto frontend = start_frontend(server_cfg, runtime, stack, *core, do_reload);
+  auto frontend = lnfs::server::Frontend::start(server_cfg, runtime, stack, *core, do_reload);
   if (!frontend) {
     runtime.stop_and_join();
     return 1;
@@ -402,7 +261,7 @@ int run_server(const std::string& config_path, bool check_only) {
   });
 
   stack.lease_stop.store(true);
-  stop_frontend(server_cfg, *frontend);
+  frontend->stop(server_cfg);
   stop_backends(runtime, *core->exports);
   runtime.stop_and_join();
   LNFS_INFO("lightnfs stopped");
