@@ -187,12 +187,11 @@ struct OpenCtx {                       // IO 调用的第一参数
 
 - `open == nullptr`（v3 路径 / v4 特殊 stateid）时后端**必须**仍能完成 IO——本地后端用内部 fd 缓存按需开（06 分册 6.3），gluster/cephfs 用以网关身份打开的每对象 glfd/Fh 缓存（门禁在网关侧完成）。
 
-**实现（2026-08-28，plan doc 10 §5.1）**：`LocalObject::open` 已实现——每 OPEN 一个
+**实现（2026-08-28）**：`LocalObject::open` 已实现——每 OPEN 一个
 独立数据 fd（读 O_RDONLY / 写 O_RDWR），read/write/seek 优先走它（open 时定权限的
 POSIX 语义，免 fd 缓存往返）；打不开时降级返回 EOPNOTSUPP，引擎继续走匿名路径，
 行为与之前一致。同 owner 合并升级（读→读写）时状态层保留原句柄，写路径检测到句柄
-不可写自动回落 fd 缓存。memory 后端维持 EOPNOTSUPP。**第二个生产者**（2026-09-03，
-plan doc 10 §5.3）：gluster 的 `GlusterOpenState` 持每 OPEN 一个 glfd（`glfs_h_open`
+不可写自动回落 fd 缓存。memory 后端维持 EOPNOTSUPP。**第二个生产者**（2026-09-03）：gluster 的 `GlusterOpenState` 持每 OPEN 一个 glfd（`glfs_h_open`
 以调用者身份打开）；kNativeAccess 后端的 `open()` 不做 EOPNOTSUPP 降级——EACCES 就是
 OPEN 的答案，v4 引擎据此跳过网关侧 `access()` 预检。其后 lustre（继承 `LocalObject::open`，
 外加 HSM 门禁）与 cephfs（`CephOpenState`，`ceph_ll_open` 以调用者 UserPerm 打开）也成为
@@ -227,7 +226,7 @@ public:
 
 原设想：网关内 LockMgr（07 分册）实现同一接口，`native_locks()` 有值时状态层**改用**后端实现。实际落地为**叠加**（见下），网关表始终权威。
 
-**实现（2026-09-03，plan doc 10 §5.3）**：接口新增一个可选操作
+**实现（2026-09-03）**：接口新增一个可选操作
 `release(Object&, const LockOwnerId&)`（默认 = 全区间 `unlock`；gluster 覆写为关闭该
 owner 的 glfd）。状态层不是"改用"而是"叠加"：网关表继续负责 stateid/本地冲突/courtesy
 回收/CB_NOTIFY_LOCK，`StateMgr::Config::native_locks` 钩子把每次 LOCK/LOCKU/LOCKT

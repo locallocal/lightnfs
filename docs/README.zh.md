@@ -335,7 +335,7 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
 
 ## 项目状态与路线
 
-按 [design/09-roadmap.md](design/09-roadmap.md) 的路线分阶段推进，每阶段以验收收尾：
+开发分阶段推进，每阶段以验收收尾：
 
 | 阶段 | 里程碑 | 内容 |
 |------|--------|------|
@@ -366,7 +366,7 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
 ## 文档索引
 
 - 设计：[design/](design/README.md)——架构、运行时/并发、传输/RPC/XDR、NFS 核心、
-  后端接口、后端实现、状态管理、配置/可观测性、路线图、v1 后优化/功能落地记录
+  后端接口、后端实现、状态管理、配置/可观测性
 - 协议调研：[nfsv3/](nfsv3/README.md)、[nfsv4/](nfsv4/README.md)
 - 运维：[部署指南](deployment.md)、[安全清单](security-checklist.md)
 - 性能与测试证据：[performance/](performance/test-report.md)——协议一致性（cthon / pynfs /

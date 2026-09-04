@@ -29,7 +29,7 @@ class LocalObject final : public Object {
 ```
 
 实现中有两层缓存：O_PATH 解析缓存（`resolve()` 命中免去 open_by_handle_at 往返，
-`lightnfs_fdcache_path_*` 指标，plan doc 10 §2.1）与本节的数据 fd 缓存。
+`lightnfs_fdcache_path_*` 指标）与本节的数据 fd 缓存。
 
 - `getattr` → `uring_statx(fd 或 AT_EMPTY_PATH)`，`Attr::change` 取 `STATX_CHANGE_COOKIE`（内核 ≥6.6 且 fs 支持 → 置 kNativeChange；否则 core 合成，见 05 分册 5.6）。
 - `lookup` → `openat(dirfd, name, O_PATH|O_NOFOLLOW)` + `name_to_handle_at` → 新 LocalObject。O_NOFOLLOW + `name` 禁 `/` 与 NUL：路径逃逸防御双保险（core 已校验一次）。
@@ -87,7 +87,7 @@ Lustre 客户端挂载就是一棵 POSIX 树，因此 **`LustreBackend : LocalBa
 | IO | 继承本地：io_uring pread/pwrite/writev，分片 fd 缓存（读→写升级），commit = fdatasync + 粘性 poison | 大条带顺序 IO 直通 |
 | change | ctime 合成（05 §5.6），**不置 kNativeChange** | 时间戳由 MDT 签发，跨网关一致；`LL_IOC_DATA_VERSION` 每条带一次 OST 往返且只覆盖数据，不上 GETATTR 路径 |
 | statfs/limits | `fstatvfs`（Lustre 聚合 OST）；`pref_read/pref_write` = 导出根默认条带大小（`lustre.lov` xattr：V1/V3 直接取，复合布局取首组件），钳到 [4K, max_read/max_write] | FSINFO 通告条带对齐值 |
-| native_locks | `LustreLockMgr`：每 (文件, lock-owner) 一个 fd + `F_OFD_SETLK/F_OFD_GETLK`；`-o flock` 挂载时由 MDS 全局仲裁 → **kByteLocks**，`native_locks()` 交给状态层下推（07 册 / plan doc 10 §5.3 同一条链路） | `localflock` 或非 Lustre 文件系统上仅主机内有效；`test()` 用新 fd 探测（OFD 不报告持有者，owner 置空 = "别人"）；`release()` 全区间解锁并关 fd；`native_locks=false` 关闭 |
+| native_locks | `LustreLockMgr`：每 (文件, lock-owner) 一个 fd + `F_OFD_SETLK/F_OFD_GETLK`；`-o flock` 挂载时由 MDS 全局仲裁 → **kByteLocks**，`native_locks()` 交给状态层下推（07 册 §7.6 同一条链路） | `localflock` 或非 Lustre 文件系统上仅主机内有效；`test()` 用新 fd 探测（OFD 不报告持有者，owner 置空 = "别人"）；`release()` 全区间解锁并关 fd；`native_locks=false` 关闭 |
 | kJukebox | 数据 fd 打开后 `LL_IOC_HSM_STATE_GET`：HS_RELEASED → 若无进行中动作则 `LL_IOC_HSM_REQUEST(RESTORE)` 一次，返回 `kJukebox`（v3 JUKEBOX / v4 DELAY；v4 OPEN 也回 DELAY 而非降级为匿名路径）→ **kJukebox** | 避免 offload / io_uring 工作线程阻塞在内核隐式 restore 上；只门禁常规文件；无 HSM 的客户端（ENOTTY）不门禁；`hsm=false` 关闭 |
 | 身份 | 继承 `identity = check \| strict \| setfsuid` | Lustre 在 MDS 侧按 fsuid 判权，root 网关宜用 setfsuid |
 
@@ -108,7 +108,7 @@ released → JUKEBOX → restore 后可读、原生锁、条带 → limits、挂
 时间戳精度）；描述符已在 fd 缓存中的文件被释放时，后续 IO 仍像原生客户端一样阻塞在
 restore 上（门禁只在打开时刻）；OFD 锁的探测无法辨认持有者身份。
 
-## 6.6 映射验证：GlusterFS 后端 ✅ 已实现（2026-09-03，plan doc 10 §5.3）
+## 6.6 映射验证：GlusterFS 后端 ✅ 已实现（2026-09-03）
 
 | Backend API | libgfapi 映射（实现） | 备注 |
 |-------------|--------------|------|
@@ -121,7 +121,7 @@ restore 上（门禁只在打开时刻）；OFD 锁的探测无法辨认持有�
 | readdir | `glfs_h_opendir` + `glfs_seekdir(cookie)` + `glfs_xreaddirplus_r(STAT\|HANDLE)`，d_off 作 cookie；每页一个目录 glfd | 富化：attr 取 xstat 的 stat，oid 取 xstat 对象的 GFID（对象随 `glfs_free(xstat)` 释放） |
 | change | 无原生 → 不置 kNativeChange，`change = ctime` 合成（05 §5.6）；v4.2 `change_attr_type = TIME_METADATA` | 多网关部署的 CTO 依赖 ctime 精度（文档限制） |
 | v4.2 | `glfs_lseek(SEEK_DATA/HOLE)` / `glfs_fallocate(0)` / `glfs_discard` → kSparseOps；`glfs_copy_file_range`（EXDEV/EOPNOTSUPP/ENOSYS/EINVAL 回落 pread/pwrite）→ kCopyRange | 无 CLONE |
-| locks | `GlusterLockMgr`：每 (文件, lock-owner) 一个 glfd（网关身份 O_RDWR，EACCES 回落 O_RDONLY）+ `glfs_fd_set_lkowner`，`glfs_posix_lock(F_SETLK)`；冲突 EAGAIN；`test()` 用探测 owner 的 F_GETLK；`release()` 全量解锁并关 glfd → **kByteLocks**，`native_locks()` 交给状态层下推（07 册 / plan doc 10 §5.3） | `native_locks=false` 关闭 |
+| locks | `GlusterLockMgr`：每 (文件, lock-owner) 一个 glfd（网关身份 O_RDWR，EACCES 回落 O_RDONLY）+ `glfs_fd_set_lkowner`，`glfs_posix_lock(F_SETLK)`；冲突 EAGAIN；`test()` 用探测 owner 的 F_GETLK；`release()` 全量解锁并关 glfd → **kByteLocks**，`native_locks()` 交给状态层下推（07 册 §7.6） | `native_locks=false` 关闭 |
 | jukebox | ENOTCONN/ETIMEDOUT/ENETDOWN/ENETUNREACH/EHOSTUNREACH/EHOSTDOWN → `kJukebox`（v3 JUKEBOX / v4 DELAY）→ **kJukebox** | 砖块重连/仲裁丢失期间客户端重试而非报错；`jukebox=false` 时回 EIO |
 
 **绑定方式**：`backend/gluster/gfapi.hpp` 定义一张 47 项函数表（签名取自 GlusterFS 11 的
@@ -157,7 +157,7 @@ fd_cache  = 4096
 readdir_enrich = true
 identity  = "check"               # check|strict|setfsuid（需 root）
 
-# GlusterFS（已实现，plan doc 10 §5.3）：path 只是客户端挂载名，树在卷里
+# GlusterFS（已实现）：path 只是客户端挂载名，树在卷里
 [[export]]
 path      = "/gluster"
 backend   = "gluster"
@@ -213,10 +213,10 @@ mount          = "/mnt/lustre"    # 挂载根，默认自动探测（沿父目�
 # native_locks = true             # v4 字节锁 → OFD fcntl 锁（-o flock 挂载时 MDS 全局仲裁）
 ```
 
-## 6.8 映射验证：CephFS 后端 ✅ 已实现（2026-09-04，plan doc 10 §5.3）
+## 6.8 映射验证：CephFS 后端 ✅ 已实现（2026-09-04）
 
-第四个后端，也是第一个**同时**具备原生 change 计数与原生字节锁的后端——09 册"多网关一致性
-两位同时具备的后端"由此出现。
+第四个后端，也是第一个**同时**具备原生 change 计数与原生字节锁的后端——多网关一致性的两个
+前提由此首次在同一个后端上具备。
 
 | Backend API | libcephfs 映射（实现） | 备注 |
 |-------------|--------------|------|

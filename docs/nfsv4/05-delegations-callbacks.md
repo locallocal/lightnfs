@@ -62,5 +62,5 @@ GET_DIR_DELEGATION 允许客户端缓存目录内容并由服务器用 CB_NOTIFY
 委托是可选项，且是 v4 实现中"做错代价 > 不做代价"的典型：
 
 1. **第一阶段：不发任何委托**（OPEN 一律 delegation=NONE，不实现 CB 服务即可，4.1 会话仍需宣告回传通道但可永不使用）。完全合规，Linux 客户端毫无怨言。——v1 发布时的状态。
-2. 第二阶段：只发**读委托**，实现 CB_RECALL + DELEGRETURN + 召回超时吊销。收益（元数据往返骤减）/复杂度比最高。——**已实现**（2026-08-28，plan doc 10 §5.2）：只对绑定了回传通道的会话授予，冲突操作 CB_RECALL + DELAY，租约期内不归还则吊销；`[protocol] delegations = false` 可关；回传通道另用于 CB_NOTIFY_LOCK。
+2. 第二阶段：只发**读委托**，实现 CB_RECALL + DELEGRETURN + 召回超时吊销。收益（元数据往返骤减）/复杂度比最高。——**已实现**（2026-08-28）：只对绑定了回传通道的会话授予，冲突操作 CB_RECALL + DELAY，租约期内不归还则吊销；`[protocol] delegations = false` 可关；回传通道另用于 CB_NOTIFY_LOCK。
 3. 写委托 + CB_GETATTR：等有真实的单写者工作负载证据再做。——仍不做。
