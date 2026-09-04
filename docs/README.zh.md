@@ -367,7 +367,7 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
 ## 文档索引
 
 - 设计：[design/](design/README.md)——架构、运行时/并发、传输/RPC/XDR、NFS 核心、
-  后端接口、后端实现、状态管理、配置/可观测性
+  后端接口、后端实现、状态管理、配置/可观测性、多网关无感故障切换（方案）
 - 协议调研：[nfsv3/](nfsv3/README.md)、[nfsv4/](nfsv4/README.md)
 - 运维：[部署指南](deployment.md)、[安全清单](security-checklist.md)
 - 性能：[基准工具使用指南](performance/benchmarks.md)（`lightnfs-ctl bench`、
