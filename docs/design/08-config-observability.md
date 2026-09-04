@@ -85,6 +85,10 @@ SLI 建议：READ/WRITE p99、GETATTR p99、错误率、grace 时长。
 histogram 语义）；v4 按 op 展开 calls/errors/duration，另有整 COMPOUND 直方图；
 per-export 维度落地为带 `{export,fsid}` 标签的数据面计数（read/write bytes+ops、
 fd 缓存）；runtime 组含 offload 队列深度、buffer 池水位、reactor 循环忙时直方图。
+分工：引擎热路径上的计数与直方图在 `obs/metrics.{hpp,cpp}`（含文本提供者注册表）；
+读取其他子系统统计的提供者——DRC、v4 状态表、每导出数据面 + 各后端缓存/jukebox/锁句柄、
+runtime 的 offload 池与 reactor 循环——在 `server/metrics_providers.{hpp,cpp}`
+（`register_metrics_providers(MetricsSources)`），由 `main.cpp` 在协议栈装配后调用一次。
 
 ## 8.4 追踪
 
