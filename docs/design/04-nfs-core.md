@@ -14,7 +14,7 @@ nfsv3 (22 procs) + mountd        nfsv4 (COMPOUND 解释器 + op_*)
               backend::Backend（05 分册）
 ```
 
-原则：**引擎只做"协议格式 ↔ core 调用"的翻译**。任何一处业务判断（权限、句柄、原子采样、错误映射）都必须落在 core，防止 v3/v4 语义漂移。
+原则：**引擎只做"协议格式 ↔ core 调用"的翻译**。任何一处业务判断（权限、句柄、原子采样、错误映射）都必须落在 core，防止 v3/v4 语义漂移。两个引擎、MOUNT、DRC、per-object 锁注册表与 StateMgr 由 `server/protocol_stack.{hpp,cpp}` 的 `ProtocolStack` 按依赖顺序构造并挂到同一个 RPC dispatcher（`CoreState` 提供导出表、句柄密钥与 boot epoch）。
 
 ## 4.2 core 的关键服务
 
