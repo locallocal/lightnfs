@@ -58,11 +58,6 @@ lnfs::Result<void> run_backend_hook(lnfs::rt::Reactor& reactor,
   return result;
 }
 
-// ---- run_server phases -----------------------------------------------------
-// Startup order (config → identity → backends → engines → listeners) and the
-// mirror-image shutdown live in run_server; each phase below is one self-contained
-// step of it.
-
 // Parse + validate the TOML. nullopt after logging the reason.
 std::optional<lnfs::core::Config> load_validated_config(const std::string& path) {
   auto config = lnfs::core::load_config(path);
@@ -154,6 +149,11 @@ void wait_for_shutdown_signal(const std::function<void()>& on_reload) {
   }
 }
 
+// ---- run_server ----------------------------------------------------------------
+// Startup order (config → identity → backends → engines → frontend) and the
+// mirror-image shutdown; each phase is one of the self-contained helpers above
+// (load_validated_config / build_core_state / start_backends, ProtocolStack,
+// Frontend::start) or a server/ module.
 int run_server(const std::string& config_path, bool check_only) {
   auto config = load_validated_config(config_path);
   if (!config) return 1;
