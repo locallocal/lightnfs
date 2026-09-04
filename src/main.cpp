@@ -20,6 +20,7 @@
 
 #include "backend/gluster.hpp"
 #include "backend/lustre.hpp"
+#include "backend/cephfs.hpp"
 #include "backend/local.hpp"
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
@@ -297,6 +298,25 @@ void register_metrics_providers(ProtocolStack& stack, lnfs::core::ExportTable& e
             "lightnfs_gluster_lock_fds{{{0}}} {10}\n",
             labels, s.fd_hits, s.fd_misses, s.fd_upgrades, s.fd_evictions, s.fd_entries,
             s.obj_hits, s.obj_misses, s.obj_entries, s.jukebox, s.lock_fds);
+        continue;
+      }
+      // CephFS backend caches + jukebox/blocklist/lock-handle counters (06 §6.8).
+      if (auto* c = dynamic_cast<lnfs::backend::CephBackend*>(entry->backend.get())) {
+        auto s = c->stats();
+        out += std::format(
+            "lightnfs_cephfs_fdcache_hits_total{{{0}}} {1}\n"
+            "lightnfs_cephfs_fdcache_misses_total{{{0}}} {2}\n"
+            "lightnfs_cephfs_fdcache_upgrades_total{{{0}}} {3}\n"
+            "lightnfs_cephfs_fdcache_evictions_total{{{0}}} {4}\n"
+            "lightnfs_cephfs_fdcache_entries{{{0}}} {5}\n"
+            "lightnfs_cephfs_objcache_hits_total{{{0}}} {6}\n"
+            "lightnfs_cephfs_objcache_misses_total{{{0}}} {7}\n"
+            "lightnfs_cephfs_objcache_entries{{{0}}} {8}\n"
+            "lightnfs_cephfs_jukebox_total{{{0}}} {9}\n"
+            "lightnfs_cephfs_blocklisted_total{{{0}}} {10}\n"
+            "lightnfs_cephfs_lock_fds{{{0}}} {11}\n",
+            labels, s.fd_hits, s.fd_misses, s.fd_upgrades, s.fd_evictions, s.fd_entries,
+            s.obj_hits, s.obj_misses, s.obj_entries, s.jukebox, s.blocklisted, s.lock_fds);
         continue;
       }
       // Lustre extras (design 06 §6.5): HSM gate + native lock descriptors; the fd /

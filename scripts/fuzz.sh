@@ -18,7 +18,7 @@ build=${LNFS_FUZZ_BUILD_DIR:-$repo/build-fuzz}
 jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
 ((jobs > 0)) || jobs=1
 
-targets=(handle_request file_handle config record_stream v4_attrs objid_local objid_gluster objid_lustre)
+targets=(handle_request file_handle config record_stream v4_attrs objid_local objid_gluster objid_lustre objid_cephfs)
 # target -> dictionary (empty = none)
 dict_for() {
   case $1 in

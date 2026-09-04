@@ -193,11 +193,11 @@ OPEN 的答案，v4 引擎据此跳过网关侧 `access()` 预检。
 
 ## 5.6 change 属性契约
 
-- kNativeChange 后端：`Attr::change` 来自存储原生计数（statx `STATX_CHANGE_COOKIE`、Lustre 版本号、gluster 无 → 不置位）。
+- kNativeChange 后端：`Attr::change` 来自存储原生计数（statx `STATX_CHANGE_COOKIE`、CephFS `stx_version`；Lustre/gluster 无 → 不置位）。
 - 无此能力时 **core 合成**：`change = ctime.sec*1e9 + ctime.nsec`，并在网关内对活跃对象维护"最近一次本网关修改后的单调递增修正"（防同 ns 双改）。多网关同挂一个后端时合成 change 不可靠——文档级限制，多网关部署要求 kNativeChange 后端。
 - **消费端（2026-09-03）**：v4.2 属性 `change_attr_type`(79) 据此位宣告 MONOTONIC_INCR
   （原生计数）或 TIME_METADATA（ctime 合成）；`core::FsProps::native_change` 是引擎侧
-  的读取点。gluster 后端不置位（无原生计数）。
+  的读取点。gluster/lustre 后端不置位（无原生计数）；cephfs 后端置位（MDS change attribute，2026-09-04）。
 
 ## 5.7 readdir cookie 契约（后端必须满足）
 
@@ -223,7 +223,8 @@ v1：网关内 LockMgr（07 分册）实现同一接口，单网关正确；`nat
 owner 的 glfd）。状态层不是"改用"而是"叠加"：网关表继续负责 stateid/本地冲突/courtesy
 回收/CB_NOTIFY_LOCK，`StateMgr::Config::native_locks` 钩子把每次 LOCK/LOCKU/LOCKT
 额外下推——后端拒绝（EAGAIN）则回滚网关授予并回 DENIED，后端错误回 DELAY/SERVERFAULT。
-第一个真实实现是 `GlusterLockMgr`（`glfs_posix_lock` + `glfs_fd_set_lkowner`）。
+第一个真实实现是 `GlusterLockMgr`（`glfs_posix_lock` + `glfs_fd_set_lkowner`）；其后
+`LustreLockMgr`（OFD 锁）与 `CephLockMgr`（`ceph_ll_setlk`，MDS 仲裁）复用同一条下推链路。
 
 ## 5.9 语义契约汇总（后端实现者检查表）
 

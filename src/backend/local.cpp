@@ -24,6 +24,7 @@
 #include "backend/fault.hpp"
 #include "backend/gluster.hpp"
 #include "backend/lustre.hpp"
+#include "backend/cephfs.hpp"
 #include "runtime/io.hpp"
 #include "runtime/offload_pool.hpp"
 #include "util/log.hpp"
@@ -1679,6 +1680,7 @@ void register_builtin_backends() {
     register_backend({"local", kBackendApiVersion, make_local});
     register_gluster_backend();
     register_lustre_backend();
+    register_cephfs_backend();
     return true;
   }();
   (void)once;

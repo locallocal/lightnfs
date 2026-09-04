@@ -111,6 +111,33 @@ readdir_enrich = true
 # jukebox = true              # transport errors → JUKEBOX/DELAY (client retries); false → EIO
 # native_locks = true         # push v4 byte-range locks into the volume (posix-locks)
 
+# CephFS export (design 06 §6.8): the tree lives in the filesystem, `path` is only the
+# name clients mount.  libcephfs.so.2 is loaded at runtime (libcephfs2); every call runs on
+# the offload pool.  The first backend with both a native change counter (stx_version →
+# change_attr_type = MONOTONIC_INCR) and native byte-range locks (MDS-arbitrated), i.e.
+# both halves of multi-gateway coherence.
+# [[export]]
+# path = "/cephfs"
+# backend = "cephfs"
+# fsid = 4
+# clients = ["192.168.0.0/24"]
+# squash = "none"          # identities are handed to libcephfs as the UserPerm of every call
+# readonly = false
+#
+# [export.cephfs]
+# conf = "/etc/ceph/ceph.conf"   # empty = library default search ($CEPH_CONF, /etc/ceph/ceph.conf)
+# id = "lightnfs"                # client id (without "client."); its MDS caps must cover subdir
+# keyring = "/etc/ceph/ceph.client.lightnfs.keyring"
+# mon_host = "mon1,mon2,mon3"    # overrides ceph.conf; empty = from ceph.conf
+# fs_name = "cephfs"             # empty = the cluster's default filesystem
+# subdir = "/exports/a"          # export root inside the filesystem (default "/")
+# log_file = ""                  # libcephfs log; empty = its default
+# options = "client_mount_timeout=30"   # extra ceph_conf_set pairs, comma separated
+# fd_cache = 1024                # anonymous-IO Fh cache and inode-handle cache capacity
+# readdir_enrich = true          # readdirplus attributes + handles (READDIRPLUS without lookups)
+# jukebox = true                 # transport errors → JUKEBOX/DELAY (client retries); false → EIO
+# native_locks = true            # push v4 byte-range locks to the MDS (ceph_ll_setlk)
+
 # Lustre export (design 06 §6.5): `path` is a directory inside a Lustre client mount.
 # Filehandles are FIDs (opened back through <mount>/.lustre/fid, no CAP_DAC_READ_SEARCH
 # needed); IO, caches and identity modes are the local backend's.  No liblustreapi is
