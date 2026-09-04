@@ -136,7 +136,7 @@ bit 31        : 最后一个片段标志（last fragment）
 bits 30..0    : 本片段长度（字节）
 ```
 
-一条 RPC 消息 = 1 到多个片段，最后一个片段置最高位。实践中几乎所有实现每条消息只发一个片段。**解析时必须处理多片段**，并对总长度设上限（防 DoS；典型上限 = 最大写请求 + 头部余量，比如 1MB wtmax 时限 ~1MB+16KB）。
+一条 RPC 消息 = 1 到多个片段，最后一个片段置最高位。实践中几乎所有实现每条消息只发一个片段。**解析时必须处理多片段**，并对总长度设上限（防 DoS；典型上限 = 最大写请求 + 头部余量；lightnfs 默认 `max_request_size` = 1MiB + 64KiB，配置示例放宽到 2MiB）。
 
 TCP 下同一连接上请求可以**流水线并发**，应答可以乱序返回（靠 xid 匹配）。服务器应支持读取多个未完成请求并发处理。
 
@@ -156,7 +156,7 @@ RPC 服务启动时向本机 rpcbind（端口 111）注册 (prog, vers, netid, a
 
 - **portmap v2**（老协议）：过程 GETPORT(prog, vers, prot, port) → 端口号；SET/UNSET 注册注销。prot 取值 6=TCP、17=UDP。
 - **rpcbind v3/v4**：地址用 universal address 字符串（如 `192.168.1.5.8.1` 表示端口 2049 = 8*256+1）。
-- Linux 客户端 mount 时通常直连 2049 端口探测 NFS，再查 rpcbind 找 MOUNT。lightnfs 需要注册 NFS(100003,3) 和 MOUNT(100005,3)；也可以选择自带一个极简 portmap 实现或依赖系统 rpcbind。
+- Linux 客户端 mount 时通常直连 2049 端口探测 NFS，再查 rpcbind 找 MOUNT。lightnfs 需要注册 NFS(100003,3) 和 MOUNT(100005,3)。**实现选择**：依赖系统 rpcbind（`[server] rpcbind = true` 时经 UDP 注册/注销，`src/server/rpcbind.cpp`），不自带 portmap 服务；纯 v4 部署置 `rpcbind = false`，v3 客户端可用 `port=/mountport=` 直连。
 
 ## 2.5 rpcgen 与 .x 接口文件
 

@@ -1,9 +1,10 @@
-# lightnfs v1 测试报告（交付物清单 §11）
+# lightnfs 测试报告
 
-汇总 v1（= 路线图阶段 5 末，另含阶段 6 第 1 项 v4.2 甜点，见
-[design/09-roadmap.md](design/09-roadmap.md)）的测试证据：协议一致性
-（cthon / pynfs / fsx）、三层基准数据与安全清单验收。逐阶段的实现过程文档已随发布收尾
-移除（记录保留在 git 历史中）；本文即汇总结论与数据，更新日期 2026-08-23。
+汇总当前代码（路线图全部阶段 + plan doc 10 各项，见 [design/09-roadmap.md](design/09-roadmap.md)）
+的测试证据：单测/集成、协议一致性（cthon / pynfs / fsx）、三层基准数据与安全清单验收。
+逐阶段的实现过程文档已随 v1 发布收尾移除（记录保留在 git 历史中）；本文即汇总结论与
+数据。协议一致性与基准数据为 v1 发布时（2026-08-23）的实测；单测与后端部分更新于
+2026-09-04。
 
 ## 1. 测试环境
 
@@ -19,20 +20,29 @@
 
 ## 2. 单测 / 集成测试
 
-| 阶段 | 用例数 | 配置 |
+| 时点 | `lnfs_tests` 用例数 | 配置 |
 |------|--------|------|
-| 阶段 0（runtime/XDR/传输） | 64 | 四配置全绿 |
-| 阶段 2（v3 读写） | 86 | 四配置全绿 |
-| 阶段 3（v4.1 只读） | 97 | 四配置全绿 |
-| 阶段 4（v4.1 读写+状态） | 107 | 三配置全绿 |
-| 阶段 5（锁+安全，v1 候选） | 111 | 三配置全绿 |
-| 当前（2026-08-23，含 v4.2 与 errlog） | 118 | Debug/Release/ASAN/TSAN/epoll 全绿 |
+| v1 发布（2026-08-23，含 v4.2 与 errlog） | 118 | Debug/Release/ASAN/TSAN/epoll 全绿 |
+| 当前（2026-09-04，+委托/TLS/故障注入/三个集群后端） | 248 | Debug/Release/ASAN/TSAN/epoll 全绿（`scripts/ci.sh`） |
+
+ctest 另含 9 个 fuzz 目标的种子回放（`fuzz_regress_*`：请求路径、filehandle、TOML 配置、
+record stream、v4 attrs、local/gluster/lustre/cephfs ObjId）与 errmap 文档漂移门禁。
 
 覆盖要点：fake ring 时序注入（EINTR/短读/乱序/取消）、StateMgr 并发矩阵（分片锁死锁自由）、
 DRC 字节级重放、EXCLUSIVE 重放、v4 wire 级 COMPOUND 纪律 / 槽重放 / stateid 家族 /
 名字空间 op / 锁生命周期、错误映射白名单生成式对照（v3+v4）、RPC-over-TLS（RFC 9289）端到端
 （`tests/test_tls.cpp`：真实 OpenSSL 客户端 STARTTLS 握手 + TLS 内 echo、optional 服务明文、
-required 拒明文回 AUTH_TOOWEAK、off 拒探测、`[tls]` 配置解析/校验；uring 与 epoll 两条 ring 均过）。
+required 拒明文回 AUTH_TOOWEAK、off 拒探测、`[tls]` 配置解析/校验；uring 与 epoll 两条 ring 均过）、
+读委托/回传通道（授予、CB_RECALL 召回、DELEGRETURN、超时吊销、CB_NOTIFY_LOCK）、故障注入
+（`tests/test_fault.cpp`）、原生锁下推链路（`tests/test_lock_mgr.cpp`/`test_state.cpp`）。
+
+**集群后端（无集群环境，经进程内 fake 跑真实后端代码）**：`tests/test_gluster.cpp` 11 例
+（`gfapi_fake`）、`tests/test_lustre.cpp` 10 例（`llapi_fake`）、`tests/test_cephfs.cpp` 12 例
+（`cephapi_fake`），覆盖 05 §5.9 检查表：句柄编解码 P1/P2/ESTALE、命名空间与 readdir cookie、
+EXCLUSIVE 重放、匿名/open-state IO、粘性 commit、v4.2、身份透传、jukebox 映射、原生锁、停/起
+零泄漏、配置工厂。绑定层对真实头文件的编译期比对：`check_gfapi_abi.sh`（GlusterFS 11.2）、
+`check_cephapi_abi.sh`（Ceph 20.2.0）通过；`check_llapi_abi.sh` 待有 `lustre_user.h` 的主机。
+真实集群/挂载验收脚本 `scripts/accept_{gluster,lustre,cephfs}.sh` 待目标环境。
 
 ## 3. 协议一致性
 
@@ -51,10 +61,12 @@ required 拒明文回 AUTH_TOOWEAK、off 拒探测、`[tls]` 配置解析/校验
 | M5（阶段 3） | 会话五组 + 扩展组 | 67/75 + 37/44，失败全部为写依赖或需 root 的树对象 |
 | M6（阶段 4） | open/rename/verify/courteous/currentstateid + 阶段 3 全部组 | **184 用例：162 通过，22 失败全部命中预期排除表**（其排除表 `pynfs_m4_expected.txt` 已随 M4 脚本在发布清理时移除，见上；现行排除表为 `pynfs_m5_expected.txt`） |
 | M7（阶段 5） | 锁 / secinfo / courtesy 组 | 26 通过 / 1 失败（CSID7 为 pynfs 自身 NameError） |
-| M8（阶段 6.1） | + secinfo_no_name/SEC1/SEC2 等 | **186 用例：168 通过，18 失败全部命中预期排除表**（`pynfs_m5_expected.txt`：委托/回传属 M8 遗留、需 root 的设备节点、CSID7） |
+| M8（阶段 6.1） | + secinfo_no_name/SEC1/SEC2 等 | **186 用例：168 通过，18 失败全部命中预期排除表**（`pynfs_m5_expected.txt`：委托组、需 root 的设备节点、CSID7） |
 
 预期排除表用于 pynfs 全量套件的漂移比对（对照 `scripts/pynfs_m5_expected.txt`，
-新失败即为回归信号），按需或定时执行。
+新失败即为回归信号），按需或定时执行。现行排除表：CSID7、DELEG1/3/5/6/7 + DSESS9002/9003
+（委托组）、LKPP/PUTFH/RNM 的 *b/*c 变体（需 root 的设备节点）。读委托落地（2026-08-28）
+后尚未在 root VM 重跑全量 pynfs 以收窄委托组的排除项——列为待办。
 
 ### fsx（xfstests）
 
@@ -100,7 +112,9 @@ lightnfs.service` + `gen_seccomp_allowlist.sh`）、AUTH_SYS 信任边界入部�
 
 - 无特权回退句柄模式在无 STATX_BTIME 的文件系统（如 tmpfs）上句柄不跨重启稳定
   （生产指引见 [deployment.md](deployment.md)）。
-- pynfs 预期排除：委托/回传（roadmap M8 遗留）、需 root 的块/字符设备树对象、
-  CSID7（pynfs 自身缺陷）。
+- pynfs 预期排除：委托组（读委托已实现但排除表未重新收窄，待 root VM 全量重跑）、
+  需 root 的块/字符设备树对象、CSID7（pynfs 自身缺陷）。
+- 集群后端只经 fake 验证；真实 GlusterFS 卷 / Lustre 挂载 / CephFS 集群上的验收
+  （`scripts/accept_{gluster,lustre,cephfs}.sh`）待目标环境。
 - fsx ≥12h 过夜首轮记录与 24h fuzz 累计为按需长稳执行项（日历项），脚本即入口
   （`fetch_fsx.sh` + 大 FSX_OPS、`fuzz_handle_request`）。

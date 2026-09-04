@@ -1,9 +1,10 @@
 # lightnfs
 
 **A userspace NFS gateway for Linux.** `lightnfsd` serves NFSv3 and NFSv4.1/4.2 on the
-north side and talks to pluggable storage backends on the south side (v1 ships a local
-POSIX-filesystem backend; the interface is designed and reviewed against Lustre and
-GlusterFS mappings). It is a single process of C++20 coroutines running on an io_uring
+north side and talks to pluggable storage backends on the south side — a local POSIX
+filesystem, GlusterFS (libgfapi), Lustre and CephFS (libcephfs), all behind one backend
+interface that was frozen with the first backend and has taken the three cluster backends
+without a change. It is a single process of C++20 coroutines running on an io_uring
 reactor (epoll fallback), with no kernel NFS server involved.
 
 [中文文档 / Chinese documentation](docs/README.zh.md)
@@ -168,10 +169,11 @@ tools/        lightnfs-ctl (admin CLI + the three-layer benchmarks under
               tools/bench/ with their baseline), lightnfs-fh
 tests/        unit/integration tests (mini test framework, fake ring) and the
               userspace acceptance client
-fuzz/         six libFuzzer targets (request path, filehandle decode, TOML config,
-              record-stream reassembly, v4 attrs, local ObjId parse) with checked-in
-              seed corpora (fuzz/seed/) and dictionaries (fuzz/dict/); grown corpora
-              stay machine-local under fuzz/corpus/
+fuzz/         nine libFuzzer targets (request path, filehandle decode, TOML config,
+              record-stream reassembly, v4 attrs, ObjId parse for the local / gluster /
+              lustre / cephfs backends) with checked-in seed corpora (fuzz/seed/) and
+              dictionaries (fuzz/dict/); grown corpora stay machine-local under
+              fuzz/corpus/
 scripts/      ci.sh (one-stop build matrix + gates), fuzz.sh (seeded/nightly runs,
               corpus minimization), one-click acceptance (loopback and VM), pinned
               tool fetchers, bench gate, fault injection, format/tidy/coverage,
@@ -196,7 +198,7 @@ existing clone.
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
-ctest --test-dir build            # ~200 unit/integration cases in lnfs_tests, plus
+ctest --test-dir build            # ~250 unit/integration cases in lnfs_tests, plus
                                   # per-target fuzz regress and the errmap drift gate
 scripts/ci.sh                     # the full matrix: GCC/Clang × Debug/Release ×
                                   # ASAN+UBSAN × TSAN × epoll × fuzz smoke + lint gates
@@ -302,7 +304,7 @@ lightnfs-ctl ping
 lightnfs-ctl metrics                 # same text as the Prometheus endpoint
 lightnfs-ctl dump-errors             # recent error log ring
 lightnfs-ctl drc                     # duplicate-request-cache stats
-lightnfs-ctl fdcache                 # local backend fd-cache stats
+lightnfs-ctl fdcache                 # fd / handle-cache stats (local, gluster, cephfs exports)
 lightnfs-ctl state                   # v4 clients/sessions/opens/locks, grace status
 lightnfs-ctl expire-client 0x500000001   # force-reclaim one client's state
 lightnfs-fh --key /etc/lightnfs/hmac.key <hex-handle>   # decode + verify a handle
@@ -338,12 +340,12 @@ The release checklist with per-item verification is in
 
 ## Testing
 
-Test layers (development plan §9):
+Test layers:
 
 | Layer | How |
 |-------|-----|
 | Runtime | fake-ring timing tests, ASAN + TSAN builds, EINTR/short-read injection |
-| XDR / request path | round-trip tests; libFuzzer over six parse boundaries — `scripts/fuzz.sh smoke` (120 s seeded, per change, also part of `ci.sh`) and `scripts/fuzz.sh nightly` (1 h); seeds are checked in, grown corpora stay machine-local (`fuzz.sh minimize` compacts them) |
+| XDR / request path | round-trip tests; libFuzzer over nine parse boundaries — `scripts/fuzz.sh smoke` (120 s seeded, per change, also part of `ci.sh`) and `scripts/fuzz.sh nightly` (1 h); seeds are checked in, grown corpora stay machine-local (`fuzz.sh minimize` compacts them) |
 | Backend contract | handle stability, 100k-entry cookie stability, write stability levels + sticky fsync EIO, v4.2 sparse/copy/clone |
 | Error mapping | the v3 whitelist test is **generated from the research document** (`scripts/gen_errmap_cases.py`); doc/code drift fails ctest (`errmap_check`); v4 rows checked against RFC tables |
 | Lint / coverage | `scripts/format_check.sh` (clang-format gate, part of `ci.sh`), `scripts/tidy.sh` (clang-tidy, bugprone/performance/concurrency), `scripts/coverage.sh` (llvm-cov report) |
@@ -378,13 +380,14 @@ in phases, each closed by an acceptance run:
 | 3 | M5 | NFSv4.1 read-only: sessions, pseudo-fs, client/session state |
 | 4 | M6 | NFSv4.1 read-write: full open-state machine, leases, courtesy, grace/reclaim |
 | 5 | M7 | byte-range locks, SECINFO, error-whitelist audit, security hardening — **v1 release candidate** |
-| 6 | M8 | **done:** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE, COPY, CLONE; test infrastructure. **Demand-gated:** second backend (Lustre/GlusterFS), read delegations + callback channel, NLM/NSM |
+| 6 | M8 | **done:** NFSv4.2 SEEK/ALLOCATE/DEALLOCATE, COPY, CLONE; READ_PLUS; read delegations + callback channel; GlusterFS, Lustre and CephFS backends with native lock push-down; test infrastructure (fuzzing, fault injection, CI matrix). **Demand-gated:** NLM/NSM |
 
 Longer-term observations: **RPC-over-TLS (RFC 9289) is now implemented** (`[tls]`).
 Still not committed — write/directory delegations (need CB_GETATTR and single-writer
-workload evidence), pNFS flexfiles MDS (a deliberate non-goal, decision D8), and
-multi-gateway consistency (needs a clustered backend that sinks native change cookies
-and byte locks).
+workload evidence) and pNFS flexfiles MDS (a deliberate non-goal, decision D8).
+Multi-gateway consistency now has a backend with both prerequisites (CephFS: native
+change attribute + MDS-arbitrated locks), but the real multi-gateway validation is
+pending a target cluster and v4 open/deny state stays per gateway.
 
 ## Known limitations
 
@@ -392,7 +395,8 @@ and byte locks).
   via built-in RPC-over-TLS (`[tls]`, RFC 9289) or an external tunnel.
 - No NLM/NSM: v3 clients have no byte-range locks, and v3 writes are not constrained
   by v4 share reservations or locks on the same export (documented boundary).
-- No delegations, no pNFS, no asynchronous or inter-server COPY, no READ_PLUS/xattr.
+- Read delegations only (no write/directory delegations), no pNFS, no asynchronous or
+  inter-server COPY, no xattr (the ops answer NOTSUPP).
 - Single gateway: v4 state lives in process memory plus the on-disk reclaim list; no
   state sharing between gateways.
 - Handle stability in `handles = "auto"` fallback mode depends on the filesystem
@@ -401,8 +405,8 @@ and byte locks).
 ## Documentation index
 
 - Design: [docs/design/](docs/design/README.md) — architecture, runtime/concurrency,
-  transport/RPC/XDR, NFS core, backend API, backend mappings, state management,
-  configuration/observability, roadmap
+  transport/RPC/XDR, NFS core, backend API, backend implementations, state management,
+  configuration/observability, roadmap, post-v1 optimization/feature record
 - Protocol research: [docs/nfsv3/](docs/nfsv3/README.md), [docs/nfsv4/](docs/nfsv4/README.md)
 - Operations: [deployment guide](docs/deployment.md),
   [security checklist](docs/security-checklist.md)

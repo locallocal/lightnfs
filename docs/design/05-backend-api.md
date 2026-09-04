@@ -3,7 +3,7 @@
 本接口是 lightnfs 的南向边界：协议层（core 及以上）**只**通过它访问存储。设计目标：
 
 1. **协议无感**：接口只讲文件系统语言（对象、属性、字节、目录游标、errno），不出现 nfsstat/stateid/COMPOUND 等字样；
-2. **一次定型**：以本地 POSIX（v1）、Lustre、GlusterFS（libgfapi）三个后端做映射验证（见 [06-backends.md](06-backends.md)），避免 v2 破坏性改版；
+2. **一次定型**：以本地 POSIX（v1）、Lustre、GlusterFS（libgfapi）三张映射表评审定型，其后 GlusterFS、Lustre、CephFS（libcephfs）三个集群后端零接口改动接入（见 [06-backends.md](06-backends.md)）——"一次定型"已经过真实检验；
 3. **全异步**：所有可能等待的方法返回 `Task<Result<T>>`；
 4. **能力协商**：后端声明能力位，core/引擎据此裁剪协议行为（NOTSUPP/属性位/FSINFO 通告），而非在后端里造假。
 
@@ -15,7 +15,7 @@
 namespace lnfs::backend {
 
 using rt::Task;
-template <class T> using Result = tl::expected<T, Errno>;   // Errno: 强类型 POSIX errno + kJukebox
+template <class T> using Result = lnfs::Result<T>;          // 自含的 expected 风格类型（util/result.hpp）；Errno: 强类型 POSIX errno + kJukebox
 
 // ── 持久对象标识 ─────────────────────────────────────────────
 // 后端自定义编码，进入文件句柄（04 分册 4.3），必须满足：
@@ -69,7 +69,7 @@ enum class Cap : uint64_t {
     kMknod          = 1 << 2,   // → MKNOD（不支持 → NOTSUPP）
     kNativeAccess   = 1 << 3,   // 后端能权威回答 access()（服务端 ACL 场景）
     kNativeChange   = 1 << 4,   // change 来自存储原生计数（否则 core 按 5.6 降级合成）
-    kStableHandles  = 1 << 5,   // ObjId 满足 P1（跨重启持久）—— v1 后端必须置位
+    kStableHandles  = 1 << 5,   // ObjId 满足 P1（跨重启持久）；本地后端仅在内核句柄模式置位（路径兜底模式不置），集群后端均置位
     kSparseOps      = 1 << 6,   // seek_hole/allocate/deallocate → v4.2 三件套
     kCloneRange     = 1 << 7,   // clone() → v4.2 CLONE
     kCopyRange      = 1 << 8,   // copy_range() → v4.2 COPY（同服）
@@ -94,6 +94,8 @@ public:
     FType        type() const;       // 构造时即知，无 IO
 
     // ── 元数据 ──
+    // （下文 `= 0` 标注的是"后端必须提供"的契约项；代码里只有 getattr 是纯虚，其余
+    //   都有 ENOTSUP/默认实现——未覆写即自然回 NOTSUPP，见 backend/api.hpp）
     virtual Task<Result<Attr>> getattr() = 0;
     virtual Task<Result<Attr>> setattr(const Cred&, const SetAttr&) = 0;   // 返回新属性
     virtual Task<Result<AccessMask>> access(const Cred&, AccessMask want); // 默认实现：getattr+权限位计算；kNativeAccess 后端覆写
@@ -117,6 +119,7 @@ public:
     virtual Task<Result<OpenPtr>> open(const Cred&, OpenFlags) = 0;        // 见 5.5
     virtual Task<Result<uint32_t>> read (OpenCtx, uint64_t off, std::span<std::byte> out, bool& eof) = 0;
     virtual Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const std::byte> in, Stability) = 0;
+    virtual Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const iovec> iov, Stability); // 向量化（WRITE 负载不拼平；默认逐段调平铺版）
     virtual Task<Result<void>>     commit(OpenCtx, uint64_t off, uint64_t len) = 0;  // len=0 → 到 EOF
 
     // ── 可选扩展（默认返回 ENOTSUP；置位对应 Cap 才覆写）──
@@ -156,10 +159,14 @@ public:
 
 // 工厂注册：配置驱动实例化
 struct BackendFactory {
-    std::string_view name;                              // "local" | "lustre" | "gluster"
-    std::unique_ptr<Backend> (*make)(const toml::table& export_cfg);
+    std::string name;                                   // "local" | "gluster" | "lustre" | "cephfs"
+    uint32_t    api_version = kBackendApiVersion;
+    std::unique_ptr<Backend> (*make)(const BackendConfig&);   // 与 TOML 库解耦的子表表示 {path, fsid, values}
+    bool virtual_path = false;                          // 集群后端：path 只是挂载名，配置校验不 stat 本机目录
 };
 void register_backend(BackendFactory);                  // 静态注册宏 LNFS_REGISTER_BACKEND(...)
+const BackendFactory* find_backend(std::string_view);
+void register_builtin_backends();                       // 静态库链接下保证四个内置后端被注册
 ```
 
 ## 5.5 打开状态：OpenPtr / OpenCtx
@@ -178,7 +185,7 @@ struct OpenCtx {                       // IO 调用的第一参数
 
 契约：
 
-- `open == nullptr`（v3 路径 / v4 特殊 stateid）时后端**必须**仍能完成 IO——本地后端用内部 fd 缓存按需开（06 分册 6.3），gluster 用匿名 fd（`glfs_h_anonymous_open`语义）。
+- `open == nullptr`（v3 路径 / v4 特殊 stateid）时后端**必须**仍能完成 IO——本地后端用内部 fd 缓存按需开（06 分册 6.3），gluster/cephfs 用以网关身份打开的每对象 glfd/Fh 缓存（门禁在网关侧完成）。
 
 **实现（2026-08-28，plan doc 10 §5.1）**：`LocalObject::open` 已实现——每 OPEN 一个
 独立数据 fd（读 O_RDONLY / 写 O_RDWR），read/write/seek 优先走它（open 时定权限的
@@ -187,7 +194,9 @@ POSIX 语义，免 fd 缓存往返）；打不开时降级返回 EOPNOTSUPP，�
 不可写自动回落 fd 缓存。memory 后端维持 EOPNOTSUPP。**第二个生产者**（2026-09-03，
 plan doc 10 §5.3）：gluster 的 `GlusterOpenState` 持每 OPEN 一个 glfd（`glfs_h_open`
 以调用者身份打开）；kNativeAccess 后端的 `open()` 不做 EOPNOTSUPP 降级——EACCES 就是
-OPEN 的答案，v4 引擎据此跳过网关侧 `access()` 预检。
+OPEN 的答案，v4 引擎据此跳过网关侧 `access()` 预检。其后 lustre（继承 `LocalObject::open`，
+外加 HSM 门禁）与 cephfs（`CephOpenState`，`ceph_ll_open` 以调用者 UserPerm 打开）也成为
+生产者：四个后端都各自产生 OpenState，前提仍是"OpenState 只回到产生它的后端"。
 - v4 引擎把 OPEN→`open()` 的 OpenPtr 存入状态表，CLOSE 时释放（shared_ptr 归零 → 后端资源回收）；同一文件多次 OPEN 合并由状态层负责，后端只见 open/close 配对。
 - `OpenFlags`：read/write/create(3 模式)/truncate；EXCLUSIVE 创建的 verifier 由 `create(..., ExclVerf*)` 传入，后端负责持久化到 atime/mtime 并在重放时比对（语义 nfsv3/04 §8——两版协议共用此实现）。
 
@@ -205,7 +214,7 @@ OPEN 的答案，v4 引擎据此跳过网关侧 `access()` 预检。
 - 取值域 ≥3（0/1/2 归 core 的 `.`/`..` 合成，见 04 分册 4.7；后端若原生 cookie 可能 <3，由 core 做偏移，后端无感知）；
 - 本地后端用 getdents64 的 d_off 天然满足；无法满足稳定性的后端必须自建索引（宁可后端复杂，不把 BAD_COOKIE 风暴丢给客户端）。
 
-## 5.8 字节锁下沉接口（v1 不实现，占位定型）
+## 5.8 字节锁下沉接口（三个集群后端已实现）
 
 ```cpp
 class LockMgr {                        // 后端原生锁（多网关共享后端时需要）
@@ -216,7 +225,7 @@ public:
 };
 ```
 
-v1：网关内 LockMgr（07 分册）实现同一接口，单网关正确；`native_locks()` 有值时状态层改用后端实现（Lustre flock 语义、gluster posix-locks xlator）。接口先行，切换点唯一。
+原设想：网关内 LockMgr（07 分册）实现同一接口，`native_locks()` 有值时状态层**改用**后端实现。实际落地为**叠加**（见下），网关表始终权威。
 
 **实现（2026-09-03，plan doc 10 §5.3）**：接口新增一个可选操作
 `release(Object&, const LockOwnerId&)`（默认 = 全区间 `unlock`；gluster 覆写为关闭该

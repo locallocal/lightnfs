@@ -90,4 +90,4 @@ NLM 服务器应把网络锁体现到底层文件系统（如 Linux 上通过 lo
 2. **进程内锁表 + 同步接口**：实现 NULL/TEST/LOCK/UNLOCK/CANCEL + GRANTED 回调，锁表放内存；NSM 只实现到"服务器重启后换 verifier/state，宽限期内拒绝新锁"的最小闭环，不做对客户端的主动监控（接受"客户端消失锁滞留"，配管理命令清锁）。
 3. **完整 NLM+NSM**：含 MON/NOTIFY、reclaim、异步消息接口。工作量大，兼容性测试繁重，除非明确需要多客户端写共享+锁，否则不建议先做。
 
-建议 lightnfs 从选项 1 起步，接口上为选项 2 预留锁表抽象。
+**实现决定**：lightnfs 采用选项 1——不注册 100021/100024，v3 无字节锁（设计决策 D8；v3 挂载用 `-o nolock`），并在部署文档明示"v3 写不受 v4 锁/deny 约束"的边界。"锁表抽象"以 v4 的 `LockMgr`（`src/state/lock_mgr.hpp`）落地，并可下推到集群后端（gluster/lustre/cephfs 的 `native_locks()`）；若将来出现 v3 锁刚需，选项 2 可在其上补 NLM 过程（09 册路线图"可选"项）。

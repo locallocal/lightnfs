@@ -11,7 +11,7 @@
 | 辅助协议 | MOUNT（小）、NLM/NSM（可跳过） | 无（内建） |
 | 状态管理 | 无（DRC 而已） | **clientid/会话/槽表/open/lock/租约/宽限期——工作量主体** |
 | 属性 | 定长 fattr3 | bitmap 编解码 + ~30 个属性 |
-| 回调 | 无（NLM GRANTED 可跳过） | 可宣告不用（不发委托） |
+| 回调 | 无（NLM GRANTED 可跳过） | 可宣告不用（不发委托）；lightnfs 已实现并用于读委托召回与 CB_NOTIFY_LOCK |
 | 粗略量级 | 1× | 3–5× |
 
 结论：**先做 v3 拿到能用的服务器，再在同一 RPC/VFS 抽象上加 v4.1**，是风险最低的路径。两版共用：传输层、XDR 基建、句柄方案、导出表、底层文件访问层（VFS 抽象）、鉴权/squash。v4 额外新建：COMPOUND 解释器、状态机、会话层、bitmap 属性层。
@@ -45,7 +45,7 @@ file_state:     fh → { opens[], locks[], deleg?, 冲突裁决入口 }
 
 - `other` 编码建议：`{boot_epoch(4B), type(1B), counter(7B)}`——重启后收到旧 epoch 直接 STALE_STATEID，无需查表。
 - 锁序：`client → file` 固定顺序；COMPOUND 入口先做会话/租约校验，操作内再做文件级锁。
-- 租约用时间轮/最小堆做过期扫描；courtesy client（过期不立即回收，冲突才回收）可后加。
+- 租约用时间轮/最小堆做过期扫描；courtesy client（过期不立即回收，冲突才回收）可后加——lightnfs 已实现（`courtesy_multiplier`，默认 24×lease）。
 - 稳定存储最小集：**客户端 co_ownerid 名单**（宽限期 reclaim 准入，见 04 分册 4.7）+ 服务器 boot epoch。每客户端一个文件或一个小 KV 即可。
 
 ## 11.4 COMPOUND 解释器要点
@@ -56,8 +56,8 @@ file_state:     fh → { opens[], locks[], deleg?, 冲突裁决入口 }
   1. 骨架：SEQUENCE, PUTROOTFH/PUTFH/GETFH, LOOKUP/LOOKUPP, GETATTR, ACCESS, READDIR, READLINK；EXCHANGE_ID/CREATE_SESSION/DESTROY_*/RECLAIM_COMPLETE/BIND_CONN_TO_SESSION —— 到这里**只读挂载可用**；
   2. IO：OPEN(CLAIM_NULL/CLAIM_FH/CLAIM_PREVIOUS), CLOSE, READ, WRITE, COMMIT, SETATTR, OPEN_DOWNGRADE, FREE_STATEID/TEST_STATEID；
   3. 目录写：CREATE, REMOVE, RENAME, LINK; VERIFY/NVERIFY, SECINFO/SECINFO_NO_NAME；
-  4. 锁：LOCK/LOCKT/LOCKU（先做非阻塞语义：冲突即 DENIED）；
-  5. 可选甜点：委托（读）、4.2 的 SEEK/ALLOCATE/DEALLOCATE/COPY/CLONE。
+  4. 锁：LOCK/LOCKT/LOCKU（先做非阻塞语义：冲突即 DENIED；lightnfs 另在区间释放时向被拒者发 CB_NOTIFY_LOCK）；
+  5. 可选甜点：委托（读）、4.2 的 SEEK/ALLOCATE/DEALLOCATE/COPY/CLONE/READ_PLUS——均已实现。
 - 所有没实现的操作统一回 NFS4ERR_NOTSUPP，**但骨架清单里的不能缺**——客户端把它们当基础设施，缺一个就挂载失败且报错难懂。
 
 ## 11.5 属性层实现
@@ -78,7 +78,10 @@ file_state:     fh → { opens[], locks[], deleg?, 冲突裁决入口 }
 - `nfsstat -c`/`mountstats` 看客户端操作分布；wireshark 对 v4 COMPOUND 解析完善，按 tag 过滤调试极方便；服务器端建议在 COMPOUND 入口打印 `tag + 操作序列 + 各操作 status` 的单行日志——v4 调试的第一生产力。
 - pynfs（4.0/4.1 套件）是 v4 服务器的标准符合性测试；cthon04 四组用 `-o vers=4.1` 全跑；fsx/fsstress 过夜同 v3。
 
-## 11.7 建议里程碑（接 v3 分册 9.9 的 M1–M4 之后）
+## 11.7 建议里程碑（接 v3 分册 9.9 的 M1–M4 之后；已全部交付）
+
+M5–M8 全部实现并经 pynfs/cthon 验收，现行状态与日期见 design/09-roadmap.md 阶段 3–6；
+M8 之外还落地了 READ_PLUS、cookieverf 语义化、RPC-over-TLS 与三个集群后端。
 
 1. **M5 v4.1 只读**：COMPOUND 解释器 + 11.4 第 1 组操作 + 会话层 + bitmap 属性最小集 + 伪根。验收：`mount -o vers=4.1,ro` 后 `ls -lR`/`cat` 正常，pynfs 会话组通过。
 2. **M6 v4.1 读写**：OPEN/CLOSE/READ/WRITE/COMMIT/SETATTR + 状态表 + 租约回收 + 宽限期（含客户端名单持久化）。验收：cthon basic/general、fsx 过夜、服务器重启恢复用例。

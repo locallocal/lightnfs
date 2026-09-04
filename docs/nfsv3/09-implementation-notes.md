@@ -65,12 +65,12 @@ lightnfs 若定位为"导出本地目录"，推荐 **方案 A + open_by_handle_a
 2. **句柄防伪**：HMAC（见 9.1）。
 3. **路径逃逸**：LOOKUP `..` 在导出根必须拦住；服务器内部任何 name 拼接前校验无 `/` 与 NUL。
 4. **squash**：root_squash（uid0→匿名）默认开启；all_squash 可选。squash 发生在**授权与落盘属主**两处。
-5. **AUTH_SYS 即无安全**：文档明示仅适用于受信网络；RPCSEC_GSS 留扩展点。
+5. **AUTH_SYS 即无安全**：文档明示仅适用于受信网络；RPCSEC_GSS 留扩展点（未实现）。通道加密已由 **RPC-over-TLS**（RFC 9289，`[tls] mode = off|optional|required`）提供，在 RPC 层之下对 v3/MOUNT 同样生效；身份仍是 AUTH_SYS 声明。
 6. 资源限制：每连接未完成请求数上限、连接数上限、READDIR 预算强制执行。
 
 ## 9.7 与真实客户端的兼容性备忘（踩坑清单）
 
-- **Linux 客户端**对 READDIR cookieverf 变化敏感：能用全 0 verf 就用全 0；cookie 必须稳定，别用会因删除位移的数组下标。
+- **Linux 客户端**对 READDIR cookieverf 变化敏感：verf 要么全 0，要么像 lightnfs 这样取目录 change 属性并在 cookie≠0 时校验（变则回 BAD_COOKIE 让客户端从头重列——客户端自动处理）；cookie 必须稳定，别用会因删除位移的数组下标。
 - READDIRPLUS 一定要实现，否则目录密集负载 RPC 数爆炸；但注意 Linux 对大目录会自动切回 READDIR（nordirplus 挂载项存在）。
 - EXCLUSIVE CREATE 要支持（O_EXCL 依赖），记得 verifier 存进 atime/mtime 且 SETATTR 能洗掉。
 - post_op 属性尽量都带上：不带会引发客户端补发 GETATTR，性能减半。
@@ -87,7 +87,11 @@ lightnfs 若定位为"导出本地目录"，推荐 **方案 A + open_by_handle_a
 - **模糊测试**：对 XDR 解码器做 fuzz（AFL/libFuzzer 直喂消息字节），解码器是最大攻击面。
 - **性能基线**：fio 顺序/随机大小块读写、mdtest/smallfile 元数据操作；对比同机 Linux knfsd 得出差距数量级。
 
-## 9.9 建议的实现里程碑
+## 9.9 建议的实现里程碑（已全部交付，现行状态见 design/09-roadmap.md）
+
+M1–M3 全部实现；M4 的可选项已决定：MKNOD **已实现**、NFSv4（4.1/4.2）**已实现**、
+NLM 锁**不做**（`-o nolock` 定位，见 06 分册）、RPCSEC_GSS **不做**（通道加密改由
+RPC-over-TLS 提供）。
 
 1. **M1 只读服务器**：RPC/XDR 框架 + TCP 记录标记 + portmap 注册 + MOUNT(MNT/EXPORT) + NULL/GETATTR/LOOKUP/ACCESS/READ/READDIR/READDIRPLUS/FSSTAT/FSINFO/PATHCONF/READLINK。Linux 能挂载、能 `ls -lR`、能 `cat`，即里程碑达成。
 2. **M2 可写**：WRITE(先全同步)/CREATE(三模式)/SETATTR/REMOVE/MKDIR/RMDIR/RENAME/LINK/SYMLINK/COMMIT + DRC + WCC。跑通 cthon basic/general。

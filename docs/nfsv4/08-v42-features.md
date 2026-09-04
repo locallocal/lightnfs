@@ -69,7 +69,7 @@ posix_fadvise 的网络化：WILLNEED/DONTNEED/SEQUENTIAL/RANDOM/NOREUSE 等 hin
 | SEEK/ALLOCATE/DEALLOCATE | **做** | 映射系统调用即可，cp/rsync 稀疏文件直接受益 |
 | 同步同服 COPY | **做** | copy_file_range 一行映射，cp 大文件流量减半 |
 | CLONE | 底层是 XFS/Btrfs 就做 | FICLONERANGE 直通 |
-| READ_PLUS | 可后做 | 先当 READ 实现（全 DATA 段）也合规 |
+| READ_PLUS | 已做 | 稀疏感知：每应答一个 DATA/HOLE 段（SEEK_DATA 探洞），无 kSparseOps 的后端退化为单 DATA 段 |
 | 异步/跨服 COPY、WRITE_SAME、sec_label、IO_ADVISE、xattr | 不做/后做 | 状态跟踪复杂或场景小众 |
 
 注意：宣告 minorversion=2 不等于要支持所有 4.2 操作——逐操作 NOTSUPP 是协议明文允许的（RFC 7862 §4.2 的 operation table 标注 OPT）。因此"实现 4.1 骨架 + 挑三个便宜的 4.2 操作"就可以对外提供 vers=4.2 挂载。

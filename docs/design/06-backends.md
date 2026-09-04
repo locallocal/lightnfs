@@ -1,4 +1,4 @@
-# 6. 后端实现：本地文件系统（v1）与未来后端映射验证
+# 6. 后端实现：本地文件系统与集群后端（Lustre / GlusterFS / CephFS）
 
 ## 6.1 本地后端（backend_local）总体
 
@@ -12,11 +12,11 @@
 
 ```
 ObjId = { fsid_hint(0—由 Backend 级 fsid 表达，不进 ObjId),
-          kernel_fhandle: handle_bytes ≤ 40B（ext4/xfs 实际 8–28B） }
+          kernel_fhandle: handle_bytes ≤ 45B（= ObjId::kMax − 6，ext4/xfs 实际 8–28B） }
 ```
 
 - P1/P2 由内核保证（fhandle 内含 inode+generation）；总长远小于 51B 上限。
-- 降级模式（无特权运行）：`ObjId = {ino(8B), gen(4B)}` + 进程内 ino→路径缓存，接受外部 rename 下的 ESTALE 误报（nfsv3 分册 9.1 方案 A 降级路径）；能力位与文档明示限制。
+- 降级模式（无特权运行，`handles = "fallback"` 或 `auto` 探测失败）：`ObjId = {tag(1B), dev(8B), ino(8B), gen(4B)}` = 21B，gen 取 STATX_BTIME（无 btime 的文件系统如 tmpfs 退为进程内计数，句柄不跨重启稳定）+ 进程内 ino→路径缓存，接受外部 rename 下的 ESTALE 误报（nfsv3 分册 9.1 方案 A 降级路径）；不置 kStableHandles，文档明示限制。
 
 ### Object 实现
 
@@ -27,6 +27,9 @@ class LocalObject final : public Object {
     FdCache::Ref    fd_;      // 惰性：首次需要 fd 的操作时 open_by_handle_at
 };
 ```
+
+实现中有两层缓存：O_PATH 解析缓存（`resolve()` 命中免去 open_by_handle_at 往返，
+`lightnfs_fdcache_path_*` 指标，plan doc 10 §2.1）与本节的数据 fd 缓存。
 
 - `getattr` → `uring_statx(fd 或 AT_EMPTY_PATH)`，`Attr::change` 取 `STATX_CHANGE_COOKIE`（内核 ≥6.6 且 fs 支持 → 置 kNativeChange；否则 core 合成，见 05 分册 5.6）。
 - `lookup` → `openat(dirfd, name, O_PATH|O_NOFOLLOW)` + `name_to_handle_at` → 新 LocalObject。O_NOFOLLOW + `name` 禁 `/` 与 NUL：路径逃逸防御双保险（core 已校验一次）。
@@ -62,12 +65,13 @@ class FdCache {          // 分片 LRU：ObjId → {fd, refcnt, last_use}
 
 ### 6.4 身份执行
 
-本地后端两种模式（配置选）：
+本地后端三种模式（`[export.local] identity`）：
 
-1. **权限位自查（默认）**：进程以 root 跑，每操作用 `Cred` 对 statx 结果做 POSIX 权限计算（含属主放宽惯例），错判风险：ACL/富权限文件系统 → 提供 `access()` 走 `faccessat2(AT_EACCESS)`（offload、切 fsuid）兜底校验的可选严格模式；
-2. **setfsuid/setfsgid**：offload 线程内切换 fsuid 后执行（线程级生效，同步原语保证串行）——语义最准，吞吐受 offload 串行度限制。
+1. **`check`（默认）权限位自查**：每操作用 `Cred` 对 statx 结果做 POSIX 权限计算（含属主放宽惯例）；错判风险在 ACL/富权限文件系统；
+2. **`strict`**：在 1 的基础上，`access()` 授予的每一位再用 `faccessat2(AT_EACCESS)`（offload、切 fsuid）复核，捕获 ACL 等 mode 位之外的策略；
+3. **`setfsuid`（需 root）**：offload 线程内切换 fsuid/fsgid 后执行，内核权威判定——语义最准，吞吐受 offload 并发度限制。
 
-v1 默认模式 1；接口上不体现差异（都在后端内部）。
+接口上不体现差异（都在后端内部）；lustre 后端继承同一套，gluster/cephfs 则把 `Cred` 交给存储侧判定（§6.6/§6.8）。
 
 ## 6.5 映射验证：Lustre 后端 ✅ 已实现（2026-09-04）
 
@@ -135,43 +139,6 @@ lk-owner 键的 posix 锁表、可注入传输错误），`tests/test_gluster.cp
 该后端吞吐上限（`[server] offload_threads` 是它的主要调优旋钮）；`glfs_*_async` 族改造
 留作后续。
 
-## 6.8 映射验证：CephFS 后端 ✅ 已实现（2026-09-04，plan doc 10 §5.3）
-
-第四个后端，也是第一个**同时**具备原生 change 计数与原生字节锁的后端——09 册"多网关一致性
-两位同时具备的后端"由此出现。
-
-| Backend API | libcephfs 映射（实现） | 备注 |
-|-------------|--------------|------|
-| Backend::start/stop | `ceph_create(id)` + `ceph_conf_read_file(conf)` + `ceph_conf_set(keyring/mon_host/log_file/options…)` + `ceph_init` + `ceph_select_filesystem(fs_name)` + `ceph_mount(subdir)`，再 `ceph_ll_lookup_root` + `ceph_ll_getattr` 取导出根（offload kHeavy）；stop 先关锁 Fh/Fh 缓存/inode 缓存/根引用再 `ceph_unmount` + `ceph_release` | 每导出一个 `ceph_mount_info`；工厂构造不连接，`start()` 才连；无 ceph.conf 且未显式配置时只告警（mon_host/keyring 可全部来自配置键） |
-| ObjId | 标记字节 `5` + 8B inode 号 + 8B snapid（`vinodeno_t`；snapid 取 `stx_dev`，libcephfs 在此字段回报 inode 的 snapid，Ganesha 同法） → kStableHandles | 17B；Ceph 不复用 inode 号，故无需世代号即满足 P2；`CephBackend::vino_from_oid` 是解析边界（fuzz 目标 `objid_cephfs`），ino 0 直接 ESTALE |
-| resolve | `ceph_ll_lookup_vino`（MDS lookup_ino）→ `Inode*`，前置分片 LRU inode 句柄缓存（容量 = fd_cache）；再一次 `ceph_ll_getattr` 定类型 | ENOENT/ESTALE/EINVAL → ESTALE；ObjPtr 共享 `InodeRef`（最后一个用户 `ceph_ll_put`） |
-| lookup/create/… | `ceph_ll_lookup/ll_create(O_CREAT\|O_EXCL\|O_RDWR，Fh 立即关闭)/ll_mkdir/ll_mknod/ll_symlink/ll_unlink/ll_rmdir/ll_rename/ll_link/ll_readlink/ll_setattr/ll_statfs` | `..` 在导出根钳到根；unlink 先 lookup 取类型与 ObjId（目录 → EISDIR，且丢弃该文件的缓存 Fh）；创建后若 MDS umask 回调/默认 ACL 改了 mode 则补一次 setattr；EXCLUSIVE verifier 存 atime/mtime（同 local 布局） |
-| 身份 | 每次调用在 offload 线程构造一个 `UserPerm`（`ceph_userperm_new(uid,gid,groups)`），调用后销毁；libcephfs 在 `client_permissions` 下判定 | **不置 kNativeAccess**：无 `ceph_ll_access`，ACCESS 由 `Object::access` 默认实现按 mode 位在网关侧回答（一次 getattr）；变更与 OPEN 仍由库以调用者身份权威判定 |
-| change | `ceph_statx.stx_version`（MDS change attribute，数据/元数据变更都递增、全客户端一致） → **kNativeChange**；v4.2 `change_attr_type = MONOTONIC_INCR` | mask 缺 VERSION（极旧 MDS）时回落 ctime 合成 |
-| open/IO | v4 OPEN：`ceph_ll_open` 以调用者 UserPerm → `CephOpenState`（EACCES 即 OPEN 的答案）；匿名 IO：每对象 Fh 缓存（读→写升级、LRU 驱逐、以网关 uid 0 的 UserPerm 打开，门禁 = mode 位 + v3 属主放宽）；`ceph_ll_read/ll_writev`，kDataSync/kFileSync → `ceph_ll_fsync(1/0)`；commit = `ceph_ll_fsync(…, 1)`，失败粘性 poison（§6.2） | 全部 offload；数据路径 kLight，同步/分配/拷贝 kHeavy；所有返回值为负 errno |
-| readdir | `ceph_ll_opendir` + `ceph_seekdir(cookie)` + `ceph_readdirplus_r(want=BASIC\|VERSION, AT_STATX_DONT_SYNC, out=NULL)`，d_off 作 cookie；每页一个目录句柄 | 富化：attr 与 oid 都直接来自 statx（ino + stx_dev），**不取 Inode 引用**——每项零额外往返 |
-| v4.2 | `ceph_ll_lseek(SEEK_DATA/HOLE)`（Ceph 无 extent 图：文件内 DATA=偏移本身、HOLE=EOF，越界 ENXIO——RFC 7862 最小实现）/ `ceph_ll_fallocate(0)` / `ceph_ll_fallocate(PUNCH_HOLE\|KEEP_SIZE)` → kSparseOps；copy_range = 网关侧 `ll_read/ll_write` 循环（libcephfs 无 copy_file_range）→ kCopyRange | 无 CLONE |
-| locks | `CephLockMgr`：每 (文件, lock-owner) 一个 Fh（网关身份 O_RDWR，EACCES 回落 O_RDONLY），`ceph_ll_setlk(fh, flock, owner64, sleep=0)`，owner64 = LockOwnerId 字节的 FNV-1a；冲突 EAGAIN/EWOULDBLOCK；`test()` 用 owner 0 的探测 Fh 走 `ceph_ll_getlk`；`release()` 全量解锁并关 Fh（Ceph 关 Fh 即释放其锁） → **kByteLocks**，`native_locks()` 交给状态层下推 | MDS 全局仲裁：多网关与原生客户端之间互相看见；`native_locks=false` 关闭 |
-| jukebox | ENOTCONN/ETIMEDOUT/ENETDOWN/ENETUNREACH/EHOSTUNREACH/EHOSTDOWN → `kJukebox`（v3 JUKEBOX / v4 DELAY）→ **kJukebox**；EBLOCKLISTED（ESHUTDOWN，会话被列入黑名单）→ **硬 EIO** + `blocklisted` 计数（重试无意义，需重启网关） | MDS failover / OSD 重连期间客户端重试而非报错；`jukebox=false` 时回 EIO |
-
-**绑定方式**：`backend/cephapi.hpp` 定义一张 46 项函数表（签名取自 Ceph 20 的
-`cephfs/libcephfs.h` / `cephfs/ceph_ll_client.h`，不透明类型按真名在全局命名空间声明；
-`ceph_statx` 与 `vinodeno_t` 在真头文件的 include guard 下自带完整定义），`cephapi.cpp`
-在 `start()` 时 `dlopen("libcephfs.so.2")` + `dlsym`（libcephfs 无符号版本）填表——二进制
-无构建期 Ceph 依赖；`scripts/check_cephapi_abi.sh` 在有头文件的主机上把每个成员与真实
-声明做编译期比对，并用 C 编译单元核对 `vinodeno_t`/`ceph_statx` 布局（已对 20.2.0 头文件
-通过）。测试用 `tests/cephapi_fake.cpp` 在本地目录上实现同一张表（UserPerm 身份、永不复用的
-合成 inode 号、stx_dev=snapid、每次变更递增的 stx_version、按 (inode, owner) 键并随 Fh 关闭
-释放的锁表、可注入传输/黑名单错误），`tests/test_cephfs.cpp` 12 个用例由此把整条后端逻辑跑在
-ctest 里；真实集群验收 = `scripts/accept_cephfs.sh`（校验启动日志 `native-change=true
-native-locks=true`）。
-
-结论（验证后）：接口**零改动**——gluster 时加的 `LockMgr::release()` 与
-`BackendFactory::virtual_path` 直接复用。边界：ACCESS 是网关侧 mode 位（POSIX ACL 只在库
-的 OPEN/变更判定里生效，ACCESS 可能比 OPEN 更宽松——客户端本就按 OPEN 结果为准）；
-copy_range 是网关内存中转（不经 NFS 线，但吃 offload 线程）；被列入黑名单的会话不自愈；
-v4 open/deny 状态仍是网关本地（05 §5.6 口径不变）。
-
 ## 6.7 后端选择与配置（示例）
 
 ```toml
@@ -182,9 +149,13 @@ fsid      = 1
 clients   = ["192.168.0.0/24"]
 squash    = "root"                # none|root|all
 readonly  = false
+# read_bps = "0"; write_bps = "0"; iops = 0   # 每导出令牌桶（0 = 不限，热重载）
+# anon_uid = 65534; anon_gid = 65534           # squash 目标身份
 [export.local]
+handles   = "auto"                # auto|kernel|fallback（kernel 需 CAP_DAC_READ_SEARCH）
 fd_cache  = 4096
-identity  = "check"               # check|setfsuid
+readdir_enrich = true
+identity  = "check"               # check|strict|setfsuid（需 root）
 
 # GlusterFS（已实现，plan doc 10 §5.3）：path 只是客户端挂载名，树在卷里
 [[export]]
@@ -241,3 +212,40 @@ mount          = "/mnt/lustre"    # 挂载根，默认自动探测（沿父目�
 # hsm          = true             # 已释放文件：提交 RESTORE 并回 JUKEBOX/DELAY（false = 内核隐式 restore，阻塞）
 # native_locks = true             # v4 字节锁 → OFD fcntl 锁（-o flock 挂载时 MDS 全局仲裁）
 ```
+
+## 6.8 映射验证：CephFS 后端 ✅ 已实现（2026-09-04，plan doc 10 §5.3）
+
+第四个后端，也是第一个**同时**具备原生 change 计数与原生字节锁的后端——09 册"多网关一致性
+两位同时具备的后端"由此出现。
+
+| Backend API | libcephfs 映射（实现） | 备注 |
+|-------------|--------------|------|
+| Backend::start/stop | `ceph_create(id)` + `ceph_conf_read_file(conf)` + `ceph_conf_set(keyring/mon_host/log_file/options…)` + `ceph_init` + `ceph_select_filesystem(fs_name)` + `ceph_mount(subdir)`，再 `ceph_ll_lookup_root` + `ceph_ll_getattr` 取导出根（offload kHeavy）；stop 先关锁 Fh/Fh 缓存/inode 缓存/根引用再 `ceph_unmount` + `ceph_release` | 每导出一个 `ceph_mount_info`；工厂构造不连接，`start()` 才连；无 ceph.conf 且未显式配置时只告警（mon_host/keyring 可全部来自配置键） |
+| ObjId | 标记字节 `5` + 8B inode 号 + 8B snapid（`vinodeno_t`；snapid 取 `stx_dev`，libcephfs 在此字段回报 inode 的 snapid，Ganesha 同法） → kStableHandles | 17B；Ceph 不复用 inode 号，故无需世代号即满足 P2；`CephBackend::vino_from_oid` 是解析边界（fuzz 目标 `objid_cephfs`），ino 0 直接 ESTALE |
+| resolve | `ceph_ll_lookup_vino`（MDS lookup_ino）→ `Inode*`，前置分片 LRU inode 句柄缓存（容量 = fd_cache）；再一次 `ceph_ll_getattr` 定类型 | ENOENT/ESTALE/EINVAL → ESTALE；ObjPtr 共享 `InodeRef`（最后一个用户 `ceph_ll_put`） |
+| lookup/create/… | `ceph_ll_lookup/ll_create(O_CREAT\|O_EXCL\|O_RDWR，Fh 立即关闭)/ll_mkdir/ll_mknod/ll_symlink/ll_unlink/ll_rmdir/ll_rename/ll_link/ll_readlink/ll_setattr/ll_statfs` | `..` 在导出根钳到根；unlink 先 lookup 取类型与 ObjId（目录 → EISDIR，且丢弃该文件的缓存 Fh）；创建后若 MDS umask 回调/默认 ACL 改了 mode 则补一次 setattr；EXCLUSIVE verifier 存 atime/mtime（同 local 布局） |
+| 身份 | 每次调用在 offload 线程构造一个 `UserPerm`（`ceph_userperm_new(uid,gid,groups)`），调用后销毁；libcephfs 在 `client_permissions` 下判定 | **不置 kNativeAccess**：无 `ceph_ll_access`，ACCESS 由 `Object::access` 默认实现按 mode 位在网关侧回答（一次 getattr）；变更与 OPEN 仍由库以调用者身份权威判定 |
+| change | `ceph_statx.stx_version`（MDS change attribute，数据/元数据变更都递增、全客户端一致） → **kNativeChange**；v4.2 `change_attr_type = MONOTONIC_INCR` | mask 缺 VERSION（极旧 MDS）时回落 ctime 合成 |
+| open/IO | v4 OPEN：`ceph_ll_open` 以调用者 UserPerm → `CephOpenState`（EACCES 即 OPEN 的答案）；匿名 IO：每对象 Fh 缓存（读→写升级、LRU 驱逐、以网关 uid 0 的 UserPerm 打开，门禁 = mode 位 + v3 属主放宽）；`ceph_ll_read/ll_writev`，kDataSync/kFileSync → `ceph_ll_fsync(1/0)`；commit = `ceph_ll_fsync(…, 1)`，失败粘性 poison（§6.2） | 全部 offload；数据路径 kLight，同步/分配/拷贝 kHeavy；所有返回值为负 errno |
+| readdir | `ceph_ll_opendir` + `ceph_seekdir(cookie)` + `ceph_readdirplus_r(want=BASIC\|VERSION, AT_STATX_DONT_SYNC, out=NULL)`，d_off 作 cookie；每页一个目录句柄 | 富化：attr 与 oid 都直接来自 statx（ino + stx_dev），**不取 Inode 引用**——每项零额外往返 |
+| v4.2 | `ceph_ll_lseek(SEEK_DATA/HOLE)`（Ceph 无 extent 图：文件内 DATA=偏移本身、HOLE=EOF，越界 ENXIO——RFC 7862 最小实现）/ `ceph_ll_fallocate(0)` / `ceph_ll_fallocate(PUNCH_HOLE\|KEEP_SIZE)` → kSparseOps；copy_range = 网关侧 `ll_read/ll_write` 循环（libcephfs 无 copy_file_range）→ kCopyRange | 无 CLONE |
+| locks | `CephLockMgr`：每 (文件, lock-owner) 一个 Fh（网关身份 O_RDWR，EACCES 回落 O_RDONLY），`ceph_ll_setlk(fh, flock, owner64, sleep=0)`，owner64 = LockOwnerId 字节的 FNV-1a；冲突 EAGAIN/EWOULDBLOCK；`test()` 用 owner 0 的探测 Fh 走 `ceph_ll_getlk`；`release()` 全量解锁并关 Fh（Ceph 关 Fh 即释放其锁） → **kByteLocks**，`native_locks()` 交给状态层下推 | MDS 全局仲裁：多网关与原生客户端之间互相看见；`native_locks=false` 关闭 |
+| jukebox | ENOTCONN/ETIMEDOUT/ENETDOWN/ENETUNREACH/EHOSTUNREACH/EHOSTDOWN → `kJukebox`（v3 JUKEBOX / v4 DELAY）→ **kJukebox**；EBLOCKLISTED（ESHUTDOWN，会话被列入黑名单）→ **硬 EIO** + `blocklisted` 计数（重试无意义，需重启网关） | MDS failover / OSD 重连期间客户端重试而非报错；`jukebox=false` 时回 EIO |
+
+**绑定方式**：`backend/cephapi.hpp` 定义一张 46 项函数表（签名取自 Ceph 20 的
+`cephfs/libcephfs.h` / `cephfs/ceph_ll_client.h`，不透明类型按真名在全局命名空间声明；
+`ceph_statx` 与 `vinodeno_t` 在真头文件的 include guard 下自带完整定义），`cephapi.cpp`
+在 `start()` 时 `dlopen("libcephfs.so.2")` + `dlsym`（libcephfs 无符号版本）填表——二进制
+无构建期 Ceph 依赖；`scripts/check_cephapi_abi.sh` 在有头文件的主机上把每个成员与真实
+声明做编译期比对，并用 C 编译单元核对 `vinodeno_t`/`ceph_statx` 布局（已对 20.2.0 头文件
+通过）。测试用 `tests/cephapi_fake.cpp` 在本地目录上实现同一张表（UserPerm 身份、永不复用的
+合成 inode 号、stx_dev=snapid、每次变更递增的 stx_version、按 (inode, owner) 键并随 Fh 关闭
+释放的锁表、可注入传输/黑名单错误），`tests/test_cephfs.cpp` 12 个用例由此把整条后端逻辑跑在
+ctest 里；真实集群验收 = `scripts/accept_cephfs.sh`（校验启动日志 `native-change=true
+native-locks=true`）。
+
+结论（验证后）：接口**零改动**——gluster 时加的 `LockMgr::release()` 与
+`BackendFactory::virtual_path` 直接复用。边界：ACCESS 是网关侧 mode 位（POSIX ACL 只在库
+的 OPEN/变更判定里生效，ACCESS 可能比 OPEN 更宽松——客户端本就按 OPEN 结果为准）；
+copy_range 是网关内存中转（不经 NFS 线，但吃 offload 线程）；被列入黑名单的会话不自愈；
+v4 open/deny 状态仍是网关本地（05 §5.6 口径不变）。

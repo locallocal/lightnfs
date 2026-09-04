@@ -1,7 +1,8 @@
-# 部署与运维（v1 发布）
+# 部署与运维
 
-lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面向"受信网络内导出本地目录树"
-的场景。本文是发布运维的落地指南：信任边界、最小特权部署、配置要点、可观测性与已知限制。
+lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面向"受信网络内导出本地目录树
+或集群文件系统（GlusterFS / Lustre / CephFS）"的场景。本文是发布运维的落地指南：信任边界、
+最小特权部署、配置要点、可观测性与已知限制。
 
 ## 1. 安全信任边界（务必先读）
 
@@ -30,9 +31,9 @@ lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面�
 `packaging/systemd/lightnfs.service` 是按安全清单 §8.5 第 7 项写的最小特权单元：
 
 - 专用系统用户 `lightnfs`（对导出树只读/按需读写，自身不拥有系统文件）；
-- 仅两个 capability：`CAP_DAC_READ_SEARCH`（`open_by_handle_at` 稳定句柄，设计 06）与
-  `CAP_NET_BIND_SERVICE`（绑定 2049/20048），其余 `CapabilityBoundingSet` 清空、
-  `NoNewPrivileges`；
+- 仅两个 capability：`CAP_DAC_READ_SEARCH`（`open_by_handle_at` 稳定句柄，设计 06；只导出
+  gluster/lustre/cephfs 时不需要）与 `CAP_NET_BIND_SERVICE`（绑定 2049/20048），其余
+  `CapabilityBoundingSet` 清空、`NoNewPrivileges`；
 - 文件系统沙箱：`ProtectSystem=strict` + 仅 `state_dir` 与显式列出的导出树可写；
 - seccomp 白名单：`@system-service` 去掉高危集，再显式加入 io_uring 与句柄系统调用
   （允许集由 `scripts/gen_seccomp_allowlist.sh` 从真实 v3+v4.1 读写+锁+v4.2 稀疏/拷贝负载
@@ -124,14 +125,14 @@ sudo systemctl enable --now lightnfs
   普通操作在 grace 内收 GRACE 重试。**不要清空 state_dir**，否则客户端无法 reclaim、
   可能丢未提交写。
 
-## 5. 已知限制（v1）
+## 5. 已知限制
 
 - **身份仅 AUTH_SYS**：无 krb5/RPCSEC_GSS（见 §1）。通道加密可用内置 **RPC-over-TLS**
   （`[tls]`，RFC 9289）：STARTTLS 探测 + 同连接 TLS 会话；socket IO 仍全走 io_uring
   （OpenSSL 在 memory BIO 上做密码学，reactor 不阻塞）。回传通道（委托召回 /
-  CB_NOTIFY_LOCK）复用同一连接，握手后自动加密。**仍不做写/目录委托、pNFS、多网关一致性**
-  （前提未变：写委托需 CB_GETATTR + 单写者证据，pNFS 为决策 D8 非目标，多网关需下沉原生锁的
-  集群后端）。
+  CB_NOTIFY_LOCK）复用同一连接，握手后自动加密。**仍不做写/目录委托、pNFS**（写委托需
+  CB_GETATTR + 单写者证据，pNFS 为决策 D8 非目标）；多网关一致性的边界见下文"单机网关"与
+  各集群后端条目（CephFS 同时具备原生 change 与原生锁，其余后端各具一半）。
 - **不实现 NLM/NSM**：v3 无字节锁（设计 D8）。v4.1 有完整字节锁；**v3 与 v4 同挂一后端时，
   v3 写不受 v4 的 share deny / 字节锁约束**（v3 侧本无锁语义，文档明示的边界）。
 - **v4.2 按 op 宣告**：启动时对每个导出探测 `kSparseOps`/`kCopyRange`/`kCloneRange` 并写
