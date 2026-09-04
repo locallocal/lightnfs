@@ -92,6 +92,7 @@ add_library(lnfs_core STATIC
   src/mountd/mount3.cpp
   src/server/rpcbind.cpp
   src/server/ctl.cpp
+  src/server/daemon.cpp
   src/server/frontend.cpp
   src/server/metrics_providers.cpp
   src/server/protocol_stack.cpp
