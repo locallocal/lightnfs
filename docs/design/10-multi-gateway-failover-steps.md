@@ -30,7 +30,7 @@
 | | B4 导出表一致性摘要 ✅ 2026-09-05 | 启动期拒绝树不一致的网关入集群 | A1 A2 |
 | C 进程生命周期 | C1 `ProtocolStack` 可重建 ✅ 2026-09-05 | 栈的构造/析构与进程解耦；连接收敛等待 | A4 |
 | | C2 `ClusterController` 状态机 ✅ 2026-09-05 | Standby/Activating/Active/Draining + 围栏协程 | A1–A4 B1 C1 |
-| | C3 ctl `cluster *` 命令 | status / takeover / standby | C2 |
+| | C3 ctl `cluster *` 命令 ✅ 2026-09-05 | status / takeover / standby | C2 |
 | | C4 指标 | role / epoch / fence age / takeovers | C2 |
 | D 后端接管钩子 | D1 `Backend::takeover()` 接口 + 脚本钩子 | 默认空操作；可配外部脚本（Lustre evict 等） | C2 |
 | | D2 CephFS reclaim 原语 | cephapi 三入口、fake、`[export.cephfs] uuid` | D1 |
@@ -405,7 +405,7 @@ Hooks——
   standby 且不监听；`v4reclaim` 客户端在 A 上持有 open 状态 → `kill -9 A` → B 在 ~3s 内自动
   接管并在同一端口监听、epoch+1、从共享名单进 grace → 客户端 CLAIM_PREVIOUS 成功；B 退出时释放围栏。
 
-### C3 ctl `cluster` 命令
+### C3 ctl `cluster` 命令（已完成，2026-09-05）
 
 **改动点**
 
@@ -417,6 +417,30 @@ Hooks——
   `tools/lightnfs_ctl.cpp:194`）。
 
 **测试**：`Ctl.AnswerCommandSurface` 加三条命令的文本/JSON 断言（fake 控制器）。
+
+**实现记录（与上文的差异）**：
+- 控制器的围栏/名单调用都是共享文件系统上的阻塞 IO（A2 约定），而 ctl 命令跑在 reactor 上，所以
+  `cluster *` 放在 `CtlServer::answer_async`，`peers()` / `request_takeover` / `request_standby`
+  经 `rt::offload` 在 offload 池执行；同步 `answer()` 只回答无控制器时的 `cluster: not enabled`。
+- `ClusterController` 新增 `config()` 与 `peers()`（`list_exports_digests` 的节点名，排序）——
+  "peers" 即向共享目录发布过导出摘要的网关，无需新的名单文件。
+- `status` 行在计划字段之外再带 `fence_epoch` / `fence_expires_in_ms`（围栏到期倒计时，负值 =
+  已过期）、`takeover`（策略）、`takeovers` / `fence_lost` / `activation_failures` /
+  `last_activation_ms`（C4 的同源计数）；无围栏记录时文本为 `none`/`-`，JSON 为 `null`。
+  `takeover` 失败时区分"非 standby（带当前角色）"与"围栏被 X 持有（提示 `--force`）"。
+- `daemon.cpp`：控制器改为在 `Management::start` 之前构造（定时线程仍在管理面起来之后才
+  `start()`），`Management::start` 多一个 `ClusterController*` 参数传给 `CtlDeps::cluster`；
+  `status` 的 `role=` 从控制器直接派生，原 `role` 回调不再需要。
+- 测试：`ClusterController` 不是接口，"fake 控制器"= 真控制器 + 内存 `ClusterStore`（从
+  `test_cluster_controller.cpp` 抽到 `tests/mem_cluster_store.hpp` 共用）+ 内联钩子；
+  `Ctl.AnswerCommandSurface` 只断言未启用集群的三条回答，其余在新用例 `Ctl.ClusterCommands`
+  （需要 runtime 的 offload 池）：status 文本/JSON、围栏被他人持有时拒绝与 `--force`、
+  active 时拒绝 takeover、standby 的钩子顺序 `activate deactivate reset` 与围栏释放、
+  过期围栏免 force、peers 读失败时 `peers=?`/`null`。
+- `lightnfs-ctl cluster <status|takeover|standby>` 为单个带位置参数的叶子（同 `drc [flush]`），
+  `--force`/`-f` 是该叶子的布尔选项，原样转发到线协议。本机双实例（同端口、同 `shared_dir`、
+  `takeover=manual`）手工验证：takeover → 对端拒绝并报持有者 → `--force` 抢占、原 active 自动
+  draining → standby 释放围栏。
 
 ### C4 指标
 

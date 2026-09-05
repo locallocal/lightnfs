@@ -5,6 +5,7 @@
 // Command tree (ccmd, third_party/ccmd):
 //   lightnfs-ctl <ping|metrics|dump-errors|drc|fdcache|clear-poison|state> [--socket=PATH]
 //   lightnfs-ctl expire-client <clientid> [--socket=PATH]
+//   lightnfs-ctl cluster <status|takeover [--force]|standby> [--socket=PATH]
 //   lightnfs-ctl bench <echo|nullrpc|fullpath> [args...]
 //
 // Socket resolution: --socket, else $LIGHTNFS_CTL, else /tmp/lightnfs-state/ctl.sock.
@@ -90,6 +91,34 @@ Cmd make_socket_leaf(const char* name, const char* example, const char* usage,
   auto cmd = std::make_shared<ccmd::c_command>(name, example, usage, help_long,
                                                help_short, run_socket_cmd);
   add_socket_flag(cmd);
+  return cmd;
+}
+
+// `cluster <status|takeover|standby>` (plan 10 C3): a socket leaf with a subcommand
+// positional, like `drc [flush]`, plus the --force flag that `takeover` forwards.
+void run_cluster_cmd(const Cmd& c) {
+  std::string line = c->name();
+  for (const auto& a : c->args()) line += " " + a;
+  if (c->var<bool>("force")) line += " --force";
+  if (c->var<bool>("json")) line += " --json";
+  line += '\n';
+  g_exit = send_ctl(c->var<std::string>("socket"), line);
+}
+
+Cmd make_cluster_leaf() {
+  auto cmd = std::make_shared<ccmd::c_command>(
+      "cluster", "lightnfs-ctl cluster takeover --force",
+      "lightnfs-ctl cluster <status|takeover [--force]|standby>",
+      "Multi-gateway failover (design 09): `status` shows this gateway's role, node, "
+      "epoch, fence owner/age, shared_dir and the peer list; `takeover` asks a standby "
+      "gateway to take the fence and start serving (--force takes a live fence held by "
+      "another node — only when that node is known to be down); `standby` drains an "
+      "active gateway and releases the fence. Answers `cluster: not enabled` on a "
+      "single gateway.",
+      "cluster role: status / takeover / standby", run_cluster_cmd);
+  add_socket_flag(cmd);
+  cmd->varp<bool>("force", "f", false,
+                  "takeover: overwrite a live fence held by another node");
   return cmd;
 }
 
@@ -250,6 +279,7 @@ int main(int argc, char** argv) {
       "End the post-restart grace period immediately (clients that have not "
       "reclaimed yet lose their claim window).",
       "end grace early"));
+  root->add_subcommand(make_cluster_leaf());
   root->add_subcommand(make_bench());
 
   try {

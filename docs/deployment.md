@@ -94,7 +94,11 @@ sudo systemctl enable --now lightnfs
   `expire-client <clientid>`（强制回收某客户端全部状态，排查挂死/泄漏）、
   `conns` / `kill-conn <id>`（连接列表与强制断开）、`loglevel <lv>`、`reload`
   （热重载，见下）、`drain`（停止接受新连接、存量继续服务——从 LB 优雅摘流，重启前
-  不可逆）、`grace-end`（提前结束 grace）。所有命令加 `--json` 输出机器可读 JSON。
+  不可逆）、`grace-end`（提前结束 grace）、`cluster status|takeover [--force]|standby`
+  （多网关主备，09/10 册：`status` 一行给出 `role= node= epoch= fence_owner= fence_age_ms=
+  shared_dir= peers=` 及接管计数；`takeover` 让 standby 网关取围栏并开始服务，`--force`
+  覆盖他人仍有效的围栏——仅在确认对方已死时使用；`standby` 让 active 网关排空连接并释放围栏。
+  单网关答 `cluster: not enabled`）。所有命令加 `--json` 输出机器可读 JSON。
   另有本地子命令 `lightnfs-ctl bench <echo|nullrpc|fullpath>`——三层基准（02 分册
   §2.8），自起进程内栈压测，不经 ctl 套接字、不涉运行中的服务。
 - **热重载**（SIGHUP 或 `lightnfs-ctl reload`）：重新解析

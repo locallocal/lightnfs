@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/config.hpp"
 #include "server/cluster_store.hpp"
@@ -81,6 +82,10 @@ class ClusterController {
 
   Snapshot snapshot() const;
   Role role() const;
+  const core::ClusterConfig& config() const { return cfg_; }
+  // The gateways known to the store (every node that published an export digest,
+  // sorted); blocking store IO, for `lightnfs-ctl cluster status` (plan 10 C3).
+  Result<std::vector<std::string>> peers() const;
 
  private:
   bool auto_takeover_allowed() const;

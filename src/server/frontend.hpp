@@ -34,11 +34,13 @@ struct Management {
   // The data plane the ctl commands address: null until a frontend attaches one.
   std::shared_ptr<DataPlaneSlot> plane = std::make_shared<DataPlaneSlot>(nullptr);
 
-  // Opens the ctl socket (with `reload` wired in and `role` feeding `status`) and
-  // starts the metrics endpoint.  Needs the runtime; needs no protocol stack.
+  // Opens the ctl socket (with `reload` wired in, `role` feeding `status` and the
+  // cluster controller behind `cluster *`, plan 10 C3) and starts the metrics
+  // endpoint.  Needs the runtime; needs no protocol stack.
   static Management start(const core::ServerConfig& cfg, rt::Runtime& runtime,
                           std::function<std::string()> reload,
-                          std::function<std::string()> role = {});
+                          std::function<std::string()> role = {},
+                          ClusterController* cluster = nullptr);
   // `plane` must stay valid until detach() returns: detach waits for every command
   // still using the plane (bounded; a warning names the stragglers).
   void attach(const DataPlane* plane) { this->plane->store(plane); }

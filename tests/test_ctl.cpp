@@ -18,9 +18,11 @@
 #include "backend/local/local.hpp"
 #include "backend/memory/memory.hpp"
 #include "core/config.hpp"
+#include "mem_cluster_store.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
 #include "runtime/runtime.hpp"
+#include "server/cluster_controller.hpp"
 #include "server/ctl.hpp"
 #include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
@@ -392,6 +394,11 @@ TEST(Ctl, AnswerCommandSurface) {
               std::string::npos);
   EXPECT_TRUE(server::CtlServer::answer(deps, "definitely-bogus").find("unknown") !=
               std::string::npos);
+  // No cluster controller (single gateway): every `cluster *` answers not enabled.
+  EXPECT_STREQ(server::CtlServer::answer(deps, "cluster status"), "cluster: not enabled\n");
+  EXPECT_STREQ(server::CtlServer::answer(deps, "cluster takeover --force --json"),
+               "{\"error\":\"not enabled\"}\n");
+  EXPECT_STREQ(server::CtlServer::answer(deps, "cluster standby"), "cluster: not enabled\n");
 
   // An attached but empty plane: the per-feature messages, and role=active.
   server::DataPlane empty{};
@@ -455,6 +462,12 @@ TEST(Ctl, ConnRegistryListAndKill) {
 
 namespace {
 
+std::string joined_calls(const std::vector<std::string>& v) {
+  std::string out;
+  for (const auto& s : v) out += (out.empty() ? "" : " ") + s;
+  return out;
+}
+
 template <class T>
 T run_task(rt::Runtime& runtime, rt::Task<T> task) {
   std::mutex mu;
@@ -508,6 +521,106 @@ TEST(Ctl, MetricsDumpErrorsAndConnsCommands) {
                   .find("\"killed\":false") != std::string::npos);
   close(sv[0]);
   close(sv[1]);
+}
+
+// plan 10 C3: `cluster status | takeover [--force] | standby` against a real controller
+// over the in-memory store (manual takeover policy, inline hooks that record their order).
+TEST(Ctl, ClusterCommands) {
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  {
+    test::MemClusterStore store;
+    store.digests["gw2"] = "sha256:b";
+    store.digests["gw1"] = "sha256:a";
+    std::vector<std::string> calls;
+    server::ClusterController::Hooks hooks;
+    hooks.activate = [&](uint64_t) -> Result<void> {
+      calls.push_back("activate");
+      return {};
+    };
+    hooks.deactivate = [&] { calls.push_back("deactivate"); };
+    hooks.backend_reset = [&] { calls.push_back("reset"); };
+    core::ClusterConfig cfg;
+    cfg.enabled = true;
+    cfg.id = "cluster-ctl-test";
+    cfg.shared_dir = "/mnt/shared/.lightnfs-cluster";
+    cfg.node = "gw1";
+    cfg.takeover = "manual";
+    cfg.fence_lease_ms = 1000;
+    server::ClusterController cc(cfg, store, std::move(hooks));
+    server::CtlDeps deps{};
+    deps.cluster = &cc;
+    auto ask = [&](const char* line) {
+      return run_task(runtime, server::CtlServer::answer_async(deps, line));
+    };
+
+    // Standby, no fence seen yet: the documented text line, then the JSON twin.
+    EXPECT_STREQ(ask("cluster status"),
+                 "role=standby node=gw1 epoch=0 fence_owner=none fence_epoch=- "
+                 "fence_age_ms=- fence_expires_in_ms=- "
+                 "shared_dir=/mnt/shared/.lightnfs-cluster peers=gw1,gw2 takeover=manual "
+                 "takeovers=0 fence_lost=0 activation_failures=0 last_activation_ms=0\n");
+    auto js = ask("cluster status --json");
+    EXPECT_TRUE(js.find("\"role\":\"standby\",\"node\":\"gw1\",\"epoch\":0,"
+                        "\"fence_owner\":null,\"fence_epoch\":null,\"fence_age_ms\":null,"
+                        "\"fence_expires_in_ms\":null,"
+                        "\"shared_dir\":\"/mnt/shared/.lightnfs-cluster\","
+                        "\"peers\":[\"gw1\",\"gw2\"],\"takeover\":\"manual\"") !=
+                std::string::npos);
+    // The process-level `status` derives its role from the controller too.
+    EXPECT_TRUE(server::CtlServer::answer(deps, "status").find("role=standby") !=
+                std::string::npos);
+    EXPECT_TRUE(ask("cluster standby").find("not active (role=standby)") != std::string::npos);
+    EXPECT_STREQ(ask("cluster bogus"), "cluster: expected status|takeover [--force]|standby\n");
+    EXPECT_STREQ(ask("cluster --json"), "{\"error\":\"bad subcommand\"}\n");
+
+    // A live fence held by gw2 (seen by one Standby tick): plain takeover is refused
+    // and names the holder; --force wins, the hooks run in order, status flips.
+    store.taken_by("gw2", 7);
+    cc.tick();
+    EXPECT_TRUE(ask("cluster status").find("fence_owner=gw2 fence_epoch=7 fence_age_ms=") !=
+                std::string::npos);
+    auto refused = ask("cluster takeover");
+    EXPECT_STREQ(refused, "cluster: fence held by gw2 (retry with --force to take it)\n");
+    EXPECT_STREQ(ask("cluster takeover --json"),
+                 "{\"error\":\"fence held by gw2 (retry with --force to take it)\"}\n");
+    EXPECT_TRUE(cc.role() == server::Role::kStandby);
+    EXPECT_STREQ(ask("cluster takeover --force"),
+                 "takeover started: node=gw1 epoch=1 role=active (forced)\n");
+    EXPECT_STREQ(joined_calls(calls), "activate");
+    EXPECT_TRUE(cc.role() == server::Role::kActive);
+    auto active = ask("cluster status");
+    EXPECT_TRUE(active.find("role=active node=gw1 epoch=1 fence_owner=gw1 fence_epoch=1 "
+                            "fence_age_ms=") != std::string::npos);
+    EXPECT_TRUE(active.find("takeovers=1 fence_lost=0") != std::string::npos);
+    EXPECT_TRUE(ask("cluster status --json").find("\"fence_owner\":\"gw1\"") !=
+                std::string::npos);
+    EXPECT_TRUE(server::CtlServer::answer(deps, "status --json")
+                    .find("\"role\":\"active\"") != std::string::npos);
+    // Already active: takeover is refused with the role.
+    EXPECT_STREQ(ask("cluster takeover"), "cluster: not standby (role=active)\n");
+    EXPECT_STREQ(ask("cluster takeover --json"),
+                 "{\"error\":\"not standby (role=active)\"}\n");
+
+    // standby: drains (deactivate → backend reset), releases our fence, back to standby.
+    EXPECT_STREQ(ask("cluster standby --json"), "{\"standby\":true}\n");
+    EXPECT_STREQ(joined_calls(calls), "activate deactivate reset");
+    EXPECT_TRUE(cc.role() == server::Role::kStandby);
+    EXPECT_FALSE(store.fence.has_value());
+    EXPECT_TRUE(ask("cluster status").find("role=standby node=gw1 epoch=0 fence_owner=gw1") !=
+                std::string::npos);  // the last record seen was ours
+    // An expired fence needs no force; JSON success carries the new epoch.
+    store.taken_by("gw2", 9);
+    store.age_out();
+    EXPECT_STREQ(ask("cluster takeover --json"),
+                 "{\"takeover\":true,\"forced\":false,\"epoch\":2,\"role\":\"active\"}\n");
+    EXPECT_STREQ(ask("cluster standby"), "standby requested: draining\n");
+    // A store that cannot list peers still answers, with the peers unknown.
+    store.fail_list = errno_from(EIO);
+    EXPECT_TRUE(ask("cluster status").find(" peers=? ") != std::string::npos);
+    EXPECT_TRUE(ask("cluster status --json").find("\"peers\":null") != std::string::npos);
+  }
+  runtime.stop_and_join();
 }
 
 TEST(Ctl, FdcacheAndClearPoisonCommands) {

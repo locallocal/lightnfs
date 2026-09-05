@@ -92,8 +92,8 @@ be auditable and testable in userspace. lightnfs targets exactly that gap:
   `root`/`all`/`none` squash, read-only flag, per-backend sub-table (`[export.local]`,
   `[export.gluster]`, `[export.lustre]`, `[export.cephfs]`).
 - `lightnfs-ctl` over a unix socket (ping, metrics, error log dump, DRC and fd-cache
-  stats, v4 state table dump, forced client expiry) and `lightnfs-fh` (file-handle
-  decoder with HMAC verification).
+  stats, v4 state table dump, forced client expiry, cluster role status / takeover /
+  standby) and `lightnfs-fh` (file-handle decoder with HMAC verification).
 - Prometheus text metrics over HTTP, structured logs with per-request summaries.
 - Least-privilege systemd unit with a generated seccomp allowlist.
 
@@ -309,6 +309,9 @@ lightnfs-ctl drc                     # duplicate-request-cache stats
 lightnfs-ctl fdcache                 # fd / handle-cache stats (local, gluster, cephfs exports)
 lightnfs-ctl state                   # v4 clients/sessions/opens/locks, grace status
 lightnfs-ctl expire-client 0x500000001   # force-reclaim one client's state
+lightnfs-ctl cluster status          # multi-gateway role / epoch / fence owner / peers
+lightnfs-ctl cluster takeover        # standby gateway takes the fence (--force: take a live one)
+lightnfs-ctl cluster standby         # active gateway drains and releases the fence
 lightnfs-fh --key /etc/lightnfs/hmac.key <hex-handle>   # decode + verify a handle
 ```
 

@@ -22,6 +22,8 @@
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
+#include "runtime/offload_pool.hpp"
+#include "server/cluster_controller.hpp"
 #include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
 #include "runtime/io.hpp"
@@ -92,8 +94,8 @@ std::string json_escape(std::string_view s) {
 const char* kHelp =
     "unknown command; available: ping|version|status|metrics|dump-errors|drc [flush]|"
     "fdcache [flush]|clear-poison|state|expire-client <clientid>|conns|kill-conn <id>|"
-    "loglevel <debug|info|warn|error>|reload|drain|grace-end  (append --json for JSON "
-    "output)\n";
+    "loglevel <debug|info|warn|error>|reload|drain|grace-end|"
+    "cluster <status|takeover [--force]|standby>  (append --json for JSON output)\n";
 
 }  // namespace
 
@@ -133,6 +135,78 @@ namespace {
 const char* not_active(bool json) {
   return json ? "{\"error\":\"not active\"}\n" : "not active\n";
 }
+
+const char* cluster_not_enabled(bool json) {
+  return json ? "{\"error\":\"not enabled\"}\n" : "cluster: not enabled\n";
+}
+
+const char* cluster_usage(bool json) {
+  return json ? "{\"error\":\"bad subcommand\"}\n"
+              : "cluster: expected status|takeover [--force]|standby\n";
+}
+
+std::string cluster_error(bool json, std::string_view text) {
+  return json ? std::format("{{\"error\":\"{}\"}}\n", json_escape(text))
+              : std::format("cluster: {}\n", text);
+}
+
+// `cluster status` (plan 10 C3): the controller's snapshot plus the store's peer list
+// (read off the reactor by the caller).  The fence fields describe the record last
+// seen: our own while we hold it (age = time since the last renew), someone else's
+// while we stand by (age = time since we read it).
+std::string cluster_status(const ClusterController& cc,
+                           const Result<std::vector<std::string>>& peers, bool json) {
+  const auto snap = cc.snapshot();
+  const auto& cfg = cc.config();
+  const auto now = std::chrono::steady_clock::now();
+  const int64_t wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count();
+  std::string owner = snap.fence ? snap.fence->node : "";
+  int64_t fence_epoch = snap.fence ? static_cast<int64_t>(snap.fence->epoch) : -1;
+  int64_t age_ms = snap.fence ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    now - snap.fence_seen)
+                                    .count()
+                              : -1;
+  int64_t expires_in_ms = snap.fence ? snap.fence->expires_at_ms - wall_ms : 0;
+  if (json) {
+    std::string peer_list = "null";
+    if (peers) {
+      peer_list = "[";
+      for (size_t i = 0; i < peers->size(); ++i)
+        peer_list += std::format("{}\"{}\"", i ? "," : "", json_escape((*peers)[i]));
+      peer_list += "]";
+    }
+    std::string fence_owner = snap.fence ? std::format("\"{}\"", json_escape(owner)) : "null";
+    std::string fence_epoch_s = snap.fence ? std::to_string(fence_epoch) : "null";
+    std::string fence_age = snap.fence ? std::to_string(age_ms) : "null";
+    std::string fence_left = snap.fence ? std::to_string(expires_in_ms) : "null";
+    return std::format(
+        "{{\"role\":\"{}\",\"node\":\"{}\",\"epoch\":{},\"fence_owner\":{},"
+        "\"fence_epoch\":{},\"fence_age_ms\":{},\"fence_expires_in_ms\":{},"
+        "\"shared_dir\":\"{}\",\"peers\":{},\"takeover\":\"{}\",\"takeovers\":{},"
+        "\"fence_lost\":{},\"activation_failures\":{},\"last_activation_ms\":{}}}\n",
+        role_name(snap.role), json_escape(snap.node), snap.epoch, fence_owner,
+        fence_epoch_s, fence_age, fence_left, json_escape(cfg.shared_dir), peer_list,
+        json_escape(cfg.takeover), snap.takeovers, snap.fence_lost,
+        snap.activation_failures, snap.last_activation.count());
+  }
+  std::string peer_list = "?";
+  if (peers) {
+    peer_list.clear();
+    for (const auto& p : *peers) peer_list += (peer_list.empty() ? "" : ",") + p;
+  }
+  return std::format(
+      "role={} node={} epoch={} fence_owner={} fence_epoch={} fence_age_ms={} "
+      "fence_expires_in_ms={} shared_dir={} peers={} takeover={} takeovers={} "
+      "fence_lost={} activation_failures={} last_activation_ms={}\n",
+      role_name(snap.role), snap.node, snap.epoch, snap.fence ? owner : "none",
+      snap.fence ? std::to_string(fence_epoch) : "-",
+      snap.fence ? std::to_string(age_ms) : "-",
+      snap.fence ? std::to_string(expires_in_ms) : "-", cfg.shared_dir, peer_list,
+      cfg.takeover, snap.takeovers, snap.fence_lost, snap.activation_failures,
+      snap.last_activation.count());
+}
 }  // namespace
 
 std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
@@ -153,7 +227,10 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
                   std::chrono::steady_clock::now() - deps.started)
                   .count();
     size_t conns = transport::ConnRegistry::instance().count();
-    std::string role = deps.role ? deps.role() : dp ? "active" : "standby";
+    std::string role = deps.role      ? deps.role()
+                       : deps.cluster ? role_name(deps.cluster->role())
+                       : dp           ? "active"
+                                      : "standby";
     bool draining = dp && dp->draining && dp->draining->load(std::memory_order_relaxed);
     size_t exports = dp && dp->exports ? dp->exports->entries().size() : 0;
     bool grace = dp && dp->state && dp->state->in_grace();
@@ -373,6 +450,9 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     if (json) return std::format("{{\"cleared\":{}}}\n", total);
     return any ? std::format("cleared {} poison marks\n", total) : "no local/gluster/cephfs exports\n";
   }
+  // `cluster *` runs its store IO off the reactor in answer_async(); only the
+  // single-gateway answer is available here.
+  if (cmd.name() == "cluster" && !deps.cluster) return cluster_not_enabled(json);
   return json ? "{\"error\":\"unknown command\"}\n" : kHelp;
 }
 
@@ -434,6 +514,49 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
     size_t dropped = co_await dp->drc->flush();
     if (json) co_return std::format("{{\"flushed\":{}}}\n", dropped);
     co_return std::format("flushed {} drc entries\n", dropped);
+  }
+  if (cmd.name() == "cluster" && deps.cluster) {
+    // The controller's store calls block on the shared filesystem (plan 10 A2): run
+    // them on the offload pool, never on this reactor.
+    ClusterController& cc = *deps.cluster;
+    const auto sub = cmd.arg(1);
+    if (sub == "status") {
+      auto peers = co_await rt::offload([&cc] { return cc.peers(); });
+      co_return cluster_status(cc, peers, json);
+    }
+    if (sub == "takeover") {
+      bool force = false;
+      for (size_t i = 2; i < cmd.args.size(); ++i) force |= cmd.args[i] == "--force";
+      auto took = co_await rt::offload([&cc, force] { return cc.request_takeover(force); });
+      if (took) {
+        auto snap = cc.snapshot();
+        if (json)
+          co_return std::format("{{\"takeover\":true,\"forced\":{},\"epoch\":{},\"role\":\"{}\"}}\n",
+                                force, snap.epoch, role_name(snap.role));
+        co_return std::format("takeover started: node={} epoch={} role={}{}\n", snap.node,
+                              snap.epoch, role_name(snap.role), force ? " (forced)" : "");
+      }
+      auto snap = cc.snapshot();
+      if (snap.role != Role::kStandby)
+        co_return cluster_error(json,
+                                std::format("not standby (role={})", role_name(snap.role)));
+      if (took.error() == errno_from(EBUSY))
+        co_return cluster_error(
+            json, std::format("fence held by {} (retry with --force to take it)",
+                              snap.fence ? snap.fence->node : "another node"));
+      co_return cluster_error(json,
+                              std::format("takeover failed: {}", errno_name(took.error())));
+    }
+    if (sub == "standby") {
+      auto asked = co_await rt::offload([&cc] { return cc.request_standby(); });
+      if (asked) {
+        if (json) co_return "{\"standby\":true}\n";
+        co_return "standby requested: draining\n";
+      }
+      co_return cluster_error(
+          json, std::format("not active (role={})", role_name(cc.snapshot().role)));
+    }
+    co_return cluster_usage(json);
   }
   co_return answer(deps, command);
 }

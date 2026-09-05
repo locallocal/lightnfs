@@ -463,14 +463,11 @@ int run_server(const std::string& config_path) {
   MainLoop loop;
   std::optional<DataPlaneInstance> plane;
   std::unique_ptr<ClusterController> controller;
-  Management mgmt = Management::start(server_cfg, runtime, do_reload, [&]() -> std::string {
-    return controller ? role_name(controller->role()) : (plane ? "active" : "standby");
-  });
-  apply_observability(server_cfg);
+  std::optional<Management> mgmt;  // started below, once the controller exists
   // The data-plane hooks the single gateway and the controller share (main thread).
   auto bring_up = [&](uint64_t epoch) -> Result<void> {
     core->epoch = epoch;
-    plane = activate(server_cfg, cluster_cfg, *core, runtime, mgmt);
+    plane = activate(server_cfg, cluster_cfg, *core, runtime, *mgmt);
     if (!plane) return Err(errno_from(EIO));
     active_stack.store(plane->stack.get(), std::memory_order_release);
     LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={} epoch={}",
@@ -481,22 +478,13 @@ int run_server(const std::string& config_path) {
   auto take_down = [&](std::chrono::milliseconds grace) {
     if (!plane) return;
     active_stack.store(nullptr);
-    (void)deactivate(*plane, server_cfg, mgmt, grace);
+    (void)deactivate(*plane, server_cfg, *mgmt, grace);
     plane.reset();
   };
-
-  if (!cluster_store) {
-    // 4+5. single gateway (plan 10 C1): the data plane once, for the whole process.
-    if (!bring_up(core->epoch)) {
-      mgmt.stop();
-      runtime.stop_and_join();
-      return 1;
-    }
-  } else {
-    // 4+5. cluster (plan 10 C2): standby until the controller takes the fence; the
-    //      data plane is built with the epoch the takeover mints and torn down again
-    //      when the fence is lost or the operator asks.
-    const std::chrono::milliseconds drain_grace(2 * cluster_cfg.fence_lease_ms);
+  const std::chrono::milliseconds drain_grace(2 * cluster_cfg.fence_lease_ms);
+  if (cluster_store) {
+    // The controller (plan 10 C2) is built before the management plane so the ctl
+    // socket can address it (`cluster *`, plan 10 C3); its timer starts after.
     ClusterController::Hooks hooks;
     hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
     hooks.activate = bring_up;
@@ -509,6 +497,21 @@ int run_server(const std::string& config_path) {
     };
     controller = std::make_unique<ClusterController>(cluster_cfg, *cluster_store,
                                                      std::move(hooks));
+  }
+  mgmt.emplace(Management::start(server_cfg, runtime, do_reload, {}, controller.get()));
+  apply_observability(server_cfg);
+
+  if (!cluster_store) {
+    // 4+5. single gateway (plan 10 C1): the data plane once, for the whole process.
+    if (!bring_up(core->epoch)) {
+      mgmt->stop();
+      runtime.stop_and_join();
+      return 1;
+    }
+  } else {
+    // 4+5. cluster (plan 10 C2): standby until the controller takes the fence; the
+    //      data plane is built with the epoch the takeover mints and torn down again
+    //      when the fence is lost or the operator asks.
     controller->start();
     LNFS_INFO("lightnfs {} standby: node={} role={} takeover={} fence_lease={}ms",
               LIGHTNFS_VERSION, core::cluster_node_name(cluster_cfg), cluster_cfg.role,
@@ -528,7 +531,7 @@ int run_server(const std::string& config_path) {
     LNFS_INFO("cluster: fence released on exit");
   }
   stop_backends(runtime, *core->exports);
-  mgmt.stop();
+  mgmt->stop();
   runtime.stop_and_join();
   LNFS_INFO("lightnfs stopped");
   shutdown_async_logging();

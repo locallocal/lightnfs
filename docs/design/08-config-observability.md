@@ -133,5 +133,5 @@ runtime 的 offload 池与 reactor 循环——在 `server/metrics_providers.{hp
 
 ## 8.6 工具
 
-- `lightnfs-ctl`：unix socket 管理口（全部命令支持 `--json`）——`ping`/`version`/`status`、`metrics`、`dump-errors`、`drc [flush]`、`fdcache [flush]`、`clear-poison`、`state`（客户端/会话/打开/锁 dump）、`expire-client`、`conns`/`kill-conn`、`loglevel`、`reload`、`drain`、`grace-end`；另有本地子命令 `bench echo|nullrpc|fullpath`（三层基准）。排障闭环不依赖重启。
+- `lightnfs-ctl`：unix socket 管理口（全部命令支持 `--json`）——`ping`/`version`/`status`、`metrics`、`dump-errors`、`drc [flush]`、`fdcache [flush]`、`clear-poison`、`state`（客户端/会话/打开/锁 dump）、`expire-client`、`conns`/`kill-conn`、`loglevel`、`reload`、`drain`、`grace-end`、`cluster status|takeover [--force]|standby`（多网关角色：查看角色/epoch/围栏/同伴，手动接管或退回 standby，10 册 C3；单网关答 `cluster: not enabled`）；另有本地子命令 `bench echo|nullrpc|fullpath`（三层基准）。排障闭环不依赖重启。
 - `lightnfs-fh`：句柄解码工具（输入 hex 句柄 → fsid/ObjId/HMAC 校验结果），配 wireshark 抓包联调。
