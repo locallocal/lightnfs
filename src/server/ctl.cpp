@@ -96,9 +96,22 @@ const char* kHelp =
 
 }  // namespace
 
+CtlDeps CtlDeps::with_plane(const DataPlane* plane) {
+  CtlDeps deps;
+  deps.plane = std::make_shared<DataPlaneSlot>(plane);
+  return deps;
+}
+
+namespace {
+const char* not_active(bool json) {
+  return json ? "{\"error\":\"not active\"}\n" : "not active\n";
+}
+}  // namespace
+
 std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
   const Cmd cmd = parse_command(command);
   const bool json = cmd.json;
+  const DataPlane* dp = deps.data_plane();
   if (cmd.name() == "ping") return json ? "{\"ok\":true}\n" : "pong\n";
   if (cmd.name() == "version") {
     return json ? std::format("{{\"version\":\"{}\"}}\n", LIGHTNFS_VERSION)
@@ -112,19 +125,21 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
                   std::chrono::steady_clock::now() - deps.started)
                   .count();
     size_t conns = transport::ConnRegistry::instance().count();
-    bool draining = deps.draining && deps.draining->load(std::memory_order_relaxed);
-    size_t exports = deps.exports ? deps.exports->entries().size() : 0;
-    bool grace = deps.state && deps.state->in_grace();
-    int64_t grace_left = deps.state ? deps.state->grace_remaining_seconds() : 0;
+    std::string role = deps.role ? deps.role() : dp ? "active" : "standby";
+    bool draining = dp && dp->draining && dp->draining->load(std::memory_order_relaxed);
+    size_t exports = dp && dp->exports ? dp->exports->entries().size() : 0;
+    bool grace = dp && dp->state && dp->state->in_grace();
+    int64_t grace_left = dp && dp->state ? dp->state->grace_remaining_seconds() : 0;
     if (json)
       return std::format(
-          "{{\"version\":\"{}\",\"uptime_s\":{},\"connections\":{},\"draining\":{},"
-          "\"exports\":{},\"grace\":{},\"grace_remaining_s\":{}}}\n",
-          LIGHTNFS_VERSION, uptime, conns, draining, exports, grace, grace_left);
+          "{{\"version\":\"{}\",\"uptime_s\":{},\"role\":\"{}\",\"connections\":{},"
+          "\"draining\":{},\"exports\":{},\"grace\":{},\"grace_remaining_s\":{}}}\n",
+          LIGHTNFS_VERSION, uptime, json_escape(role), conns, draining, exports, grace,
+          grace_left);
     return std::format(
-        "version={} uptime={}s connections={} draining={} exports={} grace={} "
+        "version={} uptime={}s role={} connections={} draining={} exports={} grace={} "
         "grace_remaining={}s\n",
-        LIGHTNFS_VERSION, uptime, conns, draining ? 1 : 0, exports, grace ? 1 : 0,
+        LIGHTNFS_VERSION, uptime, role, conns, draining ? 1 : 0, exports, grace ? 1 : 0,
         grace_left);
   }
   if (cmd.name() == "metrics") return obs::prometheus_text();
@@ -150,15 +165,17 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
                 : report;
   }
   if (cmd.name() == "drain") {
-    if (!deps.drain) return json ? "{\"error\":\"unavailable\"}\n" : "drain unavailable\n";
-    std::string report = deps.drain();
+    if (!dp) return not_active(json);
+    if (!dp->drain) return json ? "{\"error\":\"unavailable\"}\n" : "drain unavailable\n";
+    std::string report = dp->drain();
     return json ? std::format("{{\"draining\":true,\"report\":\"{}\"}}\n",
                               json_escape(report))
                 : report;
   }
   if (cmd.name() == "grace-end") {
-    if (!deps.state) return json ? "{\"error\":\"v4 disabled\"}\n" : "v4 disabled\n";
-    bool was = deps.state->end_grace();
+    if (!dp) return not_active(json);
+    if (!dp->state) return json ? "{\"error\":\"v4 disabled\"}\n" : "v4 disabled\n";
+    bool was = dp->state->end_grace();
     if (json) return std::format("{{\"grace_ended\":{}}}\n", was);
     return was ? "grace period ended\n" : "not in grace\n";
   }
@@ -190,8 +207,9 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
                   : std::format("connection {} not found\n", id);
   }
   if (cmd.name() == "drc") {
-    if (!deps.drc) return json ? "{\"error\":\"drc disabled\"}\n" : "drc disabled\n";
-    auto s = deps.drc->stats();
+    if (!dp) return not_active(json);
+    if (!dp->drc) return json ? "{\"error\":\"drc disabled\"}\n" : "drc disabled\n";
+    auto s = dp->drc->stats();
     if (json)
       return std::format(
           "{{\"inserts\":{},\"replays\":{},\"waits\":{},\"evictions\":{},"
@@ -202,10 +220,11 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
         s.replays, s.waits, s.evictions, s.entries, s.bytes);
   }
   if (cmd.name() == "fdcache" && cmd.arg(1) == "flush") {
+    if (!dp) return not_active(json);
     size_t total = 0;
     bool any = false;
-    if (deps.exports) {
-      for (const auto& entry : deps.exports->entries()) {
+    if (dp->exports) {
+      for (const auto& entry : dp->exports->entries()) {
         if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
           any = true;
           total += g->flush_fd_cache();
@@ -226,11 +245,12 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     return any ? std::format("flushed {} cached fds\n", total) : "no local/gluster/cephfs exports\n";
   }
   if (cmd.name() == "fdcache") {
+    if (!dp) return not_active(json);
     std::string out;
     if (json) out = "[";
     size_t emitted = 0;
-    if (deps.exports) {
-      for (const auto& entry : deps.exports->entries()) {
+    if (dp->exports) {
+      for (const auto& entry : dp->exports->entries()) {
         if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
           auto s = g->stats();
           if (json) {
@@ -301,10 +321,11 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
   if (cmd.name() == "clear-poison") {
     // Sticky fsync-EIO marks (design 06 §6.2) previously survived until restart
     // (plan doc 10 §1.5); this is the operator's way out after fixing the media.
+    if (!dp) return not_active(json);
     size_t total = 0;
     bool any = false;
-    if (deps.exports) {
-      for (const auto& entry : deps.exports->entries()) {
+    if (dp->exports) {
+      for (const auto& entry : dp->exports->entries()) {
         if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
           any = true;
           total += g->clear_poison();
@@ -330,9 +351,14 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
 rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string command) {
   const Cmd cmd = parse_command(command);
   const bool json = cmd.json;
+  // One load per command: the plane pointer stays valid across the awaits below only
+  // because detach happens before the data plane is torn down and the ctl server is
+  // stopped before anything it points at dies (run_server's shutdown order).
+  const DataPlane* dp = deps.data_plane();
   if (cmd.name() == "state") {
-    if (!deps.state) co_return json ? "{\"error\":\"v4 disabled\"}\n" : "v4 disabled\n";
-    auto s = deps.state->stats();
+    if (!dp) co_return not_active(json);
+    if (!dp->state) co_return json ? "{\"error\":\"v4 disabled\"}\n" : "v4 disabled\n";
+    auto s = dp->state->stats();
     if (json) {
       // Counters only: the table dumps stay a human-format text view.
       co_return std::format(
@@ -357,25 +383,27 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
         s.reclaim_forced, s.share_denied, s.open_merges, s.lock_states, s.lock_segments,
         s.lock_owners, s.lock_denied, s.delegs, s.deleg_grants, s.deleg_recalls,
         s.deleg_returns, s.deleg_revokes, s.cb_lock_notifies);
-    out += co_await deps.state->dump();
+    out += co_await dp->state->dump();
     co_return out;
   }
   if (cmd.name() == "expire-client") {
-    if (!deps.state) co_return json ? "{\"error\":\"v4 disabled\"}\n" : "v4 disabled\n";
+    if (!dp) co_return not_active(json);
+    if (!dp->state) co_return json ? "{\"error\":\"v4 disabled\"}\n" : "v4 disabled\n";
     uint64_t id = 0;
     try {
       id = std::stoull(std::string(cmd.arg(1)), nullptr, 0);
     } catch (...) {
       co_return json ? "{\"error\":\"bad clientid\"}\n" : "expire-client: bad clientid\n";
     }
-    uint32_t status = co_await deps.state->expire_client(id);
+    uint32_t status = co_await dp->state->expire_client(id);
     if (json) co_return std::format("{{\"clientid\":\"{:#x}\",\"status\":{}}}\n", id, status);
     co_return status == 0 ? std::format("client {:#x} reclaimed\n", id)
                           : std::format("client {:#x}: nfs4 status {}\n", id, status);
   }
   if (cmd.name() == "drc" && cmd.arg(1) == "flush") {
-    if (!deps.drc) co_return json ? "{\"error\":\"drc disabled\"}\n" : "drc disabled\n";
-    size_t dropped = co_await deps.drc->flush();
+    if (!dp) co_return not_active(json);
+    if (!dp->drc) co_return json ? "{\"error\":\"drc disabled\"}\n" : "drc disabled\n";
+    size_t dropped = co_await dp->drc->flush();
     if (json) co_return std::format("{{\"flushed\":{}}}\n", dropped);
     co_return std::format("flushed {} drc entries\n", dropped);
   }

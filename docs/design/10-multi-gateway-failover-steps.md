@@ -23,7 +23,7 @@
 | A 基础设施（无行为变化） | A1 `[cluster]` 配置段 ✅ 2026-09-05 | 解析、校验、restart-required 报告 | — |
 | | A2 `ClusterStore` 接口 + POSIX 实现 ✅ 2026-09-05 | 原子写、epoch、名单、围栏、导出摘要 | — |
 | | A3 稳定状态访问抽象 ✅ 2026-09-05 | 句柄密钥 / epoch / 名单三处改走接口，本机实现保持原语义 | A2 |
-| | A4 管理面与数据面分离 | ctl/metrics 不再随 `Frontend` 生死 | — |
+| | A4 管理面与数据面分离 ✅ 2026-09-05 | ctl/metrics 不再随 `Frontend` 生死 | — |
 | B 协议与状态语义 | B1 集群身份 | server_owner/scope 从 cluster id 派生 | A1 |
 | | B2 reclaim 下推失败 → DELAY | 状态层 grace 内重试 | — |
 | | B3 CLAIM_DELEG_PREV_FH | 接受为普通 open 状态 | — |
@@ -169,7 +169,7 @@
 **测试**：`tests/test_state.cpp` 加 `StateMgr.StableStoreHooks`——内存 map 实现的三钩子；
 确认 CREATE_SESSION 后 `put`、状态全清后 `erase`、新实例 `load` 后进入 grace。
 
-### A4 管理面与数据面分离
+### A4 管理面与数据面分离（已完成，2026-09-05）
 
 **目标**：`ctl` 套接字与 metrics HTTP 在 Standby（没有协议栈、不监听）时也要可用，
 否则 `lightnfs-ctl cluster takeover` 无处可发。
@@ -179,10 +179,12 @@
 - `src/server/frontend.hpp`：把 `ctl`、`metrics` 从 `Frontend` 移到新的
   `struct Management { std::unique_ptr<CtlServer> ctl; std::unique_ptr<MetricsHttp> metrics; }`，
   由 `run_server` 在阶段 3（runtime 起来后）启动，最后一个停。
-- `CtlDeps`（`src/server/ctl.hpp:26`）里指向数据面的成员（`drc`、`state`、`exports`、
-  `drain`、`draining`）改为可切换：`std::shared_ptr<std::atomic<DataPlane*>>`，
-  `DataPlane` 是 `{drc, state, exports, drain, draining}` 的聚合；为空时相关命令回
-  `"not active"`（JSON：`{"error":"not active"}`）。`status` 输出加 `role=`。
+- `CtlDeps`（`src/server/ctl.hpp`）里指向数据面的成员（`drc`、`state`、`exports`、
+  `drain`、`draining`）改为可切换：`std::shared_ptr<DataPlaneSlot>`（`std::atomic<const DataPlane*>`），
+  `DataPlane` 是 `{exports, drc, state, drain, draining}` 的聚合；为空时相关命令回
+  `"not active"`（JSON：`{"error":"not active"}`）。`status` 输出加 `role=`（无 `role` 钩子时
+  由是否 attach 派生 active/standby；C2 的控制器通过 `CtlDeps::role` 提供细分状态）。
+  `reload` 是进程级钩子，栈不存在时跳过 per-client QoS（`reload_config` 的 `stack` 可空）。
 - `Frontend::start`（`src/server/frontend.cpp:73` 附近的 ctl 组装）改为只建监听器 + rpcbind，
   并调用 `Management::attach(DataPlane)`；`Frontend::stop` 调 `detach()`。
 

@@ -359,13 +359,19 @@ TEST(Ctl, ExportReloadDynamic) {
 }
 
 TEST(Ctl, AnswerCommandSurface) {
-  server::CtlDeps deps{};  // no state/drc/hooks: commands degrade with a message
+  // No data plane attached (plan 10 A4: a standby gateway, or the window before the
+  // listeners are up): the process-level commands work, everything that addresses
+  // the exports / DRC / state / drain answers "not active".
+  server::CtlDeps deps{};
   EXPECT_TRUE(server::CtlServer::answer(deps, "version").starts_with("lightnfs "));
   EXPECT_STREQ(server::CtlServer::answer(deps, "ping --json"), "{\"ok\":true}\n");
   EXPECT_TRUE(server::CtlServer::answer(deps, "version --json").starts_with("{\"version\""));
   auto status = server::CtlServer::answer(deps, "status --json");
   EXPECT_TRUE(status.find("\"connections\":") != std::string::npos);
   EXPECT_TRUE(status.find("\"draining\":false") != std::string::npos);
+  EXPECT_TRUE(status.find("\"role\":\"standby\"") != std::string::npos);
+  EXPECT_TRUE(server::CtlServer::answer(deps, "status").find("role=standby") !=
+              std::string::npos);
   EXPECT_TRUE(server::CtlServer::answer(deps, "loglevel bogus").find("expected") !=
               std::string::npos);
   auto lv = server::CtlServer::answer(deps, "loglevel warn");
@@ -374,18 +380,51 @@ TEST(Ctl, AnswerCommandSurface) {
   set_log_level(LogLevel::kInfo);  // restore for later tests
   EXPECT_TRUE(server::CtlServer::answer(deps, "reload").find("unavailable") !=
               std::string::npos);
-  EXPECT_TRUE(server::CtlServer::answer(deps, "drain --json").find("unavailable") !=
-              std::string::npos);
-  EXPECT_TRUE(server::CtlServer::answer(deps, "grace-end").find("v4 disabled") !=
-              std::string::npos);
+  EXPECT_STREQ(server::CtlServer::answer(deps, "drain"), "not active\n");
+  EXPECT_STREQ(server::CtlServer::answer(deps, "drain --json"), "{\"error\":\"not active\"}\n");
+  EXPECT_STREQ(server::CtlServer::answer(deps, "grace-end"), "not active\n");
+  EXPECT_STREQ(server::CtlServer::answer(deps, "drc"), "not active\n");
+  EXPECT_STREQ(server::CtlServer::answer(deps, "fdcache"), "not active\n");
+  EXPECT_STREQ(server::CtlServer::answer(deps, "fdcache flush"), "not active\n");
+  EXPECT_STREQ(server::CtlServer::answer(deps, "clear-poison --json"),
+               "{\"error\":\"not active\"}\n");
   EXPECT_TRUE(server::CtlServer::answer(deps, "kill-conn nope").find("numeric id") !=
               std::string::npos);
   EXPECT_TRUE(server::CtlServer::answer(deps, "definitely-bogus").find("unknown") !=
               std::string::npos);
-  // Hooks wired: reload/drain answers carry the hook's report.
-  server::CtlDeps hooked{};
+
+  // An attached but empty plane: the per-feature messages, and role=active.
+  server::DataPlane empty{};
+  auto attached = server::CtlDeps::with_plane(&empty);
+  EXPECT_TRUE(server::CtlServer::answer(attached, "status").find("role=active") !=
+              std::string::npos);
+  EXPECT_TRUE(server::CtlServer::answer(attached, "drain --json").find("unavailable") !=
+              std::string::npos);
+  EXPECT_TRUE(server::CtlServer::answer(attached, "grace-end").find("v4 disabled") !=
+              std::string::npos);
+  EXPECT_TRUE(server::CtlServer::answer(attached, "drc").find("drc disabled") !=
+              std::string::npos);
+  // A role hook (the cluster controller's) overrides the derived text.
+  attached.role = [] { return std::string("draining"); };
+  EXPECT_TRUE(server::CtlServer::answer(attached, "status --json")
+                  .find("\"role\":\"draining\"") != std::string::npos);
+
+  // Attach / detach through the shared slot switches the answers live.
+  auto slot = std::make_shared<server::DataPlaneSlot>(nullptr);
+  server::CtlDeps switchable{};
+  switchable.plane = slot;
+  EXPECT_STREQ(server::CtlServer::answer(switchable, "drc"), "not active\n");
+  slot->store(&empty);
+  EXPECT_TRUE(server::CtlServer::answer(switchable, "drc").find("drc disabled") !=
+              std::string::npos);
+  slot->store(nullptr);
+  EXPECT_STREQ(server::CtlServer::answer(switchable, "drc"), "not active\n");
+
+  // Hooks wired: reload (process-level) and drain (data plane) carry their reports.
+  server::DataPlane plane{};
+  plane.drain = [] { return std::string("draining: no new connections will be accepted\n"); };
+  auto hooked = server::CtlDeps::with_plane(&plane);
   hooked.reload = [] { return std::string("export fsid=1: clients (2) and qos applied\n"); };
-  hooked.drain = [] { return std::string("draining: no new connections will be accepted\n"); };
   EXPECT_TRUE(server::CtlServer::answer(hooked, "reload").find("applied") !=
               std::string::npos);
   EXPECT_TRUE(server::CtlServer::answer(hooked, "reload --json").find("\"reloaded\":true") !=
@@ -484,8 +523,8 @@ TEST(Ctl, FdcacheAndClearPoisonCommands) {
     mcfg.fsid = 71;
     mcfg.clients = {"127.0.0.0/8"};
     ASSERT_TRUE(mem_only.add(mcfg, std::make_unique<backend::MemoryBackend>(71)).has_value());
-    server::CtlDeps mem_deps{};
-    mem_deps.exports = &mem_only;
+    server::DataPlane mem_plane{.exports = &mem_only};
+    auto mem_deps = server::CtlDeps::with_plane(&mem_plane);
     EXPECT_STREQ(server::CtlServer::answer(mem_deps, "fdcache"), "no local/gluster/cephfs exports\n");
     EXPECT_STREQ(server::CtlServer::answer(mem_deps, "clear-poison"), "no local/gluster/cephfs exports\n");
 
@@ -499,8 +538,8 @@ TEST(Ctl, FdcacheAndClearPoisonCommands) {
     cfg.fsid = 72;
     cfg.clients = {"127.0.0.0/8"};
     ASSERT_TRUE(exports.add(cfg, std::move(*made)).has_value());
-    server::CtlDeps deps{};
-    deps.exports = &exports;
+    server::DataPlane plane{.exports = &exports};
+    auto deps = server::CtlDeps::with_plane(&plane);
 
     auto stats = server::CtlServer::answer(deps, "fdcache");
     EXPECT_TRUE(stats.find("export=/export/data") != std::string::npos);
@@ -529,9 +568,8 @@ TEST(Ctl, AnswerAsyncStateExpireAndDrcFlush) {
   {
     state::StateMgr mgr({.boot_epoch = 9, .state_dir = dir});
     rpc::Drc drc({});
-    server::CtlDeps deps{};
-    deps.state = &mgr;
-    deps.drc = &drc;
+    server::DataPlane plane{.drc = &drc, .state = &mgr};
+    auto deps = server::CtlDeps::with_plane(&plane);
 
     auto state = run_task(runtime, server::CtlServer::answer_async(deps, "state"));
     EXPECT_TRUE(state.find("clients=0") != std::string::npos);
@@ -553,12 +591,21 @@ TEST(Ctl, AnswerAsyncStateExpireAndDrcFlush) {
                          server::CtlServer::answer_async(deps, "drc flush --json"))
                     .find("\"flushed\":0") != std::string::npos);
 
-    // Null deps degrade like the sync surface.
-    server::CtlDeps none{};
+    // An attached plane with null members degrades like the sync surface; no plane
+    // at all is "not active" (plan 10 A4).
+    server::DataPlane empty{};
+    auto none = server::CtlDeps::with_plane(&empty);
     EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(none, "state")),
                  "v4 disabled\n");
     EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(none, "drc flush")),
                  "drc disabled\n");
+    server::CtlDeps detached{};
+    EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(detached, "state")),
+                 "not active\n");
+    EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(detached, "expire-client 1")),
+                 "not active\n");
+    EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(detached, "drc flush --json")),
+                 "{\"error\":\"not active\"}\n");
     // Unknown async commands fall through to the sync answer.
     EXPECT_STREQ(run_task(runtime, server::CtlServer::answer_async(none, "ping")),
                  "pong\n");
