@@ -5,8 +5,13 @@
 
 #include "mini_test.hpp"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cerrno>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -15,6 +20,7 @@
 #include "obs/metrics.hpp"
 #include "server/cluster_controller.hpp"
 #include "server/cluster_store.hpp"
+#include "server/takeover_hook.hpp"
 
 using namespace lnfs;
 using namespace std::chrono_literals;
@@ -26,6 +32,7 @@ using MemStore = test::MemClusterStore;
 struct Recorder {
   std::vector<std::string> calls;
   std::vector<uint64_t> epochs;
+  std::vector<server::TakeoverContext> takeovers;  // what the backends/hook were told
   Errno fail_activate = Errno::kOk;
   server::ClusterController::Hooks hooks() {
     return {.post = {},  // inline
@@ -38,8 +45,9 @@ struct Recorder {
                 },
             .deactivate = [this] { calls.push_back("deactivate"); },
             .backend_takeover =
-                [this]() -> Result<void> {
+                [this](const server::TakeoverContext& ctx) -> Result<void> {
                   calls.push_back("takeover");
+                  takeovers.push_back(ctx);
                   return {};
                 },
             .backend_reset = [this] { calls.push_back("reset"); }};
@@ -88,6 +96,12 @@ TEST(ClusterController, StandbyTakesOverAFreeOrExpiredFence) {
   EXPECT_STREQ(joined(rec.calls), "takeover activate");
   ASSERT_TRUE(rec.epochs.size() == 1u);
   EXPECT_EQ(rec.epochs[0], 5u);
+  // The takeover context (plan 10 D1): identity + no previous holder on a free fence.
+  ASSERT_TRUE(rec.takeovers.size() == 1u);
+  EXPECT_STREQ(rec.takeovers[0].identity.cluster_id, "cluster-ctrl-test");
+  EXPECT_STREQ(rec.takeovers[0].identity.node, "gw1");
+  EXPECT_EQ(rec.takeovers[0].identity.epoch, 5u);
+  EXPECT_STREQ(rec.takeovers[0].prev_node, "");
   auto snap = ctl.snapshot();
   EXPECT_EQ(snap.epoch, 5u);
   EXPECT_EQ(snap.takeovers, 1u);
@@ -117,6 +131,91 @@ TEST(ClusterController, StandbyTakesOverAFreeOrExpiredFence) {
   EXPECT_STREQ(joined(rec2.calls), "takeover activate");
   EXPECT_EQ(rec2.epochs[0], 6u);
   EXPECT_STREQ(shared.fence->node, "gw2");
+  // gw2 replaced gw1's expired record: the hooks are told whom to evict.
+  ASSERT_TRUE(rec2.takeovers.size() == 1u);
+  EXPECT_STREQ(rec2.takeovers[0].prev_node, "gw1");
+  EXPECT_STREQ(rec2.takeovers[0].identity.node, "gw2");
+  EXPECT_EQ(rec2.takeovers[0].identity.epoch, 6u);
+}
+
+// plan 10 D1: the external takeover hook — spawned with the takeover in its
+// environment, bounded by a timeout, its failures reported but never fatal.
+TEST(ClusterController, TakeoverHookScriptEnvAndTimeout) {
+  char tmpl[] = "/tmp/lnfs-hook-XXXXXX";
+  std::string dir = mkdtemp(tmpl);
+  auto script = [&](const char* name, const char* body) {
+    std::string path = dir + "/" + name;
+    std::ofstream(path) << "#!/bin/sh\n" << body;
+    ::chmod(path.c_str(), 0755);
+    return path;
+  };
+  // Records its environment next to itself.
+  std::string env_hook = script(
+      "env.sh", "printf '%s|%s|%s|%s' \"$LNFS_CLUSTER_ID\" \"$LNFS_NODE\" \"$LNFS_EPOCH\" "
+                "\"$LNFS_PREV_NODE\" > \"$0.out\"\n");
+  std::string slow_hook = script("slow.sh", "sleep 30\n");
+  std::string failing_hook = script("fail.sh", "exit 3\n");
+  auto slurp = [](const std::string& path) {
+    std::ifstream in(path);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  };
+
+  // Through the controller: gw1 takes over gw-old's expired fence and the script sees
+  // the identity, the minted epoch and the node it replaced.
+  {
+    MemStore store;
+    store.epoch = 41;
+    store.taken_by("gw-old", 41);
+    store.age_out();
+    Recorder rec;
+    auto hooks = rec.hooks();
+    hooks.backend_takeover = [&](const server::TakeoverContext& ctx) -> Result<void> {
+      rec.calls.push_back("takeover");
+      return server::run_takeover_hook(env_hook, ctx.identity, ctx.prev_node, 5s);
+    };
+    server::ClusterController ctl(config("gw1"), store, std::move(hooks));
+    ctl.tick();
+    EXPECT_TRUE(ctl.role() == server::Role::kActive);
+    EXPECT_STREQ(joined(rec.calls), "takeover activate");
+    EXPECT_STREQ(slurp(env_hook + ".out"), "cluster-ctrl-test|gw1|42|gw-old");
+  }
+
+  backend::ClusterIdentity id{"cluster-ctrl-test", "gw1", 7};
+  // A stale LNFS_* variable in the daemon's own environment does not leak through.
+  setenv("LNFS_PREV_NODE", "stale", 1);
+  ASSERT_TRUE(server::run_takeover_hook(env_hook, id, "", 5s).has_value());
+  EXPECT_STREQ(slurp(env_hook + ".out"), "cluster-ctrl-test|gw1|7|");
+  unsetenv("LNFS_PREV_NODE");
+
+  // Timeout: killed, reaped, ETIMEDOUT — and well before the script's own sleep.
+  auto t0 = std::chrono::steady_clock::now();
+  auto timed_out = server::run_takeover_hook(slow_hook, id, "gw-old", 200ms);
+  auto elapsed = std::chrono::steady_clock::now() - t0;
+  ASSERT_TRUE(!timed_out.has_value());
+  EXPECT_EQ(static_cast<int>(timed_out.error()), ETIMEDOUT);
+  EXPECT_TRUE(elapsed < 5s);
+  // Non-zero exit → EIO; a path that cannot be executed → the spawn errno.
+  auto failed = server::run_takeover_hook(failing_hook, id, "", 5s);
+  ASSERT_TRUE(!failed.has_value());
+  EXPECT_EQ(static_cast<int>(failed.error()), EIO);
+  auto missing = server::run_takeover_hook(dir + "/missing.sh", id, "", 5s);
+  ASSERT_TRUE(!missing.has_value());
+  EXPECT_EQ(static_cast<int>(missing.error()), ENOENT);
+
+  // Through the controller again: a failing hook is only a warning — still Active.
+  {
+    MemStore store;
+    Recorder rec;
+    auto hooks = rec.hooks();
+    hooks.backend_takeover = [&](const server::TakeoverContext& ctx) -> Result<void> {
+      return server::run_takeover_hook(failing_hook, ctx.identity, ctx.prev_node, 5s);
+    };
+    server::ClusterController ctl(config("gw1"), store, std::move(hooks));
+    ctl.tick();
+    EXPECT_TRUE(ctl.role() == server::Role::kActive);
+    EXPECT_EQ(ctl.snapshot().takeovers, 1u);
+  }
+  std::filesystem::remove_all(dir);
 }
 
 TEST(ClusterController, ActiveLosesFenceAndDrainsWithoutReleasingIt) {

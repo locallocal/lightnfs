@@ -104,12 +104,16 @@ void ClusterController::tick() {
 }
 
 Result<void> ClusterController::begin_activation(bool force) {
+  std::string prev_node;
   {
     std::lock_guard lock(mu_);
     if (role_ != Role::kStandby) return Err(errno_from(EBUSY));
     role_ = Role::kActivating;
     activation_started_ = std::chrono::steady_clock::now();
     renew_failures_ = 0;
+    // The record we are about to replace (read by the last Standby tick, at most one
+    // lease old): the dead gateway the takeover hooks should evict.
+    if (fence_ && fence_->node != node_) prev_node = fence_->node;
   }
   // 1. fence: {node, epoch+1, now+ttl} unless someone else holds a live one.
   auto current = store_.read_epoch();
@@ -148,13 +152,16 @@ Result<void> ClusterController::begin_activation(bool force) {
             ttl().count(), force ? ", forced" : "");
   // 3+4. the data plane, on its own thread; the fence keeps being renewed meanwhile.
   uint64_t e = *epoch;
-  hooks_.post([this, e] { run_activation(e); });
+  hooks_.post([this, e, prev_node = std::move(prev_node)]() mutable {
+    run_activation(e, std::move(prev_node));
+  });
   return {};
 }
 
-void ClusterController::run_activation(uint64_t epoch) {
+void ClusterController::run_activation(uint64_t epoch, std::string prev_node) {
   if (hooks_.backend_takeover) {
-    if (auto took = hooks_.backend_takeover(); !took)
+    TakeoverContext ctx{.identity = {cfg_.id, node_, epoch}, .prev_node = std::move(prev_node)};
+    if (auto took = hooks_.backend_takeover(ctx); !took)
       LNFS_WARN("cluster: backend takeover hook failed: {} (reclaims will retry on DELAY)",
                 errno_name(took.error()));
   }

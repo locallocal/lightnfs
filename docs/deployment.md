@@ -126,6 +126,12 @@ sudo systemctl enable --now lightnfs
   `lightnfs_cluster_{takeovers,fence_lost,activation_failures}_total` 与
   `lightnfs_cluster_activation_seconds` 直方图——告警建议：`fence_age_seconds` 超过
   `fence_lease` 的 2 倍、`fence_lost_total` 增长、`role{role="active"}` 在集群内之和 ≠ 1。
+- **接管钩子**（`[cluster] takeover_hook`，10 册 D1）：接管时先对每个导出调后端的
+  `takeover()`（默认空操作；CephFS 的会话回收见 D2），再以进程身份执行该脚本，环境变量
+  `LNFS_CLUSTER_ID`、`LNFS_NODE`、`LNFS_EPOCH`、`LNFS_PREV_NODE`（被替换的围栏记录所属节点，
+  首次启动为空）。超时 `fence_lease` 后 SIGKILL；超时或非零退出只记 warn，接管照常继续
+  （grace 内 reclaim 下推失败走 DELAY 重试）。Lustre 的驱逐放在这里：
+  `lctl set_param mdc.*.evict_client=<$LNFS_PREV_NODE 的 NID>`（脚本自己维护节点→NID 映射）。
 - **慢请求日志**：超过 `[server] slow_request_ms`（默认 1000，0 关闭）的请求落一条
   warn 日志；v4 附 COMPOUND 内逐 op 耗时分解（`ops=[PUTFH=12us,READ=890000us]`），
   现网定位的第一工具。`dump-errors` 采样环大小由 `[server] error_ring`（默认 64）控制。

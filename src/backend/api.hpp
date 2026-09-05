@@ -255,6 +255,14 @@ class LockMgr {
 };
 using LockMgrRef = std::reference_wrapper<LockMgr>;
 
+// Who is taking over (design 09 §9.7, plan 10 D1): the cluster id every gateway
+// shares, this gateway's node name and the epoch minted for the takeover.
+struct ClusterIdentity {
+  std::string cluster_id;
+  std::string node;
+  uint64_t epoch = 0;
+};
+
 class Backend {
  public:
   virtual ~Backend() = default;
@@ -267,6 +275,11 @@ class Backend {
   virtual rt::Task<Result<void>> start();
   virtual rt::Task<Result<void>> stop();
   virtual std::optional<LockMgrRef> native_locks() { return std::nullopt; }
+  // Multi-gateway takeover (design 09 §9.7, plan 10 D1): called on reactor 0 while the
+  // new gateway activates, before it listens, to release whatever the failed gateway
+  // still holds on the storage side (sessions, caps, locks).  A failure is logged and
+  // the activation goes on — reclaims retry on DELAY inside grace.  Default: nothing.
+  virtual rt::Task<Result<void>> takeover(const ClusterIdentity&);
 };
 
 // A dependency-free representation of one backend's TOML subtable.

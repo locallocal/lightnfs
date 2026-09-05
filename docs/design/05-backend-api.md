@@ -155,6 +155,7 @@ public:
     virtual Task<Result<void>> start();                // 挂载/连接（gluster: glfs_init）
     virtual Task<Result<void>> stop();
     virtual std::optional<LockMgrRef> native_locks();  // kByteLocks 时提供（5.8）
+    virtual Task<Result<void>> takeover(const ClusterIdentity&);  // 多网关接管钩子（09 §9.7，10 册 D1）：默认空操作且成功；不加 Cap 位、api_version 不变
 };
 
 // 工厂注册：配置驱动实例化
@@ -249,6 +250,8 @@ owner 的 glfd）。状态层不是"改用"而是"叠加"：网关表继续负�
 
 ## 5.10 接口演进规则
 
-- 新增可选操作：基类给 ENOTSUP 默认实现 + 新 Cap 位——二进制兼容。
+- 新增可选操作：基类给 ENOTSUP 默认实现 + 新 Cap 位——二进制兼容。生命周期类钩子
+  （`takeover()`，2026-09-05）例外：默认"成功且无事"，不设 Cap 位——调用方不按能力分支，
+  每个后端都可被无条件调用。
 - 语义变更/必选操作增加：bump `kBackendApiVersion`（工厂注册时校验），不做隐式兼容。
 - 严禁在接口中出现协议类型；如果某协议特性表达不了（如未来委托下沉），先在本文件加"映射验证"章节论证再动接口。

@@ -32,7 +32,7 @@
 | | C2 `ClusterController` 状态机 ✅ 2026-09-05 | Standby/Activating/Active/Draining + 围栏协程 | A1–A4 B1 C1 |
 | | C3 ctl `cluster *` 命令 ✅ 2026-09-05 | status / takeover / standby | C2 |
 | | C4 指标 ✅ 2026-09-05 | role / epoch / fence age / takeovers | C2 |
-| D 后端接管钩子 | D1 `Backend::takeover()` 接口 + 脚本钩子 | 默认空操作；可配外部脚本（Lustre evict 等） | C2 |
+| D 后端接管钩子 | D1 `Backend::takeover()` 接口 + 脚本钩子 ✅ 2026-09-05 | 默认空操作；可配外部脚本（Lustre evict 等） | C2 |
 | | D2 CephFS reclaim 原语 | cephapi 三入口、fake、`[export.cephfs] uuid` | D1 |
 | E 验证与文档 | E1 `v4failover` 验收模式 + 本机双实例脚本 | 无 root 的端到端证明 | C3 D1 |
 | | E2 fake 注入与脑裂演练 | 残留锁、围栏分离 | B2 C2 D2 |
@@ -476,7 +476,7 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
 
 ## 阶段 D：后端接管钩子
 
-### D1 `Backend::takeover()` 接口 + 外部脚本钩子
+### D1 `Backend::takeover()` 接口 + 外部脚本钩子（已完成，2026-09-05）
 
 **改动点**
 
@@ -499,6 +499,25 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
 
 **测试**：`tests/test_backend.cpp` 默认 `takeover()` 返回成功；`test_cluster_controller`
 用可执行的临时脚本验证环境变量与超时。
+
+**实现记录（与上文的差异）**：
+- `Hooks::backend_takeover` 改为接收 `TakeoverContext{ backend::ClusterIdentity identity;
+  std::string prev_node; }`（`cluster_controller.hpp`）：`prev_node` 取自 Standby 最后一次 tick
+  读到的围栏记录（至多一个 lease 旧），记录属于本节点旧化身或围栏为空时为空串——它是钩子要驱逐的
+  死网关。
+- 脚本执行在新文件 `src/server/takeover_hook.{hpp,cpp}` 的 `run_takeover_hook(path, identity,
+  prev_node, timeout)`：用 `posix_spawn`（进程多线程，不用 `fork`），envp 为本进程环境去掉旧的
+  `LNFS_*` 再加四个变量；`waitpid(WNOHANG)` 轮询，到时 SIGKILL 并回收。返回：退出 0 → ok；
+  超时 → ETIMEDOUT；非零退出/信号 → EIO；起不来 → spawn 的 errno。每种失败都带脚本路径写 warn。
+- 钩子由 `daemon.cpp` 组装：先在 reactor 0 上对每个导出 `run_on_reactor(backend->takeover(identity))`
+  （同 `start()`），再跑脚本。它随控制器投递的接管工作在**主循环线程**执行（不是 reactor，阻塞无妨；
+  接管期间控制器线程照常续租），没有另起 offload 线程。
+- `kBackendApiVersion` 仍为 1；05 册 §5.10 记下"生命周期钩子默认成功、不设 Cap 位"的例外。
+- 测试：`Backend.DefaultTakeoverIsANoOpThatSucceeds`（memory 后端）；
+  `ClusterController.StandbyTakesOverAFreeOrExpiredFence` 断言上下文（空围栏 → `prev_node=""`，
+  替换过期记录 → `prev_node=gw1`）；新增 `ClusterController.TakeoverHookScriptEnvAndTimeout`：
+  临时脚本把四个变量写回文件、进程环境里的旧 `LNFS_PREV_NODE` 不透传、`sleep 30` 在 200ms 被杀
+  返回 ETIMEDOUT、`exit 3` → EIO、缺失路径 → ENOENT、钩子失败控制器仍转 Active。
 
 ### D2 CephFS reclaim 原语
 
