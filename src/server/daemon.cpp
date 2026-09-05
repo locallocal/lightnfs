@@ -3,10 +3,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <mutex>
@@ -16,9 +18,11 @@
 
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
+#include "core/file_handle.hpp"
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "runtime/runtime.hpp"
+#include "server/cluster_store.hpp"
 #include "server/frontend.hpp"
 #include "server/metrics_providers.hpp"
 #include "server/protocol_stack.hpp"
@@ -65,14 +69,23 @@ void apply_client_qos(ProtocolStack& stack, const core::ServerConfig& cfg) {
 
 // ---- phase 2: durable identity ------------------------------------------------------
 
-std::optional<CoreState> build_core_state(core::Config&& config) {
-  const std::string state_dir = config.server.state_dir;
-  auto exports = core::ExportTable::build(std::move(config));
-  if (!exports) {
-    LNFS_ERROR("cannot initialize exports: {}", errno_name(exports.error()));
+// Where the handle key and the epoch come from (plan 10 A3): state_dir in
+// single-gateway mode, the shared cluster store otherwise.  Both are resolved before
+// the export table is built so a bad shared_dir fails fast, and both stay outside
+// build_core_state so the caller decides when the epoch advances.
+struct Identity {
+  std::array<std::byte, 16> key{};
+  uint64_t epoch = 0;
+};
+
+std::optional<Identity> local_identity(const std::string& state_dir) {
+  std::error_code ec;
+  std::filesystem::create_directories(state_dir, ec);
+  if (ec) {
+    LNFS_ERROR("cannot create state_dir {}: {}", state_dir, errno_name(errno_from(ec.value())));
     return std::nullopt;
   }
-  auto key = core::FileHandleCodec::load_or_create(state_dir);
+  auto key = core::load_or_create_hmac_key(state_dir + "/hmac.key");
   if (!key) {
     LNFS_ERROR("cannot load file-handle key: {}", errno_name(key.error()));
     return std::nullopt;
@@ -82,7 +95,36 @@ std::optional<CoreState> build_core_state(core::Config&& config) {
     LNFS_ERROR("cannot persist boot epoch: {}", errno_name(epoch.error()));
     return std::nullopt;
   }
-  CoreState core{std::move(*exports), std::move(*key), *epoch};
+  return Identity{*key, *epoch};
+}
+
+// Cluster mode (design 09 §9.3/§9.5): the key is shared, and the epoch is the global
+// one.  Until the ClusterController (plan 10 C2) moves the bump into the takeover
+// step, every process start still advances it here so stateids from a previous
+// incarnation are never mistaken for live ones.
+std::optional<Identity> cluster_identity(ClusterStore& store) {
+  auto key = store.load_or_create_key();
+  if (!key) {
+    LNFS_ERROR("cannot load the cluster file-handle key: {}", errno_name(key.error()));
+    return std::nullopt;
+  }
+  auto epoch = store.bump_epoch();
+  if (!epoch) {
+    LNFS_ERROR("cannot advance the cluster epoch: {}", errno_name(epoch.error()));
+    return std::nullopt;
+  }
+  return Identity{*key, *epoch};
+}
+
+std::optional<CoreState> build_core_state(core::Config&& config, const Identity& identity,
+                                          ClusterStore* cluster) {
+  auto exports = core::ExportTable::build(std::move(config));
+  if (!exports) {
+    LNFS_ERROR("cannot initialize exports: {}", errno_name(exports.error()));
+    return std::nullopt;
+  }
+  CoreState core{std::move(*exports), core::FileHandleCodec::from_key_only(identity.key),
+                 identity.epoch, cluster};
   core.key.bind(*core.exports);
   return core;
 }
@@ -301,10 +343,21 @@ int run_server(const std::string& config_path) {
   const core::ClusterConfig cluster_cfg = config->cluster;
   apply_log_level(server_cfg);
 
-  // 2. durable identity: export table, handle HMAC key, boot epoch
-  auto core = build_core_state(std::move(*config));
+  // 2. durable identity: handle HMAC key + epoch (state_dir, or the shared cluster
+  //    store), then the export table
+  std::unique_ptr<ClusterStore> cluster_store;
+  if (cluster_cfg.enabled)
+    cluster_store = make_posix_cluster_store(
+        cluster_cfg.shared_dir, std::chrono::milliseconds(2 * cluster_cfg.fence_lease_ms));
+  auto identity = cluster_store ? cluster_identity(*cluster_store)
+                                : local_identity(server_cfg.state_dir);
+  if (!identity) return 1;
+  auto core = build_core_state(std::move(*config), *identity, cluster_store.get());
   if (!core) return 1;
   if (!check_cluster_backends(cluster_cfg, *core->exports)) return 1;
+  if (cluster_store)
+    LNFS_INFO("cluster mode: id={} node={} shared_dir={} epoch={}", cluster_cfg.id,
+              core::cluster_node_name(cluster_cfg), cluster_cfg.shared_dir, core->epoch);
   init_async_logging({.file = server_cfg.log_file,
                       .rotate_size = server_cfg.log_rotate_size,
                       .rotate_keep = server_cfg.log_rotate_keep});

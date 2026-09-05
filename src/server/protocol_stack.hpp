@@ -28,11 +28,16 @@
 
 namespace lnfs::server {
 
+class ClusterStore;
+
 // Durable identity: export table, handle HMAC key (bound to the exports), boot epoch.
+// `cluster` (design 09 §9.4, plan 10 A3) is the shared store the key and epoch came
+// from and where the reclaim list goes; null in single-gateway mode (state_dir/).
 struct CoreState {
   std::unique_ptr<core::ExportTable> exports;
   core::FileHandleCodec key;
   uint64_t epoch = 0;
+  ClusterStore* cluster = nullptr;
 };
 
 // Protocol engines and their shared state, wired onto one dispatcher.

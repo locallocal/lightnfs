@@ -155,8 +155,10 @@ rt::Task<std::shared_ptr<ClientRec>> StateMgr::find_client(uint64_t clientid) {
 
 // ---- grace -----------------------------------------------------------------
 
-void StateMgr::load_grace_list() {
-  std::lock_guard lock(grace_mu_);
+// The single-gateway stable store: one file per client under state_dir/clients/,
+// named by fnv64(owner), holding the co_ownerid verbatim.
+std::vector<std::string> StateMgr::load_local_clients() const {
+  std::vector<std::string> owners;
   std::error_code ec;
   std::filesystem::create_directories(cfg_.state_dir + "/clients", ec);
   for (const auto& entry :
@@ -168,10 +170,18 @@ void StateMgr::load_grace_list() {
       fclose(f);
       owner.assign(buf, n);
     }
-    if (!owner.empty()) {
-      stable_list_.insert(owner);
-      grace_pending_.insert(owner);
-    }
+    if (!owner.empty()) owners.push_back(std::move(owner));
+  }
+  return owners;
+}
+
+void StateMgr::load_grace_list() {
+  std::vector<std::string> owners = cfg_.stable.load ? cfg_.stable.load() : load_local_clients();
+  std::lock_guard lock(grace_mu_);
+  for (auto& owner : owners) {
+    if (owner.empty()) continue;
+    stable_list_.insert(owner);
+    grace_pending_.insert(std::move(owner));
   }
   uint32_t grace_secs = cfg_.grace_seconds ? cfg_.grace_seconds : cfg_.lease_seconds;
   if (!grace_pending_.empty()) {
@@ -225,6 +235,10 @@ void StateMgr::note_reclaimed(std::string_view owner_id) {
 // ---- persistence -----------------------------------------------------------
 
 void StateMgr::persist_client(const ClientRec& client) {
+  if (cfg_.stable.put) {
+    cfg_.stable.put(client.owner_id);
+    return;
+  }
   std::string dir = cfg_.state_dir + "/clients";
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
@@ -245,6 +259,10 @@ void StateMgr::persist_client(const ClientRec& client) {
 }
 
 void StateMgr::unpersist_client(const ClientRec& client) {
+  if (cfg_.stable.erase) {
+    cfg_.stable.erase(client.owner_id);
+    return;
+  }
   char name[24];
   std::snprintf(name, sizeof name, "%016llx",
                 static_cast<unsigned long long>(fnv64(client.owner_id)));

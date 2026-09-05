@@ -22,7 +22,7 @@
 |------|------|--------|------|
 | A 基础设施（无行为变化） | A1 `[cluster]` 配置段 ✅ 2026-09-05 | 解析、校验、restart-required 报告 | — |
 | | A2 `ClusterStore` 接口 + POSIX 实现 ✅ 2026-09-05 | 原子写、epoch、名单、围栏、导出摘要 | — |
-| | A3 稳定状态访问抽象 | 句柄密钥 / epoch / 名单三处改走接口，本机实现保持原语义 | A2 |
+| | A3 稳定状态访问抽象 ✅ 2026-09-05 | 句柄密钥 / epoch / 名单三处改走接口，本机实现保持原语义 | A2 |
 | | A4 管理面与数据面分离 | ctl/metrics 不再随 `Frontend` 生死 | — |
 | B 协议与状态语义 | B1 集群身份 | server_owner/scope 从 cluster id 派生 | A1 |
 | | B2 reclaim 下推失败 → DELAY | 状态层 grace 内重试 | — |
@@ -135,7 +135,7 @@
 
 **验收**：`atomic_file` 重构后 `StateMgr.GraceListPersistsAndEarlyExit` 等既有测试不变。
 
-### A3 稳定状态访问抽象（本机实现保持原语义）
+### A3 稳定状态访问抽象（本机实现保持原语义）（已完成，2026-09-05）
 
 **目标**：把三处"直接读写 state_dir"改为经接口，本机实现下行为不变，为 C2 切换到
 `ClusterStore` 铺路。
@@ -158,8 +158,13 @@
   `load_grace_list`（`state_mgr.cpp:158`）、`persist_client`（`:227`）、`unpersist_client`
   （`:246`）三处改为：有 `stable` 钩子则调钩子，否则走现有本机代码。写失败策略不变
   （只 WARN，`state_mgr.cpp:237`）。
-- epoch：`CoreState::epoch` 的来源改为 `build_core_state` 的入参；单网关仍在此
-  `bump_boot_epoch`，集群模式此处**不 bump**（推迟到 C2 的 Activating）。
+- epoch：`CoreState::epoch` 的来源改为 `build_core_state` 的入参（`daemon.cpp` 的
+  `local_identity` / `cluster_identity`）；单网关仍 `bump_boot_epoch`。集群模式的目标是
+  此处**不 bump**（推迟到 C2 的 Activating）；**过渡期**（C2 之前）集群模式在进程启动时经
+  `ClusterStore::bump_epoch()` 推进一次，否则重启后 epoch 不变、旧 stateid 不会被判 STALE。
+  C2 把这次 bump 挪进 Activating 后删除该过渡逻辑。
+- 集群模式下 `ProtocolStack` 已把 `StateMgr::Config::stable` 三钩子接到 `ClusterStore`
+  （`protocol_stack.cpp` 的 `cluster_stable_store`），`CoreState::cluster` 为该 store 指针。
 
 **测试**：`tests/test_state.cpp` 加 `StateMgr.StableStoreHooks`——内存 map 实现的三钩子；
 确认 CREATE_SESSION 后 `put`、状态全清后 `erase`、新实例 `load` 后进入 grace。
