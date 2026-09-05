@@ -83,17 +83,25 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
   mount.register_with(dispatcher);
 }
 
-void ProtocolStack::enable_v4(const core::ServerConfig& cfg, CoreState& core,
-                              rt::Runtime& runtime) {
-  state.load_grace_list();
-  // RFC 8881 §2.10.4 identity: default derives from hostname + state_dir so two
-  // distinct lightnfs instances never look like trunking paths of one server.
+ServerIdentity derive_server_identity(const core::ServerConfig& cfg,
+                                      const core::ClusterConfig& cluster) {
+  if (cluster.enabled) {  // config validation rejects explicit owner/scope here
+    std::string derived = "lightnfs-cluster:" + cluster.id;
+    return {derived, derived};
+  }
   char host[256] = "lightnfs";
   (void)::gethostname(host, sizeof host - 1);
   std::string derived = std::string(host) + ":" + cfg.state_dir;
-  nfs4.emplace(*core.exports, core.key, locks, pseudofs, state,
-               cfg.server_owner.empty() ? derived : cfg.server_owner,
-               cfg.server_scope.empty() ? derived : cfg.server_scope);
+  return {cfg.server_owner.empty() ? derived : cfg.server_owner,
+          cfg.server_scope.empty() ? derived : cfg.server_scope};
+}
+
+void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::ClusterConfig& cluster,
+                              CoreState& core, rt::Runtime& runtime) {
+  state.load_grace_list();
+  auto identity = derive_server_identity(cfg, cluster);
+  nfs4.emplace(*core.exports, core.key, locks, pseudofs, state, std::move(identity.owner),
+               std::move(identity.scope));
   nfs4->register_with(dispatcher);
   // Off reactor 0 (plan doc 10 §2.6): the auxiliary tasks used to pile onto the same
   // reactor the (old, single) accept loop lived on.

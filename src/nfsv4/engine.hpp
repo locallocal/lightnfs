@@ -43,6 +43,10 @@ class Engine {
   void register_with(rpc::Dispatcher& dispatcher);
   rt::Task<void> dispatch(transport::ConnCtx&, rpc::RpcCall&, const rpc::Cred&);
 
+  // The identity EXCHANGE_ID presents (server_owner.major_id / server_scope).
+  const std::string& server_owner() const { return server_owner_; }
+  const std::string& server_scope() const { return server_scope_; }
+
   // Per-client (clientid) token-bucket defaults ([limits] client_*, plan doc 10 §4.3).
   // Hot-reloadable: reconfigures every existing client bucket as well.
   void configure_client_qos(uint64_t read_bps, uint64_t write_bps, uint32_t iops);

@@ -1,6 +1,9 @@
 #include "core/file_handle.hpp"
 
+#include "core/atomic_file.hpp"
+
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -8,6 +11,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <string>
 
 namespace lnfs::core {
 namespace {
@@ -44,33 +48,46 @@ uint32_t load_be32(const std::byte* p) {
 
 Result<std::array<std::byte, 16>> load_or_create_hmac_key(const std::string& path) {
   std::array<std::byte, 16> key{};
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd >= 0) {
+  auto read_existing = [&]() -> Result<std::array<std::byte, 16>> {
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return Err(errno_from(errno));
     ssize_t n = ::read(fd, key.data(), key.size());
     int e = errno;
     ::close(fd);
     if (n != static_cast<ssize_t>(key.size())) return Err(errno_from(n < 0 ? e : EINVAL));
     return key;
-  }
-  if (errno != ENOENT) return Err(errno_from(errno));
+  };
+  if (auto existing = read_existing()) return existing;
+  else if (existing.error() != errno_from(ENOENT)) return existing;
+
+  // Create: the key is written to a private temp file and published with one atomic
+  // link/rename, so a concurrent reader (another gateway starting on the same shared
+  // directory, plan 10 B1) either sees no file or all 16 bytes — never a short one.
+  // Whoever publishes first wins; a loser reads the winner's key back.
   ssize_t n = getrandom(key.data(), key.size(), 0);
   if (n != static_cast<ssize_t>(key.size())) return Err(errno_from(errno ? errno : EIO));
-  // O_EXCL: whoever creates the file first wins; a loser (another gateway on a shared
-  // directory, or a racing restart) reads the winner's key back.
-  fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-  if (fd < 0) {
-    if (errno == EEXIST) return load_or_create_hmac_key(path);
-    return Err(errno_from(errno));
-  }
+  std::string tmp = unique_temp_name(path);
+  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) return Err(errno_from(errno));
   ssize_t written = ::write(fd, key.data(), key.size());
   int e = errno;
-  if (written == static_cast<ssize_t>(key.size())) (void)::fsync(fd);
+  if (written == static_cast<ssize_t>(key.size()) && ::fsync(fd) < 0) {
+    e = errno;
+    written = -1;
+  }
   ::close(fd);
   if (written != static_cast<ssize_t>(key.size())) {
-    ::unlink(path.c_str());  // never leave a short key behind for the next reader
+    ::unlink(tmp.c_str());
     return Err(errno_from(e ? e : EIO));
   }
-  return key;
+  int rc = ::link(tmp.c_str(), path.c_str());
+  if (rc < 0 && errno != EEXIST)  // no hard links here: rename, refusing to replace
+    rc = ::renameat2(AT_FDCWD, tmp.c_str(), AT_FDCWD, path.c_str(), RENAME_NOREPLACE);
+  e = errno;
+  ::unlink(tmp.c_str());
+  if (rc == 0) return key;
+  if (e != EEXIST) return Err(errno_from(e));
+  return read_existing();  // lost the race: the winner's file is complete by now
 }
 
 Result<FileHandleCodec> FileHandleCodec::load_or_create(const std::string& state_dir) {

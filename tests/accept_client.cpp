@@ -1297,6 +1297,7 @@ struct V4Client {
   uint32_t slot_seq = 1;
   uint32_t minor = 1;    // COMPOUND minorversion (2 for the v4.2 scenario)
   std::string owner_id;  // co_ownerid: distinct per simulated client
+  std::string server_owner, server_scope;  // RFC 8881 §2.10.4 identity from EXCHANGE_ID
 
   explicit V4Client(const char* host, uint16_t port, std::string owner = "lightnfs-accept-v4")
       : rpc(host, port), owner_id(std::move(owner)) {}
@@ -1358,6 +1359,13 @@ struct V4Client {
     expect_op(r.dec, kOpExchangeId);
     clientid = ru64(r.dec);
     uint32_t seq = ru32(r.dec);
+    (void)ru32(r.dec);  // flags
+    (void)ru32(r.dec);  // state_protect: SP4_NONE
+    (void)ru64(r.dec);  // server_owner.minor_id
+    if (auto major = r.dec.opaque(1024))
+      server_owner.assign(reinterpret_cast<const char*>(major->data()), major->size());
+    if (auto scope = r.dec.opaque(1024))
+      server_scope.assign(reinterpret_cast<const char*>(scope->data()), scope->size());
 
     XdrEnc cs(pool);
     cs.u32(0);
@@ -2343,6 +2351,8 @@ int cmd_v4walk(const char* host, uint16_t nfs_port, const std::string& export_pa
   std::printf("accept_client v4walk OK: %zu dirs, %zu files (%zu bytes verified) via "
               "vers=4.1 sessions; pseudo-root crossing, slot replay and negative "
               "checks passed\n", dirs, files, bytes);
+  std::printf("v4walk: server_owner=%s server_scope=%s\n", c.server_owner.c_str(),
+              c.server_scope.c_str());
   return 0;
 }
 
