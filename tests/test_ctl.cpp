@@ -217,6 +217,104 @@ TEST(Ctl, OpsConfigKeys) {
   EXPECT_FALSE(core::validate_config(*bad).has_value());
 }
 
+// Multi-gateway failover (design 09 §9.3, plan 10 A1): the [cluster] section parses,
+// its defaults hold, validation enforces the identity/role/path rules only while
+// enabled, and bad values are rejected at parse time regardless.
+TEST(Ctl, ClusterConfigKeys) {
+  const std::string valid_export =
+      "[[export]]\npath = \"/tmp\"\nfsid = 1\nclients = [\"127.0.0.0/8\"]\n";
+
+  auto defaults = core::parse_config("[server]\n" + valid_export);
+  ASSERT_TRUE(defaults.has_value());
+  EXPECT_FALSE(defaults->cluster.enabled);
+  EXPECT_STREQ(defaults->cluster.role, "auto");
+  EXPECT_STREQ(defaults->cluster.takeover, "auto");
+  EXPECT_EQ(defaults->cluster.fence_lease_ms, 3000u);
+  EXPECT_FALSE(defaults->cluster.unsafe_skip_backend_checks);
+  EXPECT_FALSE(core::cluster_node_name(defaults->cluster).empty());  // hostname default
+  EXPECT_TRUE(core::validate_config(*defaults).has_value());
+
+  const std::string cluster =
+      "[cluster]\n"
+      "enabled = true\n"
+      "id = \"3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f\"\n"
+      "shared_dir = \"/mnt/cephfs/.lightnfs-cluster/\"\n"
+      "node = \"gw1\"\n"
+      "role = \"standby\"\n"
+      "fence_lease = \"1500ms\"\n"
+      "takeover = \"manual\"\n"
+      "unsafe_skip_backend_checks = true\n";
+  auto parsed = core::parse_config(cluster + valid_export);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_TRUE(parsed->cluster.enabled);
+  EXPECT_STREQ(parsed->cluster.id, "3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f");
+  EXPECT_STREQ(parsed->cluster.shared_dir, "/mnt/cephfs/.lightnfs-cluster");  // normalized
+  EXPECT_STREQ(parsed->cluster.node, "gw1");
+  EXPECT_STREQ(core::cluster_node_name(parsed->cluster), "gw1");
+  EXPECT_STREQ(parsed->cluster.role, "standby");
+  EXPECT_EQ(parsed->cluster.fence_lease_ms, 1500u);
+  EXPECT_STREQ(parsed->cluster.takeover, "manual");
+  EXPECT_TRUE(parsed->cluster.unsafe_skip_backend_checks);
+  EXPECT_TRUE(core::validate_config(*parsed).has_value());
+  // The reload path compares the whole section: equal to itself, different after a change.
+  EXPECT_TRUE(parsed->cluster == parsed->cluster);
+  EXPECT_FALSE(parsed->cluster == defaults->cluster);
+
+  // Duration forms: seconds suffix, bare seconds; out-of-range and bad suffix rejected.
+  auto secs = core::parse_config("[cluster]\nfence_lease = \"3s\"\n");
+  ASSERT_TRUE(secs.has_value());
+  EXPECT_EQ(secs->cluster.fence_lease_ms, 3000u);
+  auto bare = core::parse_config("[cluster]\nfence_lease = \"2\"\n");
+  ASSERT_TRUE(bare.has_value());
+  EXPECT_EQ(bare->cluster.fence_lease_ms, 2000u);
+  EXPECT_FALSE(core::parse_config("[cluster]\nfence_lease = \"100ms\"\n").has_value());
+  EXPECT_FALSE(core::parse_config("[cluster]\nfence_lease = \"61s\"\n").has_value());
+  EXPECT_FALSE(core::parse_config("[cluster]\nfence_lease = \"3m\"\n").has_value());
+  // Type errors and unknown keys fail at parse time even when the section is disabled.
+  EXPECT_FALSE(core::parse_config("[cluster]\nenabled = 1\n").has_value());
+  EXPECT_FALSE(core::parse_config("[cluster]\nbogus = true\n").has_value());
+
+  // Disabled: value-level rules are not applied, whatever the fields hold.
+  auto disabled = core::parse_config(
+      "[cluster]\nenabled = false\nrole = \"weird\"\nshared_dir = \"relative\"\n" +
+      valid_export);
+  ASSERT_TRUE(disabled.has_value());
+  EXPECT_TRUE(core::validate_config(*disabled).has_value());
+
+  // Enabled: each rule rejects on its own.
+  auto rejects = [&](const std::string& section) {
+    auto cfg = core::parse_config(section + valid_export);
+    return cfg.has_value() && !core::validate_config(*cfg).has_value();
+  };
+  const std::string base =
+      "[cluster]\nenabled = true\nid = \"cluster-01\"\nshared_dir = \"/srv/shared\"\n";
+  EXPECT_FALSE(rejects(base));
+  // no id / no shared_dir
+  EXPECT_TRUE(rejects("[cluster]\nenabled = true\nshared_dir = \"/srv/shared\"\n"));
+  EXPECT_TRUE(rejects("[cluster]\nenabled = true\nid = \"short\"\nshared_dir = \"/x\"\n"));
+  EXPECT_TRUE(rejects("[cluster]\nenabled = true\nid = \"bad id/with junk\"\n"
+                      "shared_dir = \"/x\"\n"));
+  EXPECT_TRUE(rejects("[cluster]\nenabled = true\nid = \"cluster-01\"\n"));
+  EXPECT_TRUE(rejects("[cluster]\nenabled = true\nid = \"cluster-01\"\n"
+                      "shared_dir = \"relative/dir\"\n"));
+  EXPECT_TRUE(rejects(base + "role = \"primary\"\n"));
+  EXPECT_TRUE(rejects(base + "takeover = \"never\"\n"));
+  EXPECT_TRUE(rejects(base + "node = \"a/b\"\n"));
+  EXPECT_TRUE(rejects(base + "takeover_hook = \"/nonexistent/hook.sh\"\n"));
+  EXPECT_TRUE(rejects("[server]\nserver_owner = \"nodeA\"\n" + base));
+  EXPECT_TRUE(rejects("[server]\nserver_scope = \"scopeA\"\n" + base));
+
+  // takeover_hook must be an executable regular file.
+  char tmpl[] = "/tmp/lnfs-hook-XXXXXX";
+  int fd = ::mkstemp(tmpl);
+  ASSERT_TRUE(fd >= 0);
+  ::close(fd);
+  EXPECT_TRUE(rejects(base + "takeover_hook = \"" + tmpl + "\"\n"));  // not executable
+  ::chmod(tmpl, 0700);
+  EXPECT_FALSE(rejects(base + "takeover_hook = \"" + tmpl + "\"\n"));
+  ::unlink(tmpl);
+}
+
 TEST(Ctl, ExportReloadDynamic) {
   core::ExportTable table;
   core::ExportConfig cfg;

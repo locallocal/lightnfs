@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <charconv>
 #include <algorithm>
@@ -109,6 +110,20 @@ Result<std::vector<std::string>> string_array(std::string_view value) {
   return out;
 }
 
+// Duration string in milliseconds: "3s", "1500ms", or a bare number of seconds.
+Result<uint64_t> duration_ms_value(std::string_view value) {
+  std::string s = LNFS_TRY(string_value(value));
+  uint64_t n = 0;
+  size_t digits = 0;
+  while (digits < s.size() && std::isdigit(static_cast<unsigned char>(s[digits])))
+    n = n * 10 + static_cast<uint64_t>(s[digits++] - '0');
+  std::string_view suffix = std::string_view(s).substr(digits);
+  if (digits == 0) return Err(errno_from(EINVAL));
+  if (suffix == "s" || suffix.empty()) return n * 1000;
+  if (suffix == "ms") return n;
+  return Err(errno_from(EINVAL));
+}
+
 std::string normalize_path(std::string path) {
   while (path.size() > 1 && path.back() == '/') path.pop_back();
   return path;
@@ -163,7 +178,7 @@ bool Cidr::contains(const sockaddr_storage& peer) const {
 Result<Config> parse_config(std::string_view text) {
   Config config;
   enum class Section {
-    kNone, kServer, kLimits, kProtocol, kTls, kExport, kExportBackend
+    kNone, kServer, kLimits, kProtocol, kTls, kCluster, kExport, kExportBackend
   };
   Section section = Section::kNone;
   ExportConfig* exp = nullptr;
@@ -184,6 +199,7 @@ Result<Config> parse_config(std::string_view text) {
       else if (line == "[limits]") section = Section::kLimits;
       else if (line == "[protocol]") section = Section::kProtocol;
       else if (line == "[tls]") section = Section::kTls;
+      else if (line == "[cluster]") section = Section::kCluster;
       else if (line.starts_with("[export.") && exp) section = Section::kExportBackend;
       else return Err(errno_from(EINVAL));
       continue;
@@ -305,6 +321,23 @@ Result<Config> parse_config(std::string_view text) {
       else if (key == "ca") config.server.tls_ca = LNFS_TRY(string_value(value));
       else if (key == "client_cert")
         config.server.tls_require_client_cert = LNFS_TRY(bool_value(value));
+      else return Err(errno_from(EINVAL));
+    } else if (section == Section::kCluster) {
+      auto& c = config.cluster;
+      if (key == "enabled") c.enabled = LNFS_TRY(bool_value(value));
+      else if (key == "id") c.id = LNFS_TRY(string_value(value));
+      else if (key == "shared_dir")
+        c.shared_dir = normalize_path(LNFS_TRY(string_value(value)));
+      else if (key == "node") c.node = LNFS_TRY(string_value(value));
+      else if (key == "role") c.role = LNFS_TRY(string_value(value));
+      else if (key == "takeover") c.takeover = LNFS_TRY(string_value(value));
+      else if (key == "takeover_hook") c.takeover_hook = LNFS_TRY(string_value(value));
+      else if (key == "fence_lease") {
+        uint64_t ms = LNFS_TRY(duration_ms_value(value));
+        if (ms < 500 || ms > 60000) return Err(errno_from(EINVAL));
+        c.fence_lease_ms = static_cast<uint32_t>(ms);
+      } else if (key == "unsafe_skip_backend_checks")
+        c.unsafe_skip_backend_checks = LNFS_TRY(bool_value(value));
       else return Err(errno_from(EINVAL));
     } else if (section == Section::kProtocol) {
       if (key == "v3") LNFS_TRY(bool_value(value));
@@ -433,6 +466,33 @@ Result<void> validate_config(const Config& config) {
         return Err(errno_from(EINVAL));  // mutual TLS needs a CA bundle to verify against
     }
   }
+  {  // Multi-gateway failover (design 09 §9.3, plan 10 A1): the [cluster] section.
+    const auto& c = config.cluster;
+    auto valid_role = c.role == "active" || c.role == "standby" || c.role == "auto";
+    auto valid_takeover = c.takeover == "auto" || c.takeover == "manual";
+    if (c.enabled) {
+      if (!valid_role || !valid_takeover) return Err(errno_from(EINVAL));
+      if (c.id.size() < 8 || c.id.size() > 64 ||
+          !std::all_of(c.id.begin(), c.id.end(), [](unsigned char ch) {
+            return std::isalnum(ch) || ch == '_' || ch == '-';
+          }))
+        return Err(errno_from(EINVAL));
+      if (c.shared_dir.empty() || c.shared_dir.front() != '/')
+        return Err(errno_from(EINVAL));
+      if (!c.node.empty() && (c.node.size() > 64 || c.node.find('/') != std::string::npos))
+        return Err(errno_from(EINVAL));
+      // Identity is derived from `id` so every gateway presents the same server_owner/
+      // scope; an explicit value would fork it (design 09 §9.3).
+      if (!config.server.server_owner.empty() || !config.server.server_scope.empty())
+        return Err(errno_from(EINVAL));
+      if (!c.takeover_hook.empty()) {
+        struct stat st {};
+        if (stat(c.takeover_hook.c_str(), &st) < 0)
+          return Err(errno_from(errno ? errno : ENOENT));
+        if (!S_ISREG(st.st_mode) || !(st.st_mode & S_IXUSR)) return Err(errno_from(EACCES));
+      }
+    }
+  }
   std::set<uint32_t> fsids;
   std::set<std::string> paths;
   for (const auto& exp : config.exports) {
@@ -451,6 +511,13 @@ Result<void> validate_config(const Config& config) {
       if (!Cidr::parse(client)) return Err(errno_from(EINVAL));
   }
   return {};
+}
+
+std::string cluster_node_name(const ClusterConfig& cluster) {
+  if (!cluster.node.empty()) return cluster.node;
+  char host[256] = "lightnfs";
+  (void)::gethostname(host, sizeof host - 1);
+  return host;
 }
 
 Result<std::unique_ptr<ExportTable>> ExportTable::build(Config config) {

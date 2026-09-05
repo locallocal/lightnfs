@@ -1,5 +1,7 @@
 #include "server/daemon.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -83,6 +85,43 @@ std::optional<CoreState> build_core_state(core::Config&& config) {
   CoreState core{std::move(*exports), std::move(*key), *epoch};
   core.key.bind(*core.exports);
   return core;
+}
+
+// Multi-gateway failover prerequisites (design 09 §9.2, plan 10 A1): every export's
+// backend must present cluster-stable handles and push byte-range locks into the
+// storage, otherwise a second gateway cannot take the first one's clients over.  The
+// capability bits only exist once the backends are constructed, so this runs after
+// ExportTable::build rather than inside validate_config.  Returns false (reasons
+// logged) unless the test-only escape hatch downgrades the failures to warnings.
+bool check_cluster_backends(const core::ClusterConfig& cluster,
+                            const core::ExportTable& exports) {
+  if (!cluster.enabled) return true;
+  bool ok = true;
+  for (const auto& entry : exports.entries()) {
+    auto caps = entry->backend->caps();
+    std::string missing;
+    if (!caps.has(backend::Cap::kStableHandles)) missing += " stable-handles";
+    if (!caps.has(backend::Cap::kByteLocks)) missing += " byte-locks";
+    if (!entry->backend->native_locks().has_value()) missing += " native_locks";
+    if (missing.empty()) continue;
+    if (cluster.unsafe_skip_backend_checks) {
+      LNFS_WARN("export {}: cluster mode requires{} (skipped: unsafe_skip_backend_checks)",
+                entry->path, missing);
+    } else {
+      LNFS_ERROR("export {}: cluster mode requires{}", entry->path, missing);
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+// `--check-config` must not write into shared_dir (another gateway may be active);
+// it only reports whether this gateway could.
+void warn_shared_dir_access(const core::ClusterConfig& cluster) {
+  if (!cluster.enabled) return;
+  if (::access(cluster.shared_dir.c_str(), W_OK | X_OK) < 0)
+    LNFS_WARN("cluster shared_dir {} is not writable from this host: {}",
+              cluster.shared_dir, errno_name(errno_from(errno)));
 }
 
 // ---- phase 3: runtime + backends ----------------------------------------------------
@@ -171,13 +210,21 @@ std::string restart_required_report(const core::ServerConfig& fresh,
   return report;
 }
 
+// The [cluster] section fixes the gateway's identity, epoch source and fence: none of it
+// can change under a live role (plan 10 A1).
+std::string cluster_restart_required_report(const core::ClusterConfig& fresh,
+                                            const core::ClusterConfig& running) {
+  return fresh == running ? "" : "cluster settings changed: restart required\n";
+}
+
 // Re-parses the config file and applies the non-topology subset — log level,
 // slow-request threshold, error ring, per-export client allowlists + QoS, per-client
 // QoS.  Serialized by construction: SIGHUP applies on the main wait loop, `ctl reload`
 // on the ctl reactor; both funnel through this one function and concurrent invocations
 // are harmless (last writer wins on independent knobs).  Returns the ctl report text.
 std::string reload_config(const std::string& config_path, const core::ServerConfig& running,
-                          CoreState& core, ProtocolStack& stack) {
+                          const core::ClusterConfig& running_cluster, CoreState& core,
+                          ProtocolStack& stack) {
   auto fresh = load_validated_config(config_path);
   if (!fresh) return "reload failed: config invalid (details in the log)\n";
   std::string report;
@@ -190,6 +237,7 @@ std::string reload_config(const std::string& config_path, const core::ServerConf
   apply_client_qos(stack, sc);
   report += core.exports->reload_dynamic(*fresh);
   report += restart_required_report(sc, running);
+  report += cluster_restart_required_report(fresh->cluster, running_cluster);
   LNFS_INFO("configuration reloaded from {}", config_path);
   return report.empty() ? "nothing to apply\n" : report;
 }
@@ -229,11 +277,18 @@ int check_config(const std::string& config_path) {
   if (!config) return 1;
   // Also constructs the backends so per-backend keys ([export.local] identity, ...)
   // are validated exactly as a real startup would.
+  const core::ClusterConfig cluster_cfg = config->cluster;
   auto exports = core::ExportTable::build(std::move(*config));
   if (!exports) {
     LNFS_ERROR("invalid config {}: {}", config_path, errno_name(exports.error()));
     return 1;
   }
+  if (!check_cluster_backends(cluster_cfg, **exports)) {
+    LNFS_ERROR("invalid config {}: backends do not meet the cluster requirements",
+               config_path);
+    return 1;
+  }
+  warn_shared_dir_access(cluster_cfg);
   std::printf("configuration is valid\n");
   return 0;
 }
@@ -243,11 +298,13 @@ int run_server(const std::string& config_path) {
   auto config = load_validated_config(config_path);
   if (!config) return 1;
   const core::ServerConfig server_cfg = config->server;
+  const core::ClusterConfig cluster_cfg = config->cluster;
   apply_log_level(server_cfg);
 
   // 2. durable identity: export table, handle HMAC key, boot epoch
   auto core = build_core_state(std::move(*config));
   if (!core) return 1;
+  if (!check_cluster_backends(cluster_cfg, *core->exports)) return 1;
   init_async_logging({.file = server_cfg.log_file,
                       .rotate_size = server_cfg.log_rotate_size,
                       .rotate_keep = server_cfg.log_rotate_keep});
@@ -269,8 +326,8 @@ int run_server(const std::string& config_path) {
   apply_client_qos(stack, server_cfg);
 
   // 5. frontend (listeners, ctl with reload/drain, metrics endpoint, rpcbind)
-  auto do_reload = [config_path, server_cfg, &core, &stack]() -> std::string {
-    return reload_config(config_path, server_cfg, *core, stack);
+  auto do_reload = [config_path, server_cfg, cluster_cfg, &core, &stack]() -> std::string {
+    return reload_config(config_path, server_cfg, cluster_cfg, *core, stack);
   };
   auto frontend = Frontend::start(server_cfg, runtime, stack, *core, do_reload);
   if (!frontend) {

@@ -121,8 +121,30 @@ struct ExportConfig {
   backend::BackendConfig backend_config;
 };
 
+// Multi-gateway failover (design 09 §9.3, plan 10 A1): the [cluster] section.  Every
+// field is ignored while `enabled` is false; the section is not hot-reloadable.
+struct ClusterConfig {
+  bool enabled = false;
+  std::string id;            // shared by every gateway; [A-Za-z0-9_-]{8,64} (a UUID fits)
+  std::string shared_dir;    // absolute path on the shared filesystem (design 09 §9.4)
+  std::string node;          // this gateway's name; empty = gethostname() at startup
+  std::string role = "auto"; // active | standby | auto
+  uint32_t fence_lease_ms = 3000;  // fence renew period; lost after 3 missed renewals
+  std::string takeover = "auto";   // auto | manual (only `lightnfs-ctl cluster takeover`)
+  std::string takeover_hook;       // optional script run after the backend takeover hooks
+  // Test-only: turn the kStableHandles/kByteLocks/native_locks requirement into a
+  // warning so the two-instance local acceptance run can use the local backend.
+  bool unsafe_skip_backend_checks = false;
+
+  friend bool operator==(const ClusterConfig&, const ClusterConfig&) = default;
+};
+
+// `node` with the hostname default applied.
+std::string cluster_node_name(const ClusterConfig& cluster);
+
 struct Config {
   ServerConfig server;
+  ClusterConfig cluster;
   std::vector<ExportConfig> exports;
 };
 
