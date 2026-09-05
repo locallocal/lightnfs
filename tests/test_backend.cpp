@@ -102,6 +102,19 @@ TEST(Backend, MemoryLookupReadAndStableCookies) {
   EXPECT_STREQ(std::string(reinterpret_cast<char*>(data.data()), *n), "alpha");
 }
 
+TEST(Backend, DefaultTakeoverIsANoOpThatSucceeds) {
+  // plan 10 D1: Backend::takeover() is optional — the base implementation succeeds
+  // without touching anything, so every backend is cluster-callable by default.
+  backend::MemoryBackend memory(7);
+  rt::testing::FakeRing ring;
+  rt::Reactor reactor(ring);
+  backend::ClusterIdentity id{.cluster_id = "cluster-x", .node = "gw1", .epoch = 3};
+  auto took = run_immediate(reactor, memory.takeover(id));
+  EXPECT_TRUE(took.has_value());
+  auto root = run_immediate(reactor, memory.root());
+  ASSERT_TRUE(root.has_value());  // still serving afterwards
+}
+
 TEST(Backend, HundredThousandEntryTraversalHasNoDuplicatesOrOmissions) {
   backend::MemoryBackend memory(8);
   ASSERT_TRUE(memory.add_dir("/big").has_value());

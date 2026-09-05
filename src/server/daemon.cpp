@@ -26,6 +26,7 @@
 #include "runtime/runtime.hpp"
 #include "server/cluster_controller.hpp"
 #include "server/cluster_store.hpp"
+#include "server/takeover_hook.hpp"
 #include "server/data_plane.hpp"
 #include "server/frontend.hpp"
 #include "server/metrics_providers.hpp"
@@ -489,6 +490,27 @@ int run_server(const std::string& config_path) {
     hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
     hooks.activate = bring_up;
     hooks.deactivate = [&, drain_grace] { take_down(drain_grace); };
+    // Storage-side eviction of the failed gateway (plan 10 D1): every backend's
+    // takeover() on reactor 0 (as start()/stop()), then the operator's script.  Each
+    // failure is logged; the activation goes on regardless (B2's DELAY path covers
+    // whatever is still held).
+    hooks.backend_takeover = [&](const TakeoverContext& ctx) -> Result<void> {
+      Result<void> outcome{};
+      for (const auto& entry : core->exports->entries()) {
+        auto took = run_on_reactor(runtime.reactor(0), entry->backend->takeover(ctx.identity));
+        if (!took) {
+          LNFS_WARN("cluster: backend {} takeover failed: {}", entry->path,
+                    errno_name(took.error()));
+          outcome = Err(took.error());
+        }
+      }
+      if (!cluster_cfg.takeover_hook.empty()) {
+        auto ran = run_takeover_hook(cluster_cfg.takeover_hook, ctx.identity, ctx.prev_node,
+                                     std::chrono::milliseconds(cluster_cfg.fence_lease_ms));
+        if (!ran) outcome = Err(ran.error());
+      }
+      return outcome;
+    };
     hooks.backend_reset = [&] {
       stop_backends(runtime, *core->exports);
       if (!start_backends(runtime, *core->exports))

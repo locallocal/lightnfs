@@ -149,6 +149,7 @@ rt::Task<Result<void>> LockMgr::release(Object& obj, const LockOwnerId& owner) {
 
 rt::Task<Result<void>> Backend::start() { co_return Result<void>{}; }
 rt::Task<Result<void>> Backend::stop() { co_return Result<void>{}; }
+rt::Task<Result<void>> Backend::takeover(const ClusterIdentity&) { co_return Result<void>{}; }
 
 namespace {
 std::mutex& registry_mutex() {

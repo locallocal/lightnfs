@@ -28,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+#include "backend/api.hpp"
 #include "core/config.hpp"
 #include "obs/metrics.hpp"
 #include "server/cluster_store.hpp"
@@ -37,6 +38,15 @@ namespace lnfs::server {
 
 enum class Role { kStandby, kActivating, kActive, kDraining };
 const char* role_name(Role role);
+
+// What a takeover hands to the backends and the external hook (plan 10 D1).
+struct TakeoverContext {
+  backend::ClusterIdentity identity;  // cluster id, this node, the epoch just minted
+  // Node named by the fence record we replaced — the gateway whose storage-side
+  // residue the hooks should clear.  Empty when the fence was free (first start) or
+  // was our own previous incarnation.
+  std::string prev_node;
+};
 
 class ClusterController {
  public:
@@ -49,8 +59,10 @@ class ClusterController {
     std::function<Result<void>(uint64_t epoch)> activate;
     // Drain connections, tear the stack down.
     std::function<void()> deactivate;
-    // Storage-side cleanup of the failed gateway's residue (plan 10 D1); optional.
-    std::function<Result<void>()> backend_takeover;
+    // Storage-side cleanup of the failed gateway's residue (plan 10 D1): every
+    // Backend::takeover(), then the external script.  Optional; a failure is logged
+    // and the activation continues.
+    std::function<Result<void>(const TakeoverContext&)> backend_takeover;
     // stop()+start() of every backend after draining (design 09 §9.7); optional.
     std::function<void()> backend_reset;
   };
@@ -96,7 +108,7 @@ class ClusterController {
   bool auto_takeover_allowed() const;
   // Standby → Activating: fence + epoch, then post the data-plane work.
   Result<void> begin_activation(bool force);
-  void run_activation(uint64_t epoch);  // on the posting thread
+  void run_activation(uint64_t epoch, std::string prev_node);  // on the posting thread
   void begin_draining(const char* why, bool fence_lost);
   void run_draining(bool release);       // on the posting thread
   void renew();

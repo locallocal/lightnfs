@@ -56,7 +56,7 @@ node = ""                    # 本网关名；空 = 主机名
 role = "auto"                # active | standby | auto
 fence_lease = "3s"           # 围栏续租周期（500ms–60s）；3× 未续视为失效
 takeover = "auto"            # auto | manual
-takeover_hook = ""           # 可选可执行脚本，接管时在后端钩子之后运行
+takeover_hook = ""           # 可选可执行脚本，接管时在后端钩子之后运行（超时 fence_lease；环境变量 LNFS_CLUSTER_ID/NODE/EPOCH/PREV_NODE）
 # unsafe_skip_backend_checks = false   # 仅测试：后端能力不达标只告警
 
 [[export]]                   # 见 06 分册 6.7；后端子表 [export.local|gluster|lustre|cephfs]

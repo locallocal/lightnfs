@@ -100,6 +100,7 @@ add_library(lnfs_core STATIC
   src/server/frontend.cpp
   src/server/metrics_providers.cpp
   src/server/protocol_stack.cpp
+  src/server/takeover_hook.cpp
   src/runtime/reactor.cpp
   src/runtime/uring_ring.cpp
   src/runtime/epoll_ring.cpp
