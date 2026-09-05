@@ -18,10 +18,12 @@
 #include <filesystem>
 #include <mutex>
 #include <set>
+#include <thread>
 
 #include "backend/fault.hpp"
 #include "backend/lustre/lustre.hpp"
 #include "llapi_fake.hpp"
+#include "reclaim_probe.hpp"
 #include "runtime/runtime.hpp"
 
 using namespace lnfs;
@@ -602,4 +604,55 @@ TEST(Lustre, ConfigFactory) {
   EXPECT_TRUE((*made)->caps().has(backend::Cap::kStableHandles));
   EXPECT_FALSE((*made)->lustre_config().hsm);
   made->reset();
+}
+
+// plan 10 E2: the failed gateway's OFD lock still sits on the file when the
+// taking-over gateway's client reclaims inside grace, so the push (a real
+// F_OFD_SETLK from the backend's own descriptor) is refused and the state layer
+// answers DELAY (plan 10 B2); the lock is dropped after a delay — the client eviction
+// Lustre does on obd_timeout — and the retry wins, all in grace.  A competing OFD lock
+// on the backing file from a separate descriptor stands in for the dead gateway.
+TEST(Lustre, ReclaimLockDelayUntilClientEviction) {
+  Mount m;
+  auto file = m.create_file("lk", "seed");
+  ASSERT_TRUE(file != nullptr);
+  backend::ObjId oid = file->id();
+  std::string backing = m.path + "/lk";
+
+  // The dead gateway's residue: a real OFD write lock held by another descriptor.
+  int stale_fd = ::open(backing.c_str(), O_RDWR);
+  ASSERT_TRUE(stale_fd >= 0);
+  struct flock fl {};
+  fl.l_type = F_WRLCK;
+  fl.l_whence = SEEK_SET;
+  fl.l_start = 0;
+  fl.l_len = 100;
+  ASSERT_TRUE(::fcntl(stale_fd, F_OFD_SETLK, &fl) == 0);
+
+  auto* mgr = &m.be->native_locks()->get();
+  TmpDir state_dir;
+  test::ReclaimProbe probe(
+      m.runtime, state_dir.path, /*fsid=*/11, oid,
+      [mgr](uint32_t) -> backend::LockMgr* { return mgr; },
+      [be = m.be.get()](uint32_t, const backend::ObjId& o)
+          -> rt::Task<Result<backend::ObjPtr>> { co_return co_await be->resolve(o); });
+  ASSERT_TRUE(probe.in_grace());
+  EXPECT_EQ(probe.open_reclaim(), 0u);
+
+  // Refused while the OFD lock is held: DELAY, no state minted.
+  EXPECT_EQ(probe.lock_reclaim(), test::ReclaimProbe::delay());
+  EXPECT_TRUE(probe.reclaim_delays() >= 1u);
+  EXPECT_EQ(probe.lock_states(), 0u);
+
+  // The MDS evicts the dead client after ~150 ms: its OFD lock is dropped (fd closed).
+  std::thread evict([stale_fd] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    ::close(stale_fd);  // closing the descriptor releases its OFD locks
+  });
+  auto out = probe.lock_until_settled(/*attempts=*/100, std::chrono::milliseconds(20));
+  evict.join();
+  EXPECT_EQ(out.status, 0u);
+  EXPECT_TRUE(out.delays >= 1u);
+  EXPECT_EQ(probe.lock_states(), 1u);
+  EXPECT_TRUE(probe.in_grace());
 }

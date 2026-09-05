@@ -35,7 +35,7 @@
 | D 后端接管钩子 | D1 `Backend::takeover()` 接口 + 脚本钩子 ✅ 2026-09-05 | 默认空操作；可配外部脚本（Lustre evict 等） | C2 |
 | | D2 CephFS reclaim 原语 ✅ 2026-09-05 | cephapi 三入口、fake、`[export.cephfs] uuid` | D1 |
 | E 验证与文档 | E1 `v4failover` 验收模式 + 本机双实例脚本 ✅ 2026-09-05 | 无 root 的端到端证明 | C3 D1 |
-| | E2 fake 注入与脑裂演练 | 残留锁、围栏分离 | B2 C2 D2 |
+| | E2 fake 注入与脑裂演练 ✅ 2026-09-05 | 残留锁、围栏分离 | B2 C2 D2 |
 | | E3 文档 | 08 册、deployment.md、07 §7.5、09 册状态更新 | 全部 |
 
 关键路径：A2 → A3 → C1 → C2 → E1。阶段 B 的四步与阶段 A 并行无冲突。
@@ -637,15 +637,36 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
 - 未加 `accept_failover_vm.sh`（E1 只要求无 root 的本机证明；带 keepalived/内核客户端的
   VM 版在 E 阶段其余步骤再说）。
 
-### E2 fake 注入与脑裂演练
+### E2 fake 注入与脑裂演练（已完成，2026-09-05）
 
-- `cephapi_fake` 的残留锁注入（D2）接到 `test_state` 的 B2 场景：残留锁在 `takeover()`
-  后释放 → DELAY 次数 ≥ 1 且最终成功。
-- `gfapi_fake` / `llapi_fake`：加"锁在 N 毫秒后自动释放"注入（模拟 ping-timeout /
-  obd_timeout），验证 B2 在 grace 内等到释放。
+- `cephapi_fake` 的残留锁注入（D2）接到 B2 场景：残留锁在 `takeover()` 后释放 → DELAY 次数 ≥ 1
+  且最终成功。
+- `gfapi_fake` / `llapi_fake`：加"锁在 N 毫秒后自动释放"注入（模拟 ping-timeout / obd_timeout），
+  验证 B2 在 grace 内等到释放。
 - 脑裂：`test_cluster_controller` 已覆盖围栏被改写；E1 脚本覆盖真实进程。root VM 场景
   （keepalived + 内核客户端 + fsx/cthon）不进 CI，写成 `scripts/accept_failover_vm.sh`
   仿 `accept_m6_vm.sh`，三种后端各一轮，由人工触发。
+
+**实现记录（与上文的差异）**：
+- B2 的状态层 DELAY 机制本身已由 `StateMgr.ReclaimLockPushDelayInGrace`（fake `LockMgr`）覆盖；
+  E2 用**各后端真实的锁实现 + 残留锁注入**把同一条路径端到端跑一遍。三个后端共享
+  `tests/reclaim_probe.hpp` 的 `ReclaimProbe`：起一个已进 grace、名单里有"死网关客户端"的 `StateMgr`
+  （gateway A 只 `confirm_create_session` 落名单，gateway B `load_grace_list`），
+  `native_locks.manager/resolve` 指向被测后端，驱动 OPEN(CLAIM_PREVIOUS) + 反复 LOCK(reclaim)，
+  返回每次状态与 `native_lock_reclaim_delays` 计数。
+- `Cephfs.ReclaimLockDelayUntilTakeover`：`plant_stale_lock` 造死网关的排他锁 → LOCK(reclaim) 得
+  DELAY（≥1 次，未铸 state）→ `takeover()` 回收死会话、MDS 放锁 → 下一次 reclaim 成功，全程在 grace。
+- `Gluster.ReclaimLockDelayUntilBrickTimeout`：`gfapi_fake` 加 `plant_stale_lock` /
+  `release_stale_locks_after(ms)`（定时线程删幽灵段，模拟 brick ping-timeout；`join_stale_timer`
+  收线程）→ DELAY → 定时释放后 `lock_until_settled` 在 grace 内重试成功。Gluster 无 `takeover()`
+  回收原语（锁随 TCP 连接释放），DELAY 重试即全部。
+- `Lustre.ReclaimLockDelayUntilClientEviction`：Lustre 原生锁是真实 OFD `fcntl`，故不改 fake——
+  用另一个描述符对 backing 文件加真实 `F_OFD_SETLK` 写锁当残留，`~150ms` 后关 fd 释放（模拟
+  obd_timeout 驱逐），验证 DELAY → 成功。
+- root VM 脚本 `scripts/accept_failover_vm.sh`（人工、非 CI）：真实内核 `mount -o vers=4.1`，两网关
+  共享 `shared_dir` 与导出树，`flock` 持锁 + 写 → `kill -9 A` → `cluster takeover` B → 校验数据存活、
+  可重新加锁、可续写；`local` 轮无需集群（任意 root VM 可跑），`gluster/cephfs/lustre` 轮由
+  `LNFS_*` 环境变量提供集群配置，各一轮。本机无 root/内核挂载，仅 `bash -n` 语法校验。
 
 ### E3 文档
 

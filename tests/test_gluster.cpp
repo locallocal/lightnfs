@@ -21,6 +21,7 @@
 #include "backend/fault.hpp"
 #include "backend/gluster/gluster.hpp"
 #include "gfapi_fake.hpp"
+#include "reclaim_probe.hpp"
 #include "runtime/runtime.hpp"
 
 using namespace lnfs;
@@ -694,4 +695,46 @@ TEST(Gluster, ConfigFactory) {
   if (started) (void)run(runtime, (*sys)->stop());
   sys->reset();
   runtime.stop_and_join();
+}
+
+// plan 10 E2: a client's reclaim LOCK inside grace rides DELAY while the failed
+// gateway's lock lingers on the brick, then succeeds once the brick drops it on
+// ping-timeout (simulated by the fake's timed stale-lock release).  Gluster has no
+// takeover() reclaim primitive (locks follow the TCP connection) — the state layer's
+// DELAY retry is the whole story here.
+TEST(Gluster, ReclaimLockDelayUntilBrickTimeout) {
+  Volume v;
+  backend::ObjId oid;
+  {
+    auto root = v.root();
+    auto c = run(v.runtime, root->create(v.root_cred, "lk", backend::SetAttr{}, nullptr));
+    ASSERT_TRUE(c.has_value());
+    oid = c->obj->id();
+  }
+  ASSERT_TRUE(testing::FakeGfapi::plant_stale_lock("lk", 0, 100));
+  EXPECT_EQ(testing::FakeGfapi::stale_locks(), 1u);
+  auto* mgr = &v.be->native_locks()->get();
+  TmpDir state_dir;
+  test::ReclaimProbe probe(
+      v.runtime, state_dir.path, /*fsid=*/9, oid,
+      [mgr](uint32_t) -> backend::LockMgr* { return mgr; },
+      [be = v.be.get()](uint32_t, const backend::ObjId& o)
+          -> rt::Task<Result<backend::ObjPtr>> { co_return co_await be->resolve(o); });
+  ASSERT_TRUE(probe.in_grace());
+  EXPECT_EQ(probe.open_reclaim(), 0u);
+
+  // Refused while the stale lock is held: DELAY, no state minted.
+  EXPECT_EQ(probe.lock_reclaim(), test::ReclaimProbe::delay());
+  EXPECT_TRUE(probe.reclaim_delays() >= 1u);
+  EXPECT_EQ(probe.lock_states(), 0u);
+
+  // The brick lets go after ~150 ms; the state layer's retry wins inside grace.
+  testing::FakeGfapi::release_stale_locks_after(150);
+  auto out = probe.lock_until_settled(/*attempts=*/100, std::chrono::milliseconds(20));
+  EXPECT_EQ(out.status, 0u);
+  EXPECT_TRUE(out.delays >= 1u);
+  EXPECT_EQ(testing::FakeGfapi::stale_locks(), 0u);
+  EXPECT_EQ(probe.lock_states(), 1u);
+  EXPECT_TRUE(probe.in_grace());
+  testing::FakeGfapi::join_stale_timer();  // never leave a joinable std::thread
 }

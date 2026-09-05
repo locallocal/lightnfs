@@ -34,6 +34,14 @@ struct FakeGfapi {
   static int live_fds();
   // Number of glfs_h_access calls (round-trip accounting).
   static uint64_t access_calls();
+
+  // A failed gateway's residue (plan 10 E2): an exclusive lock on `rel_path` under a
+  // ghost owner; false if the file is missing.  release_stale_locks_after(ms) drops it
+  // from a timer thread — the brick letting go on ping-timeout.
+  static bool plant_stale_lock(const std::string& rel_path, uint64_t start, uint64_t len);
+  static size_t stale_locks();
+  static void release_stale_locks_after(int ms);
+  static void join_stale_timer();  // join the pending release (before process exit)
 };
 
 }  // namespace lnfs::testing

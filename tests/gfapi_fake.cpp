@@ -11,7 +11,9 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -72,6 +74,9 @@ struct State {
     bool excl;
   };
   std::vector<Seg> locks;
+  // Failed-gateway residue (plan 10 E2): a lock planted under a ghost owner, released
+  // after a delay to mimic the brick dropping it on ping-timeout.
+  std::thread stale_timer;
 };
 
 State& st() {
@@ -773,6 +778,7 @@ std::shared_ptr<const Api> FakeGfapi::api() {
 
 void FakeGfapi::set_root(std::string dir) {
   auto& s = st();
+  if (s.stale_timer.joinable()) s.stale_timer.join();
   std::lock_guard lock(s.mu);
   s.root = std::move(dir);
   s.gens.clear();
@@ -796,5 +802,40 @@ uint32_t FakeGfapi::last_fsgid() { return g_last_gid.load(); }
 int FakeGfapi::live_objects() { return st().live_objects.load(); }
 int FakeGfapi::live_fds() { return st().live_fds.load(); }
 uint64_t FakeGfapi::access_calls() { return st().access_calls.load(); }
+
+static const char* kStaleOwner = "dead-gateway";
+
+bool FakeGfapi::plant_stale_lock(const std::string& rel_path, uint64_t start, uint64_t len) {
+  auto& s = st();
+  std::string full;
+  { std::lock_guard lock(s.mu); full = s.root + "/" + rel_path; }
+  struct stat sb {};
+  if (::stat(full.c_str(), &sb) < 0) return false;
+  uint64_t end = (len == 0 || len == UINT64_MAX) ? UINT64_MAX : start + len;
+  std::lock_guard lock(s.mu);
+  s.locks.push_back({sb.st_ino, kStaleOwner, start, end, true});
+  return true;
+}
+size_t FakeGfapi::stale_locks() {
+  auto& s = st();
+  std::lock_guard lock(s.mu);
+  size_t n = 0;
+  for (const auto& seg : s.locks) n += seg.owner == kStaleOwner ? 1 : 0;
+  return n;
+}
+void FakeGfapi::release_stale_locks_after(int ms) {
+  auto& s = st();
+  if (s.stale_timer.joinable()) s.stale_timer.join();
+  s.stale_timer = std::thread([ms] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    auto& s = st();
+    std::lock_guard lock(s.mu);
+    std::erase_if(s.locks, [](const State::Seg& seg) { return seg.owner == kStaleOwner; });
+  });
+}
+void FakeGfapi::join_stale_timer() {
+  auto& s = st();
+  if (s.stale_timer.joinable()) s.stale_timer.join();
+}
 
 }  // namespace lnfs::testing

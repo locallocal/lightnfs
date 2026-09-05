@@ -21,6 +21,7 @@
 #include "backend/cephfs/cephfs.hpp"
 #include "backend/fault.hpp"
 #include "cephapi_fake.hpp"
+#include "reclaim_probe.hpp"
 #include "runtime/runtime.hpp"
 
 using namespace lnfs;
@@ -682,6 +683,54 @@ TEST(Cephfs, NativeByteRangeLocks) {
   auto on_dir = run(m.runtime, mgr.lock(*root, a, {0, 1}, true, false));
   EXPECT_FALSE(on_dir.has_value());
   EXPECT_EQ(raw(on_dir.error()), EINVAL);
+}
+
+// ---- plan 10 E2: reclaim LOCK rides DELAY until takeover frees the stale lock -------
+
+// End to end over the real CephFS lock path: the dead gateway's exclusive lock is
+// still on the MDS when the taking-over gateway's client reclaims inside grace, so the
+// push is refused and the state layer answers DELAY (plan 10 B2); takeover() reclaims
+// the dead session (D2) and the retry — still in grace — wins.
+TEST(Cephfs, ReclaimLockDelayUntilTakeover) {
+  Mount m;
+  backend::ObjId oid;
+  {
+    auto root = m.root();
+    auto c = run(m.runtime, root->create(m.root_cred, "lk", backend::SetAttr{}, nullptr));
+    ASSERT_TRUE(c.has_value());
+    oid = c->obj->id();
+  }
+  // The dead gateway held the cluster's session uuid ("<cluster id>-<fsid>", fsid 9).
+  ASSERT_TRUE(testing::FakeCephApi::plant_stale_lock("lk", "cluster-x-9", 0, 100));
+  auto* mgr = &m.be->native_locks()->get();
+  TmpDir state_dir;
+  test::ReclaimProbe probe(
+      m.runtime, state_dir.path, /*fsid=*/9, oid,
+      [mgr](uint32_t) -> backend::LockMgr* { return mgr; },
+      [be = m.be.get()](uint32_t, const backend::ObjId& o)
+          -> rt::Task<Result<backend::ObjPtr>> { co_return co_await be->resolve(o); });
+  ASSERT_TRUE(probe.in_grace());
+  EXPECT_EQ(probe.open_reclaim(), 0u);  // OPEN(CLAIM_PREVIOUS) inside grace
+
+  // While the stale lock is held the reclaim push is DELAY, not DENIED.
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(probe.lock_reclaim(), test::ReclaimProbe::delay());
+    EXPECT_EQ(probe.reclaim_delays(), static_cast<uint64_t>(i + 1));
+    EXPECT_EQ(probe.lock_states(), 0u);  // nothing minted while it retries
+    EXPECT_TRUE(probe.in_grace());
+  }
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);
+
+  // Takeover reclaims the dead session; the MDS drops its lock.
+  backend::ClusterIdentity who{.cluster_id = "cluster-x", .node = "gw-b", .epoch = 5};
+  ASSERT_TRUE(run(m.runtime, m.be->takeover(who)).has_value());
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 0u);
+
+  // The very next reclaim wins — still in grace, and the retry count stops moving.
+  EXPECT_EQ(probe.lock_reclaim(), 0u);
+  EXPECT_EQ(probe.lock_states(), 1u);
+  EXPECT_EQ(probe.reclaim_delays(), 3u);
+  EXPECT_TRUE(probe.in_grace());
 }
 
 // ---- plan 10 D2: session reclaim on takeover ---------------------------------------
