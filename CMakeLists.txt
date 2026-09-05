@@ -105,6 +105,7 @@ add_library(lnfs_core STATIC
   src/runtime/runtime.cpp
   src/runtime/buffer.cpp
   src/util/log.cpp
+  src/util/sha256.cpp
   src/obs/metrics.cpp
   src/obs/errlog.cpp
   src/transport/record_stream.cpp

@@ -152,6 +152,18 @@ Result<Config> parse_config(std::string_view toml);
 Result<Config> load_config(const std::string& path);
 Result<void> validate_config(const Config& config);
 
+// Export-table digest for the cluster consistency check (design 09 §9.3, plan 10 B4):
+// gateways of one cluster must export the same tree under the same fsids.  Covers,
+// per export (sorted by fsid): path, fsid, backend, readonly, squash, anon uid/gid and
+// every backend subtable key except the per-node ones below (credentials, log paths,
+// cache sizes: legitimately different per host).  Client allowlists and QoS are not
+// identity and are hot-reloadable, so they are left out.  "sha256:<64 hex>".
+inline constexpr std::string_view kPerNodeBackendKeys[] = {
+    "conf", "keyring", "id", "user", "name", "log_file", "fd_cache", "mon_host"};
+std::string canonical_exports_digest(const Config& config);
+// The text the digest is computed over (for diagnostics and tests).
+std::string canonical_exports_text(const Config& config);
+
 struct ExportEntry {
   std::string path;
   uint32_t fsid = 0;

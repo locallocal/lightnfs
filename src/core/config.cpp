@@ -14,6 +14,7 @@
 #include <sstream>
 
 #include "backend/api.hpp"
+#include "util/sha256.hpp"
 
 namespace lnfs::core {
 namespace {
@@ -511,6 +512,38 @@ Result<void> validate_config(const Config& config) {
       if (!Cidr::parse(client)) return Err(errno_from(EINVAL));
   }
   return {};
+}
+
+std::string canonical_exports_text(const Config& config) {
+  std::vector<const ExportConfig*> sorted;
+  for (const auto& exp : config.exports) sorted.push_back(&exp);
+  std::sort(sorted.begin(), sorted.end(), [](const ExportConfig* a, const ExportConfig* b) {
+    return a->fsid != b->fsid ? a->fsid < b->fsid : a->path < b->path;
+  });
+  std::string out;
+  for (const ExportConfig* exp : sorted) {
+    const char* squash = exp->squash == Squash::kNone ? "none"
+                         : exp->squash == Squash::kAll ? "all"
+                                                       : "root";
+    out += std::format("export path={} fsid={} backend={} readonly={} squash={} anon_uid={} "
+                       "anon_gid={}\n",
+                       exp->path, exp->fsid, exp->backend, exp->readonly ? 1 : 0, squash,
+                       exp->anon_uid, exp->anon_gid);
+    std::vector<std::pair<std::string, std::string>> keys(exp->backend_config.values.begin(),
+                                                          exp->backend_config.values.end());
+    std::sort(keys.begin(), keys.end());
+    for (const auto& [key, value] : keys) {
+      bool per_node = false;
+      for (std::string_view exempt : kPerNodeBackendKeys)
+        if (key == exempt) per_node = true;
+      if (!per_node) out += std::format("  {}={}\n", key, value);
+    }
+  }
+  return out;
+}
+
+std::string canonical_exports_digest(const Config& config) {
+  return "sha256:" + util::sha256_hex(canonical_exports_text(config));
 }
 
 std::string cluster_node_name(const ClusterConfig& cluster) {

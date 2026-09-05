@@ -71,6 +71,11 @@ rsize/wsize/dtpref 不是配置项：由后端 `FsLimits`（05 分册）推导�
 `server_owner`/`server_scope` 不得显式设置（身份由 `id` 派生）、`takeover_hook` 须为可执行文件；
 后端构造后再查每个导出 `kStableHandles + kByteLocks + native_locks`（`--check-config` 同样执行），
 `shared_dir` 不可写只告警（`--check-config` 不写共享目录）。
+启动时还把导出表的规范化摘要（`sha256:` + 每导出的 path/fsid/backend/readonly/squash/anon_uid/anon_gid
+与后端子表键值，按 fsid 排序）写入 `shared_dir/exports.<node>`，与其他节点的记录逐一比对，
+不一致则拒绝入集群。**按节点豁免键**不参与摘要：`conf`、`keyring`、`id`、`user`、`name`、
+`log_file`、`fd_cache`、`mon_host`（`core/config.hpp` 的 `kPerNodeBackendKeys`）；`clients`
+与 QoS 也不参与（可热重载的策略，不是树身份）。已下线节点的 `exports.<node>` 需运维手动删除。
 
 ## 8.2 日志
 

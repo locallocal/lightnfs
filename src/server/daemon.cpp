@@ -158,6 +158,36 @@ bool check_cluster_backends(const core::ClusterConfig& cluster,
   return ok;
 }
 
+// Export-table consistency across the cluster (design 09 §9.3, plan 10 B4): refuse to
+// join if any other node's digest differs — the same fsid over a different tree would
+// hand clients handles that resolve to different files after a takeover — and publish
+// this node's digest only once it agrees, so a misconfigured node never leaves a
+// record that would keep the healthy ones from restarting.  A removed node's stale
+// exports.<node> record must be deleted by the operator (no automatic GC).
+bool check_exports_consistency(ClusterStore& store, const std::string& node,
+                               const std::string& digest) {
+  auto listed = store.list_exports_digests();
+  if (!listed) {
+    LNFS_ERROR("cannot read the cluster export digests: {}", errno_name(listed.error()));
+    return false;
+  }
+  bool ok = true;
+  for (const auto& [peer, theirs] : *listed) {
+    if (peer == node || theirs == digest) continue;
+    LNFS_ERROR("export table differs from cluster node {}: ours {} theirs {} "
+               "(fix the config, or delete shared_dir/exports.{} if that node is gone)",
+               peer, digest, theirs, peer);
+    ok = false;
+  }
+  if (!ok) return false;
+  if (auto put = store.put_exports_digest(node, digest); !put) {
+    LNFS_ERROR("cannot publish the export digest to the cluster store: {}",
+               errno_name(put.error()));
+    return false;
+  }
+  return true;
+}
+
 // `--check-config` must not write into shared_dir (another gateway may be active);
 // it only reports whether this gateway could.
 void warn_shared_dir_access(const core::ClusterConfig& cluster) {
@@ -344,6 +374,7 @@ int run_server(const std::string& config_path) {
   if (!config) return 1;
   const core::ServerConfig server_cfg = config->server;
   const core::ClusterConfig cluster_cfg = config->cluster;
+  const std::string exports_digest = core::canonical_exports_digest(*config);
   apply_log_level(server_cfg);
 
   // 2. durable identity: handle HMAC key + epoch (state_dir, or the shared cluster
@@ -358,9 +389,12 @@ int run_server(const std::string& config_path) {
   auto core = build_core_state(std::move(*config), *identity, cluster_store.get());
   if (!core) return 1;
   if (!check_cluster_backends(cluster_cfg, *core->exports)) return 1;
-  if (cluster_store)
-    LNFS_INFO("cluster mode: id={} node={} shared_dir={} epoch={}", cluster_cfg.id,
-              core::cluster_node_name(cluster_cfg), cluster_cfg.shared_dir, core->epoch);
+  if (cluster_store) {
+    const std::string node = core::cluster_node_name(cluster_cfg);
+    if (!check_exports_consistency(*cluster_store, node, exports_digest)) return 1;
+    LNFS_INFO("cluster mode: id={} node={} shared_dir={} epoch={} exports={}", cluster_cfg.id,
+              node, cluster_cfg.shared_dir, core->epoch, exports_digest);
+  }
   init_async_logging({.file = server_cfg.log_file,
                       .rotate_size = server_cfg.log_rotate_size,
                       .rotate_keep = server_cfg.log_rotate_keep});

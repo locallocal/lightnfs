@@ -27,7 +27,7 @@
 | B 协议与状态语义 | B1 集群身份 ✅ 2026-09-05 | server_owner/scope 从 cluster id 派生 | A1 |
 | | B2 reclaim 下推失败 → DELAY ✅ 2026-09-05 | 状态层 grace 内重试 | — |
 | | B3 CLAIM_DELEG_PREV_FH ✅ 2026-09-05 | 接受为普通 open 状态 | — |
-| | B4 导出表一致性摘要 | 启动期拒绝树不一致的网关入集群 | A1 A2 |
+| | B4 导出表一致性摘要 ✅ 2026-09-05 | 启动期拒绝树不一致的网关入集群 | A1 A2 |
 | C 进程生命周期 | C1 `ProtocolStack` 可重建 | 栈的构造/析构与进程解耦；连接收敛等待 | A4 |
 | | C2 `ClusterController` 状态机 | Standby/Activating/Active/Draining + 围栏协程 | A1–A4 B1 C1 |
 | | C3 ctl `cluster *` 命令 | status / takeover / standby | C2 |
@@ -255,25 +255,30 @@ CLAIM_DELEG_PREV_FH → OK、`delegation_type == NONE`（即使带 WANT_READ_DEL
 同 owner 二次 claim 合并到同一 open 状态；grace 内普通 OPEN 仍 GRACE；CLAIM_DELEGATE_PREV
 仍 NOTSUPP；RECLAIM_COMPLETE 后 → NO_GRACE；新 grace 下未列名单客户端 → RECLAIM_BAD。
 
-### B4 导出表一致性摘要
+### B4 导出表一致性摘要（已完成，2026-09-05）
 
 **目标**：09 §9.3 末条：fsid 相同而树不同的网关不得入集群。
 
 **改动点**
 
-- `core::ExportTable::canonical_digest()`（`src/core/config.hpp`）：对每个导出取
+- `core::canonical_exports_digest(const Config&)`（`src/core/config.hpp`；实现时改为从解析后的
+  `Config` 取值而非 `ExportTable`，因为后端名与子表键值只在 `ExportConfig` 里，且摘要要在
+  `ExportTable::build` 消费掉配置之前算出）：对每个导出（按 fsid 排序）取
   `path | fsid | backend | readonly | squash | anon_uid | anon_gid` 与后端子表中
-  **除按节点豁免键之外**的所有 `key=value`（排序后拼接），整体做摘要。`util/` 里没有
-  SHA-256，句柄用的 SipHash-2-4 只有 64 位：新加一个约 100 行的 SHA-256
-  （`src/util/sha256.{hpp,cpp}`，带 FIPS 180-4 测试向量）。豁免键列表是常量
+  **除按节点豁免键之外**的所有 `key=value`（排序后拼接），整体做 SHA-256
+  （`src/util/sha256.{hpp,cpp}`，FIPS 180-4 向量 + 填充边界测试）。豁免键列表是常量
   `kPerNodeBackendKeys = {conf, keyring, id, user, name, log_file, fd_cache, mon_host}`，
-  写在 `cluster_store.hpp` 并在 08 册记录。
-- `daemon` 启动（集群模式，backend `start()` 之前）：`put_exports_digest(node, digest)`，
-  然后 `list_exports_digests()` 逐一比对，任一不同 → 打印对方节点名与本机摘要，退出码 1。
+  放在 `core/config.hpp`（core 不能依赖 server/）并在 08 册记录；`canonical_exports_text`
+  暴露摘要原文供诊断。
+- `daemon` 启动（集群模式，backend `start()` 之前）：先 `list_exports_digests()` 逐一比对，
+  任一不同 → 打印对方节点名与双方摘要，退出码 1，**不写入**自己的记录（否则一台配错的网关
+  会让健康网关重启时也被拒）；一致后才 `put_exports_digest(node, digest)`。
   被移除节点的陈旧 `exports.<node>` 需要运维手动删除（deployment.md 说明；不做自动 GC）。
 
-**测试**：`tests/test_cluster_store.cpp` 加摘要用例：仅 `keyring` 不同的两份配置摘要相同；
-`subdir` 不同则不同。
+**测试**：`ClusterStore.Sha256Vectors`、`ClusterStore.ExportDigestIgnoresPerNodeKeys`
+（两份只差凭证/日志/缓存/clients/QoS 且导出顺序不同的配置摘要相同；subdir/fsid/path/squash/
+fs_name/volume/readonly 任一不同则不同）。端到端：两个网关共用 `shared_dir`，第二个改了
+`subdir`（或 fsid）→ 启动被拒并打印对方节点名与双方摘要。
 
 ---
 
