@@ -16,7 +16,7 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 6. [后端实现](06-backends.md) —— 本地文件系统后端详设；Lustre（§6.5）、GlusterFS（§6.6）、CephFS（§6.8）三个集群后端的映射表与实现要点
 7. [状态管理](07-state-management.md) —— v3 DRC、v4 clientid/会话/槽表/租约/宽限期、持久化
 8. [配置、可观测性与安全](08-config-observability.md) —— 导出表、日志/指标/追踪、资源限制
-9. [多网关无感故障切换（已实现）](09-multi-gateway-failover.md) —— 共享后端上的主备接管：集群身份、共享 reclaim 名单、全局 epoch 与围栏、后端接管钩子；§9.10 改动清单带代码位置；多活/计划内迁移的演进路径。实施计划（A–E 全部完成）已合入并撤下逐步文档，尚未闭环的取舍与发布前门槛见 [../multi-gateway-failover-followups.md](../multi-gateway-failover-followups.md)
+9. [多网关无感故障切换（已实现）](09-multi-gateway-failover.md) —— 共享后端上的主备接管：集群身份、共享 reclaim 名单、全局 epoch 与围栏、后端接管钩子；§9.10 改动清单带代码位置；多活/计划内迁移的演进路径。实施计划（A–E 全部完成）已合入并撤下逐步文档，尚未闭环的取舍与发布前门槛见 [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)
 
 ## 一页纸架构
 
