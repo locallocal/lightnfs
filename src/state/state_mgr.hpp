@@ -403,6 +403,10 @@ class StateMgr {
     // gateway holds it) and push failures (backend error; the LOCK answers DELAY /
     // SERVERFAULT and the gateway grant is undone).
     uint64_t native_lock_denied = 0, native_lock_errors = 0;
+    // Reclaim pushes refused inside grace (design 09 §9.7, plan 10 B2): the failed
+    // gateway's lock still lingers in the storage, the LOCK(reclaim) answers DELAY
+    // and the client retries instead of losing the lock.
+    uint64_t native_lock_reclaim_delays = 0;
     // Delegations + backchannel (plan doc 10 §5.2).
     size_t delegs = 0;
     uint64_t deleg_grants = 0, deleg_recalls = 0, deleg_returns = 0, deleg_revokes = 0;
@@ -521,7 +525,8 @@ class StateMgr {
       file_count_{0}, courtesy_count_{0};
   std::atomic<uint64_t> lease_expirations_{0}, reclaim_conflict_{0},
       reclaim_timeout_{0}, reclaim_forced_{0}, share_denied_{0}, open_merges_{0},
-      lock_denied_{0}, native_lock_denied_{0}, native_lock_errors_{0};
+      lock_denied_{0}, native_lock_denied_{0}, native_lock_errors_{0},
+      native_lock_reclaim_delays_{0};
   std::atomic<int64_t> lock_count_{0};
 
   // ---- read delegations + backchannel (plan doc 10 §5.2) ----

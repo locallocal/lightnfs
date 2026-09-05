@@ -903,12 +903,19 @@ namespace {
 struct FakeNativeLocks final : backend::LockMgr {
   std::vector<std::string> calls;
   Errno fail = Errno::kOk;                          // lock() outcome when != kOk
+  int fail_times = -1;  // >= 0: only the next N lock() calls fail (a lingering lock)
   std::optional<backend::LockConflict> conflict{};  // test() answer
 
   rt::Task<Result<void>> lock(backend::Object&, const backend::LockOwnerId&,
                               backend::LockRange r, bool exclusive, bool) override {
     calls.push_back(std::format("lock {} {} {}", r.offset, r.length, exclusive ? 1 : 0));
-    if (fail != Errno::kOk) co_return Err(fail);
+    if (fail != Errno::kOk) {
+      if (fail_times < 0) co_return Err(fail);
+      if (fail_times > 0) {
+        --fail_times;
+        co_return Err(fail);
+      }
+    }
     co_return Result<void>{};
   }
   rt::Task<Result<void>> unlock(backend::Object&, const backend::LockOwnerId&,
@@ -929,6 +936,116 @@ struct FakeNativeLocks final : backend::LockMgr {
 };
 
 }  // namespace
+
+// Reclaim inside grace against a lingering storage-side lock (design 09 §9.7, plan
+// 10 B2): the failed gateway's lock is still held by the storage when the taking-over
+// gateway pushes the client's LOCK(reclaim).  The refusal answers DELAY (no stateid
+// minted, no gateway grant left behind) until the storage lets go, then the reclaim
+// succeeds.  Outside a reclaim a storage refusal stays DENIED.
+TEST(StateMgr, ReclaimLockPushDelayInGrace) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  FakeNativeLocks native;
+  backend::MemoryBackend memory(1);
+  auto make_cfg = [&](uint64_t epoch) {
+    state::StateMgr::Config cfg{.boot_epoch = epoch, .state_dir = dir.path};
+    cfg.native_locks.manager = [&](uint32_t fsid) -> backend::LockMgr* {
+      return fsid == 1 ? &native : nullptr;
+    };
+    cfg.native_locks.resolve = [&](uint32_t, const backend::ObjId&)
+        -> rt::Task<Result<backend::ObjPtr>> { co_return co_await memory.root(); };
+    return cfg;
+  };
+  {  // Gateway A: the client holds an open + lock when A dies (no CLOSE, no LOCKU).
+    state::StateMgr first(make_cfg(1));
+    run_on(runtime, [&]() -> rt::Task<void> {
+      auto a = co_await connect(first, "listed", 1);
+      auto o = co_await first.open(open_args(a.clientid, 1, "oa", state::kShareBoth, 0), nullptr);
+      EXPECT_EQ(o.status, kOk);
+      state::StateMgr::LockArgs la;
+      la.clientid = a.clientid;
+      la.fsid = 1;
+      la.oid = oid_of(1);
+      la.exclusive = true;
+      la.offset = 0;
+      la.length = 100;
+      la.new_owner = true;
+      la.open_stateid = o.stateid;
+      la.owner = "proc-a";
+      EXPECT_EQ((co_await first.lock(la)).status, kOk);
+    });
+  }
+  native.calls.clear();
+  // The storage still holds A's lock: the next three pushes are refused.
+  native.fail = errno_from(EAGAIN);
+  native.fail_times = 3;
+  native.conflict = backend::LockConflict{{}, {0, 100}, true};
+
+  // Gateway B takes over: grace armed from the list A wrote.
+  state::StateMgr second(make_cfg(2));
+  second.load_grace_list();
+  ASSERT_TRUE(second.in_grace());
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(second, "listed", 1, false);
+    auto oargs = open_args(a.clientid, 1, "oa", state::kShareBoth, 0);
+    oargs.reclaim = true;
+    auto o = co_await second.open(oargs, nullptr);
+    EXPECT_EQ(o.status, kOk);
+    state::StateMgr::LockArgs la;
+    la.clientid = a.clientid;
+    la.fsid = 1;
+    la.oid = oid_of(1);
+    la.exclusive = true;
+    la.offset = 0;
+    la.length = 100;
+    la.new_owner = true;
+    la.open_stateid = o.stateid;
+    la.owner = "proc-a";
+    la.reclaim = true;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      auto r = co_await second.lock(la);
+      EXPECT_EQ(r.status, st4(nfsv4::Status::kDelay));
+      EXPECT_EQ(r.denied.length, 0u);  // no conflict info on a DELAY
+      EXPECT_EQ(second.stats().native_lock_reclaim_delays, static_cast<uint64_t>(attempt + 1));
+      EXPECT_EQ(second.stats().lock_states, 0u);  // nothing minted, nothing granted
+      EXPECT_EQ(second.lock_table().segments({1, oid_of(1)}).size(), 0u);
+      EXPECT_TRUE(second.in_grace());
+    }
+    EXPECT_EQ(second.stats().native_lock_denied, 3u);  // the refusals are still counted
+    // The storage let go (A's session timed out / takeover hook ran): the retry wins.
+    auto ok = co_await second.lock(la);
+    EXPECT_EQ(ok.status, kOk);
+    EXPECT_EQ(second.stats().lock_states, 1u);
+    EXPECT_EQ(second.stats().native_lock_reclaim_delays, 3u);
+    size_t pushes = 0;
+    for (const auto& c : native.calls) pushes += c.starts_with("lock ") ? 1 : 0;
+    EXPECT_EQ(pushes, 4u);
+
+    // Reclaims done: a plain LOCK refused by the storage is a real holder → DENIED,
+    // with the storage's conflict, and the delay counter does not move.
+    EXPECT_EQ(co_await second.reclaim_complete(a.clientid), kOk);
+    EXPECT_FALSE(second.in_grace());
+    native.fail_times = 1;
+    native.conflict = backend::LockConflict{{}, {500, 10}, true};
+    state::StateMgr::LockArgs lb = la;
+    lb.reclaim = false;
+    lb.new_owner = false;
+    lb.lock_stateid = ok.stateid;
+    lb.offset = 500;
+    lb.length = 10;
+    auto denied = co_await second.lock(lb);
+    EXPECT_EQ(denied.status, st4(nfsv4::Status::kDenied));
+    EXPECT_EQ(denied.denied.offset, 500u);
+    EXPECT_EQ(denied.denied.length, 10u);
+    EXPECT_EQ(second.stats().native_lock_reclaim_delays, 3u);
+    EXPECT_EQ(second.stats().native_lock_denied, 4u);
+    // A late reclaim after grace is the existing NO_GRACE gate, never DELAY.
+    lb.reclaim = true;
+    EXPECT_EQ((co_await second.lock(lb)).status, st4(nfsv4::Status::kNoGrace));
+  });
+  runtime.stop_and_join();
+}
 
 TEST(StateMgr, NativeLockPushRollbackAndRelease) {
   TmpDir dir;
