@@ -69,6 +69,22 @@ inflight_per_conn = 64
 # ca   = "/etc/lightnfs/tls/clients-ca.pem"  # optional: verify client certs against this
 # client_cert = false      # require a client certificate (mutual TLS; needs `ca`)
 
+# Multi-gateway failover (design 09, plan 10): several lightnfsd gateways on one shared
+# backend (GlusterFS / Lustre / CephFS), one active at a time behind a VIP; a takeover
+# looks like a server restart to clients, who reclaim their opens and locks.  Every
+# export's backend must present stable handles and native byte-range locks.  The
+# section is not hot-reloadable.  Off by default (single gateway).
+# [cluster]
+# enabled = false
+# id = "3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f"   # identical on every gateway
+# shared_dir = "/mnt/cephfs/.lightnfs-cluster"  # shared state: key, epoch, reclaim list, fence
+# node = ""                # this gateway's name; empty = hostname
+# role = "auto"            # active | standby | auto (take over when the fence expires)
+# fence_lease = "3s"       # fence renew period; the active gateway is lost after 3 misses
+# takeover = "auto"        # auto | manual (`lightnfs-ctl cluster takeover` only)
+# takeover_hook = ""       # optional executable run after the backend takeover hooks
+#                          # (LNFS_CLUSTER_ID / LNFS_NODE / LNFS_EPOCH / LNFS_PREV_NODE)
+
 [[export]]
 path = "/tmp" # replace with the directory to export
 backend = "local"

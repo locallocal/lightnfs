@@ -48,6 +48,17 @@ client_read_bps = "0"; client_write_bps = "0"; client_iops = 0   # per-clientid 
 [tls]                        # RPC-over-TLS（RFC 9289），需 OpenSSL 构建
 mode = "off"                 # off | optional | required；cert/key/ca/client_cert
 
+[cluster]                    # 多网关主备（09 册、10 册 A1）；默认关；不可热重载
+enabled = false
+id = "3f9c…-uuid"            # 所有网关相同；[A-Za-z0-9_-]{8,64}
+shared_dir = "/mnt/cephfs/.lightnfs-cluster"   # 共享状态目录（09 §9.4）
+node = ""                    # 本网关名；空 = 主机名
+role = "auto"                # active | standby | auto
+fence_lease = "3s"           # 围栏续租周期（500ms–60s）；3× 未续视为失效
+takeover = "auto"            # auto | manual
+takeover_hook = ""           # 可选可执行脚本，接管时在后端钩子之后运行
+# unsafe_skip_backend_checks = false   # 仅测试：后端能力不达标只告警
+
 [[export]]                   # 见 06 分册 6.7；后端子表 [export.local|gluster|lustre|cephfs]
 path = "/export/data"; backend = "local"; fsid = 1
 clients = ["192.168.0.0/24"]; squash = "root"; readonly = false
@@ -56,6 +67,10 @@ read_bps = "0"; write_bps = "0"; iops = 0       # per-export 令牌桶
 
 rsize/wsize/dtpref 不是配置项：由后端 `FsLimits`（05 分册）推导为 FSINFO / v4 属性。
 校验规则启动时全量执行（fsid 唯一、路径存在——集群后端 `virtual_path` 跳过本机 stat、网段格式、TLS 证书文件），错即拒起——配置错误绝不带病运行。
+`[cluster] enabled` 时另有：`id`/`shared_dir` 非空且后者为绝对路径、`role`/`takeover` 取值合法、
+`server_owner`/`server_scope` 不得显式设置（身份由 `id` 派生）、`takeover_hook` 须为可执行文件；
+后端构造后再查每个导出 `kStableHandles + kByteLocks + native_locks`（`--check-config` 同样执行），
+`shared_dir` 不可写只告警（`--check-config` 不写共享目录）。
 
 ## 8.2 日志
 
