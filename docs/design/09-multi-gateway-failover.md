@@ -179,6 +179,8 @@ LOCK 时下推被拒（EAGAIN → 现在映射为 DENIED，`state_mgr.cpp:1800`�
 
 ## 9.9 演进：多活与计划内迁移
 
+> 完整方案见 [11 册](11-multi-gateway-active-active.md)。本节是其提纲。
+
 主备只用了一台网关的算力。多活形态：**每个导出一个活动网关**（围栏与 epoch 按导出而非
 按网关，`shared_dir/<fsid>/…`），不同导出分布在不同网关；伪根在所有网关一致。计划内迁移
 一个导出：源网关对该 fsid 进入 Draining 并对新请求回 **NFS4ERR_MOVED**，`fs_locations`
