@@ -60,6 +60,7 @@ takeover_hook = ""           # 可选可执行脚本，接管时在后端钩子�
 # unsafe_skip_backend_checks = false   # 仅测试：后端能力不达标只告警
 
 [[export]]                   # 见 06 分册 6.7；后端子表 [export.local|gluster|lustre|cephfs]
+# [export.cephfs] uuid = ""  # 多网关接管回收的会话 uuid（10 册 D2）；空 = <cluster id>-<fsid>，各网关相同
 path = "/export/data"; backend = "local"; fsid = 1
 clients = ["192.168.0.0/24"]; squash = "root"; readonly = false
 read_bps = "0"; write_bps = "0"; iops = 0       # per-export 令牌桶

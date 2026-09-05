@@ -36,7 +36,7 @@
 | | D2 CephFS reclaim 原语 ✅ 2026-09-05 | cephapi 三入口、fake、`[export.cephfs] uuid` | D1 |
 | E 验证与文档 | E1 `v4failover` 验收模式 + 本机双实例脚本 ✅ 2026-09-05 | 无 root 的端到端证明 | C3 D1 |
 | | E2 fake 注入与脑裂演练 ✅ 2026-09-05 | 残留锁、围栏分离 | B2 C2 D2 |
-| | E3 文档 | 08 册、deployment.md、07 §7.5、09 册状态更新 | 全部 |
+| | E3 文档 ✅ 2026-09-05 | 08 册、deployment.md、07 §7.5、09 册状态更新 | 全部 |
 
 关键路径：A2 → A3 → C1 → C2 → E1。阶段 B 的四步与阶段 A 并行无冲突。
 
@@ -668,7 +668,7 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
   可重新加锁、可续写；`local` 轮无需集群（任意 root VM 可跑），`gluster/cephfs/lustre` 轮由
   `LNFS_*` 环境变量提供集群配置，各一轮。本机无 root/内核挂载，仅 `bash -n` 语法校验。
 
-### E3 文档
+### E3 文档（已完成，2026-09-05）
 
 - `docs/design/08-config-observability.md`：`[cluster]` 段、`[export.cephfs] uuid`、
   按节点豁免键列表、新指标。
@@ -682,6 +682,18 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
   §9.10 改动清单逐行链接到本册步骤。
 - `docs/design/README.md` 目录加本册。
 
+
+**实现记录**：
+- deployment.md 新增 `## 5. 多网关主备（高可用）`（keepalived `notify_master/backup/fault`
+  挂 `cluster takeover/standby`、拓扑图、`bind` 只绑 VIP、NTP、`shared_dir` 权限、陈旧
+  `exports.<node>` 手工清理、Gluster `network.ping-timeout ≤ grace/2`、已知限制），
+  原"已知限制"顺延为 `## 6.`。
+- 07 §7.5 加集群模式稳定存储改到 `shared_dir` 的段落；08 加 `[export.cephfs] uuid` 键注释
+  （`[cluster]`/豁免键/指标此前各步已就位）；05 §5.10 的 `takeover()` 例外此前 D1 已记。
+- 09 册状态由"方案，未实现"改为"已实现（按阶段）"，§9.10 改动清单加"步骤"列、每行以
+  `[A1]…[E3]` 引用式链接指向本册；§9.11 标注各验证项的落地文件；design/README 目录把 09
+  标为"已实现"、10 标为"A–E 全部完成"。
+- 纯文档改动，不涉代码与测试。
 ---
 
 ## 10.2 每步的合并门槛

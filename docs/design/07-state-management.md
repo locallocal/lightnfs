@@ -107,6 +107,11 @@ state_dir/
 - 启动：epoch++ → 读 clients/ 名单 → 进入 grace（`[protocol] grace`，`auto` = lease 90s；可设更短加快恢复）。
 - grace 内：OPEN(CLAIM_PREVIOUS)/LOCK(reclaim) 仅接受名单内客户端（否则 RECLAIM_BAD）；普通新建状态操作 → GRACE；纯读操作（GETATTR/READ with 特殊 stateid）放行（实现选择：宽松放行读，兼容 v3 混布）。
 - 提前结束：名单内客户端全部 RECLAIM_COMPLETE → 立即出 grace。
+- **集群模式（`[cluster] enabled`，09 册 / 10 册）**：稳定存储从本机 `state_dir` 改到共享
+  的 `shared_dir`——`hmac.key`、全局 `epoch`（每次接管 +1，非每次进程启动）、`clients/`
+  reclaim 名单三者由 `ClusterStore` 读写，接管的网关据此进 grace 并接受故障网关客户端的
+  reclaim（`state/state_mgr.cpp` 的名单读写走接口，本机实现即原 `state_dir` 语义）。
+  另有 `fence`（围栏租约）与 `exports.<node>`（各节点导出摘要）也在 `shared_dir` 下。
 - v3 请求不受 grace 影响（v3 无状态）；同一后端同时被 v3/v4 客户端写时，grace 期间 v3 写与 v4 reclaim 锁理论上可竞争——v1 接受（不做 NLM，v3 侧本就无锁语义），文档明示。
 
 ## 7.6 字节锁表（网关内 LockMgr）
