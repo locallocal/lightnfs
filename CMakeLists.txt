@@ -94,6 +94,7 @@ add_library(lnfs_core STATIC
   src/server/rpcbind.cpp
   src/server/cluster_store.cpp
   src/server/ctl.cpp
+  src/server/data_plane.cpp
   src/server/daemon.cpp
   src/server/frontend.cpp
   src/server/metrics_providers.cpp
@@ -184,6 +185,7 @@ add_executable(lnfs_tests
   tests/test_lock_mgr.cpp
   tests/test_ctl.cpp
   tests/test_cluster_store.cpp
+  tests/test_daemon_lifecycle.cpp
   tests/test_metrics.cpp
   tests/test_rpcbind.cpp
   tests/test_fault.cpp

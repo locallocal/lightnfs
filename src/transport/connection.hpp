@@ -139,6 +139,12 @@ class ConnRegistry {
   // shutdown(SHUT_RDWR) wakes the connection's read loop; teardown then runs the
   // normal drain path.  Returns false when the id is gone already.
   bool kill(uint64_t id);
+  // kill() for every live connection (a data plane going away, plan 10 C1); returns
+  // how many were shut down.
+  size_t close_all();
+  // Blocks (not on a reactor) until no connection is registered or `timeout` passes;
+  // true when idle.  A connection leaves the registry just before closing its fd.
+  bool wait_idle(std::chrono::milliseconds timeout);
 
  private:
   struct Ent {

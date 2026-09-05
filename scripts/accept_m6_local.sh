@@ -44,10 +44,10 @@ trap cleanup EXIT
 
 echo "== building Release and ASAN configurations"
 cmake -S "$repo" -B "$repo/build-rel" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$repo/build-rel" --target lightnfsd lnfs_accept_client lnfs_tests lightnfs-ctl >/dev/null
+cmake --build "$repo/build-rel" >/dev/null  # every target: ctest also lists the fuzz_regress_* binaries
 cmake -S "$repo" -B "$repo/build-asan" -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DLNFS_SANITIZE=address >/dev/null
-cmake --build "$repo/build-asan" --target lightnfsd lnfs_accept_client lnfs_tests lightnfs-ctl >/dev/null
+cmake --build "$repo/build-asan" >/dev/null
 
 echo "== unit tests (Release + ASAN)"
 ctest --test-dir "$repo/build-rel" --output-on-failure >/dev/null

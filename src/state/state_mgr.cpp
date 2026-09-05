@@ -1971,7 +1971,10 @@ rt::Task<void> StateMgr::scan_leases() {
 
 rt::Task<void> StateMgr::run_lease_scanner(std::atomic<bool>* stop) {
   while (!stop->load(std::memory_order_relaxed)) {
-    co_await rt::sleep_for(std::chrono::seconds(1));
+    // One scan per second, sleeping in slices so a stop request (a data plane being
+    // torn down, plan 10 C1) is honoured within ~100 ms rather than a full second.
+    for (int slice = 0; slice < 10 && !stop->load(std::memory_order_relaxed); ++slice)
+      co_await rt::sleep_for(std::chrono::milliseconds(100));
     if (stop->load(std::memory_order_relaxed)) break;
     co_await scan_leases();
   }

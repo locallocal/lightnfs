@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <format>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -25,7 +26,7 @@ Management Management::start(const core::ServerConfig& cfg, rt::Runtime& runtime
                                           .role = std::move(role)});
   if (ctl) {
     mgmt.ctl = std::move(*ctl);
-    rt::spawn(mgmt.ctl->run(), runtime.reactor(1 % runtime.reactor_count()));
+    mgmt.ctl->start(runtime.reactor(1 % runtime.reactor_count()));
   } else {
     LNFS_WARN("ctl socket unavailable at {}: {}", ctl_path, errno_name(ctl.error()));
   }
@@ -39,7 +40,7 @@ Management Management::start(const core::ServerConfig& cfg, rt::Runtime& runtime
     auto metrics = MetricsHttp::create(cfg.metrics_port, cfg.metrics_bind, std::move(allow));
     if (metrics) {
       mgmt.metrics = std::move(*metrics);
-      rt::spawn(mgmt.metrics->run(), runtime.reactor(2 % runtime.reactor_count()));
+      mgmt.metrics->start(runtime.reactor(2 % runtime.reactor_count()));
     } else {
       LNFS_WARN("metrics endpoint {}:{} unavailable", cfg.metrics_bind, cfg.metrics_port);
     }
@@ -47,10 +48,21 @@ Management Management::start(const core::ServerConfig& cfg, rt::Runtime& runtime
   return mgmt;
 }
 
+void Management::detach() {
+  if (plane->load() == nullptr && plane->pins() == 0) return;
+  if (!plane->detach(std::chrono::seconds(5)))
+    LNFS_WARN("ctl: {} command(s) still using the data plane after detach; continuing",
+              plane->pins());
+}
+
 void Management::stop() {
   detach();
   if (ctl) ctl->request_stop();
   if (metrics) metrics->request_stop();
+  // Join both accept loops: after this the servers may be destroyed with the
+  // runtime still running (a stopped ctl loop must not keep accepting on a closed fd).
+  if (ctl) ctl->wait_stopped();
+  if (metrics) metrics->wait_stopped();
 }
 
 std::optional<Frontend> Frontend::start(const core::ServerConfig& cfg, rt::Runtime& runtime,
@@ -101,12 +113,13 @@ std::optional<Frontend> Frontend::start(const core::ServerConfig& cfg, rt::Runti
   fe.mount->start();
   // Buffer-pool watermark (plan doc 10 §3.5); the listeners are heap-allocated and
   // outlive every metrics scrape (the frontend stops before run_server returns).
-  obs::register_text_provider([nfs = fe.nfs.get(), mount = fe.mount.get()](std::string& out) {
-    out += std::format(
-        "lightnfs_buffer_pool_free_bytes{{listener=\"nfs\"}} {}\n"
-        "lightnfs_buffer_pool_free_bytes{{listener=\"mount\"}} {}\n",
-        nfs->pool().free_bytes(), mount->pool().free_bytes());
-  });
+  fe.pool_metric = obs::register_text_provider(
+      [nfs = fe.nfs.get(), mount = fe.mount.get()](std::string& out) {
+        out += std::format(
+            "lightnfs_buffer_pool_free_bytes{{listener=\"nfs\"}} {}\n"
+            "lightnfs_buffer_pool_free_bytes{{listener=\"mount\"}} {}\n",
+            nfs->pool().free_bytes(), mount->pool().free_bytes());
+      });
 
   // `drain` stops the accept loops but keeps serving established connections — the
   // graceful way off a load balancer (plan doc 10 §4.2).  Irreversible until restart.
@@ -138,10 +151,39 @@ void Frontend::stop(const core::ServerConfig& cfg, Management& mgmt) {
   mgmt.detach();
   nfs->request_stop();
   mount->request_stop();
+  nfs->wait_stopped();
+  mount->wait_stopped();
+  if (pool_metric) {
+    obs::unregister_text_provider(pool_metric);
+    pool_metric = 0;
+  }
   if (cfg.rpcbind) {
     (void)rpcbind_unset(nfsv3::kProgram, nfsv3::kVersion);
     (void)rpcbind_unset(mountd::kProgram, mountd::kVersion);
   }
+}
+
+bool Frontend::drain_connections(std::chrono::milliseconds grace,
+                                 std::chrono::milliseconds close_timeout) {
+  auto& registry = transport::ConnRegistry::instance();
+  if (!registry.wait_idle(grace)) {
+    size_t closed = registry.close_all();
+    LNFS_INFO("data plane: {} connection(s) still open after {} ms grace, shutting them down",
+              closed, grace.count());
+    if (!registry.wait_idle(close_timeout)) {
+      LNFS_WARN("data plane: {} connection(s) did not close within {} ms", registry.count(),
+                close_timeout.count());
+      return false;
+    }
+  }
+  // A connection leaves the registry just before its last touch of the listener's
+  // tracker: wait for that too.
+  auto deadline = std::chrono::steady_clock::now() + close_timeout;
+  while (nfs->tracker().count() > 0 || mount->tracker().count() > 0) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
 }
 
 }  // namespace lnfs::server

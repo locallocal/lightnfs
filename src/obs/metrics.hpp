@@ -160,8 +160,13 @@ void append_histogram(std::string& out, std::string_view name, std::string_view 
                       std::span<const uint64_t> bounds_us,
                       std::span<const uint64_t> buckets, uint64_t sum_us);
 
-// Extra sections appended to the exposition (DRC, per-export fd caches, ...).
-void register_text_provider(std::function<void(std::string&)> provider);
+// Extra sections appended to the exposition (DRC, per-export fd caches, ...).  The
+// handle unregisters a provider whose subject goes away before the process does (a
+// rebuilt protocol stack, plan 10 C1); process-lifetime providers may ignore it.
+using ProviderHandle = uint64_t;
+ProviderHandle register_text_provider(std::function<void(std::string&)> provider);
+void unregister_text_provider(ProviderHandle handle);
+size_t text_provider_count();
 std::string prometheus_text();
 
 }  // namespace lnfs::obs

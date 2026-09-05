@@ -185,14 +185,17 @@ void append_runtime(std::string& out, rt::Runtime& runtime) {
 
 }  // namespace
 
-void register_metrics_providers(const MetricsSources& src) {
-  obs::register_text_provider([&drc = src.drc](std::string& out) { append_drc(out, drc); });
-  obs::register_text_provider(
-      [&state = src.state](std::string& out) { append_v4_state(out, state); });
-  obs::register_text_provider(
-      [&exports = src.exports](std::string& out) { append_exports(out, exports); });
-  obs::register_text_provider(
-      [&runtime = src.runtime](std::string& out) { append_runtime(out, runtime); });
+MetricsRegistration register_metrics_providers(const MetricsSources& src) {
+  std::vector<obs::ProviderHandle> handles;
+  handles.push_back(obs::register_text_provider(
+      [&drc = src.drc](std::string& out) { append_drc(out, drc); }));
+  handles.push_back(obs::register_text_provider(
+      [&state = src.state](std::string& out) { append_v4_state(out, state); }));
+  handles.push_back(obs::register_text_provider(
+      [&exports = src.exports](std::string& out) { append_exports(out, exports); }));
+  handles.push_back(obs::register_text_provider(
+      [&runtime = src.runtime](std::string& out) { append_runtime(out, runtime); }));
+  return MetricsRegistration(std::move(handles));
 }
 
 }  // namespace lnfs::server

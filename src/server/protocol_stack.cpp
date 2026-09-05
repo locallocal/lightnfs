@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <future>
 #include <string>
 
 #include "core/boot_epoch.hpp"
@@ -104,9 +105,21 @@ void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::Cluster
                std::move(identity.scope));
   nfs4->register_with(dispatcher);
   // Off reactor 0 (plan doc 10 §2.6): the auxiliary tasks used to pile onto the same
-  // reactor the (old, single) accept loop lived on.
-  rt::spawn(state.run_lease_scanner(&lease_stop),
-            runtime.reactor(runtime.reactor_count() - 1));
+  // reactor the (old, single) accept loop lived on.  The wrapper signals the future
+  // as its last act so stop_lease_scanner() can join it.
+  std::promise<void> exited;
+  lease_exited = exited.get_future();
+  rt::spawn(
+      [](state::StateMgr* s, std::atomic<bool>* stop, std::promise<void> done) -> rt::Task<void> {
+        co_await s->run_lease_scanner(stop);
+        done.set_value();
+      }(&state, &lease_stop, std::move(exited)),
+      runtime.reactor(runtime.reactor_count() - 1));
+}
+
+void ProtocolStack::stop_lease_scanner() {
+  lease_stop.store(true, std::memory_order_release);
+  if (lease_exited.valid()) lease_exited.wait();
 }
 
 }  // namespace lnfs::server

@@ -11,6 +11,7 @@
 //    returns; main.cpp only builds and tears this down.
 
 #include <atomic>
+#include <future>
 #include <memory>
 #include <optional>
 
@@ -52,6 +53,9 @@ struct ProtocolStack {
   state::StateMgr state;
   std::optional<nfsv4::Engine> nfs4;
   std::atomic<bool> lease_stop{false};
+  // Set when the lease scanner coroutine has exited (plan 10 C1): the stack may only
+  // be destroyed once nothing on a reactor still references `state`.
+  std::future<void> lease_exited;
 
   // Builds the v3 side (engine + MOUNT registered on the dispatcher, DRC attached,
   // write verifier from the boot epoch) and the StateMgr, including the native
@@ -62,6 +66,10 @@ struct ProtocolStack {
   // (design 07 §7.4: expiry → courtesy → conflict/timeout reclaim) on the last reactor.
   void enable_v4(const core::ServerConfig& cfg, const core::ClusterConfig& cluster,
                  CoreState& core, rt::Runtime& runtime);
+  // Asks the lease scanner to stop and blocks (not on a reactor) until it has exited;
+  // a no-op when v4 was never enabled.  Idempotent.
+  void stop_lease_scanner();
+  ~ProtocolStack() { stop_lease_scanner(); }
 };
 
 // RFC 8881 §2.10.4 identity presented by EXCHANGE_ID (server_owner.major_id and

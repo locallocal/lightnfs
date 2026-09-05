@@ -24,6 +24,7 @@
 #include "obs/metrics.hpp"
 #include "runtime/runtime.hpp"
 #include "server/cluster_store.hpp"
+#include "server/data_plane.hpp"
 #include "server/frontend.hpp"
 #include "server/metrics_providers.hpp"
 #include "server/protocol_stack.hpp"
@@ -317,6 +318,9 @@ std::string reload_config(const std::string& config_path, const core::ServerConf
   return report.empty() ? "nothing to apply\n" : report;
 }
 
+// How long a stopping gateway lets established connections finish before closing them.
+constexpr std::chrono::milliseconds kShutdownDrainGrace{2000};
+
 // ---- signals -----------------------------------------------------------------------
 
 volatile std::sig_atomic_t g_stopping = 0;
@@ -415,34 +419,28 @@ int run_server(const std::string& config_path) {
                          active_stack.load(std::memory_order_acquire));
   };
   Management mgmt = Management::start(server_cfg, runtime, do_reload);
-
-  // 4. protocol engines, metrics providers, observability + QoS knobs
-  ProtocolStack stack(server_cfg, *core);
-  if (server_cfg.enable_v4) stack.enable_v4(server_cfg, cluster_cfg, *core, runtime);
-  register_metrics_providers(
-      {.drc = stack.drc, .state = stack.state, .exports = *core->exports, .runtime = runtime});
   apply_observability(server_cfg);
-  apply_client_qos(stack, server_cfg);
-  active_stack.store(&stack, std::memory_order_release);
 
-  // 5. frontend (listeners, data plane attached to ctl, rpcbind)
-  auto frontend = Frontend::start(server_cfg, runtime, stack, *core, mgmt);
-  if (!frontend) {
-    active_stack.store(nullptr);
+  // 4+5. the data plane (plan 10 C1): protocol engines + metrics providers + QoS knobs,
+  //      then the frontend (listeners, data plane attached to ctl, rpcbind).  A single
+  //      gateway activates once here; the cluster controller re-activates on takeover.
+  auto plane = activate(server_cfg, cluster_cfg, *core, runtime, mgmt);
+  if (!plane) {
     mgmt.stop();
     runtime.stop_and_join();
     return 1;
   }
+  active_stack.store(plane->stack.get(), std::memory_order_release);
   LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={}", LIGHTNFS_VERSION,
-            frontend->nfs->port(), frontend->mount->port(), core->exports->entries().size());
+            plane->frontend->nfs->port(), plane->frontend->mount->port(),
+            core->exports->entries().size());
 
   wait_for_shutdown_signal([&] { log_reload_report(do_reload()); });
 
-  // mirror-image shutdown: lease scanner → frontend (detaches the data plane) →
-  // backends → management → runtime → logging
-  stack.lease_stop.store(true);
-  frontend->stop(server_cfg, mgmt);
+  // mirror-image shutdown: data plane (detach from ctl → stop accepting → connections
+  // → lease scanner → stack) → backends → management → runtime → logging
   active_stack.store(nullptr);
+  (void)deactivate(*plane, server_cfg, mgmt, kShutdownDrainGrace);
   stop_backends(runtime, *core->exports);
   mgmt.stop();
   runtime.stop_and_join();

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <thread>
 #include <cstring>
 #include <optional>
 
@@ -131,6 +132,21 @@ bool ConnRegistry::kill(uint64_t id) {
   if (it == conns_.end()) return false;
   ::shutdown(it->second.fd, SHUT_RDWR);
   return true;
+}
+
+size_t ConnRegistry::close_all() {
+  std::lock_guard lock(mu_);
+  for (const auto& [id, ent] : conns_) ::shutdown(ent.fd, SHUT_RDWR);
+  return conns_.size();
+}
+
+bool ConnRegistry::wait_idle(std::chrono::milliseconds timeout) {
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    if (count() == 0) return true;
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
 }
 
 Task<void> ConnCtx::send(rt::SendBuf buf) {
