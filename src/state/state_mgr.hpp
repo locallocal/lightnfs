@@ -186,13 +186,24 @@ class StateMgr {
                                                        const backend::ObjId& oid)>
           resolve;
     } native_locks;
+    // Stable storage for the reclaim list (design 07 §7.5, plan 10 A3): where the
+    // co_ownerids that may reclaim after a restart live.  Unset = state_dir/clients/
+    // (single gateway); the cluster mode points these at the shared directory so the
+    // gateway taking over reads the list the failed one wrote (design 09 §9.4).  The
+    // hooks may block on IO; put/erase failures are the hooks' to log (a lost record
+    // only costs that client its reclaim, it never fails the session).
+    struct StableStore {
+      std::function<std::vector<std::string>()> load;
+      std::function<void(std::string_view owner_id)> put;
+      std::function<void(std::string_view owner_id)> erase;
+    } stable;
   };
 
   explicit StateMgr(Config cfg);
   const Config& config() const { return cfg_; }
 
   // ---- grace (7.5) ----
-  void load_grace_list();  // reads state_dir/clients/, arms the grace deadline
+  void load_grace_list();  // reads the stable store (state_dir/clients/), arms grace
   // Operator override (`lightnfs-ctl grace-end`, plan doc 10 §4.2): ends the grace
   // period immediately.  Clients that had not reclaimed yet lose their claim window.
   // Returns whether grace was active.
@@ -437,6 +448,7 @@ class StateMgr {
   void renew(ClientRec& client);
   void persist_client(const ClientRec& client);
   void unpersist_client(const ClientRec& client);
+  std::vector<std::string> load_local_clients() const;  // state_dir/clients/ (no hooks)
   void note_reclaimed(std::string_view owner_id);  // grace early-exit bookkeeping
   // O(1) clientid lookup via the dedicated index (plan doc 10 §2.6: replaces the
   // all-shards sequential locked scan). Sync; Task kept for call-site compatibility.

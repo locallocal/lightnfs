@@ -13,6 +13,7 @@
 #include <cstring>
 #include <format>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include "backend/memory/memory.hpp"
@@ -245,6 +246,103 @@ constexpr uint32_t kOk = 0;
 uint32_t st4(nfsv4::Status s) { return static_cast<uint32_t>(s); }
 
 }  // namespace
+
+// Stable-store hooks (plan 10 A3): with StateMgr::Config::stable set, the reclaim list
+// goes through the hooks instead of state_dir/clients/ — put after CREATE_SESSION
+// confirms, erase once the client's state is gone, and a fresh manager arms grace
+// from whatever load() answers.  The state_dir stays untouched.
+TEST(StateMgr, StableStoreHooks) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+
+  struct MemStore {
+    std::mutex mu;
+    std::set<std::string> owners;
+    int puts = 0, erases = 0, loads = 0;
+    state::StateMgr::Config::StableStore hooks() {
+      return {.load =
+                  [this] {
+                    std::lock_guard lock(mu);
+                    ++loads;
+                    return std::vector<std::string>(owners.begin(), owners.end());
+                  },
+              .put =
+                  [this](std::string_view owner) {
+                    std::lock_guard lock(mu);
+                    ++puts;
+                    owners.insert(std::string(owner));
+                  },
+              .erase =
+                  [this](std::string_view owner) {
+                    std::lock_guard lock(mu);
+                    ++erases;
+                    owners.erase(std::string(owner));
+                  }};
+    }
+  } store;
+
+  uint64_t listed_id = 0;
+  {
+    state::StateMgr first({.boot_epoch = 1, .state_dir = dir.path, .stable = store.hooks()});
+    first.load_grace_list();
+    EXPECT_EQ(store.loads, 1);
+    EXPECT_FALSE(first.in_grace());  // nothing listed yet
+    run_on(runtime, [&]() -> rt::Task<void> {
+      // EXCHANGE_ID alone does not persist; the confirmed CREATE_SESSION does.
+      auto ex = co_await first.exchange_id("hooked", {}, "sys/t/0", false);
+      EXPECT_EQ(store.puts, 0);
+      auto cs = co_await first.create_session(ex.clientid, ex.sequenceid, "sys/t/0", {}, {}, 1);
+      (void)cs;
+      co_await first.confirm_create_session(ex.clientid, {std::byte{1}});
+      EXPECT_EQ(store.puts, 1);
+      EXPECT_TRUE(store.owners.contains("hooked"));
+      listed_id = ex.clientid;
+      // A second client whose state is torn down (forced expiry: sessions + states
+      // released, record dropped) is erased again.
+      auto gone = co_await connect(first, "transient", 2);
+      EXPECT_EQ(store.puts, 2);
+      uint32_t st = co_await first.expire_client(gone.clientid);
+      EXPECT_EQ(st, 0u);
+      EXPECT_EQ(store.erases, 1);
+      EXPECT_FALSE(store.owners.contains("transient"));
+      EXPECT_TRUE(store.owners.contains("hooked"));
+    });
+  }
+  // Nothing was written next to the manager's own state_dir.
+  std::error_code ec;
+  EXPECT_FALSE(std::filesystem::exists(dir.path + "/clients", ec));
+
+  // "Takeover": a new manager over the same hooks arms grace from load().
+  state::StateMgr second({.boot_epoch = 2, .state_dir = dir.path, .stable = store.hooks()});
+  second.load_grace_list();
+  EXPECT_EQ(store.loads, 2);
+  EXPECT_TRUE(second.in_grace());
+  EXPECT_TRUE(second.in_stable_list("hooked"));
+  EXPECT_FALSE(second.in_stable_list("transient"));
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(second, "hooked", 1, false);
+    EXPECT_TRUE(second.in_grace());
+    uint32_t st = co_await second.reclaim_complete(a.clientid);
+    EXPECT_EQ(st, 0u);
+  });
+  EXPECT_FALSE(second.in_grace());  // the only listed client reclaimed: early exit
+  (void)listed_id;
+
+  // Without hooks the same manager keeps writing state_dir/clients/ (A3 contract).
+  {
+    state::StateMgr plain({.boot_epoch = 3, .state_dir = dir.path});
+    run_on(runtime, [&]() -> rt::Task<void> { (void)co_await connect(plain, "on-disk", 1); });
+    EXPECT_TRUE(std::filesystem::exists(dir.path + "/clients", ec));
+    int files = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir.path + "/clients")) {
+      (void)e;
+      ++files;
+    }
+    EXPECT_EQ(files, 1);
+  }
+  runtime.stop_and_join();
+}
 
 TEST(StateMgr, ShareReservationMergeDowngradeClose) {
   TmpDir dir;

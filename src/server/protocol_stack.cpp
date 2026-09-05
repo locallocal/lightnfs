@@ -7,8 +7,43 @@
 #include <string>
 
 #include "core/boot_epoch.hpp"
+#include "server/cluster_store.hpp"
+#include "util/log.hpp"
 
 namespace lnfs::server {
+namespace {
+
+// Reclaim-list hooks over the shared cluster store (design 09 §9.4): the list the
+// active gateway writes is the one the next active gateway arms grace from.  Write
+// failures only warn, as with state_dir/clients/ (a lost record costs one client its
+// reclaim, never the session).
+state::StateMgr::Config::StableStore cluster_stable_store(ClusterStore& store) {
+  return {
+      .load =
+          [&store]() -> std::vector<std::string> {
+            auto listed = store.list_clients();
+            if (!listed) {
+              LNFS_WARN("cannot read the cluster reclaim list: {}", errno_name(listed.error()));
+              return {};
+            }
+            return std::move(*listed);
+          },
+      .put =
+          [&store](std::string_view owner) {
+            if (auto ok = store.put_client(owner); !ok)
+              LNFS_WARN("cannot persist client record to the cluster store: {}",
+                        errno_name(ok.error()));
+          },
+      .erase =
+          [&store](std::string_view owner) {
+            if (auto ok = store.erase_client(owner); !ok)
+              LNFS_WARN("cannot erase client record from the cluster store: {}",
+                        errno_name(ok.error()));
+          },
+  };
+}
+
+}  // namespace
 
 ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
     : drc({.ttl = std::chrono::milliseconds(cfg.drc_ttl_ms), .max_memory = cfg.drc_mem}),
@@ -39,7 +74,9 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
                        const auto* entry = exports->by_fsid(fsid);
                        if (!entry) co_return Err(errno_from(ESTALE));
                        co_return co_await entry->backend->resolve(oid);
-                     }}}) {
+                     }},
+             .stable = core.cluster ? cluster_stable_store(*core.cluster)
+                                    : state::StateMgr::Config::StableStore{}}) {
   nfs3.set_write_verifier(core::verifier_from_epoch(core.epoch));
   nfs3.set_drc(&drc);
   nfs3.register_with(dispatcher);
