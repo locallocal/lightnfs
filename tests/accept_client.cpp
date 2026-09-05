@@ -2244,6 +2244,178 @@ int cmd_v4reclaim(const char* host, uint16_t nfs_port, const std::string& export
   return 0;
 }
 
+// ---- multi-gateway failover (design 09, plan 10 E1) ----------------------------------
+
+namespace v4 {
+constexpr uint32_t kBadSession = 10052, kDelay = 10008;
+
+// One LOCK op: new lock-owner (open_to_lock_owner4) or existing (exist_lock_owner4),
+// with the reclaim flag the grace-period path needs.  Returns the LOCK status; the
+// lock stateid on success.
+uint32_t v4_lock_op(V4Client& c, const std::vector<std::byte>& fh, uint32_t type,
+                    uint64_t off, uint64_t len, bool reclaim, bool new_owner,
+                    const Stateid4& sid, const std::string& owner, Stateid4* out) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2);
+  ops.u32(kOpPutfh);
+  ops.opaque(fh);
+  ops.u32(kOpLock);
+  ops.u32(type);
+  ops.boolean(reclaim);
+  ops.u64(off);
+  ops.u64(len);
+  ops.boolean(new_owner);
+  if (new_owner) {
+    ops.u32(0);  // open_seqid (unused in 4.1)
+    sid.encode(ops);
+    ops.u32(0);  // lock_seqid
+    ops.u64(c.clientid);
+    ops.string(owner);
+  } else {
+    sid.encode(ops);
+    ops.u32(0);
+  }
+  auto r = c.run(ops.take().to_bytes(), 0, false);
+  if (r.status != 0) return r.status;
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  uint32_t opcode = ru32(r.dec);
+  uint32_t code = ru32(r.dec);
+  if (opcode != kOpLock) fatal("v4: expected LOCK resop, got op=%u status=%u", opcode, code);
+  if (code == 0 && out) *out = Stateid4::decode(r.dec);
+  return code;
+}
+
+// SEQUENCE alone under `sessionid`: the status tells whether that session exists here.
+uint32_t v4_probe_session(V4Client& c, const std::array<std::byte, 16>& sessionid) {
+  XdrEnc ops(c.rpc.pool);
+  ops.u32(0);
+  ops.u32(c.minor);
+  ops.u32(1);
+  ops.u32(kOpSequence);
+  ops.opaque_fixed(sessionid);
+  ops.u32(1);
+  ops.u32(0);
+  ops.u32(0);
+  ops.boolean(false);
+  return c.run(ops.take().to_bytes(), 0, false).status;
+}
+}  // namespace v4
+
+// Gateway failover with state held (design 09 §9.6, plan 10 E1): gateway A serves an
+// OPEN + LOCK + unstable WRITE; `takeover_cmd` kills A and makes B take over (fence,
+// epoch+1, shared reclaim list → grace); the client then proves on B that A's session
+// is BADSESSION, the identity (server_owner/scope) is the cluster's while the clientid
+// carries the new epoch, the old stateid is STALE, CLAIM_PREVIOUS and LOCK(reclaim)
+// succeed inside grace (DELAY retried while the storage side lets go, plan 10 B2), the
+// write verifier changed so the unstable data is re-sent and byte-verified, and
+// RECLAIM_COMPLETE ends grace early.
+int cmd_v4failover(const char* host, uint16_t port_a, uint16_t port_b,
+                   const std::string& export_path, const fs::path& backing,
+                   const std::string& takeover_cmd) {
+  using namespace v4;
+  const std::string owner = "failover-owner", lock_owner = "failover-lock";
+  auto payload = random_bytes(64 * 1024, 0x0f);
+  std::vector<std::byte> fh;
+  Stateid4 open_sid, lock_sid;
+  std::array<std::byte, 16> session_a{};
+  std::array<std::byte, 8> verf_a{};
+  uint64_t clientid_a = 0;
+  std::string owner_a, scope_a;
+  {
+    V4Client a(host, port_a);
+    a.establish();
+    clientid_a = a.clientid;
+    owner_a = a.server_owner;
+    scope_a = a.server_scope;
+    session_a = a.sessionid;
+    auto root = lookup_path(a, split_path(export_path));
+    auto o = v4_open(a, root, "failover.bin", 3, 0, owner, true, 0, 0);
+    if (o.status != 0) fatal("v4failover: OPEN(CREATE) on A: status %u", o.status);
+    fh = o.fh;
+    open_sid = o.stateid;
+    if (v4_lock_op(a, fh, 2, 0, 100, false, true, open_sid, lock_owner, &lock_sid) != 0)
+      fatal("v4failover: LOCK on A failed");
+    if (v4_write(a, fh, lock_sid, 0, payload, 0, &verf_a) != 0)
+      fatal("v4failover: WRITE(UNSTABLE) on A failed");
+    std::printf("v4failover: A holds open+lock+unstable write: clientid=%#llx owner=%s "
+                "scope=%s\n",
+                (unsigned long long)clientid_a, owner_a.c_str(), scope_a.c_str());
+    // Connection dropped without CLOSE/LOCKU: the state is live when A dies.
+  }
+  std::printf("v4failover: taking over: %s\n", takeover_cmd.c_str());
+  auto t0 = std::chrono::steady_clock::now();
+  if (std::system(takeover_cmd.c_str()) != 0) fatal("v4failover: takeover command failed");
+  auto takeover_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
+
+  V4Client b(host, port_b);
+  // A's session is unknown to B: BADSESSION, not a hang or a stale reply.
+  uint32_t probe = v4_probe_session(b, session_a);
+  if (probe != kBadSession)
+    fatal("v4failover: old session on B: expected BADSESSION, got %u", probe);
+  b.establish(false);  // same co_ownerid + verifier: listed by A → no RECLAIM_COMPLETE yet
+  if (b.server_owner != owner_a || b.server_scope != scope_a)
+    fatal("v4failover: identity changed across takeover: owner %s→%s scope %s→%s",
+          owner_a.c_str(), b.server_owner.c_str(), scope_a.c_str(), b.server_scope.c_str());
+  if ((b.clientid >> 32) == (clientid_a >> 32))
+    fatal("v4failover: clientid epoch did not advance (%#llx → %#llx)",
+          (unsigned long long)clientid_a, (unsigned long long)b.clientid);
+  std::printf("v4failover: B identity kept, clientid %#llx → %#llx (epoch %llu → %llu)\n",
+              (unsigned long long)clientid_a, (unsigned long long)b.clientid,
+              (unsigned long long)(clientid_a >> 32), (unsigned long long)(b.clientid >> 32));
+
+  auto root = lookup_path(b, split_path(export_path));
+  uint32_t st = 0;
+  (void)v4_read(b, fh, open_sid, 16, &st);
+  if (st == 70) {  // NFS4ERR_STALE handle: fallback handles without btime (design 06)
+    std::printf("v4failover: note: filehandle not stable across gateways (fallback "
+                "handle mode without btime); re-resolving by name\n");
+    auto comps = split_path(export_path);
+    comps.push_back("failover.bin");
+    fh = lookup_path(b, comps);
+    (void)v4_read(b, fh, open_sid, 16, &st);
+  }
+  if (st != kStaleStateid) fatal("v4failover: old stateid on B: expected STALE_STATEID, got %u", st);
+  auto plain = v4_open(b, root, "failover.bin", 3, 0, owner, false);
+  if (plain.status != kGrace)
+    fatal("v4failover: plain OPEN in grace: expected GRACE, got %u", plain.status);
+  auto re = v4_open(b, fh, "", 3, 0, owner, false, 1);
+  if (re.status != 0) fatal("v4failover: OPEN(CLAIM_PREVIOUS) on B: status %u", re.status);
+  // LOCK(reclaim): DELAY while the failed gateway's lock is still held on the
+  // storage side (plan 10 B2) — retry inside grace, count the retries.
+  Stateid4 re_lock;
+  unsigned retries = 0;
+  for (;;) {
+    uint32_t code = v4_lock_op(b, re.fh, 2, 0, 100, true, true, re.stateid, lock_owner, &re_lock);
+    if (code == 0) break;
+    if (code != kDelay) fatal("v4failover: LOCK(reclaim) on B: status %u", code);
+    if (++retries > 200) fatal("v4failover: LOCK(reclaim) still DELAY after %u retries", retries);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  // The unstable write may not have reached the backing tree: COMMIT reports a new
+  // verifier (new epoch), so the client re-sends the data FILE_SYNC.
+  auto verf_b = v4_commit(b, re.fh);
+  if (verf_b == verf_a) fatal("v4failover: write verifier unchanged across takeover");
+  if (v4_write(b, re.fh, re_lock, 0, payload, 2) != 0)
+    fatal("v4failover: WRITE(FILE_SYNC) with reclaimed lock stateid failed");
+  auto back = v4_read(b, re.fh, re_lock, payload.size());
+  if (back != payload) fatal("v4failover: READ after re-send differs from the payload");
+  if (read_local(backing / "failover.bin") != payload)
+    fatal("v4failover: backing content differs from the payload");
+  if (v4_reclaim_complete(b) != 0) fatal("v4failover: RECLAIM_COMPLETE failed");
+  plain = v4_open(b, root, "failover.bin", 3, 0, owner, false);
+  if (plain.status != 0) fatal("v4failover: OPEN after RECLAIM_COMPLETE: status %u", plain.status);
+  if (v4_close(b, re.fh, plain.stateid) != 0) fatal("v4failover: CLOSE failed");
+  b.destroy();
+  std::printf("accept_client v4failover OK: takeover %lld ms, BADSESSION/STALE_STATEID/GRACE "
+              "gates, CLAIM_PREVIOUS + LOCK(reclaim) (%u DELAY retries), verifier changed, "
+              "data re-sent and verified, early grace exit\n",
+              (long long)takeover_ms, retries);
+  return 0;
+}
+
 // Lease-expiry scenario (development plan §6.3 / design 07 §7.4): a client holding a
 // deny-WRITE open vanishes (connection dropped, no CLOSE).  Inside the lease a second
 // client is SHARE_DENIED; once the lease lapses the holder is a courtesy client and the
@@ -2598,6 +2770,8 @@ int main(int argc, char** argv) {
                  "       accept_client v4reclaim HOST NFS_PORT MOUNT_PORT EXPORT BACKING "
                  "RESTART_CMD\n"
                  "       accept_client v4courtesy HOST NFS_PORT MOUNT_PORT EXPORT LEASE_SECS\n"
+                 "       accept_client v4failover HOST PORT_A PORT_B EXPORT BACKING "
+                 "TAKEOVER_CMD\n"
                  "       accept_client v4lock HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
                  "       accept_client v42    HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
                  "       accept_client fsync-eio HOST NFS_PORT MOUNT_PORT EXPORT\n");
@@ -2634,6 +2808,8 @@ int main(int argc, char** argv) {
     return cmd_v4reclaim(host, nfs_port, export_path, argv[6], argv[7]);
   if (cmd == "v4courtesy" && argc == 7)
     return cmd_v4courtesy(host, nfs_port, export_path, (unsigned)atoi(argv[6]));
+  if (cmd == "v4failover" && argc == 8)  // argv[4] is gateway B's port, not a mount port
+    return cmd_v4failover(host, nfs_port, mount_port, export_path, argv[6], argv[7]);
   if (cmd == "v4lock" && argc == 7)
     return cmd_v4lock(host, nfs_port, export_path, argv[6]);
   if (cmd == "v42" && argc == 7)

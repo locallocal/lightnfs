@@ -363,7 +363,11 @@ Acceptance is fully scripted, one pair per protocol generation:
 `scripts/accept_m2_local.sh` (NFSv3 read-write) and `scripts/accept_m6_local.sh`
 (NFSv4.1/4.2 with locks, reclaim, courtesy) run without root — a userspace NFS client
 drives a real server over loopback, byte-verified against the backing tree, Release +
-ASAN — while the matching `accept_m2_vm.sh`/`accept_m6_vm.sh` run real kernel mounts
+ASAN. `scripts/accept_failover_local.sh` adds a two-gateway failover proof on the same
+footing: a client holds open + lock + unstable-write state on gateway A, A is killed
+and gateway B takes the fence, and the client reclaims its state on B across the epoch
+bump (BADSESSION, STALE_STATEID, GRACE, CLAIM_PREVIOUS, verifier change), followed by a
+split-brain drain check. The matching `accept_m2_vm.sh`/`accept_m6_vm.sh` run real kernel mounts
 on a root machine. `scripts/ci.sh` is the one-stop driver: the build-matrix sweep
 (GCC/Clang, ASAN, TSAN, epoll ring, fuzz regress) plus the errmap and format gates as
 the per-change run, and `ci.sh nightly` adds the bench floor gate and a 1 h fuzz run.
