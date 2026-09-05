@@ -1,8 +1,11 @@
 # 9. 多网关无感故障切换（共享后端）——设计方案
 
-> 状态：**方案，未实现**。实现步骤拆分见 [10 册](10-multi-gateway-failover-steps.md)。目标是在多个 lightnfsd 网关共挂同一个共享后端（GlusterFS /
-> Lustre / CephFS，或任何满足 §9.2 前提的后端）时，一个网关故障后客户端切到另一个网关
-> **不重挂载、不重建应用状态**：打开的文件、字节锁、未提交的写都由协议机制恢复。
+> 状态：**已实现（2026-09-05）**。实现按阶段拆分见 [10 册](10-multi-gateway-failover-steps.md)——
+> 阶段 A（基础设施）/ B（协议语义）/ C（进程生命周期）/ D（后端接管钩子）/ E（验证与文档）
+> 全部完成，逐步的改动锚点与测试见该册；本册记"做什么、为什么"，§9.10 逐行链接到 10 册步骤。
+> 目标是在多个 lightnfsd 网关共挂同一个共享后端（GlusterFS / Lustre / CephFS，或任何满足
+> §9.2 前提的后端）时，一个网关故障后客户端切到另一个网关**不重挂载、不重建应用状态**：
+> 打开的文件、字节锁、未提交的写都由协议机制恢复。
 
 ## 9.1 现状与差距
 
@@ -182,23 +185,51 @@ LOCK 时下推被拒（EAGAIN → 现在映射为 DENIED，`state_mgr.cpp:1800`�
 （"迁移 = 该 fs 的服务器重启"，无需实现透明状态迁移 §11.10.1 的状态搬运）。本阶段新增
 的协议面：`fs_locations`/`fs_locations_info` 属性、MOVED 状态码、`SEQ4_STATUS_LEASE_MOVED`。
 
-## 9.10 改动清单（实现时）
+## 9.10 改动清单（已实现，逐行链接 10 册步骤）
 
-| 位置 | 改动 |
-|------|------|
-| `core/config.{hpp,cpp}` | `[cluster]` 段解析与校验（enabled 时要求 shared_dir 可写、后端 kStableHandles+kByteLocks、native_locks 开） |
-| `server/cluster_store.{hpp,cpp}`（新） | 共享目录访问：key / epoch / clients / fence / exports 摘要，原子写 |
-| `core/boot_epoch.cpp`、`core/file_handle.cpp` | 集群模式下 epoch 与 hmac.key 改走 ClusterStore |
-| `server/protocol_stack.cpp` | server_owner/scope 从 `[cluster] id` 派生 |
-| `state/state_mgr.cpp` | 名单读写走 ClusterStore；reclaim 模式下推失败 → DELAY 重试；grace 期不授委托 |
-| `nfsv4/engine.cpp` | CLAIM_DELEG_PREV_FH → 普通 open 状态（名单 + grace 门禁） |
-| `server/daemon.cpp` | `ClusterController` 状态机；Standby 不建栈不监听；围栏守护协程；`Frontend::start` 延后到 Activating |
-| `backend/api.hpp` + `backend/cephfs/*` | 可选 `Backend::takeover()`；cephapi 增 `ceph_set_uuid/ceph_start_reclaim/ceph_finish_reclaim`；`[export.cephfs] uuid` |
-| `server/ctl.cpp`、`tools/lightnfs_ctl.cpp` | `cluster status` / `cluster takeover` / `cluster standby` |
-| `obs` | `lightnfs_cluster_role`、`lightnfs_cluster_epoch`、`lightnfs_cluster_fence_age_seconds`；`lightnfs_v4_reclaims_total` 沿用 |
-| 文档 | 08 册配置、deployment.md 部署拓扑（VIP + keepalived 示例）、07 §7.5 稳定存储位置 |
+| 位置 | 改动 | 步骤 |
+|------|------|------|
+| `core/config.{hpp,cpp}` | `[cluster]` 段解析与校验（enabled 时要求 shared_dir 绝对路径、后端 kStableHandles+kByteLocks+native_locks；`unsafe_skip_backend_checks` 仅测试放宽） | [A1] |
+| `server/cluster_store.{hpp,cpp}`（新） | 共享目录访问：key / epoch / clients / fence / exports 摘要，`atomic_write_file` 原子写 | [A2] |
+| `state/state_mgr.cpp`、`core/file_handle.cpp` | 集群模式下句柄密钥 / epoch / reclaim 名单三处改走 `ClusterStore` 接口，本机实现保持原语义 | [A3] |
+| `server/data_plane.{hpp,cpp}`、`server/frontend.cpp` | 管理面（ctl / metrics）与数据面分离，不随 `Frontend` 生死 | [A4] |
+| `server/protocol_stack.cpp` | server_owner/scope 从 `[cluster] id` 派生（`derive_server_identity`） | [B1] |
+| `state/state_mgr.cpp` | reclaim 模式下推失败 → DELAY 在 grace 内重试（`native_lock_reclaim_delays`） | [B2] |
+| `nfsv4/engine.cpp` | CLAIM_DELEG_PREV_FH → 普通 open 状态（名单 + grace 门禁） | [B3] |
+| `server/daemon.cpp`、`server/cluster_store.cpp` | 启动期导出表一致性摘要 `exports.<node>`，树不一致拒绝入集群 | [B4] |
+| `server/data_plane.cpp`、`server/frontend.cpp` | `ProtocolStack` 可重建 + 连接收敛等待（drain → close_all → wait_idle） | [C1] |
+| `server/cluster_controller.{hpp,cpp}`（新）、`server/daemon.cpp` | `ClusterController` 状态机 Standby/Activating/Active/Draining + 定时线程围栏续租；`activate/deactivate` 投递到主循环 | [C2] |
+| `server/ctl.cpp`、`tools/lightnfs_ctl.cpp` | `cluster status` / `cluster takeover [--force]` / `cluster standby` | [C3] |
+| `server/cluster_controller.cpp`（`obs`） | `lightnfs_cluster_role`/`_epoch`/`_fence_owned`/`_fence_age_seconds`/`_takeovers_total`/`_fence_lost_total`/`_activation_failures_total`/`_activation_seconds` | [C4] |
+| `backend/api.{hpp,cpp}`、`server/takeover_hook.{hpp,cpp}`（新）、`server/daemon.cpp` | 可选 `Backend::takeover(ClusterIdentity)`（默认空操作）+ `[cluster] takeover_hook` 外部脚本 | [D1] |
+| `backend/cephfs/*` | cephapi 增 `ceph_set_uuid/ceph_start_reclaim/ceph_finish_reclaim`；`CephBackend::takeover()`；`[export.cephfs] uuid` | [D2] |
+| `tests/accept_client.cpp`、`scripts/accept_failover_local.sh`（新） | `v4failover` 验收模式 + 本机双实例脚本（Release + ASAN） | [E1] |
+| `tests/reclaim_probe.hpp`（新）、`tests/{cephapi,gfapi}_fake`、`tests/test_{cephfs,gluster,lustre}.cpp`、`scripts/accept_failover_vm.sh`（新） | 残留锁注入 + B2 端到端演练（三后端）；脑裂演练 | [E2] |
+| 文档 | 08 册配置、deployment.md §5 多网关主备（VIP + keepalived）、07 §7.5 稳定存储位置、05 册 `takeover()`、本册状态、design/README 目录 | [E3] |
 
-## 9.11 验证方案
+[A1]: 10-multi-gateway-failover-steps.md
+[A2]: 10-multi-gateway-failover-steps.md
+[A3]: 10-multi-gateway-failover-steps.md
+[A4]: 10-multi-gateway-failover-steps.md
+[B1]: 10-multi-gateway-failover-steps.md
+[B2]: 10-multi-gateway-failover-steps.md
+[B3]: 10-multi-gateway-failover-steps.md
+[B4]: 10-multi-gateway-failover-steps.md
+[C1]: 10-multi-gateway-failover-steps.md
+[C2]: 10-multi-gateway-failover-steps.md
+[C3]: 10-multi-gateway-failover-steps.md
+[C4]: 10-multi-gateway-failover-steps.md
+[D1]: 10-multi-gateway-failover-steps.md
+[D2]: 10-multi-gateway-failover-steps.md
+[E1]: 10-multi-gateway-failover-steps.md
+[E2]: 10-multi-gateway-failover-steps.md
+[E3]: 10-multi-gateway-failover-steps.md
+
+## 9.11 验证方案（已落地）
+
+实现映射：单机双实例 = `scripts/accept_failover_local.sh` + `lnfs_accept_client v4failover`（E1）；
+后端 fake 残留锁 + B2 演练 = `tests/test_{cephfs,gluster,lustre}.cpp` 经 `tests/reclaim_probe.hpp`（E2）；
+脑裂 = `test_cluster_controller`（围栏改写）+ E1 脚本的脑裂段；root VM = `scripts/accept_failover_vm.sh`（人工）。
 
 - **单机双实例（无 root）**：两个 lightnfsd 共用一个本地 `shared_dir`（tmpfs），监听不同
   端口模拟 VIP 切换；`lnfs_accept_client` 新增 `v4failover` 模式：连 A → OPEN + LOCK +

@@ -140,7 +140,74 @@ sudo systemctl enable --now lightnfs
   普通操作在 grace 内收 GRACE 重试。**不要清空 state_dir**，否则客户端无法 reclaim、
   可能丢未提交写。
 
-## 5. 已知限制
+## 5. 多网关主备（高可用）
+
+多个 lightnfsd 网关共挂同一个共享后端（GlusterFS / Lustre / CephFS）时，`[cluster]`
+段开启后一个网关故障、客户端切到另一个网关**不重挂载、不重建应用状态**：打开的文件、
+字节锁、未提交的写由 NFSv4.1 的 grace/reclaim 机制恢复（设计见 09 册，实现见 10 册）。
+
+**拓扑**：客户端只认一个服务地址（VIP 或 DNS 单名），地址漂移由外部 HA 完成——
+lightnfsd 不搬 VIP，只负责"谁在服务"（围栏）与状态恢复（grace）。典型两节点：
+
+```
+                 ┌─────────── VIP 10.0.0.9 (keepalived) ───────────┐
+   NFS client ──▶│  MASTER: gw1 (role=active)   BACKUP: gw2 (standby)│
+                 └───────────────┬──────────────────┬───────────────┘
+                    shared_dir （集群 FS 上，两网关都可读写）
+```
+
+**keepalived 挂钩**：VIP 归属变化时驱动接管，与 lightnfsd 的围栏互为二次防线。
+
+```
+# /etc/keepalived/keepalived.conf （gw1；gw2 priority 更低）
+vrrp_instance lnfs {
+  state MASTER
+  interface eth0
+  virtual_router_id 51
+  priority 100
+  virtual_ipaddress { 10.0.0.9 }
+  notify_master "/usr/local/bin/lightnfs-ctl -s /var/lib/lightnfs/ctl.sock cluster takeover"
+  notify_backup "/usr/local/bin/lightnfs-ctl -s /var/lib/lightnfs/ctl.sock cluster standby"
+  notify_fault  "/usr/local/bin/lightnfs-ctl -s /var/lib/lightnfs/ctl.sock cluster standby"
+}
+```
+
+拿到 VIP 的节点 `cluster takeover` 取围栏（epoch+1）并开始监听；失去 VIP 的节点
+`cluster standby` 排空连接、释放围栏。`takeover = manual` 时只认 ctl 请求，把"谁服务"
+的决策权完全交给 keepalived；`takeover = auto` 则 lightnfsd 自己在围栏过期时接管，
+keepalived 只管地址漂移（两者可叠加：VIP 是第一反应，围栏是脑裂时的第二道闸）。
+
+**部署要点**（配置校验期会拦下明显错误，其余靠运维遵守）：
+
+- **`bind` 只绑 VIP**：standby 不监听，active 监听 VIP。若绑 `0.0.0.0`，一个刚 drain
+  的旧 active 仍会应答直到端口关闭——把 `[server] bind` 设成 VIP（或用 keepalived 的
+  非抢占模式 + `bind` 到本机固定地址两选一），避免两个地址同时可达。
+- **NTP 必须开**：围栏租约用墙钟（`CLOCK_REALTIME`）跨节点比较，容忍 500ms 偏差
+  （`kFenceSkewTolerance`）。所有网关必须同步时钟，否则围栏过期判定会漂。
+- **`shared_dir` 权限**：放在集群 FS 上、两网关都能读写；建议 `0700` 属 lightnfsd 运行
+  用户。启动时不可写只告警不拒起（`--check-config` 不写共享目录），但接管会失败。
+- **陈旧 `exports.<node>`**：每个节点启动时写 `shared_dir/exports.<自己的 node>` 并与
+  其他节点逐一比对导出摘要，不一致则拒绝入集群。**永久下线一个节点后要手工删掉它的
+  `exports.<node>`**，否则新节点会与一份过时摘要比对而被拒。
+- **GlusterFS `network.ping-timeout ≤ grace/2`**：故障网关的锁随 TCP 断开由砖块清理，
+  默认 42s 太长——调到 grace 的一半以内，故障网关的残留锁才能在新网关 grace 内被放掉
+  （grace 内客户端的 LOCK(reclaim) 下推失败走 DELAY 重试，见下）。Lustre 的
+  `obd_timeout` 同理；CephFS 由接管钩子 `ceph_start_reclaim` 立即驱逐旧会话，无需等超时。
+
+**已知限制**（本方案主体是"主备 + 接管"，非多活）：
+
+- **DRC 与会话槽缓存不跨网关复制**：接管后客户端的 SEQUENCE 在新网关是新会话
+  （旧 sessionid → BADSESSION），已确认但客户端未收到应答的非幂等操作会被重放。
+  幂等操作无碍；这是 NFSv4.1 exactly-once 语义在网关级故障下的既有边界。
+- **委托随故障网关消亡**：故障网关授予的读委托不迁移；客户端用 CLAIM_DELEG_PREV_FH
+  被接受为普通 open 状态（名单 + grace 门禁），在 grace 内重新打开，grace 期不再授新委托。
+- **每进程一个角色**：一个网关要么整体 active 要么整体 standby，不做"按导出分角色"
+  的多活；演进路径见 09 §9.9（键空间加 `fsid` 前缀，接口已预留）。
+- **接管耗时**：铸新 epoch + 重建协议栈 + 进 grace 通常 < 1s（`lightnfs_cluster_activation_seconds`
+  指标覆盖）；客户端感知到的中断还包含 VIP 漂移与 TCP 重连时间，由 keepalived 与客户端
+  `timeo`/`retrans` 决定。
+
+## 6. 已知限制
 
 - **身份仅 AUTH_SYS**：无 krb5/RPCSEC_GSS（见 §1）。通道加密可用内置 **RPC-over-TLS**
   （`[tls]`，RFC 9289）：STARTTLS 探测 + 同连接 TLS 会话；socket IO 仍全走 io_uring
