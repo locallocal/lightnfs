@@ -29,7 +29,7 @@
 | | B3 CLAIM_DELEG_PREV_FH ✅ 2026-09-05 | 接受为普通 open 状态 | — |
 | | B4 导出表一致性摘要 ✅ 2026-09-05 | 启动期拒绝树不一致的网关入集群 | A1 A2 |
 | C 进程生命周期 | C1 `ProtocolStack` 可重建 ✅ 2026-09-05 | 栈的构造/析构与进程解耦；连接收敛等待 | A4 |
-| | C2 `ClusterController` 状态机 | Standby/Activating/Active/Draining + 围栏协程 | A1–A4 B1 C1 |
+| | C2 `ClusterController` 状态机 ✅ 2026-09-05 | Standby/Activating/Active/Draining + 围栏协程 | A1–A4 B1 C1 |
 | | C3 ctl `cluster *` 命令 | status / takeover / standby | C2 |
 | | C4 指标 | role / epoch / fence age / takeovers | C2 |
 | D 后端接管钩子 | D1 `Backend::takeover()` 接口 + 脚本钩子 | 默认空操作；可配外部脚本（Lustre evict 等） | C2 |
@@ -329,7 +329,7 @@ activate` 两轮，ASAN 下无泄漏、无 use-after-free；metrics 提供者数
   text_provider_count`；`register_metrics_providers` 返回 RAII `MetricsRegistration`；
   `Frontend` 的缓冲池指标同样按句柄注销。
 
-### C2 `ClusterController` 状态机与围栏协程
+### C2 `ClusterController` 状态机与围栏协程（已完成，2026-09-05）
 
 **目标**：09 §9.5/§9.6 的核心。
 
@@ -376,12 +376,34 @@ activate` 两轮，ASAN 下无泄漏、无 use-after-free；metrics 提供者数
   启动 `Management`（A4）与控制器；不再无条件 `activate`。
 - 单网关分支不构造控制器，与 C1 之后完全相同。
 
+**实现记录（与上文的差异）**：
+- 围栏 IO 是共享文件系统上的阻塞调用（A2 的约定：不得在 reactor 上跑），所以控制器**不用
+  reactor 协程**，而是自带一个定时线程：每 `fence_lease` 调一次 `tick()`（Standby 轮询 /
+  Activating 与 Active 续租）。`tick()` 公开，测试用内存 store 同步驱动状态机。
+- 数据面工作（`activate/deactivate`、后端钩子）经 `Hooks::post` 投递到主线程事件循环
+  （`daemon.cpp` 的 `MainLoop`：条件变量 + 队列，统一处理信号、SIGHUP reload 与投递的工作；
+  测试里 `post` 为空 = 内联执行）。**Activating 期间控制器继续续租**，接管耗时再长也不会让
+  围栏过期被别人抢走；投递的工作完成后才转 Active（失败则释放围栏、回 Standby、计数）。
+- 自动接管策略：`takeover=auto && role!=standby` 时围栏缺失/过期/属于本节点旧化身即接管；
+  `takeover=manual` 只响应 `request_takeover`；`role=standby` 永不自动接管。
+- 集群模式进程启动不再 bump epoch（A3 的过渡逻辑已删除）：`cluster_identity` 只读 epoch 作标签，
+  栈用接管时铸出的 epoch 构造（`bring_up(epoch)` 先写 `core.epoch`）。
+- 退出路径：停控制器线程 → 跑完已投递的工作 → `take_down` → 若仍持围栏则 `release_fence` →
+  后端 → 管理面 → runtime。
+- ctl 的 `status role=` 已接到控制器（C3 再加 `cluster` 子命令）；快照里带 takeovers /
+  fence_lost / activation_failures / last_activation，供 C4 出指标。
+
 **测试**：`tests/test_cluster_controller.cpp`：用内存 `ClusterStore` fake + 记录调用序列的
 Hooks——
 - Standby 见围栏过期自动接管，Hooks 调用顺序 = fence → epoch → takeover → activate；
 - Active 续租时围栏被改写 → deactivate → backend_reset → 不 release 他人围栏；
 - `takeover=manual` 时围栏过期不动作，`request_takeover(force=true)` 覆盖未过期围栏；
 - activate 失败 → 围栏释放、回 Standby、epoch 已 +1（允许，单调即可）。
+- 另加：围栏连续 3 次 IO 失败 → Draining；`request_standby` 释放自己的围栏；投递（非内联）
+  模式下 Activating 期间续租、Draining 等投递完成；定时线程在 1 个 lease 内完成接管。
+- 端到端（本机双实例，同端口、同 `shared_dir`、`fence_lease=1s`）：A 先起持围栏，B 起后为
+  standby 且不监听；`v4reclaim` 客户端在 A 上持有 open 状态 → `kill -9 A` → B 在 ~3s 内自动
+  接管并在同一端口监听、epoch+1、从共享名单进 grace → 客户端 CLAIM_PREVIOUS 成功；B 退出时释放围栏。
 
 ### C3 ctl `cluster` 命令
 

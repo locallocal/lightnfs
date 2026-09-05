@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <deque>
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -23,6 +24,7 @@
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "runtime/runtime.hpp"
+#include "server/cluster_controller.hpp"
 #include "server/cluster_store.hpp"
 #include "server/data_plane.hpp"
 #include "server/frontend.hpp"
@@ -101,18 +103,18 @@ std::optional<Identity> local_identity(const std::string& state_dir) {
 }
 
 // Cluster mode (design 09 §9.3/§9.5): the key is shared, and the epoch is the global
-// one.  Until the ClusterController (plan 10 C2) moves the bump into the takeover
-// step, every process start still advances it here so stateids from a previous
-// incarnation are never mistaken for live ones.
+// one — advanced by the ClusterController when this gateway takes over (plan 10 C2),
+// never at process start.  The value read here only labels the standby; the stack is
+// built with the epoch the takeover minted.
 std::optional<Identity> cluster_identity(ClusterStore& store) {
   auto key = store.load_or_create_key();
   if (!key) {
     LNFS_ERROR("cannot load the cluster file-handle key: {}", errno_name(key.error()));
     return std::nullopt;
   }
-  auto epoch = store.bump_epoch();
+  auto epoch = store.read_epoch();
   if (!epoch) {
-    LNFS_ERROR("cannot advance the cluster epoch: {}", errno_name(epoch.error()));
+    LNFS_ERROR("cannot read the cluster epoch: {}", errno_name(epoch.error()));
     return std::nullopt;
   }
   return Identity{*key, *epoch};
@@ -328,19 +330,59 @@ volatile std::sig_atomic_t g_reload_requested = 0;
 void on_stop_signal(int) { g_stopping = 1; }
 void on_sighup(int) { g_reload_requested = 1; }
 
-// Blocks the main thread until SIGINT/SIGTERM; SIGHUP runs `on_reload` here.
-void wait_for_shutdown_signal(const std::function<void()>& on_reload) {
-  std::signal(SIGINT, on_stop_signal);
-  std::signal(SIGTERM, on_stop_signal);
-  std::signal(SIGHUP, on_sighup);
-  while (!g_stopping) {
-    if (g_reload_requested) {
-      g_reload_requested = 0;
-      on_reload();
+// The main thread's event loop (plan 10 C2): runs until SIGINT/SIGTERM, applying
+// SIGHUP reloads and whatever other threads post — the cluster controller's activate /
+// deactivate work runs here because the data plane (Frontend::start, backend
+// lifecycle calls) belongs to the main thread.
+class MainLoop {
+ public:
+  void post(std::function<void()> fn) {
+    {
+      std::lock_guard lock(mu_);
+      queue_.push_back(std::move(fn));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    cv_.notify_one();
   }
-}
+  void run(const std::function<void()>& on_reload) {
+    std::signal(SIGINT, on_stop_signal);
+    std::signal(SIGTERM, on_stop_signal);
+    std::signal(SIGHUP, on_sighup);
+    while (!g_stopping) {
+      if (g_reload_requested) {
+        g_reload_requested = 0;
+        on_reload();
+      }
+      std::function<void()> work;
+      {
+        std::unique_lock lock(mu_);
+        cv_.wait_for(lock, std::chrono::milliseconds(100), [&] { return !queue_.empty(); });
+        if (!queue_.empty()) {
+          work = std::move(queue_.front());
+          queue_.pop_front();
+        }
+      }
+      if (work) work();
+    }
+  }
+  // Runs what is still queued (a takeover posted just before the stop signal).
+  void drain() {
+    for (;;) {
+      std::function<void()> work;
+      {
+        std::lock_guard lock(mu_);
+        if (queue_.empty()) return;
+        work = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      work();
+    }
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> queue_;
+};
 
 // One log line for a SIGHUP reload: the multi-line ctl report folded onto one line.
 void log_reload_report(std::string report) {
@@ -418,29 +460,73 @@ int run_server(const std::string& config_path) {
     return reload_config(config_path, server_cfg, cluster_cfg, *core,
                          active_stack.load(std::memory_order_acquire));
   };
-  Management mgmt = Management::start(server_cfg, runtime, do_reload);
+  MainLoop loop;
+  std::optional<DataPlaneInstance> plane;
+  std::unique_ptr<ClusterController> controller;
+  Management mgmt = Management::start(server_cfg, runtime, do_reload, [&]() -> std::string {
+    return controller ? role_name(controller->role()) : (plane ? "active" : "standby");
+  });
   apply_observability(server_cfg);
+  // The data-plane hooks the single gateway and the controller share (main thread).
+  auto bring_up = [&](uint64_t epoch) -> Result<void> {
+    core->epoch = epoch;
+    plane = activate(server_cfg, cluster_cfg, *core, runtime, mgmt);
+    if (!plane) return Err(errno_from(EIO));
+    active_stack.store(plane->stack.get(), std::memory_order_release);
+    LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={} epoch={}",
+              LIGHTNFS_VERSION, plane->frontend->nfs->port(), plane->frontend->mount->port(),
+              core->exports->entries().size(), epoch);
+    return {};
+  };
+  auto take_down = [&](std::chrono::milliseconds grace) {
+    if (!plane) return;
+    active_stack.store(nullptr);
+    (void)deactivate(*plane, server_cfg, mgmt, grace);
+    plane.reset();
+  };
 
-  // 4+5. the data plane (plan 10 C1): protocol engines + metrics providers + QoS knobs,
-  //      then the frontend (listeners, data plane attached to ctl, rpcbind).  A single
-  //      gateway activates once here; the cluster controller re-activates on takeover.
-  auto plane = activate(server_cfg, cluster_cfg, *core, runtime, mgmt);
-  if (!plane) {
-    mgmt.stop();
-    runtime.stop_and_join();
-    return 1;
+  if (!cluster_store) {
+    // 4+5. single gateway (plan 10 C1): the data plane once, for the whole process.
+    if (!bring_up(core->epoch)) {
+      mgmt.stop();
+      runtime.stop_and_join();
+      return 1;
+    }
+  } else {
+    // 4+5. cluster (plan 10 C2): standby until the controller takes the fence; the
+    //      data plane is built with the epoch the takeover mints and torn down again
+    //      when the fence is lost or the operator asks.
+    const std::chrono::milliseconds drain_grace(2 * cluster_cfg.fence_lease_ms);
+    ClusterController::Hooks hooks;
+    hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
+    hooks.activate = bring_up;
+    hooks.deactivate = [&, drain_grace] { take_down(drain_grace); };
+    hooks.backend_reset = [&] {
+      stop_backends(runtime, *core->exports);
+      if (!start_backends(runtime, *core->exports))
+        LNFS_ERROR("cluster: backends failed to restart after draining; the next takeover "
+                   "will not serve");
+    };
+    controller = std::make_unique<ClusterController>(cluster_cfg, *cluster_store,
+                                                     std::move(hooks));
+    controller->start();
+    LNFS_INFO("lightnfs {} standby: node={} role={} takeover={} fence_lease={}ms",
+              LIGHTNFS_VERSION, core::cluster_node_name(cluster_cfg), cluster_cfg.role,
+              cluster_cfg.takeover, cluster_cfg.fence_lease_ms);
   }
-  active_stack.store(plane->stack.get(), std::memory_order_release);
-  LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={}", LIGHTNFS_VERSION,
-            plane->frontend->nfs->port(), plane->frontend->mount->port(),
-            core->exports->entries().size());
 
-  wait_for_shutdown_signal([&] { log_reload_report(do_reload()); });
+  loop.run([&] { log_reload_report(do_reload()); });
 
-  // mirror-image shutdown: data plane (detach from ctl → stop accepting → connections
-  // → lease scanner → stack) → backends → management → runtime → logging
-  active_stack.store(nullptr);
-  (void)deactivate(*plane, server_cfg, mgmt, kShutdownDrainGrace);
+  // mirror-image shutdown: controller timer → pending posted work → data plane
+  // (detach from ctl → stop accepting → connections → lease scanner → stack) → fence
+  // → backends → management → runtime → logging
+  if (controller) controller->stop();
+  loop.drain();
+  take_down(kShutdownDrainGrace);
+  if (controller && controller->role() != Role::kStandby) {
+    (void)cluster_store->release_fence(core::cluster_node_name(cluster_cfg));
+    LNFS_INFO("cluster: fence released on exit");
+  }
   stop_backends(runtime, *core->exports);
   mgmt.stop();
   runtime.stop_and_join();
