@@ -3,8 +3,8 @@
 //  - CtlServer: line-oriented unix-socket admin interface for lightnfs-ctl
 //    (ping / version / status / metrics / dump-errors / fdcache [flush] / drc [flush] /
 //    clear-poison / state / expire-client <id> / conns / kill-conn <id> / loglevel /
-//    reload / drain / grace-end, every command with an optional --json rendering);
-//    owner-only socket, SO_PEERCRED-gated
+//    reload / drain / grace-end / cluster status|takeover [--force]|standby, every
+//    command with an optional --json rendering); owner-only socket, SO_PEERCRED-gated
 //  - MetricsHttp: one-shot HTTP responder serving the Prometheus text exposition
 
 #include <atomic>
@@ -27,6 +27,8 @@ class StateMgr;
 }
 
 namespace lnfs::server {
+
+class ClusterController;
 
 // The data plane the ctl commands address (plan 10 A4): what exists only while the
 // gateway serves — the export table, the DRC, the v4 state manager and the drain
@@ -90,9 +92,13 @@ struct CtlDeps {
   std::chrono::steady_clock::time_point started{};
   // The switchable data plane; a null slot or a null pointer in it means not active.
   std::shared_ptr<DataPlaneSlot> plane;
-  // `status` role text; empty = derived from the plane (active / standby).  The cluster
-  // controller (plan 10 C2) supplies the finer states.
+  // `status` role text; empty = derived from `cluster` when set, else from the plane
+  // (active / standby).
   std::function<std::string()> role;
+  // The cluster controller (plan 10 C2/C3): `cluster status|takeover|standby` and the
+  // finer `status` roles.  Null = single gateway, "cluster: not enabled".  Must outlive
+  // the ctl server.
+  ClusterController* cluster = nullptr;
 
   // Deps over a plane that stays attached for the deps' lifetime (single gateway,
   // tests).  `plane` must outlive the deps.

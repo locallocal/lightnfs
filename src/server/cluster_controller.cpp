@@ -1,5 +1,6 @@
 #include "server/cluster_controller.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <utility>
 
@@ -259,6 +260,16 @@ ClusterController::Snapshot ClusterController::snapshot() const {
 Role ClusterController::role() const {
   std::lock_guard lock(mu_);
   return role_;
+}
+
+Result<std::vector<std::string>> ClusterController::peers() const {
+  auto digests = store_.list_exports_digests();
+  if (!digests) return Err(digests.error());
+  std::vector<std::string> out;
+  out.reserve(digests->size());
+  for (auto& [node, digest] : *digests) out.push_back(node);
+  std::sort(out.begin(), out.end());
+  return out;
 }
 
 }  // namespace lnfs::server
