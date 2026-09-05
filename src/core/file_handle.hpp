@@ -14,6 +14,12 @@ struct DecodedHandle {
   backend::ObjId oid;
 };
 
+// The 16-byte handle HMAC key at `path`: read when present, otherwise generated
+// (getrandom) and created O_EXCL with mode 0600 — a concurrent creator loses the race
+// and reads the winner's key.  Shared by the local state_dir and the cluster store
+// (design 09 §9.3, plan 10 A2/A3).
+Result<std::array<std::byte, 16>> load_or_create_hmac_key(const std::string& path);
+
 class FileHandleCodec {
  public:
   static constexpr uint8_t kVersion = 1;

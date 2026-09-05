@@ -72,6 +72,7 @@ add_library(lnfs_core STATIC
   src/backend/local/local.cpp
   src/backend/lustre/lustre.cpp
   src/backend/memory/memory.cpp
+  src/core/atomic_file.cpp
   src/core/boot_epoch.cpp
   src/core/config.cpp
   src/core/file_handle.cpp
@@ -91,6 +92,7 @@ add_library(lnfs_core STATIC
   src/nfsv3/engine.cpp
   src/mountd/mount3.cpp
   src/server/rpcbind.cpp
+  src/server/cluster_store.cpp
   src/server/ctl.cpp
   src/server/daemon.cpp
   src/server/frontend.cpp
@@ -180,6 +182,7 @@ add_executable(lnfs_tests
   tests/test_state.cpp
   tests/test_lock_mgr.cpp
   tests/test_ctl.cpp
+  tests/test_cluster_store.cpp
   tests/test_metrics.cpp
   tests/test_rpcbind.cpp
   tests/test_fault.cpp

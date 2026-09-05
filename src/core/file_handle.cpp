@@ -42,11 +42,7 @@ uint32_t load_be32(const std::byte* p) {
 
 }  // namespace
 
-Result<FileHandleCodec> FileHandleCodec::load_or_create(const std::string& state_dir) {
-  std::error_code ec;
-  std::filesystem::create_directories(state_dir, ec);
-  if (ec) return Err(errno_from(ec.value()));
-  std::string path = state_dir + "/hmac.key";
+Result<std::array<std::byte, 16>> load_or_create_hmac_key(const std::string& path) {
   std::array<std::byte, 16> key{};
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
@@ -54,22 +50,34 @@ Result<FileHandleCodec> FileHandleCodec::load_or_create(const std::string& state
     int e = errno;
     ::close(fd);
     if (n != static_cast<ssize_t>(key.size())) return Err(errno_from(n < 0 ? e : EINVAL));
-    return FileHandleCodec(key);
+    return key;
   }
   if (errno != ENOENT) return Err(errno_from(errno));
   ssize_t n = getrandom(key.data(), key.size(), 0);
   if (n != static_cast<ssize_t>(key.size())) return Err(errno_from(errno ? errno : EIO));
+  // O_EXCL: whoever creates the file first wins; a loser (another gateway on a shared
+  // directory, or a racing restart) reads the winner's key back.
   fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) {
-    if (errno == EEXIST) return load_or_create(state_dir);
+    if (errno == EEXIST) return load_or_create_hmac_key(path);
     return Err(errno_from(errno));
   }
   ssize_t written = ::write(fd, key.data(), key.size());
   int e = errno;
   if (written == static_cast<ssize_t>(key.size())) (void)::fsync(fd);
   ::close(fd);
-  if (written != static_cast<ssize_t>(key.size())) return Err(errno_from(e ? e : EIO));
-  return FileHandleCodec(key);
+  if (written != static_cast<ssize_t>(key.size())) {
+    ::unlink(path.c_str());  // never leave a short key behind for the next reader
+    return Err(errno_from(e ? e : EIO));
+  }
+  return key;
+}
+
+Result<FileHandleCodec> FileHandleCodec::load_or_create(const std::string& state_dir) {
+  std::error_code ec;
+  std::filesystem::create_directories(state_dir, ec);
+  if (ec) return Err(errno_from(ec.value()));
+  return FileHandleCodec(LNFS_TRY(load_or_create_hmac_key(state_dir + "/hmac.key")));
 }
 
 uint64_t FileHandleCodec::tag(std::span<const std::byte> bytes) const {

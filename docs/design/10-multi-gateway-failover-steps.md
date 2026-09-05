@@ -21,7 +21,7 @@
 | 阶段 | 步骤 | 交付物 | 依赖 |
 |------|------|--------|------|
 | A 基础设施（无行为变化） | A1 `[cluster]` 配置段 ✅ 2026-09-05 | 解析、校验、restart-required 报告 | — |
-| | A2 `ClusterStore` 接口 + POSIX 实现 | 原子写、epoch、名单、围栏、导出摘要 | — |
+| | A2 `ClusterStore` 接口 + POSIX 实现 ✅ 2026-09-05 | 原子写、epoch、名单、围栏、导出摘要 | — |
 | | A3 稳定状态访问抽象 | 句柄密钥 / epoch / 名单三处改走接口，本机实现保持原语义 | A2 |
 | | A4 管理面与数据面分离 | ctl/metrics 不再随 `Frontend` 生死 | — |
 | B 协议与状态语义 | B1 集群身份 | server_owner/scope 从 cluster id 派生 | A1 |
@@ -86,7 +86,7 @@
 
 **验收**：`lightnfsd --check-config` 对 09 §9.3 示例配置返回 0；单网关配置不受影响。
 
-### A2 `ClusterStore` 接口与 POSIX 实现
+### A2 `ClusterStore` 接口与 POSIX 实现（已完成，2026-09-05）
 
 **目标**：09 §9.4 的共享目录访问层，含原子写与串行化。
 
@@ -142,8 +142,7 @@
 
 **改动点**
 
-- 句柄密钥：`FileHandleCodec::load_or_create(state_dir)`（`src/core/file_handle.cpp:45`）的
-  "生成/读取 16 字节密钥"逻辑抽成 `core::load_or_create_hmac_key(path)`；集群模式下
+- 句柄密钥：`core::load_or_create_hmac_key(path)` 已在 A2 抽出（`ClusterStore` 复用它）；集群模式下
   `daemon` 改用 `ClusterStore::load_or_create_key()` 再 `FileHandleCodec::from_key`
   （已有，`src/core/file_handle.hpp:21`）。
 - 名单：`StateMgr::Config` 新增
