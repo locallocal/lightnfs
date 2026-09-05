@@ -27,15 +27,37 @@ class StateMgr;
 
 namespace lnfs::server {
 
-struct CtlDeps {
+// The data plane the ctl commands address (plan 10 A4): what exists only while the
+// gateway serves — the export table, the DRC, the v4 state manager and the drain
+// hook.  Attached by the frontend when the listeners are up and detached before they
+// go away; a command arriving in between (a standby gateway, or a takeover in
+// progress) answers "not active".  A null member inside an attached plane keeps its
+// old meaning (v4 disabled, drc disabled, drain unavailable).
+struct DataPlane {
   core::ExportTable* exports = nullptr;
   rpc::Drc* drc = nullptr;
   state::StateMgr* state = nullptr;  // v4 state table dump / forced client reclaim
-  // Ops hooks (plan doc 10 §4.1/§4.2); a null hook reports the feature unavailable.
-  std::function<std::string()> reload;  // re-apply reloadable config, returns report
-  std::function<std::string()> drain;   // stop accepting new connections
+  std::function<std::string()> drain;  // stop accepting new connections
   std::atomic<bool>* draining = nullptr;
+};
+using DataPlaneSlot = std::atomic<const DataPlane*>;
+
+struct CtlDeps {
+  // Process-lifetime hooks (plan doc 10 §4.1); a null hook reports the feature unavailable.
+  std::function<std::string()> reload;  // re-apply reloadable config, returns report
   std::chrono::steady_clock::time_point started{};
+  // The switchable data plane; a null slot or a null pointer in it means not active.
+  std::shared_ptr<DataPlaneSlot> plane;
+  // `status` role text; empty = derived from the plane (active / standby).  The cluster
+  // controller (plan 10 C2) supplies the finer states.
+  std::function<std::string()> role;
+
+  // Deps over a plane that stays attached for the deps' lifetime (single gateway,
+  // tests).  `plane` must outlive the deps.
+  static CtlDeps with_plane(const DataPlane* plane);
+  const DataPlane* data_plane() const {
+    return plane ? plane->load(std::memory_order_acquire) : nullptr;
+  }
 };
 
 class CtlServer {

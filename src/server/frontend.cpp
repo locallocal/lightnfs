@@ -14,9 +14,48 @@
 
 namespace lnfs::server {
 
+Management Management::start(const core::ServerConfig& cfg, rt::Runtime& runtime,
+                             std::function<std::string()> reload,
+                             std::function<std::string()> role) {
+  Management mgmt;
+  std::string ctl_path = cfg.ctl_socket.empty() ? cfg.state_dir + "/ctl.sock" : cfg.ctl_socket;
+  auto ctl = CtlServer::create(ctl_path, {.reload = std::move(reload),
+                                          .started = std::chrono::steady_clock::now(),
+                                          .plane = mgmt.plane,
+                                          .role = std::move(role)});
+  if (ctl) {
+    mgmt.ctl = std::move(*ctl);
+    rt::spawn(mgmt.ctl->run(), runtime.reactor(1 % runtime.reactor_count()));
+  } else {
+    LNFS_WARN("ctl socket unavailable at {}: {}", ctl_path, errno_name(ctl.error()));
+  }
+
+  if (cfg.metrics_port != 0) {
+    std::vector<core::Cidr> allow;
+    for (const auto& text : cfg.metrics_allow) {
+      auto cidr = core::Cidr::parse(text);  // validated at config load
+      if (cidr) allow.push_back(std::move(*cidr));
+    }
+    auto metrics = MetricsHttp::create(cfg.metrics_port, cfg.metrics_bind, std::move(allow));
+    if (metrics) {
+      mgmt.metrics = std::move(*metrics);
+      rt::spawn(mgmt.metrics->run(), runtime.reactor(2 % runtime.reactor_count()));
+    } else {
+      LNFS_WARN("metrics endpoint {}:{} unavailable", cfg.metrics_bind, cfg.metrics_port);
+    }
+  }
+  return mgmt;
+}
+
+void Management::stop() {
+  detach();
+  if (ctl) ctl->request_stop();
+  if (metrics) metrics->request_stop();
+}
+
 std::optional<Frontend> Frontend::start(const core::ServerConfig& cfg, rt::Runtime& runtime,
                                         ProtocolStack& stack, CoreState& core,
-                                        std::function<std::string()> reload) {
+                                        Management& mgmt) {
   transport::TransportConfig transport_cfg;
   transport_cfg.max_request_size = cfg.max_request_size;
   transport_cfg.max_inflight_per_conn = cfg.inflight_per_conn;
@@ -57,8 +96,7 @@ std::optional<Frontend> Frontend::start(const core::ServerConfig& cfg, rt::Runti
                mount_listener ? "ok" : errno_name(mount_listener.error()));
     return std::nullopt;
   }
-  Frontend fe{std::move(*nfs_listener), std::move(*mount_listener), nullptr, nullptr,
-              std::move(tls_ctx)};
+  Frontend fe{std::move(*nfs_listener), std::move(*mount_listener), std::move(tls_ctx)};
   fe.nfs->start();  // per-reactor REUSEPORT accept loops (plan doc 10 §2.3)
   fe.mount->start();
   // Buffer-pool watermark (plan doc 10 §3.5); the listeners are heap-allocated and
@@ -70,7 +108,6 @@ std::optional<Frontend> Frontend::start(const core::ServerConfig& cfg, rt::Runti
         nfs->pool().free_bytes(), mount->pool().free_bytes());
   });
 
-  std::string ctl_path = cfg.ctl_socket.empty() ? cfg.state_dir + "/ctl.sock" : cfg.ctl_socket;
   // `drain` stops the accept loops but keeps serving established connections — the
   // graceful way off a load balancer (plan doc 10 §4.2).  Irreversible until restart.
   auto drain = [nfs = fe.nfs.get(), mount = fe.mount.get(),
@@ -81,34 +118,12 @@ std::optional<Frontend> Frontend::start(const core::ServerConfig& cfg, rt::Runti
     LNFS_INFO("draining: accept loops stopped, serving existing connections only");
     return "draining: no new connections will be accepted\n";
   };
-  auto ctl = CtlServer::create(ctl_path, {.exports = core.exports.get(),
-                                          .drc = &stack.drc,
-                                          .state = &stack.state,
-                                          .reload = std::move(reload),
-                                          .drain = std::move(drain),
-                                          .draining = fe.draining.get(),
-                                          .started = std::chrono::steady_clock::now()});
-  if (ctl) {
-    fe.ctl = std::move(*ctl);
-    rt::spawn(fe.ctl->run(), runtime.reactor(1 % runtime.reactor_count()));
-  } else {
-    LNFS_WARN("ctl socket unavailable at {}: {}", ctl_path, errno_name(ctl.error()));
-  }
-
-  if (cfg.metrics_port != 0) {
-    std::vector<core::Cidr> allow;
-    for (const auto& text : cfg.metrics_allow) {
-      auto cidr = core::Cidr::parse(text);  // validated at config load
-      if (cidr) allow.push_back(std::move(*cidr));
-    }
-    auto metrics = MetricsHttp::create(cfg.metrics_port, cfg.metrics_bind, std::move(allow));
-    if (metrics) {
-      fe.metrics = std::move(*metrics);
-      rt::spawn(fe.metrics->run(), runtime.reactor(2 % runtime.reactor_count()));
-    } else {
-      LNFS_WARN("metrics endpoint {}:{} unavailable", cfg.metrics_bind, cfg.metrics_port);
-    }
-  }
+  *fe.plane = DataPlane{.exports = core.exports.get(),
+                        .drc = &stack.drc,
+                        .state = &stack.state,
+                        .drain = std::move(drain),
+                        .draining = fe.draining.get()};
+  mgmt.attach(fe.plane.get());
 
   if (cfg.rpcbind) {
     auto nfs_reg = rpcbind_set(nfsv3::kProgram, nfsv3::kVersion, fe.nfs->port());
@@ -119,11 +134,10 @@ std::optional<Frontend> Frontend::start(const core::ServerConfig& cfg, rt::Runti
   return fe;
 }
 
-void Frontend::stop(const core::ServerConfig& cfg) {
+void Frontend::stop(const core::ServerConfig& cfg, Management& mgmt) {
+  mgmt.detach();
   nfs->request_stop();
   mount->request_stop();
-  if (ctl) ctl->request_stop();
-  if (metrics) metrics->request_stop();
   if (cfg.rpcbind) {
     (void)rpcbind_unset(nfsv3::kProgram, nfsv3::kVersion);
     (void)rpcbind_unset(mountd::kProgram, mountd::kVersion);

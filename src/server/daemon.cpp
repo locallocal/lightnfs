@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -264,9 +265,11 @@ std::string cluster_restart_required_report(const core::ClusterConfig& fresh,
 // QoS.  Serialized by construction: SIGHUP applies on the main wait loop, `ctl reload`
 // on the ctl reactor; both funnel through this one function and concurrent invocations
 // are harmless (last writer wins on independent knobs).  Returns the ctl report text.
+// `stack` may be null while no protocol stack exists (the management plane is up
+// before the engines, plan 10 A4): the per-client QoS knobs are then skipped.
 std::string reload_config(const std::string& config_path, const core::ServerConfig& running,
                           const core::ClusterConfig& running_cluster, CoreState& core,
-                          ProtocolStack& stack) {
+                          ProtocolStack* stack) {
   auto fresh = load_validated_config(config_path);
   if (!fresh) return "reload failed: config invalid (details in the log)\n";
   std::string report;
@@ -276,7 +279,7 @@ std::string reload_config(const std::string& config_path, const core::ServerConf
     report += std::format("log_level -> {}\n", sc.log_level);
   }
   apply_observability(sc);
-  apply_client_qos(stack, sc);
+  if (stack) apply_client_qos(*stack, sc);
   report += core.exports->reload_dynamic(*fresh);
   report += restart_required_report(sc, running);
   report += cluster_restart_required_report(fresh->cluster, running_cluster);
@@ -370,6 +373,15 @@ int run_server(const std::string& config_path) {
     return 1;
   }
 
+  // 3b. management plane (ctl socket + metrics endpoint): up before the engines and
+  //     down after them, so it answers while no data plane exists (plan 10 A4).
+  std::atomic<ProtocolStack*> active_stack{nullptr};
+  auto do_reload = [config_path, server_cfg, cluster_cfg, &core, &active_stack]() -> std::string {
+    return reload_config(config_path, server_cfg, cluster_cfg, *core,
+                         active_stack.load(std::memory_order_acquire));
+  };
+  Management mgmt = Management::start(server_cfg, runtime, do_reload);
+
   // 4. protocol engines, metrics providers, observability + QoS knobs
   ProtocolStack stack(server_cfg, *core);
   if (server_cfg.enable_v4) stack.enable_v4(server_cfg, *core, runtime);
@@ -377,13 +389,13 @@ int run_server(const std::string& config_path) {
       {.drc = stack.drc, .state = stack.state, .exports = *core->exports, .runtime = runtime});
   apply_observability(server_cfg);
   apply_client_qos(stack, server_cfg);
+  active_stack.store(&stack, std::memory_order_release);
 
-  // 5. frontend (listeners, ctl with reload/drain, metrics endpoint, rpcbind)
-  auto do_reload = [config_path, server_cfg, cluster_cfg, &core, &stack]() -> std::string {
-    return reload_config(config_path, server_cfg, cluster_cfg, *core, stack);
-  };
-  auto frontend = Frontend::start(server_cfg, runtime, stack, *core, do_reload);
+  // 5. frontend (listeners, data plane attached to ctl, rpcbind)
+  auto frontend = Frontend::start(server_cfg, runtime, stack, *core, mgmt);
   if (!frontend) {
+    active_stack.store(nullptr);
+    mgmt.stop();
     runtime.stop_and_join();
     return 1;
   }
@@ -392,10 +404,13 @@ int run_server(const std::string& config_path) {
 
   wait_for_shutdown_signal([&] { log_reload_report(do_reload()); });
 
-  // mirror-image shutdown: lease scanner → frontend → backends → runtime → logging
+  // mirror-image shutdown: lease scanner → frontend (detaches the data plane) →
+  // backends → management → runtime → logging
   stack.lease_stop.store(true);
-  frontend->stop(server_cfg);
+  frontend->stop(server_cfg, mgmt);
+  active_stack.store(nullptr);
   stop_backends(runtime, *core->exports);
+  mgmt.stop();
   runtime.stop_and_join();
   LNFS_INFO("lightnfs stopped");
   shutdown_async_logging();
