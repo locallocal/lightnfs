@@ -31,7 +31,7 @@
 | C 进程生命周期 | C1 `ProtocolStack` 可重建 ✅ 2026-09-05 | 栈的构造/析构与进程解耦；连接收敛等待 | A4 |
 | | C2 `ClusterController` 状态机 ✅ 2026-09-05 | Standby/Activating/Active/Draining + 围栏协程 | A1–A4 B1 C1 |
 | | C3 ctl `cluster *` 命令 ✅ 2026-09-05 | status / takeover / standby | C2 |
-| | C4 指标 | role / epoch / fence age / takeovers | C2 |
+| | C4 指标 ✅ 2026-09-05 | role / epoch / fence age / takeovers | C2 |
 | D 后端接管钩子 | D1 `Backend::takeover()` 接口 + 脚本钩子 | 默认空操作；可配外部脚本（Lustre evict 等） | C2 |
 | | D2 CephFS reclaim 原语 | cephapi 三入口、fake、`[export.cephfs] uuid` | D1 |
 | E 验证与文档 | E1 `v4failover` 验收模式 + 本机双实例脚本 | 无 root 的端到端证明 | C3 D1 |
@@ -442,7 +442,7 @@ Hooks——
   `takeover=manual`）手工验证：takeover → 对端拒绝并报持有者 → `--force` 抢占、原 active 自动
   draining → standby 释放围栏。
 
-### C4 指标
+### C4 指标（已完成，2026-09-05）
 
 **改动点**：控制器注册一个独立文本提供者（生命周期与进程相同，不随栈重建）：
 
@@ -459,6 +459,18 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
 
 **测试**：`tests/test_metrics.cpp` 加解析断言；`test_cluster_controller` 中接管一次后
 `takeovers_total == 1`。
+
+**实现记录（与上文的差异）**：
+- 提供者在 `ClusterController` 构造时注册、析构时注销（scrape 在注册表锁内跑提供者，注销返回后
+  不会再有 scrape 进入），不经 `register_metrics_providers`——后者随协议栈重建。
+- `lightnfs_cluster_activation_seconds` 用 `obs::LatencyHistogram`（100µs–5s 固定桶，与协议层
+  直方图同桶），每次 Standby→Active 观测一次；不做 quantile。
+- 额外系列：`lightnfs_cluster_fence_owned`（最近看到的围栏记录是否属于本节点——"active 却不持围栏"
+  的告警条件）与 `lightnfs_cluster_activation_failures_total`。`fence_age_seconds` 在未见过任何
+  围栏记录时不出样本（而非 0 或负值）。
+- 测试：`Metrics.ClusterSeriesRenderWithControllerLifetime`（standby 初值 → 接管后 role/epoch/
+  owned/age/直方图 → 围栏被夺后 fence_lost，控制器析构后提供者数回落、系列消失）；
+  `ClusterController.StandbyTakesOverAFreeOrExpiredFence` 接管后 `takeovers_total == 1`。
 
 ---
 

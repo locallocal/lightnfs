@@ -98,6 +98,7 @@ rsize/wsize/dtpref 不是配置项：由后端 `FsLimits`（05 分册）推导�
 | state | 07 分册 7.8 清单 |
 | backend | 计数/水位而非直方图：`lightnfs_fdcache_*`（local/lustre）、`lightnfs_gluster_*`、`lightnfs_cephfs_*`（含 `_blocklisted_total`）、`lightnfs_lustre_hsm_*`，各带 jukebox 计数与锁描述符数；时延直方图只在协议层（v3 过程 / v4 op / COMPOUND / reactor 循环） |
 | drc/slots | 命中/重放/in-progress 等待 |
+| cluster | 多网关（09/10 册 C4）：`lightnfs_cluster_role{role}`（one-hot）、`_epoch`、`_fence_owned`、`_fence_age_seconds`（自己持有 = 距上次续租，否则距读到他人记录；未见记录不出样本）、`_takeovers_total`、`_fence_lost_total`、`_activation_failures_total`、`_activation_seconds` 直方图（§9.6 "< 1s" 目标）；由控制器注册、随进程存活，standby 期间也可见 |
 
 SLI 建议：READ/WRITE p99、GETATTR p99、错误率、grace 时长。
 

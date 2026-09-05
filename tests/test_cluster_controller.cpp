@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "mem_cluster_store.hpp"
+#include "obs/metrics.hpp"
 #include "server/cluster_controller.hpp"
 #include "server/cluster_store.hpp"
 
@@ -57,6 +58,14 @@ core::ClusterConfig config(const std::string& node, const std::string& role = "a
   return c;
 }
 
+// Value of the first "name value" sample line in the exposition; -1 when absent.
+long long metric(const std::string& name) {
+  std::string text = obs::prometheus_text();
+  size_t pos = text.find("\n" + name + " ");
+  if (pos == std::string::npos) return -1;
+  return std::stoll(text.substr(pos + name.size() + 2));
+}
+
 std::string joined(const std::vector<std::string>& v) {
   std::string out;
   for (const auto& s : v) out += (out.empty() ? "" : " ") + s;
@@ -85,6 +94,10 @@ TEST(ClusterController, StandbyTakesOverAFreeOrExpiredFence) {
   ASSERT_TRUE(snap.fence.has_value());
   EXPECT_STREQ(snap.fence->node, "gw1");
   EXPECT_EQ(snap.fence->epoch, 5u);
+  // The controller's metrics provider (plan 10 C4) reports the same takeover.
+  EXPECT_EQ(metric("lightnfs_cluster_takeovers_total"), 1);
+  EXPECT_EQ(metric("lightnfs_cluster_epoch"), 5);
+  EXPECT_EQ(metric("lightnfs_cluster_activation_seconds_count"), 1);
   // Active ticks renew and change nothing else.
   ctl.tick();
   ctl.tick();
