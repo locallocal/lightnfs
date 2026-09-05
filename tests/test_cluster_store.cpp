@@ -19,7 +19,9 @@
 
 #include "core/atomic_file.hpp"
 #include "core/boot_epoch.hpp"
+#include "core/config.hpp"
 #include "server/cluster_store.hpp"
+#include "util/sha256.hpp"
 
 using namespace lnfs;
 using namespace std::chrono_literals;
@@ -342,4 +344,80 @@ TEST(ClusterStore, KeyConcurrentCreatorsAgree) {
     EXPECT_EQ(st.st_size, 16);
     EXPECT_EQ(st.st_mode & 0777, 0600u);
   }
+}
+
+// FIPS 180-4 vectors for the digest's hash.
+TEST(ClusterStore, Sha256Vectors) {
+  EXPECT_STREQ(util::sha256_hex(std::string_view("")),
+               "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  EXPECT_STREQ(util::sha256_hex(std::string_view("abc")),
+               "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  EXPECT_STREQ(util::sha256_hex(std::string_view(
+                   "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+               "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+  // Padding boundaries: 55 / 56 / 63 / 64 / 65 bytes cross the one-block limit.
+  EXPECT_STREQ(util::sha256_hex(std::string(55, 'a')),
+               "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318");
+  EXPECT_STREQ(util::sha256_hex(std::string(56, 'a')),
+               "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a");
+  EXPECT_STREQ(util::sha256_hex(std::string(64, 'a')),
+               "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
+  EXPECT_STREQ(util::sha256_hex(std::string(1000000, 'a')),
+               "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+// Export-table digest (design 09 §9.3, plan 10 B4): per-node keys (credentials, log
+// paths, cache sizes) do not change it; the tree identity (subdir, fsid, path,
+// backend, squash) does.  Export order in the file does not matter.
+TEST(ClusterStore, ExportDigestIgnoresPerNodeKeys) {
+  auto parse = [](const std::string& text) {
+    auto cfg = core::parse_config(text);
+    if (!cfg.has_value()) MT_FAIL("parse failed");
+    return cfg.has_value() ? std::move(*cfg) : core::Config{};
+  };
+  const std::string a =
+      "[[export]]\npath = \"/vol\"\nbackend = \"cephfs\"\nfsid = 1\nsquash = \"root\"\n"
+      "clients = [\"10.0.0.0/8\"]\n"
+      "[export.cephfs]\nfs_name = \"cephfs\"\nsubdir = \"/exports/a\"\n"
+      "keyring = \"/etc/ceph/gw1.keyring\"\nid = \"gw1\"\nlog_file = \"/var/log/gw1.log\"\n"
+      "fd_cache = 1024\nmon_host = \"mon1\"\nconf = \"/etc/ceph/gw1.conf\"\n"
+      "[[export]]\npath = \"/scratch\"\nbackend = \"gluster\"\nfsid = 2\n"
+      "[export.gluster]\nvolume = \"scratch\"\n";
+  const std::string b =  // other node: different credentials/logs/cache, exports swapped
+      "[[export]]\npath = \"/scratch\"\nbackend = \"gluster\"\nfsid = 2\n"
+      "[export.gluster]\nvolume = \"scratch\"\n"
+      "[[export]]\npath = \"/vol\"\nbackend = \"cephfs\"\nfsid = 1\n"
+      "clients = [\"192.168.0.0/16\"]\nread_bps = \"10MiB\"\n"
+      "[export.cephfs]\nsubdir = \"/exports/a\"\nfs_name = \"cephfs\"\n"
+      "keyring = \"/etc/ceph/gw2.keyring\"\nid = \"gw2\"\nlog_file = \"/var/log/gw2.log\"\n"
+      "fd_cache = 4096\nmon_host = \"mon2\"\nconf = \"/etc/ceph/gw2.conf\"\n";
+  auto da = core::canonical_exports_digest(parse(a));
+  auto db = core::canonical_exports_digest(parse(b));
+  EXPECT_TRUE(da.starts_with("sha256:"));
+  EXPECT_EQ(da.size(), 7u + 64u);
+  EXPECT_STREQ(da, db);
+  auto text = core::canonical_exports_text(parse(a));
+  EXPECT_TRUE(text.find("keyring") == std::string::npos);
+  EXPECT_TRUE(text.find("subdir=/exports/a") != std::string::npos);
+  EXPECT_TRUE(text.find("fsid=1") < text.find("fsid=2"));  // sorted by fsid
+
+  // Each identity-bearing difference changes the digest.
+  auto differs = [&](const std::string& from, const std::string& to) {
+    std::string mutated = a;
+    size_t at = mutated.find(from);
+    if (at == std::string::npos) MT_FAIL("pattern missing");
+    mutated.replace(at, from.size(), to);
+    return core::canonical_exports_digest(parse(mutated)) != da;
+  };
+  EXPECT_TRUE(differs("subdir = \"/exports/a\"", "subdir = \"/exports/b\""));
+  EXPECT_TRUE(differs("fsid = 1\n", "fsid = 3\n"));
+  EXPECT_TRUE(differs("path = \"/vol\"", "path = \"/volume\""));
+  EXPECT_TRUE(differs("squash = \"root\"", "squash = \"none\""));
+  EXPECT_TRUE(differs("fs_name = \"cephfs\"", "fs_name = \"other\""));
+  EXPECT_TRUE(differs("volume = \"scratch\"", "volume = \"scratch2\""));
+  EXPECT_TRUE(differs("[[export]]\npath = \"/scratch\"",
+                      "[[export]]\nreadonly = true\npath = \"/scratch\""));
+  // Per-node keys and client policy do not.
+  EXPECT_FALSE(differs("fd_cache = 1024", "fd_cache = 8"));
+  EXPECT_FALSE(differs("clients = [\"10.0.0.0/8\"]", "clients = [\"127.0.0.0/8\"]"));
 }
