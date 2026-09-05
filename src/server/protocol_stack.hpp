@@ -60,7 +60,21 @@ struct ProtocolStack {
 
   // Grace list + COMPOUND engine registration + the lease scanner coroutine
   // (design 07 §7.4: expiry → courtesy → conflict/timeout reclaim) on the last reactor.
-  void enable_v4(const core::ServerConfig& cfg, CoreState& core, rt::Runtime& runtime);
+  void enable_v4(const core::ServerConfig& cfg, const core::ClusterConfig& cluster,
+                 CoreState& core, rt::Runtime& runtime);
 };
+
+// RFC 8881 §2.10.4 identity presented by EXCHANGE_ID (server_owner.major_id and
+// server_scope; minor_id stays 0).  Single gateway: the configured values, else
+// hostname + state_dir so two distinct instances never look like trunking paths of
+// one server.  Cluster (design 09 §9.3, plan 10 B1): derived from the cluster id
+// alone, so every gateway of the cluster is the same server to its clients and a
+// takeover reads as that server restarting.
+struct ServerIdentity {
+  std::string owner;
+  std::string scope;
+};
+ServerIdentity derive_server_identity(const core::ServerConfig& cfg,
+                                      const core::ClusterConfig& cluster);
 
 }  // namespace lnfs::server

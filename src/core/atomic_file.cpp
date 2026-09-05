@@ -3,13 +3,21 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 
 namespace lnfs::core {
 
+std::string unique_temp_name(const std::string& path) {
+  static std::atomic<uint64_t> counter{0};
+  return path + ".tmp." + std::to_string(::getpid()) + "." +
+         std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
 Result<void> atomic_write_file(const std::string& path, std::string_view bytes, mode_t mode) {
-  std::string tmp = path + ".tmp." + std::to_string(::getpid());
+  std::string tmp = unique_temp_name(path);
   int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
   if (fd < 0) return Err(errno_from(errno));
   size_t done = 0;

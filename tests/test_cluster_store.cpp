@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <vector>
 
 #include "core/atomic_file.hpp"
 #include "core/boot_epoch.hpp"
@@ -314,4 +315,31 @@ TEST(ClusterStore, ExportDigestsPerNode) {
   auto still = a->list_exports_digests();
   ASSERT_TRUE(still.has_value());
   EXPECT_EQ(still->size(), 2u);
+}
+
+// Two gateways starting on a fresh shared directory at the same moment (plan 10 B1
+// found this): every creator must end up with the same 16 bytes, no reader may ever
+// see a partial key, and nothing is left behind.
+TEST(ClusterStore, KeyConcurrentCreatorsAgree) {
+  for (int round = 0; round < 20; ++round) {
+    TmpDir dir;
+    constexpr int kThreads = 8;
+    std::vector<std::thread> threads;
+    std::vector<Result<std::array<std::byte, 16>>> keys(kThreads, Err(errno_from(EIO)));
+    for (int i = 0; i < kThreads; ++i)
+      threads.emplace_back([&, i] {
+        auto store = server::make_posix_cluster_store(dir.path);
+        keys[static_cast<size_t>(i)] = store->load_or_create_key();
+      });
+    for (auto& t : threads) t.join();
+    for (int i = 0; i < kThreads; ++i) {
+      ASSERT_TRUE(keys[static_cast<size_t>(i)].has_value());
+      EXPECT_TRUE(*keys[static_cast<size_t>(i)] == *keys[0]);
+    }
+    EXPECT_FALSE(has_tmp_leftovers(dir.path));
+    struct stat st {};
+    ASSERT_TRUE(::stat((dir.path + "/hmac.key").c_str(), &st) == 0);
+    EXPECT_EQ(st.st_size, 16);
+    EXPECT_EQ(st.st_mode & 0777, 0600u);
+  }
 }

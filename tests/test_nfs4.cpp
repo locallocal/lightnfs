@@ -23,7 +23,9 @@
 #include "nfsv4/attrs.hpp"
 #include "nfsv4/engine.hpp"
 #include "runtime/reactor.hpp"
+#include "runtime/runtime.hpp"
 #include "runtime/testing/fake_ring.hpp"
+#include "server/protocol_stack.hpp"
 #include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
 
@@ -2363,4 +2365,117 @@ TEST(Nfs4, JukeboxIsDelayAndRetrySucceeds) {
   V4Fixture::expect_op(ok.dec, Op::kPutfh, 0);
   V4Fixture::expect_op(ok.dec, Op::kRead, 0);
   backend::fault::clear();
+}
+
+// Cluster identity (design 09 §9.3, plan 10 B1): every gateway of a cluster presents
+// the same server_owner.major_id / server_scope, derived from the cluster id alone,
+// so a client that lands on another gateway sees "the same server, restarted" and
+// runs its reclaim path instead of rebuilding state.  Single gateway: unchanged —
+// the configured values, or hostname + state_dir.
+TEST(Nfs4, ClusterIdentityDerivation) {
+  core::ServerConfig a;
+  a.state_dir = "/var/lib/lightnfs-a";
+  core::ServerConfig b;
+  b.state_dir = "/var/lib/lightnfs-b";
+  core::ClusterConfig off;
+
+  // Single gateway: two instances with different state_dirs are different servers.
+  auto ia = server::derive_server_identity(a, off);
+  auto ib = server::derive_server_identity(b, off);
+  EXPECT_TRUE(ia.owner.ends_with(":/var/lib/lightnfs-a"));
+  EXPECT_STREQ(ia.owner, ia.scope);
+  EXPECT_FALSE(ia.owner == ib.owner);
+  // Explicit values win on a single gateway.
+  core::ServerConfig explicit_cfg = a;
+  explicit_cfg.server_owner = "nodeA";
+  explicit_cfg.server_scope = "scopeX";
+  auto ie = server::derive_server_identity(explicit_cfg, off);
+  EXPECT_STREQ(ie.owner, "nodeA");
+  EXPECT_STREQ(ie.scope, "scopeX");
+
+  // Cluster: the same id makes the same identity whatever the host-local settings.
+  core::ClusterConfig cluster;
+  cluster.enabled = true;
+  cluster.id = "3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f";
+  cluster.node = "gw1";
+  core::ClusterConfig cluster_other_node = cluster;
+  cluster_other_node.node = "gw2";
+  auto ca = server::derive_server_identity(a, cluster);
+  auto cb = server::derive_server_identity(b, cluster_other_node);
+  EXPECT_STREQ(ca.owner, "lightnfs-cluster:3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f");
+  EXPECT_STREQ(ca.scope, ca.owner);
+  EXPECT_STREQ(cb.owner, ca.owner);
+  EXPECT_STREQ(cb.scope, ca.scope);
+  // A different cluster is a different server.
+  core::ClusterConfig other = cluster;
+  other.id = "another-cluster-id";
+  EXPECT_FALSE(server::derive_server_identity(a, other).owner == ca.owner);
+  // enabled = false ignores the id.
+  core::ClusterConfig disabled = cluster;
+  disabled.enabled = false;
+  EXPECT_STREQ(server::derive_server_identity(a, disabled).owner, ia.owner);
+}
+
+TEST(Nfs4, ClusterIdentityAcrossProtocolStacks) {
+  // Two gateways: distinct state_dirs, distinct epochs, the same cluster id.
+  char tmpl_a[] = "/tmp/lnfs-ida-XXXXXX";
+  char tmpl_b[] = "/tmp/lnfs-idb-XXXXXX";
+  std::string dir_a = mkdtemp(tmpl_a);
+  std::string dir_b = mkdtemp(tmpl_b);
+  auto make_core = [](uint64_t epoch) {
+    auto exports = std::make_unique<core::ExportTable>();
+    core::ExportConfig cfg;
+    cfg.path = "/export/mem";
+    cfg.fsid = 7;
+    cfg.clients = {"127.0.0.0/8"};
+    (void)exports->add(cfg, std::make_unique<backend::MemoryBackend>(7));
+    std::array<std::byte, 16> key{std::byte{1}};
+    server::CoreState core{std::move(exports), core::FileHandleCodec::from_key_only(key), epoch};
+    core.key.bind(*core.exports);
+    return core;
+  };
+  core::ClusterConfig cluster;
+  cluster.enabled = true;
+  cluster.id = "cluster-identity-test";
+  core::ServerConfig cfg_a;
+  cfg_a.state_dir = dir_a;
+  cfg_a.state_shards = 1;
+  core::ServerConfig cfg_b = cfg_a;
+  cfg_b.state_dir = dir_b;
+
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  {
+    auto core_a = make_core(11);
+    auto core_b = make_core(12);
+    server::ProtocolStack stack_a(cfg_a, core_a);
+    server::ProtocolStack stack_b(cfg_b, core_b);
+    stack_a.enable_v4(cfg_a, cluster, core_a, runtime);
+    stack_b.enable_v4(cfg_b, cluster, core_b, runtime);
+    ASSERT_TRUE(stack_a.nfs4.has_value() && stack_b.nfs4.has_value());
+    EXPECT_STREQ(stack_a.nfs4->server_owner(), "lightnfs-cluster:cluster-identity-test");
+    EXPECT_STREQ(stack_b.nfs4->server_owner(), stack_a.nfs4->server_owner());
+    EXPECT_STREQ(stack_b.nfs4->server_scope(), stack_a.nfs4->server_scope());
+    // The epochs (write verifier / stateid epoch) still differ: a takeover is a restart.
+    EXPECT_FALSE(stack_a.state.config().boot_epoch == stack_b.state.config().boot_epoch);
+
+    // The same two gateways without the cluster section are two servers.
+    core::ClusterConfig off;
+    auto core_c = make_core(13);
+    auto core_d = make_core(14);
+    server::ProtocolStack stack_c(cfg_a, core_c);
+    server::ProtocolStack stack_d(cfg_b, core_d);
+    stack_c.enable_v4(cfg_a, off, core_c, runtime);
+    stack_d.enable_v4(cfg_b, off, core_d, runtime);
+    EXPECT_FALSE(stack_c.nfs4->server_owner() == stack_d.nfs4->server_owner());
+    EXPECT_FALSE(stack_c.nfs4->server_owner() == stack_a.nfs4->server_owner());
+
+    stack_a.lease_stop.store(true);
+    stack_b.lease_stop.store(true);
+    stack_c.lease_stop.store(true);
+    stack_d.lease_stop.store(true);
+    runtime.stop_and_join();
+  }
+  std::filesystem::remove_all(dir_a);
+  std::filesystem::remove_all(dir_b);
 }

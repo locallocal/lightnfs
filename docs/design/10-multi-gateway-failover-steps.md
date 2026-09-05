@@ -24,7 +24,7 @@
 | | A2 `ClusterStore` 接口 + POSIX 实现 ✅ 2026-09-05 | 原子写、epoch、名单、围栏、导出摘要 | — |
 | | A3 稳定状态访问抽象 ✅ 2026-09-05 | 句柄密钥 / epoch / 名单三处改走接口，本机实现保持原语义 | A2 |
 | | A4 管理面与数据面分离 ✅ 2026-09-05 | ctl/metrics 不再随 `Frontend` 生死 | — |
-| B 协议与状态语义 | B1 集群身份 | server_owner/scope 从 cluster id 派生 | A1 |
+| B 协议与状态语义 | B1 集群身份 ✅ 2026-09-05 | server_owner/scope 从 cluster id 派生 | A1 |
 | | B2 reclaim 下推失败 → DELAY | 状态层 grace 内重试 | — |
 | | B3 CLAIM_DELEG_PREV_FH | 接受为普通 open 状态 | — |
 | | B4 导出表一致性摘要 | 启动期拒绝树不一致的网关入集群 | A1 A2 |
@@ -197,14 +197,24 @@
 
 ## 阶段 B：协议与状态语义
 
-### B1 集群身份
+### B1 集群身份（已完成，2026-09-05）
 
-**改动点**：`ProtocolStack::enable_v4`（`src/server/protocol_stack.cpp:52`）：
-`cluster.enabled` 时 `derived = "lightnfs-cluster:" + cluster.id`，owner 与 scope 都用它，
-`minor_id` 仍为 0。非集群路径保持 `hostname:state_dir`。
+**改动点**：派生逻辑抽成 `server::derive_server_identity(cfg, cluster)`（`protocol_stack.hpp`），
+`ProtocolStack::enable_v4` 多一个 `ClusterConfig` 入参：`cluster.enabled` 时
+`derived = "lightnfs-cluster:" + cluster.id`，owner 与 scope 都用它，`minor_id` 仍为 0。
+非集群路径保持 `hostname:state_dir`（显式 `server_owner/scope` 仍优先）。`nfsv4::Engine`
+增加 `server_owner()/server_scope()` 只读访问器供测试与 C3 的 `cluster status` 使用。
 
-**测试**：`tests/test_nfs4.cpp` 现有 EXCHANGE_ID 用例加一条：两个 `ProtocolStack`（不同
-`state_dir`、相同 cluster id）返回相同 `server_owner.major_id`/`server_scope`。
+**测试**：`Nfs4.ClusterIdentityDerivation`（纯函数：单机/显式/集群/不同集群/enabled=false）、
+`Nfs4.ClusterIdentityAcrossProtocolStacks`（两个 `ProtocolStack`，不同 `state_dir` 与 epoch、
+相同 cluster id → 相同 owner/scope；去掉集群段则不同）。`lnfs_accept_client` 的 v4 客户端
+在 EXCHANGE_ID 后记录 `server_owner`，`v4walk` 打印它，供双实例脚本比对线上取值。
+
+**顺带修复**：双实例同时在空 `shared_dir` 上启动时暴露出 `load_or_create_hmac_key` 的竞争——
+读者可能在创建者 `O_EXCL` 建文件之后、写满 16 字节之前读到短文件（EINVAL）。改为写私有临时文件
+后用 `link()`（无硬链接的文件系统退回 `renameat2(RENAME_NOREPLACE)`）原子发布，读者只会看到
+"不存在"或"完整"两种状态；`atomic_write_file` 的临时名也改为进程内唯一
+（`.tmp.<pid>.<n>`）。`ClusterStore.KeyConcurrentCreatorsAgree` 覆盖 8 线程 × 20 轮并发创建。
 
 ### B2 reclaim 模式下的下推失败 → DELAY
 

@@ -384,7 +384,7 @@ int run_server(const std::string& config_path) {
 
   // 4. protocol engines, metrics providers, observability + QoS knobs
   ProtocolStack stack(server_cfg, *core);
-  if (server_cfg.enable_v4) stack.enable_v4(server_cfg, *core, runtime);
+  if (server_cfg.enable_v4) stack.enable_v4(server_cfg, cluster_cfg, *core, runtime);
   register_metrics_providers(
       {.drc = stack.drc, .state = stack.state, .exports = *core->exports, .runtime = runtime});
   apply_observability(server_cfg);
