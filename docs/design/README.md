@@ -17,6 +17,8 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 7. [状态管理](07-state-management.md) —— v3 DRC、v4 clientid/会话/槽表/租约/宽限期、持久化
 8. [配置、可观测性与安全](08-config-observability.md) —— 导出表、日志/指标/追踪、资源限制
 9. [多网关无感故障切换（已实现）](09-multi-gateway-failover.md) —— 共享后端上的主备接管：集群身份、共享 reclaim 名单、全局 epoch 与围栏、后端接管钩子；§9.10 改动清单带代码位置；多活/计划内迁移的演进路径。实施计划（A–E 全部完成）已合入并撤下逐步文档，尚未闭环的取舍与发布前门槛见 [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)
+10. ~~多网关故障切换——实现步骤拆分~~ —— 09 的实施计划，A–E 全部完成后撤下；每步实现记录见 git 历史，待决项见 [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)
+11. [多网关多活（每导出一个活动网关，方案）](11-multi-gateway-active-active.md) —— 09 的演进：per-fsid 围栏/epoch/grace、伪根 + fs_locations + NFS4ERR_MOVED 把客户端引到每个导出的属主网关、导出级故障接管与计划内迁移；CephFS 天生契合，v3/老客户端边界写明
 
 ## 一页纸架构
 
