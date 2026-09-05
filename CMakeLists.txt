@@ -92,6 +92,7 @@ add_library(lnfs_core STATIC
   src/nfsv3/engine.cpp
   src/mountd/mount3.cpp
   src/server/rpcbind.cpp
+  src/server/cluster_controller.cpp
   src/server/cluster_store.cpp
   src/server/ctl.cpp
   src/server/data_plane.cpp
@@ -184,6 +185,7 @@ add_executable(lnfs_tests
   tests/test_state.cpp
   tests/test_lock_mgr.cpp
   tests/test_ctl.cpp
+  tests/test_cluster_controller.cpp
   tests/test_cluster_store.cpp
   tests/test_daemon_lifecycle.cpp
   tests/test_metrics.cpp
