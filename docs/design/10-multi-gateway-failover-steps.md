@@ -26,7 +26,7 @@
 | | A4 管理面与数据面分离 ✅ 2026-09-05 | ctl/metrics 不再随 `Frontend` 生死 | — |
 | B 协议与状态语义 | B1 集群身份 ✅ 2026-09-05 | server_owner/scope 从 cluster id 派生 | A1 |
 | | B2 reclaim 下推失败 → DELAY ✅ 2026-09-05 | 状态层 grace 内重试 | — |
-| | B3 CLAIM_DELEG_PREV_FH | 接受为普通 open 状态 | — |
+| | B3 CLAIM_DELEG_PREV_FH ✅ 2026-09-05 | 接受为普通 open 状态 | — |
 | | B4 导出表一致性摘要 | 启动期拒绝树不一致的网关入集群 | A1 A2 |
 | C 进程生命周期 | C1 `ProtocolStack` 可重建 | 栈的构造/析构与进程解耦；连接收敛等待 | A4 |
 | | C2 `ClusterController` 状态机 | Standby/Activating/Active/Draining + 围栏协程 | A1–A4 B1 C1 |
@@ -238,7 +238,7 @@ grace 结束后仍被拒 → 原样 DENIED（此时确实有第三方持锁）�
 N 次后成功；出 grace 后普通 LOCK 被拒 → DENIED（带存储侧冲突），迟到的 LOCK(reclaim) 走既有
 NO_GRACE 门禁而非 DELAY（实现注：出 grace 后 reclaim 请求先被门禁拦下，"DENIED"只对非 reclaim 锁成立）。
 
-### B3 CLAIM_DELEG_PREV_FH 接受为普通 open 状态
+### B3 CLAIM_DELEG_PREV_FH 接受为普通 open 状态（已完成，2026-09-05）
 
 **目标**：09 §9.7 第 3 条，让 Linux 客户端找回委托的路径零退避。
 
@@ -250,8 +250,10 @@ RECLAIM_BAD / NO_GRACE，`state_mgr.cpp:776`）；应答 `OPEN_DELEGATE_NONE`，
 grace 期不授新委托已由 `maybe_grant_read_deleg` 的 `in_grace()` 判定覆盖
 （`state_mgr.cpp:931`），无需改动。
 
-**测试**：`tests/test_nfs4.cpp`——重启后名单内客户端 CLAIM_DELEG_PREV_FH → OK 且
-`delegation_type == NONE`；未列名单 → RECLAIM_BAD；grace 外 → NO_GRACE。
+**测试**：`Nfs4.ClaimDelegPrevFhReclaimsAsPlainOpen`——重启后名单内客户端
+CLAIM_DELEG_PREV_FH → OK、`delegation_type == NONE`（即使带 WANT_READ_DELEG）、读写可用、
+同 owner 二次 claim 合并到同一 open 状态；grace 内普通 OPEN 仍 GRACE；CLAIM_DELEGATE_PREV
+仍 NOTSUPP；RECLAIM_COMPLETE 后 → NO_GRACE；新 grace 下未列名单客户端 → RECLAIM_BAD。
 
 ### B4 导出表一致性摘要
 

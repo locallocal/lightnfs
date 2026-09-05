@@ -1211,6 +1211,107 @@ TEST(Nfs4, RestartReclaimWithinGrace) {
             stv(Status::kReclaimBad));
 }
 
+// Reboot recovery of a delegated open (design 09 §9.7, plan 10 B3): after a restart
+// (or a takeover) the client tries CLAIM_DELEG_PREV_FH for the opens it held under a
+// delegation.  It is accepted as a plain reclaim — listed client inside grace, no
+// delegation handed back — so the Linux client neither backs off on NOTSUPP nor
+// spins on GRACE; unlisted clients and late claims hit the CLAIM_PREVIOUS gates.
+TEST(Nfs4, ClaimDelegPrevFhReclaimsAsPlainOpen) {
+  V4Fixture f;
+  f.establish_session();
+  auto dir_fh = f.path_fh({"export", "data"});
+  auto o = do_open(f, dir_fh, "dprev", 3, 0, "owner-d", 0,
+                   [&](xdr::XdrEnc& e) { fattr_mode(e, f.pool, 0644); });
+  ASSERT_TRUE(o.status == 0);
+  EXPECT_EQ(do_write(f, o.fh, o.stateid, 0, "delegated", 2), 0u);
+  auto file_fh = o.fh;
+
+  // "Restart": new epoch over the same state_dir → grace armed, the client is listed.
+  f.engine.reset();
+  f.state.emplace(state::StateMgr::Config{.boot_epoch = 21, .state_dir = f.state_dir});
+  f.state->load_grace_list();
+  ASSERT_TRUE(f.state->in_grace());
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state);
+  f.establish_session(false);
+
+  // CLAIM_DELEG_PREV_FH: accepted, plain open stateid, OPEN_DELEGATE_NONE even when
+  // the client asks for a delegation back (WANT_READ_DELEG), and the open works.
+  auto re = do_open(f, file_fh, "", 3 | 0x0100, 0, "owner-d", std::nullopt, {}, 6);
+  ASSERT_TRUE(re.status == 0);
+  EXPECT_TRUE(re.deleg_type != 1u);
+  EXPECT_EQ(re.stateid.seqid, 1u);
+  EXPECT_STREQ(do_read(f, re.fh, re.stateid, 0, 64), "delegated");
+  EXPECT_EQ(do_write(f, re.fh, re.stateid, 9, "!", 2), 0u);
+  EXPECT_EQ(f.state->stats().delegs, 0u);
+  // Still in grace: a plain OPEN waits, a second reboot claim by the same owner
+  // merges into the same open state (seqid bumps, no new record).
+  EXPECT_EQ(do_open(f, dir_fh, "dprev", 3, 0, "owner-d").status, stv(Status::kGrace));
+  auto again = do_open(f, file_fh, "", 1, 0, "owner-d", std::nullopt, {}, 6);
+  ASSERT_TRUE(again.status == 0);
+  EXPECT_EQ(again.stateid.seqid, 2u);
+  EXPECT_EQ(f.state->stats().opens, 1u);
+  // The 4.0-style name-based delegation claims stay unsupported.
+  EXPECT_EQ(do_open(f, file_fh, "", 3, 0, "owner-d", std::nullopt, {}, 3).status,
+            stv(Status::kNotsupp));
+
+  // RECLAIM_COMPLETE: grace over; a late reboot claim is NO_GRACE, like CLAIM_PREVIOUS.
+  xdr::XdrEnc rc(f.pool);
+  rc.u32(static_cast<uint32_t>(Op::kReclaimComplete));
+  rc.boolean(false);
+  EXPECT_EQ(f.parse(f.compound_raw(f.session_body(1, rc.take()))).status, 0u);
+  EXPECT_FALSE(f.state->in_grace());
+  EXPECT_EQ(do_open(f, file_fh, "", 3, 0, "owner-d", std::nullopt, {}, 6).status,
+            stv(Status::kNoGrace));
+  EXPECT_EQ(do_close(f, re.fh, again.stateid), 0u);
+
+  // A fresh grace with an unlisted client: RECLAIM_BAD.
+  f.engine.reset();
+  f.state.emplace(state::StateMgr::Config{.boot_epoch = 22, .state_dir = f.state_dir});
+  f.state->load_grace_list();
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state);
+  {
+    xdr::XdrEnc body(f.pool);
+    body.u32(0);
+    body.u32(1);
+    body.u32(1);
+    body.u32(static_cast<uint32_t>(Op::kExchangeId));
+    std::array<std::byte, 8> verf{std::byte{7}};
+    body.opaque_fixed(verf);
+    body.string("unlisted-deleg-client");
+    body.u32(0);
+    body.u32(0);
+    body.u32(0);
+    auto reply = f.parse(f.compound_raw(body.take()));
+    ASSERT_TRUE(reply.status == 0);
+    V4Fixture::expect_op(reply.dec, Op::kExchangeId, 0);
+    f.clientid = *reply.dec.u64();
+    uint32_t eir_seq = *reply.dec.u32();
+    xdr::XdrEnc cs(f.pool);
+    cs.u32(0);
+    cs.u32(1);
+    cs.u32(1);
+    cs.u32(static_cast<uint32_t>(Op::kCreateSession));
+    cs.u64(f.clientid);
+    cs.u32(eir_seq);
+    cs.u32(0);
+    nfsv4::ChannelAttrs fore;
+    fore.max_requests = 8;
+    fore.encode(cs);
+    fore.encode(cs);
+    cs.u32(0x40000000);
+    cs.u32(1);
+    cs.u32(0);
+    auto csr = f.parse(f.compound_raw(cs.take()));
+    ASSERT_TRUE(csr.status == 0);
+    V4Fixture::expect_op(csr.dec, Op::kCreateSession, 0);
+    auto sid = *csr.dec.opaque_fixed(16);
+    std::copy(sid.begin(), sid.end(), f.sessionid.begin());
+    for (auto& s : f.slot_seq) s = 1;
+  }
+  EXPECT_EQ(do_open(f, file_fh, "", 3, 0, "owner-x", std::nullopt, {}, 6).status,
+            stv(Status::kReclaimBad));
+}
+
 TEST(Nfs4, CurrentStateidAndReclaimCompleteGate) {
   V4Fixture f;
   f.establish_session();
