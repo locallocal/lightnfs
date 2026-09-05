@@ -34,7 +34,7 @@
 | | C4 指标 ✅ 2026-09-05 | role / epoch / fence age / takeovers | C2 |
 | D 后端接管钩子 | D1 `Backend::takeover()` 接口 + 脚本钩子 ✅ 2026-09-05 | 默认空操作；可配外部脚本（Lustre evict 等） | C2 |
 | | D2 CephFS reclaim 原语 ✅ 2026-09-05 | cephapi 三入口、fake、`[export.cephfs] uuid` | D1 |
-| E 验证与文档 | E1 `v4failover` 验收模式 + 本机双实例脚本 | 无 root 的端到端证明 | C3 D1 |
+| E 验证与文档 | E1 `v4failover` 验收模式 + 本机双实例脚本 ✅ 2026-09-05 | 无 root 的端到端证明 | C3 D1 |
 | | E2 fake 注入与脑裂演练 | 残留锁、围栏分离 | B2 C2 D2 |
 | | E3 文档 | 08 册、deployment.md、07 §7.5、09 册状态更新 | 全部 |
 
@@ -589,7 +589,7 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
 
 ## 阶段 E：验证与文档
 
-### E1 `v4failover` 验收模式 + 本机双实例脚本
+### E1 `v4failover` 验收模式 + 本机双实例脚本（已完成，2026-09-05）
 
 **改动点**
 
@@ -613,6 +613,29 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
   Release + ASAN 各跑一轮，沿用 `accept_m6_local.sh` 的骨架。
 
 **验收**：脚本 0 退出；Activating 用时（C4 指标）< 1s；无 EIO/ESTALE。
+
+**实现记录（与上文的差异）**：
+- `cmd_v4failover(host, port_a, port_b, export, backing, takeover_cmd)`：A 连 `port_a` 建
+  OPEN(CREATE)+LOCK[0,100)+WRITE(UNSTABLE) 并记验证器，丢连接（不 CLOSE）；跑 `takeover_cmd`；
+  连 `port_b`。断言链：先发一条只带旧 sessionid 的 SEQUENCE → **BADSESSION**（10052）；
+  EXCHANGE_ID 同 co_ownerid → `server_owner`/`scope` 与 A 相同、clientid 高 32 位（epoch）变化；
+  旧 stateid READ → **STALE_STATEID**；plain OPEN → **GRACE**；OPEN(CLAIM_PREVIOUS) → OK；
+  LOCK(reclaim) 循环重试 **DELAY**（B2 下推兜底，本机 local 后端 0 次重试）；COMMIT 验证器变化 →
+  WRITE(FILE_SYNC) 重发 → READ 与 backing 逐字节比对；RECLAIM_COMPLETE → plain OPEN OK。
+  参数复用 `main` 的 `nfs_port`/`mount_port` 两个位置当 A/B 端口。
+- `scripts/accept_failover_local.sh`：骨架仿 `accept_m6_local.sh`，但 workdir 落在
+  `build/`（**不是 /tmp**——tmpfs 无 STATX_BTIME，fallback 句柄跨进程不稳定，客户端已用"按名重解析"
+  兜底并打印一行 note）。每配置（Release、ASAN）跑：起 A(active/auto)+B(standby/manual)、断言
+  B 不监听；v3 `wtest` 打 A；`v4failover`——takeover 脚本 `kill -9 A` 后**不带 --force**轮询
+  `cluster takeover`（A 的围栏 3×lease 过期后才被接受，贴近真实运维）；断言 B `role=active
+  epoch+1 takeovers=1 last_activation_ms<1000` 且 `lightnfs_cluster_takeovers_total==1`；
+  v3 `wtest` 打 B；脑裂：A 以 standby 重起，手工把 `fence` 改写成 A → B 下次续租丢围栏、
+  `≤3×fence_lease` 内 Draining（`fence_lost=1`、`lightnfs_cluster_fence_lost_total==1`、端口关闭），
+  A 见记录属于自己→自动接管（epoch+2）；最后干净关停、A 退出释放围栏、无 `level=error` 行。
+- `LNFS_BUILD_DIRS="dir:label …"` 可跳过内建的 rel/asan 构建、复用已有构建目录迭代；
+  `now_ms` 用 `date +%s%N`/1e6（有的 `date` 忽略 `%3N`）。
+- 未加 `accept_failover_vm.sh`（E1 只要求无 root 的本机证明；带 keepalived/内核客户端的
+  VM 版在 E 阶段其余步骤再说）。
 
 ### E2 fake 注入与脑裂演练
 
