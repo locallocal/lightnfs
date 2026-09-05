@@ -1656,6 +1656,15 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
       for (const auto& seg : before)
         (void)locks_.lock(key, lowner, GatewayLockMgr::to_range(seg.start, seg.end),
                           seg.exclusive);
+      // A reclaim refused by the storage inside grace (design 09 §9.7, plan 10 B2) is
+      // most likely the failed gateway's own lock lingering until the storage times
+      // its session out: DELAY keeps the client retrying rather than dropping the
+      // lock.  Once grace is over a refusal is a real third-party holder: DENIED.
+      if (pushed.status == as_u32(Status::kDenied) && args.reclaim && in_grace()) {
+        native_lock_reclaim_delays_.fetch_add(1, std::memory_order_relaxed);
+        pushed.status = as_u32(Status::kDelay);
+        pushed.denied = {};
+      }
       co_return pushed;
     }
   }
@@ -2083,6 +2092,7 @@ StateMgr::Stats StateMgr::stats() const {
   out.lock_denied = lock_denied_.load(std::memory_order_relaxed);
   out.native_lock_denied = native_lock_denied_.load(std::memory_order_relaxed);
   out.native_lock_errors = native_lock_errors_.load(std::memory_order_relaxed);
+  out.native_lock_reclaim_delays = native_lock_reclaim_delays_.load(std::memory_order_relaxed);
   out.delegs = nonneg(deleg_count_);
   out.deleg_grants = deleg_grants_.load(std::memory_order_relaxed);
   out.deleg_recalls = deleg_recalls_.load(std::memory_order_relaxed);

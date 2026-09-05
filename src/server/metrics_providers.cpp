@@ -48,13 +48,16 @@ void append_v4_state(std::string& out, state::StateMgr& state) {
       "lightnfs_v4_deleg_recalls_total {}\nlightnfs_v4_deleg_returns_total {}\n"
       "lightnfs_v4_deleg_revokes_total {}\nlightnfs_v4_cb_lock_notifies_total {}\n"
       // Native lock push (plan doc 10 §5.3).
-      "lightnfs_v4_native_lock_denied_total {}\nlightnfs_v4_native_lock_errors_total {}\n",
+      "lightnfs_v4_native_lock_denied_total {}\nlightnfs_v4_native_lock_errors_total {}\n"
+      // Reclaim pushes refused inside grace → DELAY (design 09 §9.7, plan 10 B2).
+      "lightnfs_v4_native_lock_reclaim_delays_total {}\n",
       s.clients, s.sessions, s.opens, s.seq_new, s.seq_replay, s.seq_misordered,
       s.seq_waits, s.grace ? 1 : 0, s.grace_remaining, s.files, s.courtesy,
       s.lease_expirations, s.reclaim_conflict, s.reclaim_timeout, s.reclaim_forced,
       s.share_denied, s.open_merges, s.lock_states, s.lock_segments, s.lock_owners,
       s.lock_denied, s.delegs, s.deleg_grants, s.deleg_recalls, s.deleg_returns,
-      s.deleg_revokes, s.cb_lock_notifies, s.native_lock_denied, s.native_lock_errors);
+      s.deleg_revokes, s.cb_lock_notifies, s.native_lock_denied, s.native_lock_errors,
+      s.native_lock_reclaim_delays);
 }
 
 // ---- per-backend cache / jukebox / lock-handle counters --------------------------

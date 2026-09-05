@@ -25,7 +25,7 @@
 | | A3 稳定状态访问抽象 ✅ 2026-09-05 | 句柄密钥 / epoch / 名单三处改走接口，本机实现保持原语义 | A2 |
 | | A4 管理面与数据面分离 ✅ 2026-09-05 | ctl/metrics 不再随 `Frontend` 生死 | — |
 | B 协议与状态语义 | B1 集群身份 ✅ 2026-09-05 | server_owner/scope 从 cluster id 派生 | A1 |
-| | B2 reclaim 下推失败 → DELAY | 状态层 grace 内重试 | — |
+| | B2 reclaim 下推失败 → DELAY ✅ 2026-09-05 | 状态层 grace 内重试 | — |
 | | B3 CLAIM_DELEG_PREV_FH | 接受为普通 open 状态 | — |
 | | B4 导出表一致性摘要 | 启动期拒绝树不一致的网关入集群 | A1 A2 |
 | C 进程生命周期 | C1 `ProtocolStack` 可重建 | 栈的构造/析构与进程解耦；连接收敛等待 | A4 |
@@ -216,7 +216,7 @@
 "不存在"或"完整"两种状态；`atomic_write_file` 的临时名也改为进程内唯一
 （`.tmp.<pid>.<n>`）。`ClusterStore.KeyConcurrentCreatorsAgree` 覆盖 8 线程 × 20 轮并发创建。
 
-### B2 reclaim 模式下的下推失败 → DELAY
+### B2 reclaim 模式下的下推失败 → DELAY（已完成，2026-09-05）
 
 **目标**：09 §9.7 第 1 条。故障网关在存储侧残留的锁让新网关 grace 内的 LOCK(reclaim)
 下推被拒时，客户端得到 DELAY 重试而不是 DENIED 丢锁。
@@ -233,9 +233,10 @@ if (pushed.status == as_u32(Status::kDenied) && args.reclaim && in_grace()) {
 grace 结束后仍被拒 → 原样 DENIED（此时确实有第三方持锁）。新增计数器
 `lightnfs_v4_native_lock_reclaim_delays_total`（`src/server/metrics_providers.cpp:51` 旁）。
 
-**测试**：`tests/test_state.cpp` 仿 `NativeLockPushRollbackAndRelease`：fake `LockMgr` 前 N 次
-`lock()` 回 EAGAIN——名单内客户端 grace 内 LOCK(reclaim) 得 DELAY，重试至 N 次后成功；
-`end_grace()` 后同一场景得 DENIED。
+**测试**：`StateMgr.ReclaimLockPushDelayInGrace`：fake `LockMgr` 前 N 次 `lock()` 回 EAGAIN——
+名单内客户端 grace 内 LOCK(reclaim) 得 DELAY（无 stateid、无网关授予、`denied` 清空），重试至
+N 次后成功；出 grace 后普通 LOCK 被拒 → DENIED（带存储侧冲突），迟到的 LOCK(reclaim) 走既有
+NO_GRACE 门禁而非 DELAY（实现注：出 grace 后 reclaim 请求先被门禁拦下，"DENIED"只对非 reclaim 锁成立）。
 
 ### B3 CLAIM_DELEG_PREV_FH 接受为普通 open 状态
 
