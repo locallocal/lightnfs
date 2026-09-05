@@ -28,7 +28,7 @@
 | | B2 reclaim 下推失败 → DELAY ✅ 2026-09-05 | 状态层 grace 内重试 | — |
 | | B3 CLAIM_DELEG_PREV_FH ✅ 2026-09-05 | 接受为普通 open 状态 | — |
 | | B4 导出表一致性摘要 ✅ 2026-09-05 | 启动期拒绝树不一致的网关入集群 | A1 A2 |
-| C 进程生命周期 | C1 `ProtocolStack` 可重建 | 栈的构造/析构与进程解耦；连接收敛等待 | A4 |
+| C 进程生命周期 | C1 `ProtocolStack` 可重建 ✅ 2026-09-05 | 栈的构造/析构与进程解耦；连接收敛等待 | A4 |
 | | C2 `ClusterController` 状态机 | Standby/Activating/Active/Draining + 围栏协程 | A1–A4 B1 C1 |
 | | C3 ctl `cluster *` 命令 | status / takeover / standby | C2 |
 | | C4 指标 | role / epoch / fence age / takeovers | C2 |
@@ -284,7 +284,7 @@ fs_name/volume/readonly 任一不同则不同）。端到端：两个网关共�
 
 ## 阶段 C：进程生命周期
 
-### C1 `ProtocolStack` 可重建 + 连接收敛等待
+### C1 `ProtocolStack` 可重建 + 连接收敛等待（已完成，2026-09-05）
 
 **目标**：09 §9.6 的前提——接管时重新构造协议栈（epoch 在构造时固化），退出服务时能
 干净销毁而不停 runtime。
@@ -311,6 +311,23 @@ fs_name/volume/readonly 任一不同则不同）。端到端：两个网关共�
 activate` 两轮，ASAN 下无泄漏、无 use-after-free；metrics 提供者数量两轮后不增长。
 
 **验收**：`accept_m6_local.sh` 的 reclaim/courtesy/ctl 段全过（单网关路径等价）。
+
+**实现记录**：
+- `activate/deactivate` 与 `DataPlaneInstance` 放在新文件 `src/server/data_plane.{hpp,cpp}`
+  （而非 `daemon.cpp` 的匿名命名空间），`tests/test_daemon_lifecycle.cpp` 才能直接驱动。
+- `Frontend::drain_connections(grace, close_timeout)`：`ConnRegistry::wait_idle(grace)` →
+  `close_all()` → `wait_idle(close_timeout)` → 再等两个监听器的 `ConnTracker` 归零（连接协程在
+  离开注册表之后还会碰一次 tracker）。单网关退出用 `kShutdownDrainGrace = 2s`；C2 用 `2 × fence_lease`。
+- `Listener::wait_stopped()`、`CtlServer/MetricsHttp::start()+wait_stopped()`：accept 协程退出时
+  signal，析构前必须 join——测试暴露了一个既有隐患：`Management` 若先于 runtime 销毁，ctl 的
+  accept 循环会在已关闭的 fd 上死循环（`run_server` 的关停顺序恰好掩盖了它）。
+- ctl 命令对数据面的引用改为**计数钉住**（`DataPlaneSlot::acquire()` → `PlaneRef`），
+  `Management::detach()` 等待钉住数归零（上限 5s，超时告警），封掉 A4 留下的
+  "state dump 中途 detach" 窗口。
+- 租约扫描器改为 100ms 切片睡眠，`stop_lease_scanner()` 用 promise/future join，停栈延迟 ≤ ~100ms。
+- 指标提供者：`obs::register_text_provider` 返回句柄、新增 `unregister_text_provider/
+  text_provider_count`；`register_metrics_providers` 返回 RAII `MetricsRegistration`；
+  `Frontend` 的缓冲池指标同样按句柄注销。
 
 ### C2 `ClusterController` 状态机与围栏协程
 

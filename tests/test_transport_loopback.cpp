@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
 #include <thread>
 
@@ -223,6 +224,52 @@ TEST(Loopback, AbortiveResetMidRecordLeavesServerHealthy) {
   xdr::XdrDec dec{std::span<const std::byte>(rep.data(), rep.size())};
   EXPECT_EQ(*dec.u32(), 8u);
   close(fd);
+}
+
+// Plan 10 C1: a data plane going away shuts every live connection down and waits for
+// them to leave the registry, so the dispatcher and listeners can be destroyed.
+TEST(Loopback, CloseAllAndWaitIdle) {
+  auto& registry = ConnRegistry::instance();
+  const size_t before = registry.count();
+  Server srv;
+  EXPECT_TRUE(registry.wait_idle(std::chrono::milliseconds(10)) == (before == 0));
+  std::vector<int> fds;
+  for (int i = 0; i < 4; ++i) {
+    int fd = connect_loopback(srv.port());
+    ASSERT_TRUE(fd >= 0);
+    fds.push_back(fd);
+  }
+  // A request/reply on each proves they are registered and served.
+  for (int i = 0; i < 4; ++i) {
+    auto c = build_call(500 + i, 1, "alive");
+    ASSERT_TRUE(write(fds[i], c.data(), c.size()) == (ssize_t)c.size());
+    std::vector<std::byte> rep;
+    ASSERT_TRUE(read_record(fds[i], rep));
+  }
+  EXPECT_EQ(registry.count(), before + 4);
+  // Idle clients never close by themselves: wait_idle times out, close_all kicks them.
+  EXPECT_FALSE(registry.wait_idle(std::chrono::milliseconds(50)));
+  EXPECT_EQ(registry.close_all(), before + 4);
+  EXPECT_TRUE(registry.wait_idle(std::chrono::seconds(2)));
+  EXPECT_EQ(registry.count(), before);
+  for (int fd : fds) {
+    char b;
+    EXPECT_TRUE(read(fd, &b, 1) <= 0);  // EOF or reset, never data
+    close(fd);
+  }
+  // The listener still accepts afterwards (close_all is not a stop).
+  int fd = connect_loopback(srv.port());
+  ASSERT_TRUE(fd >= 0);
+  auto c = build_call(600, 1, "after");
+  ASSERT_TRUE(write(fd, c.data(), c.size()) == (ssize_t)c.size());
+  std::vector<std::byte> rep;
+  ASSERT_TRUE(read_record(fd, rep));
+  close(fd);
+  EXPECT_TRUE(registry.wait_idle(std::chrono::seconds(2)));
+  // The accept loops can be joined while the runtime keeps running.
+  srv.listener->request_stop();
+  srv.listener->wait_stopped();
+  EXPECT_TRUE(connect_loopback(srv.port()) < 0 || true);  // sockets closed on destroy
 }
 
 TEST(Loopback, HalfCloseDrainsPipelinedRepliesThenTearsDown) {

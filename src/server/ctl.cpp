@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <thread>
 #include <format>
 #include <memory>
 #include <sstream>
@@ -102,6 +103,32 @@ CtlDeps CtlDeps::with_plane(const DataPlane* plane) {
   return deps;
 }
 
+PlaneRef::~PlaneRef() {
+  if (slot_) slot_->pins_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+PlaneRef DataPlaneSlot::acquire() {
+  // Pin first, then read: a detach that stores null before our load sees our pin and
+  // waits; one that stores null after our load also waits, because the pin is up.
+  pins_.fetch_add(1, std::memory_order_acq_rel);
+  const DataPlane* plane = plane_.load(std::memory_order_acquire);
+  if (!plane) {
+    pins_.fetch_sub(1, std::memory_order_acq_rel);
+    return {};
+  }
+  return PlaneRef(this, plane);
+}
+
+bool DataPlaneSlot::detach(std::chrono::milliseconds timeout) {
+  plane_.store(nullptr, std::memory_order_release);
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (pins_.load(std::memory_order_acquire) > 0) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
 namespace {
 const char* not_active(bool json) {
   return json ? "{\"error\":\"not active\"}\n" : "not active\n";
@@ -111,7 +138,8 @@ const char* not_active(bool json) {
 std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
   const Cmd cmd = parse_command(command);
   const bool json = cmd.json;
-  const DataPlane* dp = deps.data_plane();
+  PlaneRef pin = deps.acquire_plane();
+  const DataPlane* dp = pin.get();
   if (cmd.name() == "ping") return json ? "{\"ok\":true}\n" : "pong\n";
   if (cmd.name() == "version") {
     return json ? std::format("{{\"version\":\"{}\"}}\n", LIGHTNFS_VERSION)
@@ -351,10 +379,10 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
 rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string command) {
   const Cmd cmd = parse_command(command);
   const bool json = cmd.json;
-  // One load per command: the plane pointer stays valid across the awaits below only
-  // because detach happens before the data plane is torn down and the ctl server is
-  // stopped before anything it points at dies (run_server's shutdown order).
-  const DataPlane* dp = deps.data_plane();
+  // The pin keeps the plane alive across the awaits below: a detach in progress waits
+  // for it to drop before the data plane is torn down (plan 10 C1).
+  PlaneRef pin = deps.acquire_plane();
+  const DataPlane* dp = pin.get();
   if (cmd.name() == "state") {
     if (!dp) co_return not_active(json);
     if (!dp->state) co_return json ? "{\"error\":\"v4 disabled\"}\n" : "v4 disabled\n";
@@ -473,7 +501,20 @@ rt::Task<void> CtlServer::serve(int cfd) {
   co_await uring_close(cfd);
 }
 
+void CtlServer::start(rt::Reactor& reactor) {
+  started_ = true;
+  spawn(run(), reactor);
+}
+
+void CtlServer::wait_stopped() {
+  if (started_) exited_future_.wait();
+}
+
 rt::Task<void> CtlServer::run() {
+  struct Exit {  // signals wait_stopped() however the loop ends
+    std::promise<void>* p;
+    ~Exit() { p->set_value(); }
+  } exit_guard{&exited_};
   run_reactor_.store(&current_reactor());
   auto token = stop_.token();
   for (;;) {
@@ -567,7 +608,20 @@ rt::Task<void> MetricsHttp::serve(int cfd) {
   co_await uring_close(cfd);
 }
 
+void MetricsHttp::start(rt::Reactor& reactor) {
+  started_ = true;
+  spawn(run(), reactor);
+}
+
+void MetricsHttp::wait_stopped() {
+  if (started_) exited_future_.wait();
+}
+
 rt::Task<void> MetricsHttp::run() {
+  struct Exit {
+    std::promise<void>* p;
+    ~Exit() { p->set_value(); }
+  } exit_guard{&exited_};
   run_reactor_.store(&current_reactor());
   auto token = stop_.token();
   for (;;) {

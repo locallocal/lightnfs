@@ -22,10 +22,15 @@ const char* v3_proc_name(uint32_t proc) {
 
 namespace {
 std::mutex g_providers_mu;
-std::vector<std::function<void(std::string&)>>& providers() {
-  static std::vector<std::function<void(std::string&)>> v;
+struct Provider {
+  ProviderHandle id;
+  std::function<void(std::string&)> fn;
+};
+std::vector<Provider>& providers() {
+  static std::vector<Provider> v;
   return v;
 }
+ProviderHandle g_next_provider = 1;
 std::atomic<uint64_t> g_slow_us{0};
 }  // namespace
 
@@ -72,9 +77,26 @@ void append_histogram(std::string& out, std::string_view name, std::string_view 
                    snap.sum_us);
 }
 
-void register_text_provider(std::function<void(std::string&)> provider) {
+ProviderHandle register_text_provider(std::function<void(std::string&)> provider) {
   std::lock_guard lock(g_providers_mu);
-  providers().push_back(std::move(provider));
+  ProviderHandle id = g_next_provider++;
+  providers().push_back({id, std::move(provider)});
+  return id;
+}
+
+void unregister_text_provider(ProviderHandle handle) {
+  std::lock_guard lock(g_providers_mu);
+  auto& v = providers();
+  for (auto it = v.begin(); it != v.end(); ++it)
+    if (it->id == handle) {
+      v.erase(it);
+      return;
+    }
+}
+
+size_t text_provider_count() {
+  std::lock_guard lock(g_providers_mu);
+  return providers().size();
 }
 
 std::string prometheus_text() {
@@ -131,7 +153,7 @@ std::string prometheus_text() {
   out += std::format("lightnfs_write_bytes_total {}\n",
                      m.write_bytes.load(std::memory_order_relaxed));
   std::lock_guard lock(g_providers_mu);
-  for (const auto& p : providers()) p(out);
+  for (const auto& p : providers()) p.fn(out);
   return out;
 }
 

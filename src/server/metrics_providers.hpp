@@ -7,6 +7,10 @@
 // counters, per-backend caches, the runtime's offload pool and reactor loops — sit
 // here in server/, the one layer allowed to know all of them, instead of in main.cpp.
 
+#include <vector>
+
+#include "obs/metrics.hpp"
+
 namespace lnfs::core {
 class ExportTable;
 }
@@ -29,8 +33,35 @@ struct MetricsSources {
   rt::Runtime& runtime;
 };
 
-// Registers one text provider per group. The referenced objects must outlive every
-// scrape (run_server tears the frontend down before they go away).
-void register_metrics_providers(const MetricsSources& sources);
+// Registers one text provider per group; the registration unregisters them all when
+// destroyed, which must happen before the referenced objects go away (the data plane
+// is torn down and rebuilt on a takeover, plan 10 C1).
+class MetricsRegistration {
+ public:
+  MetricsRegistration() = default;
+  explicit MetricsRegistration(std::vector<obs::ProviderHandle> handles)
+      : handles_(std::move(handles)) {}
+  MetricsRegistration(MetricsRegistration&& o) noexcept : handles_(std::move(o.handles_)) {
+    o.handles_.clear();
+  }
+  MetricsRegistration& operator=(MetricsRegistration&& o) noexcept {
+    if (this != &o) {
+      reset();
+      handles_ = std::move(o.handles_);
+      o.handles_.clear();
+    }
+    return *this;
+  }
+  ~MetricsRegistration() { reset(); }
+  void reset() {
+    for (auto h : handles_) obs::unregister_text_provider(h);
+    handles_.clear();
+  }
+
+ private:
+  std::vector<obs::ProviderHandle> handles_;
+};
+
+MetricsRegistration register_metrics_providers(const MetricsSources& sources);
 
 }  // namespace lnfs::server

@@ -91,7 +91,16 @@ Listener::~Listener() {
 }
 
 void Listener::start() {
+  {
+    std::lock_guard lock(loops_mu_);
+    loops_running_ = fds_.size();
+  }
   for (size_t i = 0; i < fds_.size(); ++i) spawn(run_one(i), rt_.reactor(i));
+}
+
+void Listener::wait_stopped() {
+  std::unique_lock lock(loops_mu_);
+  loops_cv_.wait(lock, [&] { return loops_running_ == 0; });
 }
 
 void Listener::request_stop() {
@@ -104,6 +113,14 @@ void Listener::request_stop() {
 }
 
 rt::Task<void> Listener::run_one(size_t idx) {
+  // Signals wait_stopped() as the very last thing this frame does with `this`.
+  struct Exit {
+    Listener* l;
+    ~Exit() {
+      std::lock_guard lock(l->loops_mu_);
+      if (--l->loops_running_ == 0) l->loops_cv_.notify_all();
+    }
+  } exit_guard{this};
   const int lfd = fds_[idx];
   auto token = stop_.token();
   for (;;) {

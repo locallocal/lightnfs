@@ -13,12 +13,14 @@
 // aborts startup.
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 
 #include "core/config.hpp"
+#include "obs/metrics.hpp"
 #include "runtime/runtime.hpp"
 #include "server/ctl.hpp"
 #include "server/protocol_stack.hpp"
@@ -37,10 +39,10 @@ struct Management {
   static Management start(const core::ServerConfig& cfg, rt::Runtime& runtime,
                           std::function<std::string()> reload,
                           std::function<std::string()> role = {});
-  // `plane` must stay valid until detach(); commands loaded before a detach may still
-  // be using it, so the caller stops the ctl server before destroying what it points at.
-  void attach(const DataPlane* plane) { this->plane->store(plane, std::memory_order_release); }
-  void detach() { plane->store(nullptr, std::memory_order_release); }
+  // `plane` must stay valid until detach() returns: detach waits for every command
+  // still using the plane (bounded; a warning names the stragglers).
+  void attach(const DataPlane* plane) { this->plane->store(plane); }
+  void detach();
   void stop();
 };
 
@@ -53,6 +55,7 @@ struct Frontend {
   // heap-owned so Frontend stays movable while the ctl side keeps stable pointers.
   std::shared_ptr<std::atomic<bool>> draining = std::make_shared<std::atomic<bool>>(false);
   std::shared_ptr<DataPlane> plane = std::make_shared<DataPlane>();
+  obs::ProviderHandle pool_metric = 0;
 
   // Builds the TLS context, creates and starts both listeners on `stack.dispatcher`,
   // registers the buffer-pool metric, attaches the data plane (exports, DRC, state,
@@ -60,9 +63,16 @@ struct Frontend {
   static std::optional<Frontend> start(const core::ServerConfig& cfg, rt::Runtime& runtime,
                                        ProtocolStack& stack, CoreState& core,
                                        Management& mgmt);
-  // Detaches the data plane, stops the accept loops and unregisters from rpcbind.
-  // Established connections drain with the runtime.
+  // Detaches the data plane (waiting for in-flight ctl commands), stops the accept
+  // loops and joins them, drops the buffer-pool metric and unregisters from rpcbind.
+  // Established connections are left alone: see drain_connections.
   void stop(const core::ServerConfig& cfg, Management& mgmt);
+  // Lets established connections finish for up to `grace`, then shuts the rest down
+  // and waits for every connection coroutine to leave the listeners' trackers (bounded
+  // by `close_timeout`).  True when nothing references the listeners or the stack any
+  // more — only then may they be destroyed (plan 10 C1).
+  bool drain_connections(std::chrono::milliseconds grace,
+                         std::chrono::milliseconds close_timeout);
 };
 
 }  // namespace lnfs::server
