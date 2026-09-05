@@ -7,8 +7,10 @@
 #include <thread>
 #include <vector>
 
+#include "mem_cluster_store.hpp"
 #include "mini_test.hpp"
 #include "obs/metrics.hpp"
+#include "server/cluster_controller.hpp"
 
 using namespace lnfs;
 
@@ -109,6 +111,71 @@ TEST(Metrics, FlatTotalsRenderCurrentValues) {
             static_cast<long long>(m.read_bytes.load()));
   EXPECT_EQ(sample_value(text, "lightnfs_connections_active"),
             static_cast<long long>(m.conns_active.load()));
+}
+
+// plan 10 C4: the cluster controller's own text provider — role one-hot, epoch, fence
+// ownership/age, takeover counters and the activation histogram — registered for the
+// controller's lifetime and gone with it.
+TEST(Metrics, ClusterSeriesRenderWithControllerLifetime) {
+  const size_t providers_before = obs::text_provider_count();
+  {
+    test::MemClusterStore store;
+    store.epoch = 4;
+    core::ClusterConfig cfg;
+    cfg.enabled = true;
+    cfg.id = "cluster-metrics-test";
+    cfg.node = "gw1";
+    cfg.fence_lease_ms = 1000;
+    server::ClusterController ctl(cfg, store, {});  // inline hooks, nothing to run
+    EXPECT_EQ(obs::text_provider_count(), providers_before + 1);
+
+    // Standby, nothing seen yet: role one-hot, no fence age sample, zero counters.
+    auto text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_role{role=\"standby\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_role{role=\"activating\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_role{role=\"active\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_role{role=\"draining\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_epoch"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fence_owned"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fence_age_seconds"), -1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_takeovers_total"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fence_lost_total"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_activation_failures_total"), 0);
+    EXPECT_TRUE(text.find("# TYPE lightnfs_cluster_activation_seconds histogram\n") !=
+                std::string::npos);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_activation_seconds_count"), 0);
+
+    // One takeover (free fence): active, epoch minted, our fence with an age, one
+    // observation in the histogram (activation is far under the first bound).
+    ctl.tick();
+    ASSERT_TRUE(ctl.role() == server::Role::kActive);
+    text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_role{role=\"standby\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_role{role=\"active\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_epoch"), 5);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fence_owned"), 1);
+    EXPECT_TRUE(text.find("\nlightnfs_cluster_fence_age_seconds 0.") != std::string::npos);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_takeovers_total"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_activation_seconds_count"), 1);
+    EXPECT_TRUE(text.find("lightnfs_cluster_activation_seconds_bucket{le=\"0.0001\"} 1\n") !=
+                std::string::npos);
+    EXPECT_TRUE(text.find("lightnfs_cluster_activation_seconds_bucket{le=\"+Inf\"} 1\n") !=
+                std::string::npos);
+
+    // Fence taken by another node: draining → standby, fence_lost counted, the record
+    // seen is theirs (not owned), epoch back to 0.
+    store.taken_by("gw2", 9);
+    ctl.tick();
+    ASSERT_TRUE(ctl.role() == server::Role::kStandby);
+    text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_role{role=\"standby\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fence_owned"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fence_lost_total"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_epoch"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_takeovers_total"), 1);
+  }
+  EXPECT_EQ(obs::text_provider_count(), providers_before);
+  EXPECT_EQ(sample_value(obs::prometheus_text(), "lightnfs_cluster_epoch"), -1);
 }
 
 TEST(Metrics, AppendHistogramSpanOverload) {

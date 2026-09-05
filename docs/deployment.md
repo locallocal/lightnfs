@@ -121,6 +121,11 @@ sudo systemctl enable --now lightnfs
   多导出定位用带 `{export,fsid}` 标签的
   `lightnfs_export_{read,write}_{bytes,ops}_total` 与 `lightnfs_fdcache_*`；
   runtime 层另有 `lightnfs_offload_*` 与 `lightnfs_buffer_pool_free_bytes{listener}`。
+  多网关模式（`[cluster] enabled`）再加 `lightnfs_cluster_role{role}`（one-hot）、
+  `lightnfs_cluster_epoch`、`lightnfs_cluster_fence_owned` / `_fence_age_seconds`、
+  `lightnfs_cluster_{takeovers,fence_lost,activation_failures}_total` 与
+  `lightnfs_cluster_activation_seconds` 直方图——告警建议：`fence_age_seconds` 超过
+  `fence_lease` 的 2 倍、`fence_lost_total` 增长、`role{role="active"}` 在集群内之和 ≠ 1。
 - **慢请求日志**：超过 `[server] slow_request_ms`（默认 1000，0 关闭）的请求落一条
   warn 日志；v4 附 COMPOUND 内逐 op 耗时分解（`ops=[PUTFH=12us,READ=890000us]`），
   现网定位的第一工具。`dump-errors` 采样环大小由 `[server] error_ring`（默认 64）控制。

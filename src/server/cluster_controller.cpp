@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <format>
 #include <utility>
 
 #include "util/log.hpp"
@@ -22,9 +23,15 @@ ClusterController::ClusterController(const core::ClusterConfig& cfg, ClusterStor
                                      Hooks hooks)
     : cfg_(cfg), store_(store), hooks_(std::move(hooks)), node_(core::cluster_node_name(cfg)) {
   if (!hooks_.post) hooks_.post = [](std::function<void()> fn) { fn(); };
+  metrics_ = obs::register_text_provider([this](std::string& out) { append_metrics(out); });
 }
 
-ClusterController::~ClusterController() { stop(); }
+ClusterController::~ClusterController() {
+  stop();
+  // The scrape runs providers under the registry lock, so after this returns no
+  // scrape can still be inside append_metrics().
+  obs::unregister_text_provider(metrics_);
+}
 
 void ClusterController::start() {
   if (thread_.joinable()) return;
@@ -157,8 +164,10 @@ void ClusterController::run_activation(uint64_t epoch) {
   if (activated) {
     role_ = Role::kActive;
     ++takeovers_;
-    last_activation_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - activation_started_);
+    auto took = std::chrono::steady_clock::now() - activation_started_;
+    last_activation_ = std::chrono::duration_cast<std::chrono::milliseconds>(took);
+    activation_hist_.observe_us(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(took).count()));
     LNFS_INFO("cluster: {} active (epoch {}, activation {} ms)", node_, epoch,
               last_activation_.count());
     return;
@@ -260,6 +269,34 @@ ClusterController::Snapshot ClusterController::snapshot() const {
 Role ClusterController::role() const {
   std::lock_guard lock(mu_);
   return role_;
+}
+
+void ClusterController::append_metrics(std::string& out) const {
+  const Snapshot snap = snapshot();
+  static constexpr Role kRoles[] = {Role::kStandby, Role::kActivating, Role::kActive,
+                                    Role::kDraining};
+  for (Role r : kRoles)
+    out += std::format("lightnfs_cluster_role{{role=\"{}\"}} {}\n", role_name(r),
+                       r == snap.role ? 1 : 0);
+  out += std::format("lightnfs_cluster_epoch {}\n", snap.epoch);
+  // Fence: 1 when the record last seen is ours.  Age = seconds since we renewed it
+  // (ours) or read it (someone else's); no sample until a record has been seen.
+  const bool owned = snap.fence && snap.fence->node == snap.node;
+  out += std::format("lightnfs_cluster_fence_owned {}\n", owned ? 1 : 0);
+  if (snap.fence) {
+    auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - snap.fence_seen)
+                      .count();
+    out += std::format("lightnfs_cluster_fence_age_seconds {:.3f}\n",
+                       static_cast<double>(age_ms) / 1000.0);
+  }
+  out += std::format(
+      "lightnfs_cluster_takeovers_total {}\nlightnfs_cluster_fence_lost_total {}\n"
+      "lightnfs_cluster_activation_failures_total {}\n",
+      snap.takeovers, snap.fence_lost, snap.activation_failures);
+  out += "# TYPE lightnfs_cluster_activation_seconds histogram\n";
+  obs::append_histogram(out, "lightnfs_cluster_activation_seconds", "",
+                        activation_hist_.snapshot());
 }
 
 Result<std::vector<std::string>> ClusterController::peers() const {

@@ -13,6 +13,10 @@
 // controller keeps renewing the fence while that work runs so a slow takeover never
 // lets the lease lapse under it.  Every transition is serialized by one mutex;
 // tick() is public so tests drive the machine without the thread.
+//
+// The controller also owns the cluster metrics (plan 10 C4): one text provider that
+// lives as long as the controller (the process, in lightnfsd) rather than the
+// protocol stack, so role/epoch/fence/takeover series stay visible while standing by.
 
 #include <atomic>
 #include <chrono>
@@ -25,6 +29,7 @@
 #include <vector>
 
 #include "core/config.hpp"
+#include "obs/metrics.hpp"
 #include "server/cluster_store.hpp"
 #include "util/result.hpp"
 
@@ -95,6 +100,8 @@ class ClusterController {
   void begin_draining(const char* why, bool fence_lost);
   void run_draining(bool release);       // on the posting thread
   void renew();
+  // Prometheus text provider: lightnfs_cluster_* (plan 10 C4).
+  void append_metrics(std::string& out) const;
   std::chrono::milliseconds ttl() const {
     return std::chrono::milliseconds(3 * cfg_.fence_lease_ms);
   }
@@ -113,6 +120,8 @@ class ClusterController {
   uint64_t takeovers_ = 0, fence_lost_ = 0, activation_failures_ = 0;
   std::chrono::steady_clock::time_point activation_started_{};
   std::chrono::milliseconds last_activation_{0};
+  obs::LatencyHistogram activation_hist_;  // Standby → Active, per completed takeover
+  obs::ProviderHandle metrics_ = 0;
 
   std::thread thread_;
   std::mutex wake_mu_;
