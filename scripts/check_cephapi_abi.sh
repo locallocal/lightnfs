@@ -52,6 +52,7 @@ MEMBERS=$(grep -oE '\(\*(ceph_[a-z_0-9]+)\)' src/backend/cephfs/cephapi.hpp | tr
   echo 'static_assert(CEPH_SETATTR_MTIME_NOW == c::kSetMtimeNow && CEPH_SETATTR_ATIME_NOW == c::kSetAtimeNow);'
   echo 'static_assert(AT_STATX_DONT_SYNC == c::kStatxDontSync);'
   echo 'static_assert(FALLOC_FL_KEEP_SIZE == c::kFallocKeepSize && FALLOC_FL_PUNCH_HOLE == c::kFallocPunchHole);'
+  echo 'static_assert(CEPH_RECLAIM_RESET == c::kReclaimReset);'
   echo 'int main() { return 0; }'
 } > "$TMP/check.cpp"
 # vinodeno_t is only complete in C; its layout (two uint64 by value) and the

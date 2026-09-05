@@ -33,7 +33,7 @@
 | | C3 ctl `cluster *` 命令 ✅ 2026-09-05 | status / takeover / standby | C2 |
 | | C4 指标 ✅ 2026-09-05 | role / epoch / fence age / takeovers | C2 |
 | D 后端接管钩子 | D1 `Backend::takeover()` 接口 + 脚本钩子 ✅ 2026-09-05 | 默认空操作；可配外部脚本（Lustre evict 等） | C2 |
-| | D2 CephFS reclaim 原语 | cephapi 三入口、fake、`[export.cephfs] uuid` | D1 |
+| | D2 CephFS reclaim 原语 ✅ 2026-09-05 | cephapi 三入口、fake、`[export.cephfs] uuid` | D1 |
 | E 验证与文档 | E1 `v4failover` 验收模式 + 本机双实例脚本 | 无 root 的端到端证明 | C3 D1 |
 | | E2 fake 注入与脑裂演练 | 残留锁、围栏分离 | B2 C2 D2 |
 | | E3 文档 | 08 册、deployment.md、07 §7.5、09 册状态更新 | 全部 |
@@ -519,7 +519,7 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
   临时脚本把四个变量写回文件、进程环境里的旧 `LNFS_PREV_NODE` 不透传、`sleep 30` 在 200ms 被杀
   返回 ETIMEDOUT、`exit 3` → EIO、缺失路径 → ENOENT、钩子失败控制器仍转 Active。
 
-### D2 CephFS reclaim 原语
+### D2 CephFS reclaim 原语（已完成，2026-09-05）
 
 **目标**：09 §9.7 CephFS 条：以同一 uuid 接管旧会话，MDS 立即驱逐并释放 caps/锁。
 
@@ -558,6 +558,32 @@ lightnfs_cluster_activation_seconds{quantile=...}  # 或直方图，覆盖 §9.6
   `reclaim_calls()` 计数。
 - `tests/test_cephfs.cpp`：`takeover()` 前对残留区间 `lock()` 得 EAGAIN，`takeover()` 后成功；
   缺失符号时 `takeover()` 返回 ENOTSUP 而非崩溃。
+
+**实现记录（与上文的差异）**：
+- 真实签名（Ceph 20.2 `libcephfs.h`，`check_cephapi_abi.sh` 已比对通过）：`ceph_set_uuid` 返回
+  **void**，不是 int；`ceph_finish_reclaim` 也是 void。`kReclaimReset` 由脚本与 `CEPH_RECLAIM_RESET`
+  静态断言。
+- **顺序改为 unmount → `start_reclaim(uuid, RESET)` → `finish_reclaim` → `set_uuid(uuid)` → mount**：
+  libcephfs 的 `Client::start_reclaim` 对"句柄自身已带的 uuid"直接回 EINVAL，所以 uuid 必须在回收
+  **之后**才设到句柄上（Ganesha FSAL_CEPH 同序）。回收失败（EOPNOTSUPP/ENOTRECOVERABLE）时**不**
+  `set_uuid`，让下次接管还能重试回收；同一会话再次 `takeover()`（uuid 已是自己的）只重挂不回收。
+- uuid 为空时由后端在 `takeover()` 里按 `ClusterIdentity.cluster_id + "-" + fsid` 派生，不需要 daemon
+  在构造前注入——各网关得到相同值，效果一致，少一处耦合。
+- 重挂失败（`ceph_mount`/取根失败）：释放句柄与 UserPerm，导出回到"未启动"（`started()==false`、
+  操作回 ENOTCONN），返回该错误；控制器 Draining 后的 `backend_reset` 用 `stop()+start()` 重建。
+  `start()` 的挂载 + 取根尾段抽成 `mount_root()` 与 `takeover()` 共用。
+- fake：会话注册表（`ceph_create`/`ceph_release`）、`ceph_mount_info.uuid/evicted`、
+  `plant_stale_lock(path, uuid, start, len)` 造一个持 uuid 的"幽灵会话"及其排他锁，`start_reclaim`
+  按真实语义（未 init → ENOTCONN、已挂载 → EISCONN、自身 uuid → EINVAL、无人持有 → ENOENT、
+  `fail_reclaim(err)` 注入）驱逐持同 uuid 的其他会话并删其锁，被驱逐会话此后 `setlk` 回 ESHUTDOWN；
+  `api_without_reclaim()` 给出缺三个符号的表（`complete()` 对可选项放行）；另有 `stale_locks()`/
+  `reclaim_calls()`/`last_uuid()`。
+- 测试：`Cephfs.TakeoverReclaimsStaleLocks`（残留锁 EAGAIN → takeover → 成功；他人 uuid 的锁不受影响；
+  同会话二次 takeover 不再回收；stop/start 后会话无 uuid、再接管 ENOENT 视为成功；无泄漏）、
+  `Cephfs.TakeoverExplicitUuidAndFailures`（显式 uuid；ENOTRECOVERABLE/EOPNOTSUPP 报错但仍服务且
+  下次重试成功；重挂失败停用后 `start()` 恢复）、`Cephfs.TakeoverWithoutReclaimSymbolsOrMount`
+  （ENOTSUP 且继续服务；未启动 → ENOTCONN）；`ConfigFactory` 加 `uuid` 键。本机无 Ceph 集群，
+  真实库只核对了 `libcephfs.so.2`（20.2.0）导出这三个符号；集群验收留给 E1/`accept_cephfs.sh`。
 
 ---
 

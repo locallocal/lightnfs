@@ -231,8 +231,9 @@ mount          = "/mnt/lustre"    # 挂载根，默认自动探测（沿父目�
 | v4.2 | `ceph_ll_lseek(SEEK_DATA/HOLE)`（Ceph 无 extent 图：文件内 DATA=偏移本身、HOLE=EOF，越界 ENXIO——RFC 7862 最小实现）/ `ceph_ll_fallocate(0)` / `ceph_ll_fallocate(PUNCH_HOLE\|KEEP_SIZE)` → kSparseOps；copy_range = 网关侧 `ll_read/ll_write` 循环（libcephfs 无 copy_file_range）→ kCopyRange | 无 CLONE |
 | locks | `CephLockMgr`：每 (文件, lock-owner) 一个 Fh（网关身份 O_RDWR，EACCES 回落 O_RDONLY），`ceph_ll_setlk(fh, flock, owner64, sleep=0)`，owner64 = LockOwnerId 字节的 FNV-1a；冲突 EAGAIN/EWOULDBLOCK；`test()` 用 owner 0 的探测 Fh 走 `ceph_ll_getlk`；`release()` 全量解锁并关 Fh（Ceph 关 Fh 即释放其锁） → **kByteLocks**，`native_locks()` 交给状态层下推 | MDS 全局仲裁：多网关与原生客户端之间互相看见；`native_locks=false` 关闭 |
 | jukebox | ENOTCONN/ETIMEDOUT/ENETDOWN/ENETUNREACH/EHOSTUNREACH/EHOSTDOWN → `kJukebox`（v3 JUKEBOX / v4 DELAY）→ **kJukebox**；EBLOCKLISTED（ESHUTDOWN，会话被列入黑名单）→ **硬 EIO** + `blocklisted` 计数（重试无意义，需重启网关） | MDS failover / OSD 重连期间客户端重试而非报错；`jukebox=false` 时回 EIO |
+| Backend::takeover（09 §9.7，10 册 D2，2026-09-05） | 先清锁 Fh/Fh 缓存/inode 缓存/根引用，`ceph_unmount` → `ceph_start_reclaim(uuid, CEPH_RECLAIM_RESET)`（0 → `ceph_finish_reclaim`；-ENOENT = 没有旧会话，视为成功；其他错误只告警）→ 成功时 `ceph_set_uuid(uuid)` → `ceph_mount` + 重新取根。uuid = `[export.cephfs] uuid`，空则 `<cluster id>-<fsid>`（各网关相同） | MDS 立即驱逐持同一 uuid 的故障网关会话并释放其 caps/锁；**先 reclaim 后 set_uuid**——库拒绝回收句柄自身已带的 uuid；Standby 从不带 uuid 挂载（会踢掉活动网关），stop()+start() 回到无 uuid 会话；三个符号在函数表里可选，旧 libcephfs 缺失时 `takeover()` 回 ENOTSUP 并告警；重挂失败则导出停用（同未启动）待下次 `start()` |
 
-**绑定方式**：`backend/cephfs/cephapi.hpp` 定义一张 46 项函数表（签名取自 Ceph 20 的
+**绑定方式**：`backend/cephfs/cephapi.hpp` 定义一张 49 项函数表（其中会话回收的 3 项可选）（签名取自 Ceph 20 的
 `cephfs/libcephfs.h` / `cephfs/ceph_ll_client.h`，不透明类型按真名在全局命名空间声明；
 `ceph_statx` 与 `vinodeno_t` 在真头文件的 include guard 下自带完整定义），`cephapi.cpp`
 在 `start()` 时 `dlopen("libcephfs.so.2")` + `dlsym`（libcephfs 无符号版本）填表——二进制
@@ -240,7 +241,8 @@ mount          = "/mnt/lustre"    # 挂载根，默认自动探测（沿父目�
 声明做编译期比对，并用 C 编译单元核对 `vinodeno_t`/`ceph_statx` 布局（已对 20.2.0 头文件
 通过）。测试用 `tests/cephapi_fake.cpp` 在本地目录上实现同一张表（UserPerm 身份、永不复用的
 合成 inode 号、stx_dev=snapid、每次变更递增的 stx_version、按 (inode, owner) 键并随 Fh 关闭
-释放的锁表、可注入传输/黑名单错误），`tests/test_cephfs.cpp` 12 个用例由此把整条后端逻辑跑在
+释放的锁表、可注入传输/黑名单错误、带 uuid 的会话表与 `plant_stale_lock` 植入的故障网关残留锁），
+`tests/test_cephfs.cpp` 15 个用例由此把整条后端逻辑跑在
 ctest 里；真实集群验收 = `scripts/accept_cephfs.sh`（校验启动日志 `native-change=true
 native-locks=true`）。
 

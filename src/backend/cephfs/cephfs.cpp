@@ -561,6 +561,39 @@ bool CephBackend::valid_name(std::string_view name, bool allow_dotdot) {
   return true;
 }
 
+namespace {
+
+// ceph_mount(subdir) + the export root (lookup_root + getattr + directory check).
+// On failure the handle is left unmounted again, so the caller can release it.
+struct MountedRoot {
+  Inode* root;
+  struct ceph_statx st;
+};
+Result<MountedRoot> mount_root(const cephapi::Api& api, ceph_mount_info* m,
+                               const std::string& subdir, const UserPerm* perms) {
+  int rc = api.ceph_mount(m, subdir.c_str());
+  if (rc < 0) return Err(errno_from(-rc));
+  Inode* root = nullptr;
+  if ((rc = api.ceph_ll_lookup_root(m, &root)) < 0 || !root) {
+    api.ceph_unmount(m);
+    return Err(errno_from(rc < 0 ? -rc : ENOENT));
+  }
+  struct ceph_statx st {};
+  if ((rc = api.ceph_ll_getattr(m, root, &st, kWant, 0, perms)) < 0) {
+    api.ceph_ll_put(m, root);
+    api.ceph_unmount(m);
+    return Err(errno_from(-rc));
+  }
+  if (!S_ISDIR(st.stx_mode)) {
+    api.ceph_ll_put(m, root);
+    api.ceph_unmount(m);
+    return Err(errno_from(ENOTDIR));
+  }
+  return MountedRoot{root, st};
+}
+
+}  // namespace
+
 rt::Task<Result<void>> CephBackend::start() {
   if (mount_) co_return Result<void>{};
   if (!api_) {
@@ -589,10 +622,8 @@ rt::Task<Result<void>> CephBackend::start() {
     ceph_mount_info* m = nullptr;
     int rc = api->ceph_create(&m, cfg.id.empty() ? nullptr : cfg.id.c_str());
     if (rc < 0 || !m) return Err(errno_from(rc < 0 ? -rc : ENOMEM));
-    bool mounted = false;
     auto fail = [&](int e) {
-      if (mounted) api->ceph_shutdown(m);
-      else api->ceph_release(m);
+      api->ceph_release(m);  // never mounted on any failure path below
       return Err(errno_from(e ? e : EIO));
     };
     rc = api->ceph_conf_read_file(m, cfg.conf.empty() ? nullptr : cfg.conf.c_str());
@@ -612,32 +643,19 @@ rt::Task<Result<void>> CephBackend::start() {
     if ((rc = api->ceph_init(m)) < 0) return fail(-rc);
     if (!cfg.fs_name.empty() && (rc = api->ceph_select_filesystem(m, cfg.fs_name.c_str())) < 0)
       return fail(-rc);
-    if ((rc = api->ceph_mount(m, cfg.subdir.c_str())) < 0) return fail(-rc);
-    mounted = true;
     UserPerm* root_perms = api->ceph_userperm_new(0, 0, 0, nullptr);
     if (!root_perms) return fail(ENOMEM);
-    Inode* root = nullptr;
-    if ((rc = api->ceph_ll_lookup_root(m, &root)) < 0 || !root) {
+    auto mounted = mount_root(*api, m, cfg.subdir, root_perms);
+    if (!mounted) {
       api->ceph_userperm_destroy(root_perms);
-      return fail(rc < 0 ? -rc : ENOENT);
-    }
-    struct ceph_statx st {};
-    if ((rc = api->ceph_ll_getattr(m, root, &st, kWant, 0, root_perms)) < 0) {
-      api->ceph_ll_put(m, root);
-      api->ceph_userperm_destroy(root_perms);
-      return fail(-rc);
-    }
-    if (!S_ISDIR(st.stx_mode)) {
-      api->ceph_ll_put(m, root);
-      api->ceph_userperm_destroy(root_perms);
-      return fail(ENOTDIR);
+      return fail(static_cast<int>(mounted.error()));
     }
     char buf[64] = {};
     std::string fsid;
     if (api->ceph_conf_get(m, "fsid", buf, sizeof buf) >= 0) fsid = buf;
     int major = 0, minor = 0, patch = 0;
     const char* ver = api->ceph_version(&major, &minor, &patch);
-    return Started{m, root_perms, root, st, fsid, api->ceph_get_fs_cid(m),
+    return Started{m, root_perms, mounted->root, mounted->st, fsid, api->ceph_get_fs_cid(m),
                    ver ? ver : "?"};
   }, rt::OffloadClass::kHeavy);
   if (!started) {
@@ -651,6 +669,7 @@ rt::Task<Result<void>> CephBackend::start() {
   root_oid_ = oid_of(started->st);
   cluster_fsid_ = started->cluster_fsid;
   fscid_ = started->fscid;
+  session_uuid_.clear();  // a fresh session: no uuid until a takeover sets one
   obj_cache_->insert(root_oid_,
                      std::make_shared<ObjCache::Entry>(root_oid_, root_, FType::kDir));
   LNFS_INFO("cephfs export {} up: cluster {} fs '{}' (fscid {}) libcephfs {} "
@@ -678,6 +697,93 @@ rt::Task<Result<void>> CephBackend::stop() {
     api->ceph_release(m);
   }, rt::OffloadClass::kHeavy);
   co_return Result<void>{};
+}
+
+rt::Task<Result<void>> CephBackend::takeover(const ClusterIdentity& who) {
+  if (!mount_) co_return Err(errno_from(ENOTCONN));
+  if (!cephapi::reclaim_supported(*api_)) {
+    LNFS_WARN("cephfs export {}: libcephfs has no session reclaim (ceph_start_reclaim); "
+              "the failed gateway's caps and locks expire on the MDS's own timeout",
+              cfg_.subdir);
+    co_return Err(errno_from(ENOTSUP));
+  }
+  const std::string uuid =
+      cfg_.uuid.empty() ? who.cluster_id + "-" + std::to_string(cfg_.fsid) : cfg_.uuid;
+  // Everything that references the mount goes first, as in stop(): a standby has no
+  // protocol stack, so nothing else holds objects or Fhs.
+  if (locks_) locks_->close_all();
+  fd_cache_->clear();
+  obj_cache_->clear();
+  root_.reset();
+  ceph_mount_info* m = mount_;
+  mount_ = nullptr;  // anything arriving meanwhile answers ENOTCONN
+  const bool already_ours = session_uuid_ == uuid;
+  auto api = api_;
+  auto cfg = cfg_;
+  UserPerm* perms = root_perms_;
+  struct Outcome {
+    Result<void> reclaim;
+    Result<MountedRoot> root;
+  };
+  auto out = co_await rt::offload([api, m, cfg, perms, uuid, already_ours, node = who.node,
+                                   epoch = who.epoch]() -> Outcome {
+    Outcome o{Result<void>{}, Result<MountedRoot>(Err(errno_from(EIO)))};
+    // The reclaim entries want an initialised but unmounted handle.
+    int rc = api->ceph_unmount(m);
+    if (rc < 0 && rc != -ENOTCONN)
+      LNFS_WARN("cephfs export {}: unmount before reclaim failed: {}", cfg.subdir,
+                errno_name(errno_from(-rc)));
+    if (already_ours) {
+      // Reclaiming one's own uuid is rejected by the library (EINVAL); the session
+      // is ours already, only the remount is needed.
+      LNFS_INFO("cephfs export {}: session uuid {} already ours; remounting", cfg.subdir,
+                uuid);
+    } else {
+      // Reclaim first, then adopt the uuid: the library refuses to reclaim the uuid
+      // the handle already carries.  RESET = evict the holder, do not inherit state.
+      rc = api->ceph_start_reclaim(m, uuid.c_str(), cephapi::kReclaimReset);
+      if (rc == 0) {
+        api->ceph_finish_reclaim(m);
+        LNFS_INFO("cephfs export {}: reclaimed session uuid {} for {} (epoch {}): the MDS "
+                  "evicted the previous holder",
+                  cfg.subdir, uuid, node, epoch);
+      } else if (rc == -ENOENT) {
+        LNFS_INFO("cephfs export {}: no session with uuid {} to reclaim (epoch {})",
+                  cfg.subdir, uuid, epoch);
+      } else {
+        o.reclaim = Err(errno_from(-rc));
+        LNFS_WARN("cephfs export {}: reclaim of session uuid {} failed: {} (locks held "
+                  "by the failed gateway expire on the MDS's own timeout; the uuid is "
+                  "not adopted so the next takeover retries)",
+                  cfg.subdir, uuid, errno_name(o.reclaim.error()));
+      }
+      // Adopt the uuid only after a reclaim outcome that settled it: with the uuid
+      // set, the library refuses a later reclaim of the same uuid (EINVAL).
+      if (o.reclaim) api->ceph_set_uuid(m, uuid.c_str());
+    }
+    o.root = mount_root(*api, m, cfg.subdir, perms);
+    return o;
+  }, rt::OffloadClass::kHeavy);
+  if (!out.root) {
+    // The export is down until the next start(): drop the handle so stop()/start()
+    // rebuild it from scratch (the controller's backend_reset after draining).
+    LNFS_ERROR("cephfs export {}: remount after reclaim failed: {}", cfg_.subdir,
+               errno_name(out.root.error()));
+    root_perms_ = nullptr;
+    session_uuid_.clear();
+    co_await rt::offload([api, m, perms] {
+      api->ceph_userperm_destroy(perms);
+      api->ceph_shutdown(m);
+    }, rt::OffloadClass::kHeavy);
+    co_return Err(out.root.error());
+  }
+  mount_ = m;
+  if (out.reclaim) session_uuid_ = uuid;
+  root_ = std::make_shared<InodeRef>(api_.get(), mount_, out.root->root);
+  root_oid_ = oid_of(out.root->st);
+  obj_cache_->insert(root_oid_,
+                     std::make_shared<ObjCache::Entry>(root_oid_, root_, FType::kDir));
+  co_return out.reclaim;
 }
 
 rt::Task<Result<ObjPtr>> CephBackend::root() {
@@ -1677,6 +1783,7 @@ std::unique_ptr<Backend> make_cephfs(const BackendConfig& cfg) {
     else if (key == "fs_name" || key == "filesystem") c.fs_name = value;
     else if (key == "subdir") c.subdir = value;
     else if (key == "log_file") c.log_file = value;
+    else if (key == "uuid") c.uuid = value;
     else if (key == "options") {
       if (!parse_options(value, c.options)) return bad("options", value);
     } else if (key == "fd_cache") {

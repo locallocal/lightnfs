@@ -12,10 +12,12 @@ namespace {
 struct Sym {
   const char* name;
   size_t offset;  // of the member in Api
+  bool optional = false;  // missing in older libraries: left null, not an error
 };
 
 // libcephfs exports unversioned symbols (no version script), so plain dlsym.
 #define LNFS_CEPH_SYM(fn) Sym{#fn, offsetof(Api, fn)}
+#define LNFS_CEPH_OPT_SYM(fn) Sym{#fn, offsetof(Api, fn), true}
 constexpr Sym kSyms[] = {
     LNFS_CEPH_SYM(ceph_version),
     LNFS_CEPH_SYM(ceph_create),
@@ -63,18 +65,29 @@ constexpr Sym kSyms[] = {
     LNFS_CEPH_SYM(ceph_ll_releasedir),
     LNFS_CEPH_SYM(ceph_readdirplus_r),
     LNFS_CEPH_SYM(ceph_seekdir),
+    LNFS_CEPH_OPT_SYM(ceph_set_uuid),
+    LNFS_CEPH_OPT_SYM(ceph_start_reclaim),
+    LNFS_CEPH_OPT_SYM(ceph_finish_reclaim),
 };
 #undef LNFS_CEPH_SYM
+#undef LNFS_CEPH_OPT_SYM
+
+bool present(const Api& api, const Sym& s) {
+  void* fn = nullptr;
+  std::memcpy(&fn, reinterpret_cast<const char*>(&api) + s.offset, sizeof fn);
+  return fn != nullptr;
+}
 
 }  // namespace
 
 bool complete(const Api& api) {
-  for (const Sym& s : kSyms) {
-    void* fn = nullptr;
-    std::memcpy(&fn, reinterpret_cast<const char*>(&api) + s.offset, sizeof fn);
-    if (!fn) return false;
-  }
+  for (const Sym& s : kSyms)
+    if (!s.optional && !present(api, s)) return false;
   return true;
+}
+
+bool reclaim_supported(const Api& api) {
+  return api.ceph_set_uuid && api.ceph_start_reclaim && api.ceph_finish_reclaim;
 }
 
 Result<std::shared_ptr<const Api>> load_system_api(std::string* detail) {
@@ -104,6 +117,7 @@ Result<std::shared_ptr<const Api>> load_system_api(std::string* detail) {
   auto api = std::make_shared<Api>();
   for (const Sym& s : kSyms) {
     void* fn = ::dlsym(handle, s.name);
+    if (!fn && s.optional) continue;
     if (!fn) {
       cached_error = errno_from(ENOEXEC);
       cached_detail = std::string("missing symbol ") + s.name + " (Ceph >= 15 required)";
