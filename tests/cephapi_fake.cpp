@@ -26,6 +26,10 @@ struct ceph_mount_info {
   bool mounted = false;
   std::string fs_name;
   std::unordered_map<std::string, std::string> conf;
+  // Session reclaim (plan 10 D2): the uuid this session carries (ceph_set_uuid) and
+  // whether another session reclaimed it (its locks are gone, its calls fail).
+  std::string uuid;
+  bool evicted = false;
 };
 
 struct Inode {
@@ -94,6 +98,14 @@ struct State {
     bool excl;
   };
   std::vector<Seg> locks;
+  // Live sessions (ceph_create → ceph_release) plus the "ghost" sessions of failed
+  // gateways planted by plant_stale_lock — the ones a reclaim evicts.
+  std::vector<ceph_mount_info*> mounts;
+  std::vector<std::unique_ptr<ceph_mount_info>> ghosts;
+  std::vector<std::unique_ptr<Fh>> ghost_fhs;
+  std::atomic<uint64_t> reclaim_calls{0};
+  std::string last_uuid;
+  int fail_reclaim = 0;
 };
 
 State& st() {
@@ -274,6 +286,11 @@ const char* f_version(int* major, int* minor, int* patch) {
 int f_create(ceph_mount_info** out, const char* const id) {
   auto* m = new ceph_mount_info;
   m->id = id ? id : "admin";
+  {
+    auto& s = st();
+    std::lock_guard lock(s.mu);
+    s.mounts.push_back(m);
+  }
   *out = m;
   return 0;
 }
@@ -337,9 +354,49 @@ int f_unmount(ceph_mount_info* m) {
 }
 int f_release(ceph_mount_info* m) {
   if (m->mounted) return -EISCONN;
+  {
+    auto& s = st();
+    std::lock_guard lock(s.mu);
+    std::erase(s.mounts, m);
+  }
   delete m;
   return 0;
 }
+
+// ---- session reclaim (design 09 §9.7, plan 10 D2) --------------------------------
+// Real semantics: set_uuid/start_reclaim want an initialised, unmounted handle;
+// start_reclaim(u, RESET) evicts every other session carrying u (their locks go
+// with them) and is refused (EINVAL) for the caller's own uuid; ENOENT when nobody
+// holds u.  An evicted session answers every later call with EBLOCKLISTED.
+
+void f_set_uuid(ceph_mount_info* m, const char* uuid) {
+  auto& s = st();
+  std::lock_guard lock(s.mu);
+  m->uuid = uuid ? uuid : "";
+  s.last_uuid = m->uuid;
+}
+int f_start_reclaim(ceph_mount_info* m, const char* uuid, unsigned flags) {
+  auto& s = st();
+  std::lock_guard lock(s.mu);
+  s.reclaim_calls.fetch_add(1);
+  if (!m->inited) return -ENOTCONN;
+  if (m->mounted) return -EISCONN;
+  if (!uuid || !*uuid) return -EINVAL;
+  if (m->uuid == uuid) return -EINVAL;
+  if (flags != capi::kReclaimReset) return -EINVAL;
+  if (s.fail_reclaim) return -s.fail_reclaim;
+  bool found = false;
+  auto evict = [&](ceph_mount_info* other) {
+    if (other == m || other->uuid != uuid || other->evicted) return;
+    found = true;
+    other->evicted = true;
+    std::erase_if(s.locks, [&](const State::Seg& seg) { return seg.fh->mount == other; });
+  };
+  for (auto* other : s.mounts) evict(other);
+  for (auto& ghost : s.ghosts) evict(ghost.get());
+  return found ? 0 : -ENOENT;
+}
+void f_finish_reclaim(ceph_mount_info*) {}
 void f_shutdown(ceph_mount_info* m) {
   if (m->mounted) f_unmount(m);
   f_release(m);
@@ -743,6 +800,7 @@ int f_ll_close(ceph_mount_info*, Fh* fh) {
 int do_lock(Fh* fh, struct flock* fl, uint64_t owner, bool test) {
   auto& s = st();
   std::lock_guard lock(s.mu);
+  if (fh->mount && fh->mount->evicted) return -ESHUTDOWN;  // EBLOCKLISTED
   uint64_t start = static_cast<uint64_t>(fl->l_start);
   uint64_t end = fl->l_len == 0 ? UINT64_MAX : start + static_cast<uint64_t>(fl->l_len);
   auto overlaps = [&](const State::Seg& seg) {
@@ -908,9 +966,70 @@ std::shared_ptr<const Api> FakeCephApi::api() {
     a->ceph_ll_releasedir = f_ll_releasedir;
     a->ceph_readdirplus_r = f_readdirplus_r;
     a->ceph_seekdir = f_seekdir;
+    a->ceph_set_uuid = f_set_uuid;
+    a->ceph_start_reclaim = f_start_reclaim;
+    a->ceph_finish_reclaim = f_finish_reclaim;
     return std::shared_ptr<const Api>(a);
   }();
   return table;
+}
+
+std::shared_ptr<const Api> FakeCephApi::api_without_reclaim() {
+  static std::shared_ptr<const Api> table = [] {
+    auto a = std::make_shared<Api>(*api());
+    a->ceph_set_uuid = nullptr;
+    a->ceph_start_reclaim = nullptr;
+    a->ceph_finish_reclaim = nullptr;
+    return std::shared_ptr<const Api>(a);
+  }();
+  return table;
+}
+
+bool FakeCephApi::plant_stale_lock(const std::string& rel_path, const std::string& uuid,
+                                   uint64_t start, uint64_t len) {
+  auto& s = st();
+  std::string full;
+  {
+    std::lock_guard lock(s.mu);
+    full = s.root + "/" + rel_path;
+  }
+  struct stat sb {};
+  if (stat(full.c_str(), &sb) < 0) return false;
+  uint64_t ino = synthetic_ino(sb, rel_path, false);
+  std::lock_guard lock(s.mu);
+  auto ghost = std::make_unique<ceph_mount_info>();
+  ghost->id = "dead-gateway";
+  ghost->inited = true;
+  ghost->uuid = uuid;
+  auto fh = std::make_unique<Fh>();
+  fh->mount = ghost.get();
+  fh->ino = ino;
+  uint64_t end = len == 0 || len == UINT64_MAX ? UINT64_MAX : start + len;
+  // Owner 0xdead…: distinct from anything a gateway derives from a LockOwnerId.
+  s.locks.push_back({ino, 0xdeadbeefdeadbeefull, fh.get(), start, end, true});
+  s.ghosts.push_back(std::move(ghost));
+  s.ghost_fhs.push_back(std::move(fh));
+  return true;
+}
+size_t FakeCephApi::stale_locks() {
+  auto& s = st();
+  std::lock_guard lock(s.mu);
+  size_t n = 0;
+  for (const auto& seg : s.locks)
+    for (const auto& ghost : s.ghosts)
+      if (seg.fh->mount == ghost.get()) ++n;
+  return n;
+}
+uint64_t FakeCephApi::reclaim_calls() { return st().reclaim_calls.load(); }
+std::string FakeCephApi::last_uuid() {
+  auto& s = st();
+  std::lock_guard lock(s.mu);
+  return s.last_uuid;
+}
+void FakeCephApi::fail_reclaim(int err) {
+  auto& s = st();
+  std::lock_guard lock(s.mu);
+  s.fail_reclaim = err;
 }
 
 void FakeCephApi::set_root(std::string dir) {
@@ -921,6 +1040,11 @@ void FakeCephApi::set_root(std::string dir) {
   s.paths.clear();
   s.versions.clear();
   s.locks.clear();
+  s.ghosts.clear();
+  s.ghost_fhs.clear();
+  s.reclaim_calls.store(0);
+  s.last_uuid.clear();
+  s.fail_reclaim = 0;
   s.next_ino = 0x10000000000ull;
   s.fail_mount = 0;
   s.fail_left.store(0);

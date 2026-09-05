@@ -61,13 +61,21 @@ T run(rt::Runtime& runtime, rt::Task<T> task) {
 }
 
 // A started fake-backed CephFS export.
+struct MountOpts {
+  bool jukebox = true;
+  bool locks = true;
+  std::string uuid;  // [export.cephfs] uuid; empty = derived at takeover
+  std::shared_ptr<const backend::cephapi::Api> api = testing::FakeCephApi::api();
+};
 struct Mount {
   TmpDir dir;
   rt::Runtime runtime{{.reactors = 1, .offload_threads = 4}};
   std::unique_ptr<backend::CephBackend> be;
   backend::Cred root_cred{0, 0, {}};
 
-  explicit Mount(bool jukebox = true, bool locks = true) {
+  explicit Mount(bool jukebox = true, bool locks = true)
+      : Mount(MountOpts{.jukebox = jukebox, .locks = locks}) {}
+  explicit Mount(MountOpts opts) {
     testing::FakeCephApi::set_root(dir.path);
     backend::fault::clear();
     runtime.start();
@@ -76,9 +84,10 @@ struct Mount {
     cfg.fs_name = "cephfs";
     cfg.id = "lightnfs";
     cfg.mon_host = "10.0.0.1";
-    cfg.jukebox = jukebox;
-    cfg.native_locks = locks;
-    auto made = backend::CephBackend::create(cfg, testing::FakeCephApi::api());
+    cfg.jukebox = opts.jukebox;
+    cfg.native_locks = opts.locks;
+    cfg.uuid = opts.uuid;
+    auto made = backend::CephBackend::create(cfg, opts.api);
     ASSERT_TRUE(made.has_value());
     be = std::move(*made);
     auto started = run(runtime, be->start());
@@ -675,6 +684,173 @@ TEST(Cephfs, NativeByteRangeLocks) {
   EXPECT_EQ(raw(on_dir.error()), EINVAL);
 }
 
+// ---- plan 10 D2: session reclaim on takeover ---------------------------------------
+
+namespace {
+backend::LockOwnerId owner_id(const char* tag) {
+  backend::LockOwnerId id;
+  id.len = 4;
+  std::memcpy(id.bytes.data(), tag, 4);
+  return id;
+}
+backend::ObjPtr child(Mount& m, const char* name) {
+  auto root = m.root();
+  auto got = run(m.runtime, root->lookup(m.root_cred, name));
+  EXPECT_TRUE(got.has_value());
+  return got ? *got : nullptr;
+}
+}  // namespace
+
+TEST(Cephfs, TakeoverReclaimsStaleLocks) {
+  const int inodes_before = testing::FakeCephApi::live_inodes();
+  const int fhs_before = testing::FakeCephApi::live_fhs();
+  const int perms_before = testing::FakeCephApi::live_perms();
+  Mount m;
+  {
+    auto root = m.root();
+    ASSERT_TRUE(run(m.runtime, root->create(m.root_cred, "lk", backend::SetAttr{}, nullptr))
+                    .has_value());
+    ASSERT_TRUE(run(m.runtime, root->create(m.root_cred, "other", backend::SetAttr{}, nullptr))
+                    .has_value());
+  }
+  // The dead gateway's residue: it held the cluster's uuid ("<cluster id>-<fsid>");
+  // a third party's lock under another uuid must survive the reclaim.
+  ASSERT_TRUE(testing::FakeCephApi::plant_stale_lock("lk", "cluster-x-9", 0, 10));
+  ASSERT_TRUE(testing::FakeCephApi::plant_stale_lock("other", "someone-else", 0, 10));
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 2u);
+  auto& mgr = m.be->native_locks()->get();
+  const auto a = owner_id("own1");
+  {
+    auto lk = child(m, "lk");
+    auto conflict = run(m.runtime, mgr.lock(*lk, a, {0, 10}, true, false));
+    ASSERT_TRUE(!conflict.has_value());
+    EXPECT_EQ(raw(conflict.error()), EAGAIN);
+  }
+  EXPECT_TRUE(m.be->session_uuid().empty());  // a standby's session carries no uuid
+
+  // Takeover: reclaim(uuid, RESET) evicted the ghost, our session now carries the
+  // uuid, the remounted export serves and the range is free.
+  backend::ClusterIdentity who{.cluster_id = "cluster-x", .node = "gw2", .epoch = 5};
+  ASSERT_TRUE(run(m.runtime, m.be->takeover(who)).has_value());
+  EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 1u);
+  EXPECT_STREQ(testing::FakeCephApi::last_uuid(), "cluster-x-9");
+  EXPECT_STREQ(m.be->session_uuid(), "cluster-x-9");
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);
+  EXPECT_TRUE(m.be->started());
+  EXPECT_EQ(m.be->stats().lock_fds, 0u);  // caches and lock Fhs were dropped for the remount
+  {
+    auto lk = child(m, "lk");
+    ASSERT_TRUE(run(m.runtime, mgr.lock(*lk, a, {0, 10}, true, false)).has_value());
+    auto other = child(m, "other");
+    auto still = run(m.runtime, mgr.lock(*other, a, {0, 10}, true, false));
+    ASSERT_TRUE(!still.has_value());
+    EXPECT_EQ(raw(still.error()), EAGAIN);
+    ASSERT_TRUE(run(m.runtime, mgr.release(*lk, a)).has_value());
+  }
+  // A second takeover on the same session: the uuid is ours, only the remount runs.
+  ASSERT_TRUE(run(m.runtime, m.be->takeover(who)).has_value());
+  EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 1u);
+  EXPECT_TRUE(child(m, "lk") != nullptr);
+  // stop()+start() (the controller's backend_reset after draining) is a plain session
+  // again; the next takeover reclaims — nobody holds the uuid now → ENOENT → success.
+  ASSERT_TRUE(run(m.runtime, m.be->stop()).has_value());
+  ASSERT_TRUE(run(m.runtime, m.be->start()).has_value());
+  EXPECT_TRUE(m.be->session_uuid().empty());
+  ASSERT_TRUE(run(m.runtime, m.be->takeover(who)).has_value());
+  EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 2u);
+  EXPECT_STREQ(m.be->session_uuid(), "cluster-x-9");
+  EXPECT_TRUE(child(m, "other") != nullptr);
+  ASSERT_TRUE(run(m.runtime, m.be->stop()).has_value());
+  EXPECT_EQ(testing::FakeCephApi::live_inodes(), inodes_before);
+  EXPECT_EQ(testing::FakeCephApi::live_fhs(), fhs_before);
+  EXPECT_EQ(testing::FakeCephApi::live_perms(), perms_before);
+}
+
+TEST(Cephfs, TakeoverExplicitUuidAndFailures) {
+  const int inodes_before = testing::FakeCephApi::live_inodes();
+  const int perms_before = testing::FakeCephApi::live_perms();
+  Mount m(MountOpts{.uuid = "ha-uuid-1"});
+  {
+    auto root = m.root();
+    ASSERT_TRUE(run(m.runtime, root->create(m.root_cred, "lk", backend::SetAttr{}, nullptr))
+                    .has_value());
+  }
+  ASSERT_TRUE(testing::FakeCephApi::plant_stale_lock("lk", "ha-uuid-1", 0, 10));
+  auto& mgr = m.be->native_locks()->get();
+  const auto a = owner_id("own1");
+  backend::ClusterIdentity who{.cluster_id = "cluster-x", .node = "gw2", .epoch = 5};
+
+  // The MDS cannot reclaim: the error is reported, the export is remounted and
+  // serving, the uuid is not adopted so the next takeover retries the reclaim.
+  for (int err : {ENOTRECOVERABLE, EOPNOTSUPP}) {
+    testing::FakeCephApi::fail_reclaim(err);
+    auto took = run(m.runtime, m.be->takeover(who));
+    ASSERT_TRUE(!took.has_value());
+    EXPECT_EQ(raw(took.error()), err);
+    EXPECT_TRUE(m.be->started());
+    EXPECT_TRUE(m.be->session_uuid().empty());
+    EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);
+    auto lk = child(m, "lk");
+    ASSERT_TRUE(lk != nullptr);
+    EXPECT_FALSE(run(m.runtime, mgr.lock(*lk, a, {0, 10}, true, false)).has_value());
+  }
+  EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 2u);
+  testing::FakeCephApi::fail_reclaim(0);
+  ASSERT_TRUE(run(m.runtime, m.be->takeover(who)).has_value());
+  EXPECT_STREQ(testing::FakeCephApi::last_uuid(), "ha-uuid-1");  // the configured one
+  EXPECT_STREQ(m.be->session_uuid(), "ha-uuid-1");
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 0u);
+  {
+    auto lk = child(m, "lk");
+    ASSERT_TRUE(run(m.runtime, mgr.lock(*lk, a, {0, 10}, true, false)).has_value());
+    ASSERT_TRUE(run(m.runtime, mgr.release(*lk, a)).has_value());
+  }
+
+  // The remount fails: the export is down (as if never started) until start(),
+  // and nothing of the old session — inode references, the gateway's UserPerm —
+  // is left behind.
+  testing::FakeCephApi::fail_mount(ETIMEDOUT);
+  auto down = run(m.runtime, m.be->takeover(who));
+  ASSERT_TRUE(!down.has_value());
+  EXPECT_EQ(raw(down.error()), ETIMEDOUT);
+  EXPECT_FALSE(m.be->started());
+  EXPECT_FALSE(run(m.runtime, m.be->root()).has_value());
+  EXPECT_EQ(testing::FakeCephApi::live_inodes(), inodes_before);
+  EXPECT_EQ(testing::FakeCephApi::live_perms(), perms_before);
+  testing::FakeCephApi::fail_mount(0);
+  ASSERT_TRUE(run(m.runtime, m.be->start()).has_value());
+  EXPECT_TRUE(m.be->started());
+  EXPECT_TRUE(child(m, "lk") != nullptr);
+}
+
+TEST(Cephfs, TakeoverWithoutReclaimSymbolsOrMount) {
+  // An older libcephfs (no ceph_start_reclaim): the table still loads, takeover()
+  // answers ENOTSUP and the export keeps serving as it was.
+  Mount m(MountOpts{.api = testing::FakeCephApi::api_without_reclaim()});
+  EXPECT_TRUE(backend::cephapi::complete(*testing::FakeCephApi::api_without_reclaim()));
+  EXPECT_FALSE(backend::cephapi::reclaim_supported(*testing::FakeCephApi::api_without_reclaim()));
+  EXPECT_TRUE(backend::cephapi::reclaim_supported(*testing::FakeCephApi::api()));
+  backend::ClusterIdentity who{.cluster_id = "cluster-x", .node = "gw2", .epoch = 5};
+  auto took = run(m.runtime, m.be->takeover(who));
+  ASSERT_TRUE(!took.has_value());
+  EXPECT_EQ(raw(took.error()), ENOTSUP);
+  EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 0u);
+  EXPECT_TRUE(m.be->started());
+  auto root = m.root();
+  ASSERT_TRUE(root != nullptr);
+  EXPECT_TRUE(run(m.runtime, root->create(m.root_cred, "f", backend::SetAttr{}, nullptr))
+                  .has_value());
+
+  // Never started: nothing to reclaim on.
+  backend::CephBackend::Config cfg;
+  cfg.fsid = 9;
+  auto idle = backend::CephBackend::create(cfg, testing::FakeCephApi::api());
+  ASSERT_TRUE(idle.has_value());
+  auto not_started = run(m.runtime, (*idle)->takeover(who));
+  ASSERT_TRUE(!not_started.has_value());
+  EXPECT_EQ(raw(not_started.error()), ENOTCONN);
+}
+
 TEST(Cephfs, StopRestartAndLeakFree) {
   int inodes_before = testing::FakeCephApi::live_inodes();
   int fhs_before = testing::FakeCephApi::live_fhs();
@@ -727,6 +903,7 @@ TEST(Cephfs, ConfigFactory) {
   cfg.values["mon_host"] = "10.0.0.1,10.0.0.2";
   cfg.values["fs_name"] = "cephfs";
   cfg.values["subdir"] = "/exports/a";
+  cfg.values["uuid"] = "ha-uuid-1";
   cfg.values["options"] = "client_mount_timeout=30, client_cache_size=32768";
   cfg.values["fd_cache"] = "128";
   cfg.values["readdir_enrich"] = "false";
@@ -741,6 +918,7 @@ TEST(Cephfs, ConfigFactory) {
   EXPECT_STREQ(c->config().mon_host, "10.0.0.1,10.0.0.2");
   EXPECT_STREQ(c->config().fs_name, "cephfs");
   EXPECT_STREQ(c->config().subdir, "/exports/a");
+  EXPECT_STREQ(c->config().uuid, "ha-uuid-1");
   ASSERT_TRUE(c->config().options.size() == 2u);
   EXPECT_STREQ(c->config().options[0].first, "client_mount_timeout");
   EXPECT_STREQ(c->config().options[0].second, "30");

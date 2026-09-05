@@ -73,7 +73,7 @@ sudo systemctl enable --now lightnfs
 | 来源白名单 | `[[export]] clients` | CIDR 列表，收敛到受信网段 |
 | 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none` |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
-| 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` / `[export.lustre]` / `[export.cephfs]` | `local`（本机目录树）、`gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名）或 `lustre`（Lustre 客户端挂载内的目录：`mount`（默认自动探测）/`hsm`/`native_locks`/`identity`/`fd_cache`；非 Lustre 挂载启动即拒，写明 statfs magic 不符）或 `cephfs`（libcephfs 挂载：`conf`/`id`/`keyring`/`mon_host`/`fs_name`/`subdir`/`options`；运行时加载 `libcephfs.so.2`，缺库启动失败并写明；`path` 只是挂载名） |
+| 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` / `[export.lustre]` / `[export.cephfs]` | `local`（本机目录树）、`gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名）或 `lustre`（Lustre 客户端挂载内的目录：`mount`（默认自动探测）/`hsm`/`native_locks`/`identity`/`fd_cache`；非 Lustre 挂载启动即拒，写明 statfs magic 不符）或 `cephfs`（libcephfs 挂载：`conf`/`id`/`keyring`/`mon_host`/`fs_name`/`subdir`/`options`/`uuid`（多网关接管时回收的会话 uuid，默认 `<cluster id>-<fsid>`）；运行时加载 `libcephfs.so.2`，缺库启动失败并写明；`path` 只是挂载名） |
 | 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |
 | 传输加密 | `[tls] mode` / `cert` / `key` / `ca` / `client_cert` | RPC-over-TLS（RFC 9289）：off/optional/required + 证书；改动需重启 |
 | 租约 | `[protocol] lease` | v4.1 租约（默认 90s） |
@@ -199,6 +199,11 @@ sudo systemctl enable --now lightnfs
   `lightnfs_cephfs_blocklisted_total`——出现即需重启网关重连。`lightnfs-ctl fdcache` 对
   cephfs 导出显示 Fh/inode 缓存/jukebox/黑名单/锁句柄计数；`clear-poison` 同样适用；
   `scripts/check_cephapi_abi.sh` 在有 `cephfs/libcephfs.h` 的主机上校验绑定签名与结构布局。
+  多网关接管（10 册 D2）：新网关以同一会话 uuid（`[export.cephfs] uuid`，默认
+  `<cluster id>-<fsid>`）`ceph_start_reclaim(…, RESET)`，MDS 立即驱逐故障网关的会话并释放其
+  caps/锁，客户端在 grace 内的 reclaim 不再被残留锁挡住；standby 会话不带 uuid。MDS 不支持
+  （EOPNOTSUPP）或 libcephfs 太旧（缺 `ceph_start_reclaim`）只告警，残留按 MDS 自身会话超时
+  （`mds_session_autoclose`，默认 300s）清理——此时 grace 内的 LOCK reclaim 走 DELAY 重试。
 - **Lustre 后端**：文件句柄是 FID，经 `<mount>/.lustre/fid` 打开——网关进程**不需要**
   `CAP_DAC_READ_SEARCH` 即可获得跨重启稳定的句柄（本地后端在无该能力时只能走路径兜底）。
   客户端挂载建议 `-o flock`：`native_locks = true` 时 v4 字节锁以 OFD fcntl 锁下推，

@@ -83,6 +83,9 @@ inline constexpr int kSetMode = 1 << 0, kSetUid = 1 << 1, kSetGid = 1 << 2,
 inline constexpr unsigned kStatxDontSync = 0x4000;
 // libcephfs.h CEPH_NOSNAP: the head (non-snapshot) version of an inode
 inline constexpr uint64_t kNoSnap = static_cast<uint64_t>(-2);
+// libcephfs.h CEPH_RECLAIM_RESET: evict the session being reclaimed instead of
+// inheriting its state (design 09 §9.7, plan 10 D2)
+inline constexpr unsigned kReclaimReset = 1;
 // ceph_ll_client.h FALLOC_FL_* (Ceph accepts mode 0 and PUNCH_HOLE|KEEP_SIZE only)
 inline constexpr int kFallocKeepSize = 0x01, kFallocPunchHole = 0x02;
 
@@ -166,6 +169,12 @@ struct Api {
                             struct ceph_statx* stx, unsigned want, unsigned flags,
                             Inode** out) = nullptr;
   void (*ceph_seekdir)(ceph_mount_info*, ceph_dir_result* dirp, int64_t offset) = nullptr;
+  // state reclaim (design 09 §9.7, plan 10 D2) — optional: a libcephfs without them
+  // (pre-Nautilus) still loads; CephBackend::takeover() then answers ENOTSUP.
+  // set_uuid/start_reclaim want an initialised, *unmounted* handle.
+  void (*ceph_set_uuid)(ceph_mount_info*, const char* uuid) = nullptr;
+  int (*ceph_start_reclaim)(ceph_mount_info*, const char* uuid, unsigned flags) = nullptr;
+  void (*ceph_finish_reclaim)(ceph_mount_info*) = nullptr;
 };
 
 // dlopen(libcephfs.so.2) and resolve every entry of Api.  Errors: ENOENT when the
@@ -174,7 +183,10 @@ struct Api {
 // stays open for the life of the process.
 Result<std::shared_ptr<const Api>> load_system_api(std::string* detail = nullptr);
 
-// Every pointer set?  (The fake and the loader both go through this before use.)
+// Every required pointer set?  (The fake and the loader both go through this before
+// use; the optional reclaim entries may stay null.)
 bool complete(const Api& api);
+// The three reclaim entries present?
+bool reclaim_supported(const Api& api);
 
 }  // namespace lnfs::backend::cephapi

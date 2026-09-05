@@ -8,7 +8,8 @@
 // identity; inode numbers are never reused (a re-created file gets a fresh one, so
 // the old handle is ENOENT → ESTALE, P2); stx_dev carries the snapid and stx_version
 // a change counter bumped on every mutation; fcntl locks are keyed by (inode, owner)
-// and dropped when the Fh that took them is closed.
+// and dropped when the Fh that took them is closed; session reclaim (plan 10 D2)
+// evicts every other session carrying the uuid and frees its locks.
 
 #include <cstdint>
 #include <memory>
@@ -38,6 +39,19 @@ struct FakeCephApi {
   static int live_perms();
   // Number of ceph_ll_getattr calls (round-trip accounting).
   static uint64_t getattr_calls();
+
+  // Session reclaim (plan 10 D2).  The same table minus the three reclaim entries
+  // (an old libcephfs).
+  static std::shared_ptr<const backend::cephapi::Api> api_without_reclaim();
+  // A failed gateway's residue: an exclusive lock on `rel_path` (relative to the
+  // root) held by a ghost session carrying `uuid`; false when the file is missing.
+  static bool plant_stale_lock(const std::string& rel_path, const std::string& uuid,
+                               uint64_t start, uint64_t len);
+  static size_t stale_locks();  // ghost-held segments still in the table
+  static uint64_t reclaim_calls();  // ceph_start_reclaim calls
+  static std::string last_uuid();   // the last ceph_set_uuid value
+  // ceph_start_reclaim fails with -err (ENOTRECOVERABLE, EOPNOTSUPP) until cleared.
+  static void fail_reclaim(int err);
 };
 
 }  // namespace lnfs::testing

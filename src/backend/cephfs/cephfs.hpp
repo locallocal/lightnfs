@@ -33,6 +33,11 @@
 //   jukebox          = transport-class errors (ENOTCONN/ETIMEDOUT/ENET*/EHOST*) →
 //                      kJukebox (v3 JUKEBOX / v4 DELAY); a blocklisted session
 //                      (EBLOCKLISTED = ESHUTDOWN) is permanent → EIO + counter
+//   takeover         = ceph_start_reclaim(uuid, RESET) + ceph_set_uuid(uuid) on the
+//                      unmounted handle, then remount: the MDS evicts the failed
+//                      gateway's session (same uuid) and frees its caps and locks at
+//                      once (design 09 §9.7, plan 10 D2).  A standby never mounts
+//                      with the uuid — that would evict the active gateway.
 //
 // libcephfs is a blocking library: every call runs on the offload pool (02 §2.2);
 // the binding is a runtime-loaded function table (backend/cephfs/cephapi.hpp), so the
@@ -65,6 +70,9 @@ class CephBackend final : public Backend {
     std::string fs_name;   // ceph_select_filesystem; empty = the cluster's default fs
     std::string subdir = "/";  // export root inside the filesystem (the mount root)
     std::string log_file;      // ceph_conf_set("log_file", …); empty = library default
+    // Session uuid every gateway of the cluster reclaims on takeover; empty = derived
+    // from the cluster id and fsid at takeover time (the same on every gateway).
+    std::string uuid;
     std::vector<std::pair<std::string, std::string>> options;  // extra ceph_conf_set pairs
     uint64_t fsid = 0;
     size_t fd_cache = 1024;
@@ -88,9 +96,16 @@ class CephBackend final : public Backend {
   rt::Task<Result<void>> start() override;
   rt::Task<Result<void>> stop() override;
   std::optional<LockMgrRef> native_locks() override;
+  // Reclaims the failed gateway's session (see the header comment).  ENOTSUP when
+  // the loaded libcephfs has no reclaim entries; ENOENT from the MDS ("no such
+  // session") counts as success; the remount happens regardless of the reclaim's
+  // outcome, and its failure (the backend is then down, as if never started) wins.
+  rt::Task<Result<void>> takeover(const ClusterIdentity&) override;
 
   const Config& config() const { return cfg_; }
   bool started() const { return mount_ != nullptr; }
+  // The uuid the current session carries (empty until a takeover set one).
+  const std::string& session_uuid() const { return session_uuid_; }
   const std::string& cluster_fsid() const { return cluster_fsid_; }
   int64_t fscid() const { return fscid_; }
 
@@ -154,6 +169,7 @@ class CephBackend final : public Backend {
   ObjId root_oid_{};
   std::string cluster_fsid_;
   int64_t fscid_ = -1;
+  std::string session_uuid_;
   std::unique_ptr<FdCache> fd_cache_;
   std::unique_ptr<ObjCache> obj_cache_;
   std::unique_ptr<CephLockMgr> locks_;
