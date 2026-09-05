@@ -4,7 +4,7 @@
 > C 进程生命周期 / D 后端接管钩子 / E 验证与文档）全部完成并合入；那份逐步文档在完成后
 > 撤下，每步的详细实现记录保留在 git 历史里。当前实现总览见本册 §9.10 改动清单（带代码
 > 位置）；**尚未闭环的取舍、待决与发布前必补的门槛**汇总在
-> [docs/multi-gateway-failover-followups.md](../multi-gateway-failover-followups.md)。本册记
+> [docs/toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)。本册记
 > "做什么、为什么"。目标是在多个 lightnfsd 网关共挂同一个共享后端（GlusterFS / Lustre /
 > CephFS，或任何满足 §9.2 前提的后端）时，一个网关故障后客户端切到另一个网关
 > **不重挂载、不重建应用状态**：打开的文件、字节锁、未提交的写都由协议机制恢复。

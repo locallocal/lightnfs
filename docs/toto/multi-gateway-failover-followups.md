@@ -2,8 +2,8 @@
 
 > 背景：多网关主备的实现计划（原 `docs/design/10-multi-gateway-failover-steps.md`）的
 > 阶段 A–E 已全部完成并合入（2026-09-05）。那份逐步拆分文档在完成后撤下，**每步的详细
-> 实现记录保留在 git 历史里**；当前的实现总览见 [09 册](design/09-multi-gateway-failover.md) §9.10 改动清单，
-> 设计动机见 [09 册](design/09-multi-gateway-failover.md)，部署与运维见 [deployment.md §5 多网关主备](deployment.md)。
+> 实现记录保留在 git 历史里**；当前的实现总览见 [09 册](../design/09-multi-gateway-failover.md) §9.10 改动清单，
+> 设计动机见 [09 册](../design/09-multi-gateway-failover.md)，部署与运维见 [deployment.md §5 多网关主备](../deployment.md)。
 >
 > 本文只收口三类还没闭环的东西：**刻意不做的取舍**、**依赖目标环境未验证的部分**、
 > **本机开发环境跳过的门槛**。
@@ -72,8 +72,8 @@ clang-format clang-tidy`）并把两个门槛都跑了一遍——结论：**多
 
 | 想找 | 去哪 |
 |------|------|
-| 实现总览（改动清单 + 代码位置） | [09 册](design/09-multi-gateway-failover.md) §9.10 |
-| 设计动机与协议语义 | [09 册](design/09-multi-gateway-failover.md) |
-| 部署拓扑、keepalived、运维 | [deployment.md §5](deployment.md) |
-| 配置键与指标 | [08 册](design/08-config-observability.md) |
+| 实现总览（改动清单 + 代码位置） | [09 册](../design/09-multi-gateway-failover.md) §9.10 |
+| 设计动机与协议语义 | [09 册](../design/09-multi-gateway-failover.md) |
+| 部署拓扑、keepalived、运维 | [deployment.md §5](../deployment.md) |
+| 配置键与指标 | [08 册](../design/08-config-observability.md) |
 | 每步的详细实现记录（A1–E3） | git 历史中的 `docs/design/10-multi-gateway-failover-steps.md`（已撤下） |
