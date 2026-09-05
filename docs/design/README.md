@@ -17,6 +17,7 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 7. [状态管理](07-state-management.md) —— v3 DRC、v4 clientid/会话/槽表/租约/宽限期、持久化
 8. [配置、可观测性与安全](08-config-observability.md) —— 导出表、日志/指标/追踪、资源限制
 9. [多网关无感故障切换（方案）](09-multi-gateway-failover.md) —— 共享后端上的主备接管：集群身份、共享 reclaim 名单、全局 epoch 与围栏、后端接管钩子；多活/计划内迁移的演进路径
+10. [多网关故障切换——实现步骤拆分](10-multi-gateway-failover-steps.md) —— 09 册的实施计划：五个阶段、每步的改动点（带代码锚点）、测试与合并门槛
 
 ## 一页纸架构
 
