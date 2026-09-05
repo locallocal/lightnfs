@@ -1515,6 +1515,11 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       break;
     }
     case kClaimFh: break;
+    // Reboot recovery of a delegated open (design 09 §9.7, plan 10 B3): the client
+    // lost its delegation with the server (or the gateway) and reclaims the open it
+    // held under it.  No arguments (RFC 8881 §18.16.1); gated like CLAIM_PREVIOUS and
+    // answered as a plain open state — delegations never survive a restart here.
+    case kClaimDelegPrevFh: break;
     case kClaimDelegCurFh: {
       // Recall response (plan doc 10 §5.2): the client converts opens it holds under
       // a delegation being recalled into real open stateids before DELEGRETURN.
@@ -1528,9 +1533,8 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       break;
     }
     case kClaimDelegateCur:
-    case kClaimDelegatePrev:
-    case kClaimDelegPrevFh: {
-      enc.u32(st(Status::kNotsupp));  // 4.0-style / reboot delegation claims
+    case kClaimDelegatePrev: {
+      enc.u32(st(Status::kNotsupp));  // 4.0-style (name-based) delegation claims
       co_return st(Status::kNotsupp);
     }
     default: {
@@ -1691,7 +1695,7 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       }
       file = std::move(made->obj);
     }
-  } else {  // CLAIM_FH / CLAIM_PREVIOUS / CLAIM_DELEG_CUR_FH: CFH is the file itself
+  } else {  // CLAIM_FH / CLAIM_PREVIOUS / CLAIM_DELEG_{CUR,PREV}_FH: CFH is the file
     if (dir->pseudo()) {
       enc.u32(st(Status::kIsdir));
       co_return st(Status::kIsdir);
@@ -1770,7 +1774,7 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   args.owner = std::move(owner_bytes);
   args.access = access;
   args.deny = deny;
-  const bool is_reclaim = *claim == kClaimPrevious;
+  const bool is_reclaim = *claim == kClaimPrevious || *claim == kClaimDelegPrevFh;
   args.reclaim = is_reclaim;
   args.deleg_claim = deleg_claim;
   auto opened = co_await state_.open(std::move(args), std::move(bopen));
@@ -1782,10 +1786,11 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
   ctx.current_sid = opened.stateid;
   ctx.current_valid = true;
   // Read delegation grant (plan doc 10 §5.2): policy lives in the state manager; a
-  // WANT_NO_DELEG / WANT_CANCEL request and the recall-response claim never grant.
+  // WANT_NO_DELEG / WANT_CANCEL request, the recall-response claim and the reboot
+  // delegation claim never grant (the state manager also refuses every reclaim).
   uint32_t want = *share_access & 0xFF00;
   state::StateMgr::DelegGrant grant;
-  if (!deleg_claim && want != 0x0400 && want != 0x0500) {
+  if (!deleg_claim && *claim != kClaimDelegPrevFh && want != 0x0400 && want != 0x0500) {
     grant = co_await state_.maybe_grant_read_deleg(ctx.sessionid, ctx.clientid,
                                                    exp->fsid, file->id(), ctx.cfh,
                                                    access, is_reclaim);
