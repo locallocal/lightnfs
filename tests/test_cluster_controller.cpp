@@ -960,3 +960,38 @@ TEST(FsClusterController, StuckUnownedFsidSkipsIdlePredecessor) {
   EXPECT_TRUE(fs_role(gw2, 2) == server::Role::kActive);
 }
 
+// Gateways starting together (design 11 §11.8): a predecessor that has not written
+// any record yet is not dead — for one ttl after our own start we leave its exports
+// alone; once it has heartbeated we keep yielding, and only silence past that window
+// counts as dead.  An expired record is dead at once.
+TEST(FsClusterController, UnheardPredecessorGetsOneTtlAtStartup) {
+  MemStore store;
+  Exports exports({{"gw1", "gw2"}, {"gw3", "gw2"}, {"gw2"}});
+  core::FsOwnerView view;
+  FsRecorder rec;
+  core::ClusterConfig cfg = aa_config("gw2");
+  cfg.fence_lease_ms = 100;  // ttl 300 ms
+  server::FsClusterController gw2(cfg, exports.table, store, view, rec.hooks());
+  // gw1 (F1) and gw3 (F2) have no record; F3 is ours outright.
+  gw2.tick();
+  EXPECT_TRUE(fs_role(gw2, 1) == server::Role::kStandby);
+  EXPECT_TRUE(fs_role(gw2, 2) == server::Role::kStandby);
+  EXPECT_TRUE(fs_role(gw2, 3) == server::Role::kActive);
+  // gw1 heartbeats inside the window: F1 stays its.  gw3 never shows up.
+  (void)store.renew_fences("gw1", 60s);
+  std::this_thread::sleep_for(350ms);
+  gw2.tick();
+  EXPECT_TRUE(fs_role(gw2, 1) == server::Role::kStandby);
+  EXPECT_TRUE(fs_role(gw2, 2) == server::Role::kActive);
+  EXPECT_STREQ(rec.takeovers.back().prev_node, "");
+  // A fresh controller and a predecessor whose record has lapsed: no waiting.
+  MemStore store2;
+  core::FsOwnerView view2;
+  FsRecorder rec2;
+  server::FsClusterController late(cfg, exports.table, store2, view2, rec2.hooks());
+  (void)store2.renew_fences("gw1", 60s);
+  store2.age_out_node("gw1", 1000);
+  late.tick();
+  EXPECT_TRUE(fs_role(late, 1) == server::Role::kActive);
+  EXPECT_TRUE(fs_role(late, 2) == server::Role::kStandby);  // gw3 unheard, still settling
+}

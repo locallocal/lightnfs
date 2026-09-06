@@ -339,7 +339,7 @@ FsClusterController::FsClusterController(const core::ClusterConfig& cfg,
       node_epoch_(node_epoch) {
   if (!hooks_.post) hooks_.post = [](const std::function<void()>& fn) { fn(); };
   for (const auto& entry : exports.entries()) fs_[entry->fsid].exp = entry.get();
-  last_.now_ms = wall_now_ms();
+  last_.now_ms = started_ms_ = wall_now_ms();
   // Until the first tick has read the store nothing is known to be ours: every export
   // is Unowned in the view (clients wait), never silently served.
   publish(nullptr);
@@ -408,9 +408,17 @@ bool FsClusterController::our_turn(const core::ExportEntry& exp, const StoreView
   if (stuck) return true;  // the predecessors had their 2 × ttl and did not take it
   // Everyone ahead of us in the export's list gets the first chance: their heartbeat
   // record (empty or not) still live means they are up and will take it themselves.
+  // No record at all is a node we have not heard from: dead, unless we ourselves are
+  // younger than one ttl — then it may simply not have written its first heartbeat.
+  const bool settling = sv.now_ms - started_ms_ < ttl().count();
   for (auto it = exp.nodes.begin(); it != self; ++it) {
-    for (const auto& rec : sv.fences)
-      if (rec.node == *it && !expired(rec, sv.now_ms)) return false;
+    bool heard = false;
+    for (const auto& rec : sv.fences) {
+      if (rec.node != *it) continue;
+      heard = true;
+      if (!expired(rec, sv.now_ms)) return false;
+    }
+    if (!heard && settling) return false;
   }
   return true;
 }

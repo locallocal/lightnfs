@@ -268,7 +268,10 @@ class FsClusterController {
   static std::optional<Holder> holder_of(const StoreView& sv, uint32_t fsid);
   // Automatic takeover policy for one export (plan 12 C2): takeover = auto, we are in
   // its `nodes`, and nobody ahead of us in that list is alive — unless the export has
-  // sat unowned for over 2 × ttl (`stuck`), when the order no longer applies.
+  // sat unowned for over 2 × ttl (`stuck`), when the order no longer applies.  A
+  // predecessor with no record at all is "not heard from yet" for our first ttl after
+  // start (gateways starting together must not race each other's exports away) and
+  // dead after that.
   bool our_turn(const core::ExportEntry& exp, const StoreView& sv, bool stuck) const;
   // 2 × ttl: how long an unowned export waits for its live predecessors.
   std::chrono::milliseconds stuck_after() const { return 2 * ttl(); }
@@ -291,6 +294,7 @@ class FsClusterController {
   std::string node_;
   uint64_t node_epoch_ = 0;
   obs::ProviderHandle metrics_ = 0;
+  int64_t started_ms_ = 0;  // wall clock at construction
 
   mutable std::mutex mu_;
   std::map<uint32_t, Fs> fs_;
