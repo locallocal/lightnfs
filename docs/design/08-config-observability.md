@@ -57,12 +57,15 @@ role = "auto"                # active | standby | auto
 fence_lease = "3s"           # 围栏续租周期（500ms–60s）；3× 未续视为失效
 takeover = "auto"            # auto | manual
 takeover_hook = ""           # 可选可执行脚本，接管时在后端钩子之后运行（超时 fence_lease；环境变量 LNFS_CLUSTER_ID/NODE/EPOCH/PREV_NODE）
+mode = "failover"            # failover（09 主备）| active-active（11 册多活，12 册 A1；C1 落地前拒绝启动）
+node_address = ""            # 多活：本网关自有地址 "host:port" / "[v6]:port"，写入 fs_locations；failover 下忽略
 # unsafe_skip_backend_checks = false   # 仅测试：后端能力不达标只告警
 
 [[export]]                   # 见 06 分册 6.7；后端子表 [export.local|gluster|lustre|cephfs]
 # [export.cephfs] uuid = ""  # 多网关接管回收的会话 uuid（10 册 D2）；空 = <cluster id>-<fsid>，各网关相同
 path = "/export/data"; backend = "local"; fsid = 1
 clients = ["192.168.0.0/24"]; squash = "root"; readonly = false
+# nodes = ["gw1", "gw2"]    # 多活属主优先级列表（12 册 A1）：仅 mode = active-active；进导出摘要；改动需重启
 read_bps = "0"; write_bps = "0"; iops = 0       # per-export 令牌桶
 ```
 
@@ -72,6 +75,9 @@ rsize/wsize/dtpref 不是配置项：由后端 `FsLimits`（05 分册）推导�
 `server_owner`/`server_scope` 不得显式设置（身份由 `id` 派生）、`takeover_hook` 须为可执行文件；
 后端构造后再查每个导出 `kStableHandles + kByteLocks + native_locks`（`--check-config` 同样执行），
 `shared_dir` 不可写只告警（`--check-config` 不写共享目录）。
+`mode = "active-active"` 时再加（12 册 A1）：`node_address` 形如 `host:port`、`role` 只能 `auto`、每个
+`[[export]]` 的 `nodes` 非空且无重复（名字 `[A-Za-z0-9_.-]{1,64}`）、同一 Gluster `volume` / Lustre `mount`
+上的导出 `nodes` 必须逐项相同（11 §11.6）；failover 下出现这些键只告警忽略。
 启动时还把导出表的规范化摘要（`sha256:` + 每导出的 path/fsid/backend/readonly/squash/anon_uid/anon_gid
 与后端子表键值，按 fsid 排序）写入 `shared_dir/exports.<node>`，与其他节点的记录逐一比对，
 不一致则拒绝入集群。**按节点豁免键**不参与摘要：`conf`、`keyring`、`id`、`user`、`name`、

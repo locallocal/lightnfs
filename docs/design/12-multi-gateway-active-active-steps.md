@@ -41,7 +41,7 @@
 
 | 阶段 | 步骤 | 交付物 | 依赖 | 11 册阶段 |
 |------|------|--------|------|-----------|
-| A 基础设施（无行为变化） | A1 多活配置键 | `mode` / `node_address` / `[[export]] nodes` 解析、校验、Gluster/Lustre 同卷约束 | — | P1 |
+| A 基础设施（无行为变化） | A1 多活配置键 ✅ 2026-09-06 | `mode` / `node_address` / `[[export]] nodes` 解析、校验、Gluster/Lustre 同卷约束 | — | P1 |
 | | A2 `ClusterStore` per-fsid 键空间 | `fs/<fsid>/{epoch,owner,clients/}`、批量 `fence.<node>`、`nodes/<node>`、`epoch.<node>` | — | P1 |
 | | A3 `StateMgr` per-fsid grace | `fsid → {deadline, reclaim_set}`；名单钩子加 fsid；`release_fsid()` | A2 | P1 |
 | B 协议面 | B1 多活身份 + `eir_flags` | `server_owner.major_id` 按 node 派生；`SUPP_MOVED_REFER\|MIGR` | A1 | P2 |
@@ -64,7 +64,7 @@
 
 ## 阶段 A：基础设施
 
-### A1 多活配置键
+### A1 多活配置键（已完成，2026-09-06）
 
 **目标**：解析并校验 11 §11.10 的三个新键；`mode = "failover"`（默认）时后两个键被忽略。
 
@@ -95,6 +95,11 @@
   `nodes` 变化 → `"cluster settings changed: restart required"`。
 - 多活模式的后端能力校验与 09 A1 相同（`kStableHandles` + `kByteLocks` + `native_locks`；
   `unsafe_skip_backend_checks` 放宽）。
+- 实现注（2026-09-06）：`nodes` 非空时进入导出表摘要（`canonical_exports_text` 加一行
+  `nodes=a,b,c`）——属主顺位是集群身份的一部分，各网关必须一致；failover 配置的摘要不变。
+  `ExportTable::reload_dynamic` 对 `nodes` 变化报 restart required、不热应用。在 C1 落地前
+  `run_server` 对 `mode = active-active` 直接拒绝启动（`--check-config` 照常返回 0），避免
+  静默按主备运行。校验失败的原因以 WARN 日志给出（`validate_config` 只返回 EINVAL）。
 
 **测试**：`tests/test_ctl.cpp` 仿 `Ctl.ClusterConfigKeys`（`test_ctl.cpp:225`）加
 `Ctl.ActiveActiveConfigKeys`——默认 failover；`nodes` 缺失 / 重复 / 空被拒；`node_address` 缺

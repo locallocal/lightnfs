@@ -10,10 +10,12 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 
 #include "backend/api.hpp"
+#include "util/log.hpp"
 #include "util/sha256.hpp"
 
 namespace lnfs::core {
@@ -333,6 +335,8 @@ Result<Config> parse_config(std::string_view text) {
       else if (key == "role") c.role = LNFS_TRY(string_value(value));
       else if (key == "takeover") c.takeover = LNFS_TRY(string_value(value));
       else if (key == "takeover_hook") c.takeover_hook = LNFS_TRY(string_value(value));
+      else if (key == "mode") c.mode = LNFS_TRY(string_value(value));
+      else if (key == "node_address") c.node_address = LNFS_TRY(string_value(value));
       else if (key == "fence_lease") {
         uint64_t ms = LNFS_TRY(duration_ms_value(value));
         if (ms < 500 || ms > 60000) return Err(errno_from(EINVAL));
@@ -392,6 +396,7 @@ Result<Config> parse_config(std::string_view text) {
         exp->fsid = static_cast<uint32_t>(n);
       }
       else if (key == "clients") exp->clients = LNFS_TRY(string_array(value));
+      else if (key == "nodes") exp->nodes = LNFS_TRY(string_array(value));
       else if (key == "readonly") exp->readonly = LNFS_TRY(bool_value(value));
       else if (key == "anon_uid") {
         uint64_t n = LNFS_TRY(uint_value(value));
@@ -435,6 +440,97 @@ Result<Config> load_config(const std::string& path) {
   return parse_config(contents.str());
 }
 
+bool valid_cluster_node_name(std::string_view name) {
+  return !name.empty() && name.size() <= 64 &&
+         std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+           return std::isalnum(ch) || ch == '_' || ch == '.' || ch == '-';
+         });
+}
+
+bool valid_node_address(std::string_view address) {
+  size_t colon = address.rfind(':');
+  if (colon == std::string_view::npos || colon == 0) return false;
+  std::string_view host = address.substr(0, colon), port = address.substr(colon + 1);
+  if (host.front() == '[') {  // bracketed IPv6 literal
+    if (host.size() < 3 || host.back() != ']') return false;
+  } else if (host.find(':') != std::string_view::npos) {
+    return false;  // an unbracketed v6 literal has no unambiguous port
+  }
+  if (port.empty() || port.size() > 5 ||
+      !std::all_of(port.begin(), port.end(), [](unsigned char ch) { return std::isdigit(ch); }))
+    return false;
+  unsigned long n = std::stoul(std::string(port));
+  return n >= 1 && n <= 65535;
+}
+
+bool cluster_active_active(const ClusterConfig& cluster) {
+  return cluster.enabled && cluster.mode == "active-active";
+}
+
+namespace {
+
+// Active-active rules (design 11 §11.10, plan 12 A1), applied only when the cluster
+// section is enabled: under failover the per-export `nodes` and `node_address` are
+// warned about and ignored (so a fleet can be reconfigured one gateway at a time);
+// under active-active every export needs an owner list, the gateway needs an address,
+// `role` must stay "auto" (roles are per fsid now) and exports sharing one Gluster
+// volume / Lustre mount must share one owner list, because those connections are
+// per volume, not per fsid (design 11 §11.6).
+Result<void> validate_active_active(const Config& config) {
+  const auto& c = config.cluster;
+  if (!cluster_active_active(c)) {
+    if (!c.node_address.empty())
+      LNFS_WARN("[cluster] node_address is ignored under mode = \"{}\"", c.mode);
+    for (const auto& exp : config.exports)
+      if (!exp.nodes.empty())
+        LNFS_WARN("export fsid={}: nodes is ignored under [cluster] mode = \"{}\"", exp.fsid,
+                  c.mode);
+    return {};
+  }
+  if (c.role != "auto") {
+    LNFS_WARN("[cluster] role must be \"auto\" under active-active (roles are per export)");
+    return Err(errno_from(EINVAL));
+  }
+  if (!valid_node_address(c.node_address)) {
+    LNFS_WARN("[cluster] node_address must be \"host:port\" under active-active");
+    return Err(errno_from(EINVAL));
+  }
+  // Isolation constraint: key → (fsid, nodes) of the first export seen in that group.
+  std::map<std::string, std::pair<uint32_t, const std::vector<std::string>*>> groups;
+  for (const auto& exp : config.exports) {
+    if (exp.nodes.empty()) {
+      LNFS_WARN("export fsid={}: nodes is required under active-active", exp.fsid);
+      return Err(errno_from(EINVAL));
+    }
+    std::set<std::string_view> seen;
+    for (const auto& node : exp.nodes) {
+      if (!valid_cluster_node_name(node) || !seen.insert(node).second) {
+        LNFS_WARN("export fsid={}: nodes has an invalid or duplicate entry \"{}\"", exp.fsid,
+                  node);
+        return Err(errno_from(EINVAL));
+      }
+    }
+    const char* shared_key = exp.backend == "gluster"  ? "volume"
+                             : exp.backend == "lustre" ? "mount"
+                                                       : nullptr;
+    if (!shared_key) continue;
+    auto it = exp.backend_config.values.find(shared_key);
+    std::string group =
+        exp.backend + ":" + (it == exp.backend_config.values.end() ? "" : it->second);
+    auto [slot, fresh] = groups.emplace(group, std::make_pair(exp.fsid, &exp.nodes));
+    if (!fresh && *slot->second.second != exp.nodes) {
+      LNFS_WARN("export fsid={} and fsid={} share one {} {} but list different nodes: a "
+                "{} connection is per volume, so their owner lists must match (design 11 "
+                "§11.6)",
+                slot->second.first, exp.fsid, exp.backend, shared_key, exp.backend);
+      return Err(errno_from(EINVAL));
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
 Result<void> validate_config(const Config& config) {
   backend::register_builtin_backends();
   if (config.exports.empty() || config.server.offload_threads <= 0 ||
@@ -473,6 +569,7 @@ Result<void> validate_config(const Config& config) {
     auto valid_takeover = c.takeover == "auto" || c.takeover == "manual";
     if (c.enabled) {
       if (!valid_role || !valid_takeover) return Err(errno_from(EINVAL));
+      if (c.mode != "failover" && c.mode != "active-active") return Err(errno_from(EINVAL));
       if (c.id.size() < 8 || c.id.size() > 64 ||
           !std::all_of(c.id.begin(), c.id.end(), [](unsigned char ch) {
             return std::isalnum(ch) || ch == '_' || ch == '-';
@@ -480,8 +577,8 @@ Result<void> validate_config(const Config& config) {
         return Err(errno_from(EINVAL));
       if (c.shared_dir.empty() || c.shared_dir.front() != '/')
         return Err(errno_from(EINVAL));
-      if (!c.node.empty() && (c.node.size() > 64 || c.node.find('/') != std::string::npos))
-        return Err(errno_from(EINVAL));
+      if (!c.node.empty() && !valid_cluster_node_name(c.node)) return Err(errno_from(EINVAL));
+      LNFS_TRY(validate_active_active(config));
       // Identity is derived from `id` so every gateway presents the same server_owner/
       // scope; an explicit value would fork it (design 09 §9.3).
       if (!config.server.server_owner.empty() || !config.server.server_scope.empty())
@@ -538,6 +635,12 @@ std::string canonical_exports_text(const Config& config) {
         if (key == exempt) per_node = true;
       if (!per_node) out += std::format("  {}={}\n", key, value);
     }
+    if (!exp->nodes.empty()) {  // owner order must agree cluster-wide (plan 12 A1)
+      out += "  nodes=";
+      for (size_t i = 0; i < exp->nodes.size(); ++i)
+        out += (i ? "," : "") + exp->nodes[i];
+      out += "\n";
+    }
   }
   return out;
 }
@@ -577,6 +680,7 @@ Result<void> ExportTable::add(ExportConfig cfg, std::unique_ptr<backend::Backend
   entry->anon_uid = cfg.anon_uid;
   entry->anon_gid = cfg.anon_gid;
   entry->readonly = cfg.readonly;
+  entry->nodes = std::move(cfg.nodes);
   entry->backend = std::move(backend);
   std::vector<Cidr> clients;
   for (const auto& client : cfg.clients) clients.push_back(LNFS_TRY(Cidr::parse(client)));
@@ -640,6 +744,8 @@ std::string ExportTable::reload_dynamic(const Config& fresh) {
           "(clients/qos still applied)\n",
           cfg.fsid);
     }
+    if (cfg.nodes != entry->nodes)
+      report += std::format("export fsid={}: nodes changed, restart required\n", cfg.fsid);
     std::vector<Cidr> clients;
     for (const auto& client : cfg.clients)
       clients.push_back(*Cidr::parse(client));  // fresh passed validate_config

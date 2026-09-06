@@ -118,6 +118,10 @@ struct ExportConfig {
   uint64_t read_bps = 0;
   uint64_t write_bps = 0;
   uint32_t iops = 0;
+  // Active-active owner priority list (design 11 §11.3/§11.10, plan 12 A1): the first
+  // live node serves this fsid, the rest take over in order.  Empty outside
+  // `[cluster] mode = "active-active"`; a restart-required change.
+  std::vector<std::string> nodes;
   backend::BackendConfig backend_config;
 };
 
@@ -128,7 +132,13 @@ struct ClusterConfig {
   std::string id;            // shared by every gateway; [A-Za-z0-9_-]{8,64} (a UUID fits)
   std::string shared_dir;    // absolute path on the shared filesystem (design 09 §9.4)
   std::string node;          // this gateway's name; empty = gethostname() at startup
-  std::string role = "auto"; // active | standby | auto
+  std::string role = "auto"; // active | standby | auto (active-active: auto only)
+  // failover (design 09: one active gateway behind one VIP) | active-active (design 11:
+  // one owner gateway per export, clients referred with fs_locations).  Plan 12 A1.
+  std::string mode = "failover";
+  // active-active: this gateway's own "host:port" ("[v6]:port" for IPv6), the address
+  // its fs_locations answers carry for the exports it owns.  Ignored under failover.
+  std::string node_address;
   uint32_t fence_lease_ms = 3000;  // fence renew period; lost after 3 missed renewals
   std::string takeover = "auto";   // auto | manual (only `lightnfs-ctl cluster takeover`)
   std::string takeover_hook;       // optional script run after the backend takeover hooks
@@ -141,6 +151,12 @@ struct ClusterConfig {
 
 // `node` with the hostname default applied.
 std::string cluster_node_name(const ClusterConfig& cluster);
+// `enabled` and `mode = "active-active"`.
+bool cluster_active_active(const ClusterConfig& cluster);
+// Node-name syntax shared by `[cluster] node` and `[[export]] nodes`: [A-Za-z0-9_.-]{1,64}.
+bool valid_cluster_node_name(std::string_view name);
+// "host:port" / "[v6]:port" with a non-empty host and a port in 1..65535.
+bool valid_node_address(std::string_view address);
 
 struct Config {
   ServerConfig server;
@@ -171,6 +187,7 @@ struct ExportEntry {
   uint32_t anon_uid = 65534;
   uint32_t anon_gid = 65534;
   bool readonly = false;
+  std::vector<std::string> nodes;  // active-active owner priority list (plan 12 A1)
   std::unique_ptr<backend::Backend> backend;
   // Per-export data-path counters (plan doc 10 §3.3), exported with export/fsid labels.
   obs::ExportMetrics metrics;
