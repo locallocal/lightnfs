@@ -103,19 +103,27 @@ std::optional<Identity> local_identity(const std::string& state_dir) {
   return Identity{*key, *epoch};
 }
 
-// Cluster mode (design 09 §9.3/§9.5): the key is shared, and the epoch is the global
-// one — advanced by the ClusterController when this gateway takes over (plan 10 C2),
-// never at process start.  The value read here only labels the standby; the stack is
-// built with the epoch the takeover minted.
-std::optional<Identity> cluster_identity(ClusterStore& store) {
+// Cluster mode (design 09 §9.3/§9.5): the key is shared.  Failover: the epoch is the
+// global one — advanced by the ClusterController when this gateway takes over (plan
+// 10 C2), never at process start; the value read here only labels the standby and the
+// stack is built with the epoch the takeover minted.  Active-active (design 11 §11.5,
+// plan 12 B1): every gateway is its own server, so the epoch is the node's own
+// (epoch.<node>), advanced once per process start like a single gateway's boot epoch
+// — the stack is built once and stays up while exports come and go.
+std::optional<Identity> cluster_identity(ClusterStore& store,
+                                         const core::ClusterConfig& cluster) {
   auto key = store.load_or_create_key();
   if (!key) {
     LNFS_ERROR("cannot load the cluster file-handle key: {}", errno_name(key.error()));
     return std::nullopt;
   }
-  auto epoch = store.read_epoch();
+  auto epoch = core::cluster_active_active(cluster)
+                   ? store.bump_node_epoch(core::cluster_node_name(cluster))
+                   : store.read_epoch();
   if (!epoch) {
-    LNFS_ERROR("cannot read the cluster epoch: {}", errno_name(epoch.error()));
+    LNFS_ERROR("cannot {} the cluster epoch: {}",
+               core::cluster_active_active(cluster) ? "advance" : "read",
+               errno_name(epoch.error()));
     return std::nullopt;
   }
   return Identity{*key, *epoch};
@@ -435,7 +443,7 @@ int run_server(const std::string& config_path) {
   if (cluster_cfg.enabled)
     cluster_store = make_posix_cluster_store(
         cluster_cfg.shared_dir, std::chrono::milliseconds(2 * cluster_cfg.fence_lease_ms));
-  auto identity = cluster_store ? cluster_identity(*cluster_store)
+  auto identity = cluster_store ? cluster_identity(*cluster_store, cluster_cfg)
                                 : local_identity(server_cfg.state_dir);
   if (!identity) return 1;
   auto core = build_core_state(std::move(*config), *identity, cluster_store.get());
