@@ -1,29 +1,54 @@
 #include "nfsv4/attrs.hpp"
 
 #include <cstring>
+#include <span>
 #include <string>
 
 namespace lnfs::nfsv4 {
 
 using namespace attr;
 
-const Bitmap& supported_attrs() {
-  static const Bitmap value = [] {
-    Bitmap b;
-    for (uint32_t id : {kSupportedAttrs, kType, kFhExpireType, kChange, kSize,
-                        kLinkSupport, kSymlinkSupport, kNamedAttr, kFsid, kUniqueHandles,
-                        kLeaseTime, kRdattrError, kCansettime, kCaseInsensitive,
-                        kCasePreserving, kChownRestricted, kFilehandle, kFileid,
-                        kFilesAvail, kFilesFree, kFilesTotal, kHomogeneous, kMaxfilesize,
-                        kMaxlink, kMaxname, kMaxread, kMaxwrite, kMode, kNoTrunc,
-                        kNumlinks, kOwner, kOwnerGroup, kRawdev, kSpaceAvail, kSpaceFree,
-                        kSpaceTotal, kSpaceUsed, kTimeAccess, kTimeDelta, kTimeMetadata,
-                        kTimeModify, kMountedOnFileid, kTimeAccessSet,
-                        kTimeModifySet, kSuppattrExclCreat, kChangeAttrType})
-      b.set(id);
+namespace {
+
+Bitmap base_supported_attrs() {
+  Bitmap b;
+  for (uint32_t id : {kSupportedAttrs, kType, kFhExpireType, kChange, kSize,
+                      kLinkSupport, kSymlinkSupport, kNamedAttr, kFsid, kUniqueHandles,
+                      kLeaseTime, kRdattrError, kCansettime, kCaseInsensitive,
+                      kCasePreserving, kChownRestricted, kFilehandle, kFileid,
+                      kFilesAvail, kFilesFree, kFilesTotal, kHomogeneous, kMaxfilesize,
+                      kMaxlink, kMaxname, kMaxread, kMaxwrite, kMode, kNoTrunc,
+                      kNumlinks, kOwner, kOwnerGroup, kRawdev, kSpaceAvail, kSpaceFree,
+                      kSpaceTotal, kSpaceUsed, kTimeAccess, kTimeDelta, kTimeMetadata,
+                      kTimeModify, kMountedOnFileid, kTimeAccessSet,
+                      kTimeModifySet, kSuppattrExclCreat, kChangeAttrType})
+    b.set(id);
+  return b;
+}
+
+// pathname4: component4<>.
+void encode_pathname(xdr::XdrEnc& enc, std::span<const std::string> parts) {
+  enc.u32(static_cast<uint32_t>(parts.size()));
+  for (const auto& part : parts) enc.string(part);
+}
+
+// The one location an export has: its owner's host (empty when there is none to name).
+std::string location_server(const AttrSource& src) {
+  return src.owner && !src.owner->address.empty() ? core::address_host(src.owner->address)
+                                                  : std::string();
+}
+
+}  // namespace
+
+const Bitmap& supported_attrs(bool referrals) {
+  static const Bitmap plain = base_supported_attrs();
+  static const Bitmap with_referrals = [] {
+    Bitmap b = base_supported_attrs();
+    b.set(kFsLocations);
+    b.set(kFsLocationsInfo);
     return b;
   }();
-  return value;
+  return referrals ? with_referrals : plain;
 }
 
 bool wants_stats(const Bitmap& wanted) {
@@ -42,7 +67,7 @@ void patch_be32(std::byte* gap, uint32_t v) {
 
 void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src) {
   Bitmap actual;
-  const Bitmap& sup = supported_attrs();
+  const Bitmap& sup = supported_attrs(src.referrals);
   for (uint32_t w = 0; w < 3; ++w) {
     uint32_t bits = (w < wanted.words.size() ? wanted.words[w] : 0) &
                     (w < sup.words.size() ? sup.words[w] : 0);
@@ -68,7 +93,7 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
   xdr::XdrEnc& vals = enc;
   auto ok = [&](uint32_t id) { return actual.test(id); };
 
-  if (ok(kSupportedAttrs)) supported_attrs().encode(vals);
+  if (ok(kSupportedAttrs)) supported_attrs(src.referrals).encode(vals);
   if (ok(kType)) vals.u32(static_cast<uint32_t>(a.type));
   if (ok(kFhExpireType)) vals.u32(0);  // FH4_PERSISTENT
   if (ok(kChange)) vals.u64(a.change);
@@ -92,6 +117,20 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
   if (ok(kFilesAvail)) vals.u64(st.afiles);
   if (ok(kFilesFree)) vals.u64(st.ffiles);
   if (ok(kFilesTotal)) vals.u64(st.tfiles);
+  // fs_locations (RFC 8881 §11.10, plan 12 B2): fs_root = the export's pseudo path;
+  // locations = its owner, with the same root path there (every gateway of the
+  // cluster presents the same pseudo tree).  The pseudo fs itself, or an export with
+  // nobody to name, answers an empty list.
+  if (ok(kFsLocations)) {
+    encode_pathname(vals, src.fs_root);
+    std::string server = location_server(src);
+    vals.u32(server.empty() ? 0 : 1);
+    if (!server.empty()) {
+      vals.u32(1);  // server<>
+      vals.string(server);
+      encode_pathname(vals, src.fs_root);
+    }
+  }
   if (ok(kHomogeneous)) vals.boolean(core::FsProps::kHomogeneous);
   if (ok(kMaxfilesize)) vals.u64(lim.max_filesize);
   if (ok(kMaxlink)) vals.u32(lim.max_link);
@@ -115,6 +154,22 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
   if (ok(kTimeDelta)) encode_nfstime(vals, lim.time_delta);
   if (ok(kTimeMetadata)) encode_nfstime(vals, a.ctime);
   if (ok(kTimeModify)) encode_nfstime(vals, a.mtime);
+  // fs_locations_info (RFC 8881 §11.10.1): the same single location — currency
+  // unknown (-1), no fls_info, valid for one lease — under fli_flags 0.
+  if (ok(kFsLocationsInfo)) {
+    vals.u32(0);                  // fli_flags
+    vals.u32(src.lease_seconds);  // fli_valid_for
+    encode_pathname(vals, src.fs_root);
+    std::string server = location_server(src);
+    vals.u32(server.empty() ? 0 : 1);  // fli_items<>
+    if (!server.empty()) {
+      vals.u32(1);            // fli_entries<>
+      vals.u32(0xffffffffu);  // fls_currency = -1
+      vals.u32(0);            // fls_info: empty
+      vals.string(server);
+      encode_pathname(vals, src.fs_root);
+    }
+  }
   if (ok(kMountedOnFileid))
     vals.u64(src.mounted_on_fileid ? src.mounted_on_fileid : a.fileid);
   if (ok(kSuppattrExclCreat)) settable_attrs().encode(vals);

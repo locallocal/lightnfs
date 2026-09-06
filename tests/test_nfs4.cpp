@@ -2537,6 +2537,163 @@ TEST(Nfs4, ClusterIdentityDerivation) {
   EXPECT_STREQ(server::derive_server_identity(a, aa_disabled).owner, ia.owner);
 }
 
+// fs_locations / fs_locations_info (RFC 8881 §11.10, plan 12 B2): under active-active
+// the export root answers where the export lives — fs_root = its pseudo path, one
+// location = its owner's host — and the supported set advertises both attributes; a
+// single gateway ignores the bits as before.
+TEST(Nfs4, FsLocationsEncoding) {
+  struct Locations {
+    std::vector<std::string> fs_root;
+    std::vector<std::vector<std::string>> servers;  // per location
+    std::vector<std::vector<std::string>> rootpaths;
+  };
+  auto pathname = [](xdr::XdrDec& dec) {
+    std::vector<std::string> parts;
+    uint32_t n = *dec.u32();
+    for (uint32_t i = 0; i < n; ++i) parts.push_back(std::string(*dec.string(1024)));
+    return parts;
+  };
+  // PUTFH + GETATTR(mask); returns the decoder positioned at the attribute values and
+  // the attrmask the server answered with.
+  struct GetattrReply {
+    V4Fixture::Reply parsed;
+    nfsv4::Bitmap mask;
+  };
+  auto getattr = [&](V4Fixture& f, const std::vector<std::byte>& fh,
+                     std::initializer_list<uint32_t> bits) {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(fh);
+    ops.u32(static_cast<uint32_t>(Op::kGetattr));
+    nfsv4::Bitmap want;
+    for (uint32_t b : bits) want.set(b);
+    want.encode(ops);
+    GetattrReply out{f.parse(f.compound_raw(f.session_body(2, ops.take()))), {}};
+    EXPECT_EQ(out.parsed.status, 0u);
+    if (out.parsed.status != 0) return out;
+    V4Fixture::expect_op(out.parsed.dec, Op::kSequence, 0);
+    (void)out.parsed.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(out.parsed.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(out.parsed.dec, Op::kGetattr, 0);
+    out.mask = *nfsv4::Bitmap::decode(out.parsed.dec);
+    (void)out.parsed.dec.u32();  // attrlist length
+    return out;
+  };
+  auto decode_locations = [&](xdr::XdrDec& dec) {
+    Locations loc;
+    loc.fs_root = pathname(dec);
+    uint32_t n = *dec.u32();
+    for (uint32_t i = 0; i < n; ++i) {
+      std::vector<std::string> servers;
+      uint32_t m = *dec.u32();
+      for (uint32_t j = 0; j < m; ++j) servers.push_back(std::string(*dec.string(1024)));
+      loc.servers.push_back(std::move(servers));
+      loc.rootpaths.push_back(pathname(dec));
+    }
+    return loc;
+  };
+
+  // Single gateway: the bits are not supported — ignored in the answer, absent from
+  // supported_attrs.
+  {
+    V4Fixture single;
+    single.establish_session();
+    auto data_fh = single.path_fh({"export", "data"});
+    ASSERT_TRUE(!data_fh.empty());
+    auto r = getattr(single, data_fh, {nfsv4::attr::kFsid, nfsv4::attr::kFsLocations,
+                                       nfsv4::attr::kFsLocationsInfo});
+    EXPECT_TRUE(r.mask.test(nfsv4::attr::kFsid));
+    EXPECT_FALSE(r.mask.test(nfsv4::attr::kFsLocations));
+    EXPECT_FALSE(r.mask.test(nfsv4::attr::kFsLocationsInfo));
+    auto sup = getattr(single, data_fh, {nfsv4::attr::kSupportedAttrs});
+    auto bits = *nfsv4::Bitmap::decode(sup.parsed.dec);
+    EXPECT_FALSE(bits.test(nfsv4::attr::kFsLocations));
+    EXPECT_FALSE(bits.test(nfsv4::attr::kFsLocationsInfo));
+  }
+
+  // Active-active: export 23 is owned by gw2.
+  V4Fixture f;
+  core::FsOwnerView view;
+  view.publish({{23, {core::FsRole::kRemote, "gw2", "10.0.0.12:2049", 3}}});
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state, "lightnfs-cluster:c:gw1",
+                   "lightnfs-cluster:c", true);
+  f.engine->set_owner_view(&view);
+  EXPECT_EQ(static_cast<int>(f.engine->role_of(23)), static_cast<int>(core::FsRole::kRemote));
+  EXPECT_EQ(static_cast<int>(f.engine->role_of(99)), static_cast<int>(core::FsRole::kActive));
+  EXPECT_STREQ(f.engine->owner_of(23).address, "10.0.0.12:2049");
+  f.establish_session();
+  auto root_fh = f.path_fh({});
+  auto data_fh = f.path_fh({"export", "data"});
+  ASSERT_TRUE(!root_fh.empty() && !data_fh.empty());
+
+  auto sup = getattr(f, data_fh, {nfsv4::attr::kSupportedAttrs});
+  auto bits = *nfsv4::Bitmap::decode(sup.parsed.dec);
+  EXPECT_TRUE(bits.test(nfsv4::attr::kFsLocations));
+  EXPECT_TRUE(bits.test(nfsv4::attr::kFsLocationsInfo));
+
+  auto r = getattr(f, data_fh, {nfsv4::attr::kFsid, nfsv4::attr::kFsLocations});
+  EXPECT_TRUE(r.mask.test(nfsv4::attr::kFsLocations));
+  EXPECT_EQ(*r.parsed.dec.u64(), 23u);  // fsid.major
+  (void)r.parsed.dec.u64();             // fsid.minor
+  auto loc = decode_locations(r.parsed.dec);
+  ASSERT_TRUE(loc.fs_root.size() == 2u);
+  EXPECT_STREQ(loc.fs_root[0], "export");
+  EXPECT_STREQ(loc.fs_root[1], "data");
+  ASSERT_TRUE(loc.servers.size() == 1u && loc.servers[0].size() == 1u);
+  EXPECT_STREQ(loc.servers[0][0], "10.0.0.12");  // the host: clients use the NFS port
+  ASSERT_TRUE(loc.rootpaths.size() == 1u && loc.rootpaths[0].size() == 2u);
+  EXPECT_STREQ(loc.rootpaths[0][1], "data");
+
+  auto info = getattr(f, data_fh, {nfsv4::attr::kFsLocationsInfo});
+  EXPECT_TRUE(info.mask.test(nfsv4::attr::kFsLocationsInfo));
+  EXPECT_EQ(*info.parsed.dec.u32(), 0u);  // fli_flags
+  EXPECT_EQ(*info.parsed.dec.u32(), f.state->config().lease_seconds);  // fli_valid_for
+  auto info_root = pathname(info.parsed.dec);
+  ASSERT_TRUE(info_root.size() == 2u);
+  EXPECT_EQ(*info.parsed.dec.u32(), 1u);  // fli_items
+  EXPECT_EQ(*info.parsed.dec.u32(), 1u);  // fli_entries
+  EXPECT_EQ(*info.parsed.dec.u32(), 0xffffffffu);  // fls_currency = -1
+  EXPECT_EQ(info.parsed.dec.opaque(64)->size(), 0u);  // fls_info
+  EXPECT_STREQ(std::string(*info.parsed.dec.string(1024)), "10.0.0.12");
+  auto item_root = pathname(info.parsed.dec);
+  EXPECT_TRUE(item_root == info_root);
+
+  // The pseudo root is nobody's referral: empty root path, no locations.
+  auto pr = getattr(f, root_fh, {nfsv4::attr::kFsLocations});
+  EXPECT_TRUE(pr.mask.test(nfsv4::attr::kFsLocations));
+  auto ploc = decode_locations(pr.parsed.dec);
+  EXPECT_EQ(ploc.fs_root.size(), 0u);
+  EXPECT_EQ(ploc.servers.size(), 0u);
+
+  // The view is read per operation: the export moves to a v6 host, then comes home
+  // (kActive with this node's own address), then loses its owner (no location).
+  view.publish({{23, {core::FsRole::kRemote, "gw3", "[fd00::13]:2049", 4}}});
+  auto v6_reply = getattr(f, data_fh, {nfsv4::attr::kFsLocations});
+  auto v6 = decode_locations(v6_reply.parsed.dec);
+  ASSERT_TRUE(v6.servers.size() == 1u);
+  EXPECT_STREQ(v6.servers[0][0], "fd00::13");
+  view.publish({{23, {core::FsRole::kActive, "gw1", "10.0.0.11:2049", 5}}});
+  auto home_reply = getattr(f, data_fh, {nfsv4::attr::kFsLocations});
+  auto home = decode_locations(home_reply.parsed.dec);
+  ASSERT_TRUE(home.servers.size() == 1u);
+  EXPECT_STREQ(home.servers[0][0], "10.0.0.11");
+  view.publish({{23, {core::FsRole::kUnowned, "", "", 5}}});
+  auto nobody_reply = getattr(f, data_fh, {nfsv4::attr::kFsLocations});
+  auto nobody = decode_locations(nobody_reply.parsed.dec);
+  EXPECT_EQ(nobody.fs_root.size(), 2u);
+  EXPECT_EQ(nobody.servers.size(), 0u);
+  view.publish({});  // unknown export: served here, no address to name
+  auto unknown_reply = getattr(f, data_fh, {nfsv4::attr::kFsLocations});
+  auto unknown = decode_locations(unknown_reply.parsed.dec);
+  EXPECT_EQ(unknown.servers.size(), 0u);
+
+  // address_host: the piece of a node address that fs_locations carries.
+  EXPECT_STREQ(core::address_host("10.0.0.12:2049"), "10.0.0.12");
+  EXPECT_STREQ(core::address_host("[fd00::13]:2049"), "fd00::13");
+  EXPECT_STREQ(core::address_host("gw2.example.net:2049"), "gw2.example.net");
+  EXPECT_STREQ(core::address_host("gw2"), "gw2");
+}
+
 // EXCHANGE_ID under active-active (plan 12 B1): the reply announces referral and
 // migration support (EXCHGID4_FLAG_SUPP_MOVED_REFER | _MIGR) and the per-node
 // server_owner; a single gateway and a failover gateway announce neither bit.

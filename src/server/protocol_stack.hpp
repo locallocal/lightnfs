@@ -17,6 +17,7 @@
 
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
+#include "core/fs_owner_view.hpp"
 #include "core/obj_lock.hpp"
 #include "core/pseudofs.hpp"
 #include "mountd/mount3.hpp"
@@ -39,6 +40,9 @@ struct CoreState {
   core::FileHandleCodec key;
   uint64_t epoch = 0;
   ClusterStore* cluster = nullptr;
+  // Per-export ownership under active-active (plan 12 B2); null = every export is
+  // served here.
+  const core::FsOwnerView* owners = nullptr;
 };
 
 // Protocol engines and their shared state, wired onto one dispatcher.

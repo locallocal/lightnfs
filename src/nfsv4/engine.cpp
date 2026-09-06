@@ -844,14 +844,35 @@ rt::Task<uint32_t> Engine::op_lookupp(Ctx& ctx, xdr::XdrEnc& enc) {
   co_return st(Status::kOk);
 }
 
+// ---- ownership (plan 12 B2) ------------------------------------------------
+
+core::FsOwner Engine::owner_of(uint32_t fsid) const {
+  if (owners_) {
+    auto snapshot = owners_->snapshot();
+    if (auto it = snapshot->find(fsid); it != snapshot->end()) return it->second;
+  }
+  return core::FsOwner{};  // kActive: served here
+}
+
+core::FsRole Engine::role_of(uint32_t fsid) const {
+  if (owners_) {
+    auto snapshot = owners_->snapshot();
+    if (auto it = snapshot->find(fsid); it != snapshot->end()) return it->second.role;
+  }
+  return core::FsRole::kActive;
+}
+
 // ---- attributes ------------------------------------------------------------
 
 rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
                                       const Bitmap& wanted, xdr::XdrEnc& enc) {
   AttrSource src;
+  src.referrals = referrals_;
   backend::Attr attr;
   core::FsProps fs;
   backend::FsStats stats;
+  core::FsOwner owner;
+  std::vector<std::string> fs_root;
   if (resolved.pseudo()) {
     attr = pseudo_.attr_of(*resolved.node);
     src.fsid = 0;  // src.fs stays null: pseudo defaults
@@ -881,6 +902,13 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
         if (auto* crossing = pseudo_.for_export(resolved.exp->fsid))
           src.mounted_on_fileid = crossing->id;
       }
+    }
+    if (referrals_ && (wanted.test(attr::kFsLocations) || wanted.test(attr::kFsLocationsInfo))) {
+      owner = owner_of(resolved.exp->fsid);
+      src.owner = &owner;
+      if (auto* crossing = pseudo_.for_export(resolved.exp->fsid))
+        fs_root = core::PseudoFs::path_of(*crossing);
+      src.fs_root = fs_root;
     }
   }
   src.attr = &attr;
@@ -1327,6 +1355,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     enc.u64(entry_cookie);
     enc.string(name);
     AttrSource src;
+    src.referrals = referrals_;
     src.attr = &attr;
     src.fsid = fsid_val;
     src.mounted_on_fileid = mounted_on;
@@ -2120,7 +2149,7 @@ rt::Task<uint32_t> Engine::op_verify(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
   }
-  const Bitmap& sup = supported_attrs();
+  const Bitmap& sup = supported_attrs(referrals_);
   for (uint32_t bit = 0; bit < 96; ++bit) {
     if (!mask->test(bit)) continue;
     if (bit == attr::kRdattrError) {  // never meaningful in a VERIFY

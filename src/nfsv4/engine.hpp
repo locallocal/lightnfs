@@ -20,6 +20,7 @@
 #include "core/config.hpp"
 #include "core/file_handle.hpp"
 #include "core/obj_lock.hpp"
+#include "core/fs_owner_view.hpp"
 #include "core/pseudofs.hpp"
 #include "nfsv4/nfs4_types.hpp"
 #include "rpc/dispatch.hpp"
@@ -52,6 +53,12 @@ class Engine {
   const std::string& server_owner() const { return server_owner_; }
   const std::string& server_scope() const { return server_scope_; }
   bool referrals() const { return referrals_; }
+  // Per-export ownership (plan 12 B2): null (the default) serves every export here.
+  void set_owner_view(const core::FsOwnerView* owners) { owners_ = owners; }
+  // The owner of an export as this gateway sees it; kActive when the view is unset or
+  // does not know the export.
+  core::FsOwner owner_of(uint32_t fsid) const;
+  core::FsRole role_of(uint32_t fsid) const;
 
   // Per-client (clientid) token-bucket defaults ([limits] client_*, plan doc 10 §4.3).
   // Hot-reloadable: reconfigures every existing client bucket as well.
@@ -185,6 +192,7 @@ class Engine {
   core::WriteVerf write_verf_;
   std::string server_owner_, server_scope_;
   bool referrals_ = false;
+  const core::FsOwnerView* owners_ = nullptr;
   std::mutex root_oid_mu_;
   std::unordered_map<uint32_t, backend::ObjId> root_oids_;  // fsid -> root oid
 
