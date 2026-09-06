@@ -83,7 +83,10 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
              .stable = core.cluster ? cluster_stable_store(*core.cluster)
                                     : state::StateMgr::Config::StableStore{},
              .per_fsid_reclaim = core.active_active}) {
-  nfs3.set_write_verifier(core::verifier_from_epoch(core.epoch));
+  // Active-active: gateways keep independent epochs, so the node name goes into the
+  // verifier too — an export that migrates must not look like the same server.
+  nfs3.set_write_verifier(core.active_active ? core::verifier_for_node(core.epoch, core.node)
+                                             : core::verifier_from_epoch(core.epoch));
   nfs3.set_drc(&drc);
   nfs3.register_with(dispatcher);
   mount.register_with(dispatcher);
@@ -115,6 +118,7 @@ void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::Cluster
   auto identity = derive_server_identity(cfg, cluster);
   nfs4.emplace(*core.exports, core.key, locks, pseudofs, state, std::move(identity.owner),
                std::move(identity.scope), core::cluster_active_active(cluster));
+  if (core.active_active) nfs4->set_write_verifier(core::verifier_for_node(core.epoch, core.node));
   nfs4->set_owner_view(core.owners);
   nfs4->register_with(dispatcher);
   // Off reactor 0 (plan doc 10 §2.6): the auxiliary tasks used to pile onto the same

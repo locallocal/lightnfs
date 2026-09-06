@@ -79,17 +79,26 @@ inflight_per_conn = 64
 # id = "3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f"   # identical on every gateway
 # shared_dir = "/mnt/cephfs/.lightnfs-cluster"  # shared state: key, epoch, reclaim list, fence
 # node = ""                # this gateway's name; empty = hostname
-# role = "auto"            # active | standby | auto (take over when the fence expires)
+# mode = "failover"        # failover (default, one active gateway holds every export) |
+#                          # active-active (one active gateway per export; plan 12)
+# role = "auto"            # failover: active | standby | auto (take over when the fence
+#                          # expires).  Must be "auto" under active-active.
+# node_address = ""        # active-active only: "host:port" clients reach THIS gateway
+#                          # at; where its exports' fs_locations point.  Must be reachable.
 # fence_lease = "3s"       # fence renew period; the active gateway is lost after 3 misses
-# takeover = "auto"        # auto | manual (`lightnfs-ctl cluster takeover` only)
+# takeover = "auto"        # auto | manual (`lightnfs-ctl cluster takeover [<fsid>]` only)
 # takeover_hook = ""       # optional executable run after the backend takeover hooks
-#                          # (LNFS_CLUSTER_ID / LNFS_NODE / LNFS_EPOCH / LNFS_PREV_NODE)
+#                          # (LNFS_CLUSTER_ID / LNFS_NODE / LNFS_EPOCH / LNFS_PREV_NODE;
+#                          #  active-active also sets LNFS_FSID and LNFS_REASON)
 
 [[export]]
 path = "/tmp" # replace with the directory to export
 backend = "local"
 fsid = 1
 clients = ["192.168.0.0/24", "127.0.0.0/8"]
+# nodes = ["gw1", "gw2"]   # active-active only: owner priority for this export, identical
+#                          # cluster-wide; exports on one Gluster volume / Lustre mount
+#                          # must list the same nodes
 squash = "root"
 readonly = true     # phase 2: set false for read-write exports
 # Per-export token buckets (READ/WRITE data path); 0 / omitted = unlimited.

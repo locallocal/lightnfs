@@ -20,6 +20,7 @@
 
 #include "backend/fault.hpp"
 #include "backend/gluster/gluster.hpp"
+#include "core/config.hpp"
 #include "gfapi_fake.hpp"
 #include "reclaim_probe.hpp"
 #include "runtime/runtime.hpp"
@@ -695,6 +696,45 @@ TEST(Gluster, ConfigFactory) {
   if (started) (void)run(runtime, (*sys)->stop());
   sys->reset();
   runtime.stop_and_join();
+}
+
+// plan 12 A1 (design 11 §11.6): under active-active, exports sharing one
+// `[export.gluster] volume` ride one libgfapi connection, so they must list the same
+// owner nodes.  The validator reads the section's real `volume` key — the same key the
+// factory turns into GlusterBackend::Config::volume.
+TEST(Gluster, SameVolumeExportsShareOwnerList) {
+  backend::register_builtin_backends();
+  auto text = [](const std::string& nodes_b) {
+    return std::string(
+               "[cluster]\nenabled = true\nid = \"cluster-01\"\nshared_dir = \"/srv/shared\"\n"
+               "mode = \"active-active\"\nnode_address = \"10.0.0.11:2049\"\n"
+               "[[export]]\npath = \"/vol1\"\nfsid = 1\nbackend = \"gluster\"\n"
+               "clients = [\"127.0.0.0/8\"]\nnodes = [\"gw1\", \"gw2\"]\n"
+               "[export.gluster]\nvolume = \"vol0\"\nservers = \"gs1\"\n"
+               "[[export]]\npath = \"/vol2\"\nfsid = 2\nbackend = \"gluster\"\n"
+               "clients = [\"127.0.0.0/8\"]\nnodes = ") +
+           nodes_b + "\n[export.gluster]\nvolume = \"vol0\"\nservers = \"gs1\"\n";
+  };
+  auto same = core::parse_config(text("[\"gw1\", \"gw2\"]"));
+  ASSERT_TRUE(same.has_value());
+  ASSERT_TRUE(same->exports.size() == 2u);
+  EXPECT_STREQ(same->exports[1].backend_config.values.at("volume"), "vol0");
+  EXPECT_TRUE(core::validate_config(*same).has_value());
+  {  // the key the validator grouped on is the one the factory consumes
+    backend::BackendConfig bc = same->exports[1].backend_config;
+    bc.path = same->exports[1].path;
+    bc.fsid = same->exports[1].fsid;
+    auto made = backend::find_backend("gluster")->make(bc);
+    ASSERT_TRUE(made != nullptr);
+    auto* g = dynamic_cast<backend::GlusterBackend*>(made.get());
+    ASSERT_TRUE(g != nullptr);
+    EXPECT_STREQ(g->config().volume, "vol0");
+  }
+  auto diff = core::parse_config(text("[\"gw2\", \"gw1\"]"));
+  ASSERT_TRUE(diff.has_value());
+  auto rejected = core::validate_config(*diff);
+  ASSERT_TRUE(!rejected.has_value());
+  EXPECT_EQ(raw(rejected.error()), EINVAL);
 }
 
 // plan 10 E2: a client's reclaim LOCK inside grace rides DELAY while the failed

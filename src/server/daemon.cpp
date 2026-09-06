@@ -136,8 +136,14 @@ std::optional<CoreState> build_core_state(core::Config&& config, const Identity&
     LNFS_ERROR("cannot initialize exports: {}", errno_name(exports.error()));
     return std::nullopt;
   }
-  CoreState core{std::move(*exports), core::FileHandleCodec::from_key_only(identity.key),
-                 identity.epoch, cluster};
+  CoreState core{.exports = std::move(*exports),
+                 .key = core::FileHandleCodec::from_key_only(identity.key),
+                 .epoch = identity.epoch,
+                 .cluster = cluster,
+                 .owners = nullptr,        // set under active-active in run_server
+                 .active_active = false,   // "
+                 .node = {}};              // "
+
   core.key.bind(*core.exports);
   return core;
 }
@@ -462,6 +468,7 @@ int run_server(const std::string& config_path) {
       }
       core->owners = &owner_view;
       core->active_active = true;
+      core->node = node;
     }
     LNFS_INFO("cluster mode: id={} node={} mode={} shared_dir={} epoch={} exports={}",
               cluster_cfg.id, node, cluster_cfg.mode, cluster_cfg.shared_dir, core->epoch,

@@ -48,24 +48,24 @@ client_read_bps = "0"; client_write_bps = "0"; client_iops = 0   # per-clientid 
 [tls]                        # RPC-over-TLS（RFC 9289），需 OpenSSL 构建
 mode = "off"                 # off | optional | required；cert/key/ca/client_cert
 
-[cluster]                    # 多网关主备（09 册、10 册 A1）；默认关；不可热重载
+[cluster]                    # 多网关主备（09 册）/ 多活（11、12 册）；默认关；不可热重载；mode 二选一
 enabled = false
 id = "3f9c…-uuid"            # 所有网关相同；[A-Za-z0-9_-]{8,64}
-shared_dir = "/mnt/cephfs/.lightnfs-cluster"   # 共享状态目录（09 §9.4）
+shared_dir = "/mnt/cephfs/.lightnfs-cluster"   # 共享状态目录（09 §9.4；多活的 per-fsid 键空间见 11 §11.3）
 node = ""                    # 本网关名；空 = 主机名
-role = "auto"                # active | standby | auto
-fence_lease = "3s"           # 围栏续租周期（500ms–60s）；3× 未续视为失效
-takeover = "auto"            # auto | manual
-takeover_hook = ""           # 可选可执行脚本，接管时在后端钩子之后运行（超时 fence_lease；环境变量 LNFS_CLUSTER_ID/NODE/EPOCH/PREV_NODE）
-mode = "failover"            # failover（09 主备）| active-active（11 册多活，12 册 A1；C1 落地前拒绝启动）
-node_address = ""            # 多活：本网关自有地址 "host:port" / "[v6]:port"，写入 fs_locations；failover 下忽略
+role = "auto"                # active | standby | auto；多活下只能 auto（角色按导出，不按进程）
+fence_lease = "3s"           # 围栏续租周期（500ms–60s）；3× 未续视为失效；多活下一个网关的所有 fsid 一条批量续租
+takeover = "auto"            # auto | manual；多活下按导出生效：manual = 只认 `ctl cluster takeover <fsid>` / `migrate`
+takeover_hook = ""           # 可选可执行脚本，接管时在后端钩子之后运行（超时 fence_lease；环境变量 LNFS_CLUSTER_ID/NODE/EPOCH/PREV_NODE；多活另有 LNFS_FSID、LNFS_REASON=takeover|migrate）
+mode = "failover"            # failover（09 主备，默认）| active-active（11 册多活，每导出一个属主网关；12 册 A1 解析、C1 接通）
+node_address = ""            # 多活必填：本网关自有地址 "host:port" / "[v6]:port"，写入 owner 记录、作为 fs_locations 指向本网关的地址；failover 下忽略
 # unsafe_skip_backend_checks = false   # 仅测试：后端能力不达标只告警
 
 [[export]]                   # 见 06 分册 6.7；后端子表 [export.local|gluster|lustre|cephfs]
 # [export.cephfs] uuid = ""  # 多网关接管回收的会话 uuid（10 册 D2）；空 = <cluster id>-<fsid>，各网关相同
 path = "/export/data"; backend = "local"; fsid = 1
 clients = ["192.168.0.0/24"]; squash = "root"; readonly = false
-# nodes = ["gw1", "gw2"]    # 多活属主优先级列表（12 册 A1）：仅 mode = active-active；进导出摘要；改动需重启
+# nodes = ["gw1", "gw2"]    # 多活属主优先级列表（11 §11.3，12 册 A1）：仅 mode = active-active 且每导出必填；第一个活着的网关服务、其余按序接管；进导出摘要（全集群逐字相同）；改动需重启
 read_bps = "0"; write_bps = "0"; iops = 0       # per-export 令牌桶
 ```
 
@@ -75,11 +75,14 @@ rsize/wsize/dtpref 不是配置项：由后端 `FsLimits`（05 分册）推导�
 `server_owner`/`server_scope` 不得显式设置（身份由 `id` 派生）、`takeover_hook` 须为可执行文件；
 后端构造后再查每个导出 `kStableHandles + kByteLocks + native_locks`（`--check-config` 同样执行），
 `shared_dir` 不可写只告警（`--check-config` 不写共享目录）。
-`mode = "active-active"` 时再加（12 册 A1）：`node_address` 形如 `host:port`、`role` 只能 `auto`、每个
-`[[export]]` 的 `nodes` 非空且无重复（名字 `[A-Za-z0-9_.-]{1,64}`）、同一 Gluster `volume` / Lustre `mount`
-上的导出 `nodes` 必须逐项相同（11 §11.6）；failover 下出现这些键只告警忽略。
+`mode = "active-active"` 时再加（12 册 A1，`core/config.cpp` 的 `validate_active_active`）：`node_address`
+形如 `host:port`（不解析 DNS）、`role` 只能 `auto`、`takeover` 取值不变、每个 `[[export]]` 的 `nodes`
+非空且无重复（名字 `[A-Za-z0-9_.-]{1,64}`；成员是否为集群里的活网关在运行期按 `fence.<node>` 心跳判定）、
+同一 Gluster `volume` / Lustre `mount` 上的导出 `nodes` 必须逐项相同（11 §11.6 同卷同进退：libgfapi
+连接 / Lustre 挂载是整卷级，单 fsid 迁移会波及同卷其他 fsid）；failover 下出现这些键只告警忽略
+（便于逐台切换配置）。校验失败的原因以 WARN 日志给出，`validate_config` 只返回 EINVAL。
 启动时还把导出表的规范化摘要（`sha256:` + 每导出的 path/fsid/backend/readonly/squash/anon_uid/anon_gid
-与后端子表键值，按 fsid 排序）写入 `shared_dir/exports.<node>`，与其他节点的记录逐一比对，
+与后端子表键值、多活下再加 `nodes` 一行，按 fsid 排序）写入 `shared_dir/exports.<node>`，与其他节点的记录逐一比对，
 不一致则拒绝入集群。**按节点豁免键**不参与摘要：`conf`、`keyring`、`id`、`user`、`name`、
 `log_file`、`fd_cache`、`mon_host`（`core/config.hpp` 的 `kPerNodeBackendKeys`）；`clients`
 与 QoS 也不参与（可热重载的策略，不是树身份）。已下线节点的 `exports.<node>` 需运维手动删除。
@@ -105,7 +108,8 @@ rsize/wsize/dtpref 不是配置项：由后端 `FsLimits`（05 分册）推导�
 | state | 07 分册 7.8 清单 |
 | backend | 计数/水位而非直方图：`lightnfs_fdcache_*`（local/lustre）、`lightnfs_gluster_*`、`lightnfs_cephfs_*`（含 `_blocklisted_total`）、`lightnfs_lustre_hsm_*`，各带 jukebox 计数与锁描述符数；时延直方图只在协议层（v3 过程 / v4 op / COMPOUND / reactor 循环） |
 | drc/slots | 命中/重放/in-progress 等待 |
-| cluster | 多网关（09/10 册 C4）：`lightnfs_cluster_role{role}`（one-hot）、`_epoch`、`_fence_owned`、`_fence_age_seconds`（自己持有 = 距上次续租，否则距读到他人记录；未见记录不出样本）、`_takeovers_total`、`_fence_lost_total`、`_activation_failures_total`、`_activation_seconds` 直方图（§9.6 "< 1s" 目标）；由控制器注册、随进程存活，standby 期间也可见 |
+| cluster | 多网关主备（09/10 册 C4，`mode = failover`）：`lightnfs_cluster_role{role}`（one-hot）、`_epoch`、`_fence_owned`、`_fence_age_seconds`（自己持有 = 距上次续租，否则距读到他人记录；未见记录不出样本）、`_takeovers_total`、`_fence_lost_total`、`_activation_failures_total`、`_activation_seconds` 直方图（§9.6 "< 1s" 目标）；由控制器注册、随进程存活，standby 期间也可见 |
+| cluster（多活） | `mode = active-active`（11 §11.13，12 册 C4/D1，`FsClusterController::append_metrics`）：整机两条 `lightnfs_cluster_node_epoch`（本网关自有 epoch，进程启动 +1）、`lightnfs_cluster_migrations_total`（本网关作为源发起的 `cluster migrate` 次数）；每导出一组带 `{fsid}` 标签——`lightnfs_cluster_fs_role{fsid,role}`（one-hot，`role` ∈ active / activating / draining / remote / unowned，本网关视角）、`lightnfs_cluster_fs_owner{fsid,node}`（本网关看到的属主，值恒 1；无属主时不出样本，可据此告警"导出无人服务"）、`lightnfs_cluster_fs_epoch{fsid}`（该导出的接管代数，只做诊断，不进 stateid）、`lightnfs_cluster_fs_takeovers_total{fsid}`、`lightnfs_cluster_fs_fence_lost_total{fsid}`（该导出的围栏被他人改写 → Draining）、`lightnfs_cluster_fs_activation_failures_total{fsid}`；引擎侧 `lightnfs_v4_moved_total{fsid}`（`server/metrics_providers.cpp` 的 `append_v4_moved`：非属主导出边界回 `NFS4ERR_MOVED` 与缺席 fs 属性应答的计数，持续增长说明客户端没有跟随 `fs_locations`）。09 的 `lightnfs_cluster_role/_epoch/_fence_*` 整机系列在多活下**不**出样本 |
 
 SLI 建议：READ/WRITE p99、GETATTR p99、错误率、grace 时长。
 
@@ -141,5 +145,9 @@ runtime 的 offload 池与 reactor 循环——在 `server/metrics_providers.{hp
 
 ## 8.6 工具
 
-- `lightnfs-ctl`：unix socket 管理口（全部命令支持 `--json`）——`ping`/`version`/`status`、`metrics`、`dump-errors`、`drc [flush]`、`fdcache [flush]`、`clear-poison`、`state`（客户端/会话/打开/锁 dump）、`expire-client`、`conns`/`kill-conn`、`loglevel`、`reload`、`drain`、`grace-end`、`cluster status|takeover [--force]|standby`（多网关角色：查看角色/epoch/围栏/同伴，手动接管或退回 standby，10 册 C3；单网关答 `cluster: not enabled`）；另有本地子命令 `bench echo|nullrpc|fullpath`（三层基准）。排障闭环不依赖重启。
+- `lightnfs-ctl`：unix socket 管理口（全部命令支持 `--json`）——`ping`/`version`/`status`、`metrics`、`dump-errors`、`drc [flush]`、`fdcache [flush]`、`clear-poison`、`state`（客户端/会话/打开/锁 dump）、`expire-client`、`conns`/`kill-conn`、`loglevel`、`reload`、`drain`、`grace-end`、`cluster status|takeover [--force]|standby`（多网关主备角色：查看角色/epoch/围栏/同伴，手动接管或退回 standby，10 册 C3；单网关答 `cluster: not enabled`）；另有本地子命令 `bench echo|nullrpc|fullpath`（三层基准）。排障闭环不依赖重启。
+  - **多活（`mode = active-active`，12 册 C4/D1；`server/ctl.cpp` 的 `cluster_fs_status` 与 `cluster` 分支）**：同一 `cluster` 子命令换成按导出的形态——
+    `cluster status` 先一行网关总览 `mode=active-active node= node_epoch= node_address= shared_dir= peers= peers_alive= takeover= migrations= exports=`（`peers` = 共享目录里登记过地址的网关，`peers_alive` = `fence.<node>` 心跳未过期的网关），再每导出一行
+    `fsid= role= nodes= owner= address= fs_epoch= fence_age_ms= fence_expires_in_ms= grace_remaining_s= takeovers= fence_lost= activation_failures=`（`role` 为本网关视角的 active/activating/draining/remote/unowned；无属主时 `owner=none address=-`，无围栏记录时两个 fence 字段为 `-`；`grace_remaining_s` 只对本网关 Active 的导出有意义）；`--json` 同样字段，`exports` 为数组。
+    `cluster takeover <fsid> [--force]`：对本网关视角为 remote 的导出取围栏并接管（围栏仍有效时报 `fence held by <node>`，`--force` 覆盖——仅在确认对方已死时用）；`cluster standby <fsid>`：释放本网关持有的一个导出（走 Draining，释放后不再自动抢回，直到别的网关持有过它或运维再次 `takeover`）；`cluster migrate <fsid> <node>`：**在当前属主上运行**，把一个导出交给一个活着的同伴（先写 owner 记录再放围栏，目标网关的下一次轮询无视顺位接管；非属主上执行报 `not active here (role=…, owner=…)`，目标无心跳报 `not a live gateway`）。09 的无参 `takeover` / `standby` 在多活下答 `fsid required`。滚动维护的封装见 `scripts/cluster_roll.sh`（D2）。
 - `lightnfs-fh`：句柄解码工具（输入 hex 句柄 → fsid/ObjId/HMAC 校验结果），配 wireshark 抓包联调。

@@ -118,11 +118,14 @@ migrate() {
     fail "migrate $fsid $owner → $target failed: $out"
   grep -q '"migrate":true' <<<"$out" || fail "migrate $fsid $owner → $target refused: $out"
   echo "migrating fsid $fsid: $owner → $target"
+  # Wait until the target itself serves the export, not merely until the source has let
+  # go: the handover is source-writes-owner-then-releases, target-takes-on-its-next-tick
+  # (plan 12 D1), and the next roll step must not race into the gap between the two.
   deadline=$((SECONDS + timeout_s))
   while :; do
-    row=$(rows "$(status_json "$owner")" | awk -v f="$fsid" '$1 == f')
-    [[ $row == "$fsid remote $target "* ]] && { echo "  fsid $fsid served by $target"; return 0; }
-    ((SECONDS < deadline)) || fail "fsid $fsid not taken by $target within ${timeout_s}s (row: $row)"
+    row=$(rows "$(status_json "$target")" | awk -v f="$fsid" '$1 == f')
+    [[ $row == "$fsid active $target "* ]] && { echo "  fsid $fsid served by $target"; return 0; }
+    ((SECONDS < deadline)) || fail "fsid $fsid not served by $target within ${timeout_s}s (row: $row)"
     sleep 0.2
   done
 }

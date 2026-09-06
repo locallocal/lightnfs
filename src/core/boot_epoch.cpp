@@ -28,4 +28,16 @@ WriteVerf verifier_from_epoch(uint64_t epoch) {
   return out;
 }
 
+WriteVerf verifier_for_node(uint64_t epoch, std::string_view node) {
+  uint64_t hash = 1469598103934665603ULL;  // FNV-1a
+  for (unsigned char ch : node) {
+    hash ^= ch;
+    hash *= 1099511628211ULL;
+  }
+  const uint64_t mixed = (epoch & 0xffffffffULL) | (hash & 0xffffffff00000000ULL);
+  WriteVerf out{};
+  std::memcpy(out.data(), &mixed, sizeof(mixed));
+  return out;
+}
+
 }  // namespace lnfs::core

@@ -22,6 +22,7 @@
 
 #include "backend/fault.hpp"
 #include "backend/lustre/lustre.hpp"
+#include "core/config.hpp"
 #include "llapi_fake.hpp"
 #include "reclaim_probe.hpp"
 #include "runtime/runtime.hpp"
@@ -604,6 +605,38 @@ TEST(Lustre, ConfigFactory) {
   EXPECT_TRUE((*made)->caps().has(backend::Cap::kStableHandles));
   EXPECT_FALSE((*made)->lustre_config().hsm);
   made->reset();
+}
+
+// plan 12 A1 (design 11 §11.6): under active-active, exports sharing one
+// `[export.lustre] mount` ride one client connection, so they must list the same owner
+// nodes — the validator reads the section's real `mount` key.
+TEST(Lustre, SameMountExportsShareOwnerList) {
+  backend::register_builtin_backends();
+  TmpDir dir;  // exports are real directories inside the (stand-in) client mount
+  const std::string a = dir.path + "/a", b = dir.path + "/b";
+  ASSERT_TRUE(std::filesystem::create_directory(a) && std::filesystem::create_directory(b));
+  auto text = [&](const std::string& nodes_b) {
+    return "[cluster]\nenabled = true\nid = \"cluster-01\"\nshared_dir = \"/srv/shared\"\n"
+           "mode = \"active-active\"\nnode_address = \"10.0.0.11:2049\"\n"
+           "[[export]]\npath = \"" +
+           a + "\"\nfsid = 1\nbackend = \"lustre\"\n" +
+           "clients = [\"127.0.0.0/8\"]\nnodes = [\"gw1\", \"gw2\"]\n"
+           "[export.lustre]\nmount = \"" +
+           dir.path + "\"\n" + "[[export]]\npath = \"" + b +
+           "\"\nfsid = 2\nbackend = \"lustre\"\n" +
+           "clients = [\"127.0.0.0/8\"]\nnodes = " + nodes_b + "\n[export.lustre]\nmount = \"" +
+           dir.path + "\"\n";
+  };
+  auto same = core::parse_config(text("[\"gw1\", \"gw2\"]"));
+  ASSERT_TRUE(same.has_value());
+  ASSERT_TRUE(same->exports.size() == 2u);
+  EXPECT_STREQ(same->exports[1].backend_config.values.at("mount"), dir.path);
+  EXPECT_TRUE(core::validate_config(*same).has_value());
+  auto diff = core::parse_config(text("[\"gw2\", \"gw1\"]"));
+  ASSERT_TRUE(diff.has_value());
+  auto rejected = core::validate_config(*diff);
+  ASSERT_TRUE(!rejected.has_value());
+  EXPECT_EQ(raw(rejected.error()), EINVAL);
 }
 
 // plan 10 E2: the failed gateway's OFD lock still sits on the file when the

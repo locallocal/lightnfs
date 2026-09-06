@@ -112,6 +112,29 @@ state_dir/
   reclaim 名单三者由 `ClusterStore` 读写，接管的网关据此进 grace 并接受故障网关客户端的
   reclaim（`state/state_mgr.cpp` 的名单读写走接口，本机实现即原 `state_dir` 语义）。
   另有 `fence`（围栏租约）与 `exports.<node>`（各节点导出摘要）也在 `shared_dir` 下。
+- **多活（`[cluster] mode = active-active`，11 册 §11.5 / 12 册 A3、C3）：grace 与名单加 fsid 维度**。
+  `StateMgr` 的 grace 从一个全局窗口变成按 fsid 的窗口集合（`state/state_mgr.hpp`：
+  `load_grace_list(fsid)` / `in_grace(fsid)` / `end_grace(fsid)` / `in_stable_list(fsid, owner)` /
+  `grace_remaining_seconds(fsid)`），**窗口 0 = 全部导出**，即单网关重启与 failover 接管的既有
+  全局 grace；导出自己的窗口在本网关接管该导出时从该导出的名单 arm，只门禁该导出——
+  其他已 Active 的导出照常服务。名单也按导出存放：`shared_dir/fs/<fsid>/clients/`（无钩子的
+  本机路径 `state_dir/fs/<fsid>/clients/`），`StableStore` 三钩子 `load/put/erase` 带 `fsid` 首参
+  （0 = 全局名单）。
+  - **写点变化**（`Config::per_fsid_reclaim`，多活打开）：全局名单**不再在 CREATE_SESSION 写**；
+    客户端在导出 F 内**首次铸出 stateid**（OPEN / LOCK / 委托）时 `put(F, owner)`，该客户端在 F
+    内最后一个状态销毁或客户端过期时 `erase(F, owner)`（`ClientRec::fs_states` 按 fsid 计数）。
+    名单语义因此收紧为"在 F 持有状态、可能 reclaim 的客户端"。failover / 单网关的 `fsid = 0`
+    路径原样保留。
+  - `RECLAIM_COMPLETE` 仍是整 clientid 的（引擎接受 `rca_one_fs` 但不按 fs 处理），一次完成对
+    该客户端所在的所有窗口生效；`lightnfs-ctl grace-end` 结束全部窗口，`Stats::fs_grace` /
+    `cluster status` 的 `grace_remaining_s` 按导出报告。
+  - **属主权交出**（`release_fsid(F)`，迁移或围栏丢失时由 `FsClusterController` 调）：丢弃本网关
+    在 F 内的全部 open / lock / 委托——**不**改名单（新属主据此 arm 它的 grace）、**不**下推原生
+    unlock（存储侧残留由新属主的 takeover 钩子清理）、不发回调；F 的 grace 窗口结束；clientid 与
+    会话保留；持有过 F 状态的每个客户端记 `ClientRec::lease_moved_until = now + lease`，其后一个
+    租约期内 `SEQUENCE` 应答置 `SEQ4_STATUS_LEASE_MOVED`（0x80），提示客户端查 `fs_locations`
+    到新属主 reclaim。epoch / clientid / stateid / 写验证器仍按网关（不按 fsid）：旧属主铸的
+    stateid 在新属主上天然 STALE，无需 per-fsid epoch。
 - v3 请求不受 grace 影响（v3 无状态）；同一后端同时被 v3/v4 客户端写时，grace 期间 v3 写与 v4 reclaim 锁理论上可竞争——v1 接受（不做 NLM，v3 侧本就无锁语义），文档明示。
 
 ## 7.6 字节锁表（网关内 LockMgr）

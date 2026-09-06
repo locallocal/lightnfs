@@ -129,7 +129,9 @@ sudo systemctl enable --now lightnfs
 - **接管钩子**（`[cluster] takeover_hook`，10 册 D1）：接管时先对每个导出调后端的
   `takeover()`（默认空操作；CephFS 的会话回收见 D2），再以进程身份执行该脚本，环境变量
   `LNFS_CLUSTER_ID`、`LNFS_NODE`、`LNFS_EPOCH`、`LNFS_PREV_NODE`（被替换的围栏记录所属节点，
-  首次启动为空）。超时 `fence_lease` 后 SIGKILL；超时或非零退出只记 warn，接管照常继续
+  首次启动为空）；多活（§6）下每次只接管一个导出，再加 `LNFS_FSID`（该导出的 fsid，主备接管为空）
+  与 `LNFS_REASON`（`takeover` = 属主猝死/被驱逐，`migrate` = 前属主主动交出）。
+  超时 `fence_lease` 后 SIGKILL；超时或非零退出只记 warn，接管照常继续
   （grace 内 reclaim 下推失败走 DELAY 重试）。Lustre 的驱逐放在这里：
   `lctl set_param mdc.*.evict_client=<$LNFS_PREV_NODE 的 NID>`（脚本自己维护节点→NID 映射）。
 - **慢请求日志**：超过 `[server] slow_request_ms`（默认 1000，0 关闭）的请求落一条
@@ -145,6 +147,11 @@ sudo systemctl enable --now lightnfs
 多个 lightnfsd 网关共挂同一个共享后端（GlusterFS / Lustre / CephFS）时，`[cluster]`
 段开启后一个网关故障、客户端切到另一个网关**不重挂载、不重建应用状态**：打开的文件、
 字节锁、未提交的写由 NFSv4.1 的 grace/reclaim 机制恢复（设计见 09 册，实现见 10 册）。
+
+**二选一**：同一个 `[cluster]` 段有两种互斥的形态，由 `mode` 选择——`mode = "failover"`
+（默认，本节：一个 VIP、整机一个角色、一个网关服务全部导出）或 `mode = "active-active"`
+（§6：每个导出一个属主网关、协议引导客户端）。一个部署只能是其中之一，`nodes` /
+`node_address` 在 failover 下被忽略（只告警），`role = active|standby` 在多活下被拒绝。
 
 **拓扑**：客户端只认一个服务地址（VIP 或 DNS 单名），地址漂移由外部 HA 完成——
 lightnfsd 不搬 VIP，只负责"谁在服务"（围栏）与状态恢复（grace）。典型两节点：
@@ -201,13 +208,130 @@ keepalived 只管地址漂移（两者可叠加：VIP 是第一反应，围栏�
   幂等操作无碍；这是 NFSv4.1 exactly-once 语义在网关级故障下的既有边界。
 - **委托随故障网关消亡**：故障网关授予的读委托不迁移；客户端用 CLAIM_DELEG_PREV_FH
   被接受为普通 open 状态（名单 + grace 门禁），在 grace 内重新打开，grace 期不再授新委托。
-- **每进程一个角色**：一个网关要么整体 active 要么整体 standby，不做"按导出分角色"
-  的多活；演进路径见 09 §9.9（键空间加 `fsid` 前缀，接口已预留）。
+- **每进程一个角色**：failover 模式下一个网关要么整体 active 要么整体 standby；要"按导出
+  分角色"、让多台网关同时服务，用 `mode = "active-active"`（§6，设计见 11 册）。
 - **接管耗时**：铸新 epoch + 重建协议栈 + 进 grace 通常 < 1s（`lightnfs_cluster_activation_seconds`
   指标覆盖）；客户端感知到的中断还包含 VIP 漂移与 TCP 重连时间，由 keepalived 与客户端
   `timeo`/`retrans` 决定。
 
-## 6. 已知限制
+## 6. 多网关多活（每导出一个属主网关）
+
+`[cluster] mode = "active-active"`（设计见 11 册，实现步骤见 12 册）让 N 个网关同时对外
+服务：**每个导出（fsid）有且只有一个属主网关**在服务，不同导出可落在不同网关；属主猝死时
+它的每个导出各自迁到各自的备选网关（负载自然分散），计划内迁移把一个导出平滑交给指定网关。
+客户端由 NFSv4.1 协议本身引导到属主：伪根 `/` 在所有网关一致，跨进一个导出的边界时，非属主
+网关回 `NFS4ERR_MOVED` 并在 `fs_locations` / `fs_locations_info` 属性里给出属主网关的地址，
+客户端对该导出到属主重新 `EXCHANGE_ID/CREATE_SESSION`。一个导出仍只有一个写者——多活是
+导出级并行，不是文件级并行；热点单导出不会因多活变快，建导出时按 fsid 拆分负载。
+
+**配置**（每台网关一份，`nodes` 与后端子表全集群相同，`node` / `node_address` 各自不同）：
+
+```toml
+[cluster]
+enabled      = true
+id           = "3f9c…-uuid"
+shared_dir   = "/mnt/cephfs/.lightnfs-cluster"
+mode         = "active-active"
+node         = "gw1"
+node_address = "10.0.0.11:2049"       # 本网关自有地址，fs_locations 里指向本网关的就是它
+fence_lease  = "3s"
+# role 必须为 auto（默认）；takeover = auto|manual 按导出生效
+
+[[export]]
+path = "/export/a"; fsid = 1; backend = "cephfs"
+nodes = ["gw1", "gw2", "gw3"]         # 属主优先级：第一个活着的服务，其余按序接管
+[[export]]
+path = "/export/b"; fsid = 2; backend = "cephfs"
+nodes = ["gw2", "gw3", "gw1"]         # b 的属主优先 gw2 → 负载分摊
+```
+
+启动时校验：`node_address` 形如 `host:port`、`role` 只能 `auto`、每个导出 `nodes` 非空无重复；
+`nodes` 进导出摘要，各网关必须逐字相同（否则拒绝入集群）。多活下 `shared_dir` 里除 09 的
+`hmac.key` / `exports.<node>` 外，另有每网关的 `epoch.<node>`（自有 epoch，进程启动 +1）、
+`nodes/<node>`（地址登记）、`fence.<node>`（该网关持有的 fsid 集与统一到期时间——**同时是
+心跳**，不持任何导出的网关也按周期写空集）、`fs/<fsid>/owner` / `fs/<fsid>/epoch` /
+`fs/<fsid>/clients/`（每导出的属主、接管代数、reclaim 名单）。§5 的 NTP、`shared_dir` 权限、
+陈旧 `exports.<node>` 三条要点在多活下原样适用。
+
+**地址规划**（这是与 §5 最不同的一处）：
+
+- **入口地址只做伪根的初次接触**：客户端 `mount <入口>:/ /mnt` 落到任一网关，沿伪根向下
+  走；入口可以是 DNS 轮询（每个网关一条 A 记录）或一个轻量 VIP——它只需把"第一次
+  PUTROOTFH/LOOKUP"送到任一活着的网关，不承载数据面，故障切换也不依赖它漂移。
+- **每个网关的 `node_address` 必须能被所有客户端直达**：跨进导出后客户端按 `fs_locations`
+  改连属主网关的 `node_address`（Linux 挂成一个子挂载，clientid 按目标网关独立），`[server]
+  bind` 要监听这个地址（不要只绑 VIP）。NAT / 防火墙要放行每台网关的 2049。
+- **各网关是不同的 server**：`server_owner.major_id = lightnfs-cluster:<id>:<node>`，
+  `server_scope = lightnfs-cluster:<id>`（同一管理域，referral/migration 生效的前提）。客户端
+  挂了落在不同网关的多个导出，就持有多个 clientid——这是 RFC 8881 的正确行为。
+
+**客户端要求**：
+
+- **Linux NFSv4.1 客户端**（`-o vers=4.1`，4.2 亦可）是目标客户端：服务器在 `EXCHANGE_ID`
+  应答里置 `EXCHGID4_FLAG_SUPP_MOVED_REFER | SUPP_MOVED_MIGR`，内核对 referral 自动建子挂载
+  （`ls /mnt/export/b` 触发，`/proc/self/mountinfo` 里子挂载目标是属主的 `node_address`），
+  对 migration 在 `SEQUENCE` 收到 `SEQ4_STATUS_LEASE_MOVED` 后查 `fs_locations` 跟到新属主并
+  reclaim，应用不中断、不重挂载。
+- **不支持 referral 的老 v4 客户端**收到 MOVED 会失败：**直接挂到属主网关的 `node_address`**
+  （`mount gw2:/export/b`），放弃分流透明性；属主变了要手工换挂。
+- **NFSv3 客户端**：v3 没有 `fs_locations`，多活对 v3 只能"每导出挂到其属主网关的地址"，
+  由运维/自动化维护导出 → 属主地址的映射（`lightnfs-ctl cluster status` 的 `owner=` /
+  `address=` 列）。这是多活对 v3 的明确边界；混挂 v3/v4 的部署，v3 侧要么固定挂属主，
+  要么整个部署退回 `mode = "failover"`。
+- **无属主的导出**（全部备选都不在）：状态类操作回 `NFS4ERR_DELAY`，客户端按 grace 语义
+  重试直到某个备选接管；`lightnfs_cluster_fs_owner{fsid}` 无样本、`cluster status` 里
+  `role=unowned owner=none`，据此告警。
+
+**接管与迁移**：
+
+- **自动接管**（`takeover = auto`）：属主的 `fence.<node>` 心跳过期后，该导出 `nodes` 里
+  排在前面且仍活着的网关先接；前位活着但 `2 × 3 × fence_lease` 内不接（如 `takeover =
+  manual`），后位跳过它接管。不在 `nodes` 里的网关永不自动接管（`--force` 可以）。接管 =
+  取围栏、`fs/<fsid>/epoch` +1、只对**该导出**arm grace 并跑该后端的 `takeover()` +
+  `takeover_hook`（`LNFS_FSID` 已置），其他导出照常服务；客户端只对该导出 reclaim。
+- **手动**：`lightnfs-ctl cluster takeover <fsid> [--force]` / `cluster standby <fsid>`
+  与 §5 同义，scope 到一个导出（`standby` 释放后不自动抢回，直到别人持有过或再次
+  `takeover`）。
+- **计划内迁移**：`lightnfs-ctl cluster migrate <fsid> <node>` **在当前属主上运行**：源对该
+  导出进入 Draining（新请求回 MOVED，`fs_locations` 指向目标）、写 `fs/<fsid>/owner` 后释放
+  围栏，目标的下一次轮询无视顺位接管；受影响客户端一个租约期内在 `SEQUENCE` 收到
+  `LEASE_MOVED`，到目标网关 reclaim。目标必须是活着的同伴（无心跳报错）。
+- **滚动升级 / 维护一台网关**：`scripts/cluster_roll.sh evacuate <node> [--to <node>]` 把
+  `<node>` 服务的每个导出逐个 `migrate` 到 `--to`，或到该导出 `nodes` 里的下一个活网关，
+  并轮询到 `<node>` 不再服务任何导出；然后升级/重启它；`cluster_roll.sh restore <node>` 把
+  `nodes[0] == <node>` 的导出迁回。脚本全程经 `lightnfs-ctl cluster status --json` 与
+  `cluster migrate` 工作，因此需要每台涉及网关的 ctl 套接字：`--sockets
+  gw1=/run/lightnfs/ctl.sock,gw2=…`（远端先把 unix socket 转发到本机）或环境变量
+  `LNFS_CTL_SOCKETS`；`evacuate` 只需被撤空网关的套接字，`restore` 需要每个当前属主的。
+  每一步失败即停并打印当前属主表。全程无客户端重挂载。
+- **迁移窗口**：迁移/接管期间该导出有一个 grace 窗口（默认 = lease，`[protocol] grace` 可
+  调短），窗口内新建状态回 GRACE、读放行——只影响该导出，其他导出不受影响。§5 的"DRC /
+  会话槽不复制、委托不迁移"两条边界在多活下按导出同样成立。
+
+**后端**：
+
+- **CephFS 最契合**：每导出一个会话 uuid（`[export.cephfs] uuid`，默认 `<cluster id>-<fsid>`），
+  接管只 `ceph_start_reclaim` 回收**该导出**的旧会话，同网关正在服务的其他导出不受影响。
+  多活优先在 CephFS 上部署。
+- **GlusterFS / Lustre 同卷同进退**：libgfapi 的连接、Lustre 的客户端挂载是整卷 / 整挂载级，
+  不是按 fsid，单个导出迁走会波及同一网关上同卷的其他导出。因此**同一 Gluster `volume` /
+  同一 Lustre `mount` 上的所有导出必须列出完全相同的 `nodes`**（配置校验拒绝不一致的组合），
+  要么整卷一个导出、要么整卷的导出一起迁移；`cluster_roll.sh` 逐个 `migrate` 时它们会依次
+  到同一目标。§5 的 `network.ping-timeout` / `obd_timeout ≤ grace/2` 要求同样适用。
+
+**观测**：`lightnfs-ctl cluster status`（多活下先一行网关总览：`mode node node_epoch
+node_address shared_dir peers peers_alive takeover migrations exports`，再每导出一行
+`fsid role nodes owner address fs_epoch fence_age_ms fence_expires_in_ms grace_remaining_s
+takeovers fence_lost activation_failures`；`--json` 时 `exports` 为数组）与指标
+`lightnfs_cluster_fs_role{fsid,role}`（one-hot：active/activating/draining/remote/unowned）、
+`lightnfs_cluster_fs_owner{fsid,node}`、`lightnfs_cluster_fs_epoch{fsid}`、
+`lightnfs_cluster_fs_{takeovers,fence_lost,activation_failures}_total{fsid}`、
+`lightnfs_cluster_node_epoch`、`lightnfs_cluster_migrations_total`、`lightnfs_v4_moved_total{fsid}`。
+告警建议：某 fsid 的 `fs_role{role="active"}` 在集群内之和 ≠ 1、`fs_owner` 长时间无样本、
+`fs_fence_lost_total` 增长（脑裂 / 围栏被改写）、`v4_moved_total` 持续增长（客户端没有跟随
+`fs_locations`：老客户端或 `node_address` 不可达）。
+
+## 7. 已知限制
 
 - **身份仅 AUTH_SYS**：无 krb5/RPCSEC_GSS（见 §1）。通道加密可用内置 **RPC-over-TLS**
   （`[tls]`，RFC 9289）：STARTTLS 探测 + 同连接 TLS 会话；socket IO 仍全走 io_uring

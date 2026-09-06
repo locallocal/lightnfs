@@ -46,6 +46,7 @@ struct CoreState {
   // `[cluster] mode = "active-active"` (plan 12 C1): the reclaim list is kept per
   // export and grace is armed per export by the FsClusterController, never globally.
   bool active_active = false;
+  std::string node;  // this gateway's node name under active-active (verifier, logs)
 };
 
 // Protocol engines and their shared state, wired onto one dispatcher.
