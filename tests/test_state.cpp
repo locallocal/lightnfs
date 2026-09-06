@@ -1369,6 +1369,63 @@ TEST(StateMgr, StableStoreHooksPerFsid) {
   runtime.stop_and_join();
 }
 
+// SEQ4_STATUS_LEASE_MOVED (design 11 §11.4, plan 12 C3): after an export is handed
+// over, every client that held state in it sees the bit for one lease (coarse
+// seconds) on every SEQUENCE while its other exports keep working; a client with no
+// state there never sees it; the bit clears by itself once the lease has run out.
+TEST(StateMgr, LeaseMovedFlagAfterReleaseFsid) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  FsMemStore store;
+  // 2 s lease: the coarse deadline is 1–2 s away, so the bit is certainly still up
+  // one second in and certainly down after 2.1 s.
+  state::StateMgr mgr({.boot_epoch = 1,
+                       .state_dir = dir.path,
+                       .lease_seconds = 2,
+                       .stable = store.hooks(),
+                       .per_fsid_reclaim = true});
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(mgr, "mover", 1);
+    auto b = co_await connect(mgr, "bystander", 2);
+    auto o1 = co_await mgr.open(open_in(1, a.clientid, 1, "oa"), nullptr);
+    auto o2 = co_await mgr.open(open_in(2, a.clientid, 2, "oa"), nullptr);
+    auto ob = co_await mgr.open(open_in(2, b.clientid, 3, "ob"), nullptr);
+    EXPECT_EQ(o1.status, kOk);
+    EXPECT_EQ(o2.status, kOk);
+    EXPECT_EQ(ob.status, kOk);
+    auto sequence = [&](const auto& c, uint32_t seqid) -> rt::Task<uint32_t> {
+      auto seq = co_await mgr.sequence_begin(c.sessionid, 0, seqid, 0, false, 1);
+      EXPECT_EQ(seq.status, kOk);
+      co_await mgr.sequence_complete(c.sessionid, 0, seqid, false, {});
+      co_return seq.status_flags;
+    };
+    // Nothing moved yet: no bit for anybody.
+    EXPECT_EQ(co_await sequence(a, 1) & 0x80u, 0u);
+    EXPECT_EQ(co_await sequence(b, 1) & 0x80u, 0u);
+
+    EXPECT_EQ(co_await mgr.release_fsid(1), 1u);
+    // The mover is told on its very next SEQUENCE, and keeps being told; export 2
+    // IO on the same session is unaffected.
+    EXPECT_EQ(co_await sequence(a, 2) & 0x80u, 0x80u);
+    auto kept = co_await mgr.check_io(o2.stateid, a.clientid, 2, oid_of(2), state::kShareRead);
+    EXPECT_EQ(kept.status, kOk);
+    EXPECT_EQ(co_await sequence(a, 3) & 0x80u, 0x80u);
+    // The bystander held nothing in export 1: no bit.
+    EXPECT_EQ(co_await sequence(b, 2) & 0x80u, 0u);
+    co_await rt::sleep_for(std::chrono::milliseconds(1000));
+    EXPECT_EQ(co_await sequence(a, 4) & 0x80u, 0x80u);
+    // Past the lease the bit is gone, no explicit clearing needed.
+    co_await rt::sleep_for(std::chrono::milliseconds(1150));
+    EXPECT_EQ(co_await sequence(a, 5) & 0x80u, 0u);
+    EXPECT_EQ(co_await sequence(b, 3) & 0x80u, 0u);
+    // The dump line agrees.
+    std::string dump = co_await mgr.dump();
+    EXPECT_TRUE(dump.find("lease_moved=1") == std::string::npos);
+  });
+  runtime.stop_and_join();
+}
+
 TEST(StateMgr, ReleaseFsidDropsStateKeepsClient) {
   TmpDir dir;
   rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
