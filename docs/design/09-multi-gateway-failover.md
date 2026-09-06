@@ -179,8 +179,9 @@ LOCK 时下推被拒（EAGAIN → 现在映射为 DENIED，`state_mgr.cpp:1800`�
 
 ## 9.9 演进：多活与计划内迁移
 
-> **已实现（2026-09-06）**：完整方案见 [11 册](11-multi-gateway-active-active.md)，实施步骤、
-> 代码锚点与验收见 [12 册](12-multi-gateway-active-active-steps.md)（阶段 A–D 已合并，E 验证中）；
+> **已实现（2026-09-06）**：完整方案见 [11 册](11-multi-gateway-active-active.md)；实施步骤、
+> 代码锚点与验收原属 12 册（A–E 全部完成后与 10 册同样撤下，每步实现记录见 git 历史，未闭环项
+> 见 [../toto/multi-gateway-active-active-followups.md](../toto/multi-gateway-active-active-followups.md)）；
 > 配置 / 指标 / ctl 见 08 册，部署见 `deployment.md` §6。本节只是其提纲——`[cluster] mode =
 > failover`（本册）与 `active-active`（11 册）是同一 `[cluster]` 段的两种互斥形态。
 

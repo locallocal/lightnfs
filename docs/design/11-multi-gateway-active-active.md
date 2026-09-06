@@ -1,14 +1,15 @@
 # 11. 多网关多活（每导出一个活动网关）——设计方案
 
-> 状态：**已实现（2026-09-06）**——阶段 P1–P4 全部合并，P5 验收进行中；实施步骤、代码锚点
-> 与每步的实现注由 [12 册](12-multi-gateway-active-active-steps.md) 跟踪（A1–D2 ✅，E3 文档已完成，
-> E1/E2 验证进行中）。运维视角见 `deployment.md` §6，配置 / 指标 / ctl 见 08 册，状态层见 07 §7.5。
+> 状态：**已实现（2026-09-06）**——阶段 P1–P5 全部完成。实施步骤、代码锚点与每步的实现注
+> 原属 12 册（A1–E3 ✅ 2026-09-06，全部完成后与 10 册同样撤下，见 git 历史；未闭环项见
+> [../toto/multi-gateway-active-active-followups.md](../toto/multi-gateway-active-active-followups.md)）。
+> 运维视角见 `deployment.md` §6，配置 / 指标 / ctl 见 08 册，状态层见 07 §7.5。
 > 本册把 [09 册](09-multi-gateway-failover.md) §9.9 的一句展开成完整
 > 方案：在 09 主备接管的原语（`ClusterStore`、围栏租约、集群身份、后端接管钩子、per-fsid
 > 会话 uuid）之上，把"一个集群一个活动网关"扩展成 **每个导出一个活动网关**，用 RFC 8881
 > 的 `fs_locations` 属性 + `NFS4ERR_MOVED` 把客户端引导到每个文件系统的**属主网关**。
 > 09 回答"主备怎么无感切换"，本册回答"怎么让 N 个网关同时对外服务、各管一部分导出"。
-> 实施步骤拆分（阶段、依赖、代码锚点、测试与验收）见 [12 册](12-multi-gateway-active-active-steps.md)。
+> 实施步骤拆分（阶段、依赖、代码锚点、测试与验收）原属 12 册，A–E 全部完成后撤下，见 git 历史。
 >
 > 前置：09 册全部前提（§9.2）、`ClusterStore` 抽象（§9.4）、集群身份（§9.3）、围栏与全局
 > epoch（§9.5）、接管流程（§9.6）、后端接管钩子（§9.7）均已实现（见 09 §9.10 改动清单）。
@@ -244,7 +245,7 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
 | P2 | `fs_locations`/`fs_locations_info` 属性编码 + 非属主导出根回 `NFS4ERR_MOVED` + `eir_flags` REFER/MIGR | P1 | ✅ 2026-09-06（12 册 B1–B3） |
 | P3 | `ClusterController` 改 per-fsid 角色状态机 + per-fsid auto-takeover（备选按 `nodes` 顺序接管过期围栏）+ `SEQ4_STATUS_LEASE_MOVED` | P1 P2 | ✅ 2026-09-06（12 册 C1–C4） |
 | P4 | `ctl cluster migrate <fsid> <node>` 计划内迁移 + 滚动升级脚本 | P3 | ✅ 2026-09-06（12 册 D1–D2） |
-| P5 | 验收：三网关三导出，杀一个网关看其导出各自接管到不同网关；`migrate` 滚动；Linux 客户端跨导出不中断；CephFS per-fsid uuid 回收验证 | P1–P4 | 进行中（12 册 E1 `v4moved` 验收模式与三实例脚本、E2 fake 演练进行中；E3 文档已完成 2026-09-06） |
+| P5 | 验收：三网关三导出，杀一个网关看其导出各自接管到不同网关；`migrate` 滚动；Linux 客户端跨导出不中断；CephFS per-fsid uuid 回收验证 | P1–P4 | ✅ 2026-09-06（原 12 册 E1 `v4moved` 验收模式与三实例脚本 `scripts/accept_active_active_local.sh`、E2 fake 演练、E3 文档） |
 
 - **先单网关自测**：P1 落地后先让**一个网关持所有 fsid 的围栏**，行为应与单机等价（多活的
   单网关退化 = 主备的单网关路径），作为回归门。
