@@ -42,7 +42,7 @@
 | 阶段 | 步骤 | 交付物 | 依赖 | 11 册阶段 |
 |------|------|--------|------|-----------|
 | A 基础设施（无行为变化） | A1 多活配置键 ✅ 2026-09-06 | `mode` / `node_address` / `[[export]] nodes` 解析、校验、Gluster/Lustre 同卷约束 | — | P1 |
-| | A2 `ClusterStore` per-fsid 键空间 | `fs/<fsid>/{epoch,owner,clients/}`、批量 `fence.<node>`、`nodes/<node>`、`epoch.<node>` | — | P1 |
+| | A2 `ClusterStore` per-fsid 键空间 ✅ 2026-09-06 | `fs/<fsid>/{epoch,owner,clients/}`、批量 `fence.<node>`、`nodes/<node>`、`epoch.<node>` | — | P1 |
 | | A3 `StateMgr` per-fsid grace | `fsid → {deadline, reclaim_set}`；名单钩子加 fsid；`release_fsid()` | A2 | P1 |
 | B 协议面 | B1 多活身份 + `eir_flags` | `server_owner.major_id` 按 node 派生；`SUPP_MOVED_REFER\|MIGR` | A1 | P2 |
 | | B2 `fs_locations` / `fs_locations_info` 属性 | `attrs.cpp` 两属性编码；属主视图 `FsOwnerView` | A1 A2 | P2 |
@@ -108,7 +108,7 @@ failover 模式下 `nodes` 只告警。
 
 **验收**：`lightnfsd --check-config` 对 11 §11.10 示例返回 0；09 的示例配置与单网关配置结果不变。
 
-### A2 `ClusterStore` per-fsid 键空间与批量续租
+### A2 `ClusterStore` per-fsid 键空间与批量续租（已完成，2026-09-06）
 
 **目标**：11 §11.3 的键空间，**只加不改**——09 的全局 `epoch` / `fence` / `clients/` 方法原样保留
 给 failover 模式。
@@ -171,6 +171,17 @@ failover 模式下 `nodes` 只告警。
 记录只有一个文件；B 取 F1 得 EBUSY、取 F3 成功；A 过期后 B 取 F1 成功且 A `renew` 后
 `read_fs_fence(F1)` 仍是 B；`release(F2)` 后 A 记录只剩空集但文件仍在（心跳）；owner/fs epoch/
 名单往返；`list_nodes` 返回地址。
+
+- 实现注（2026-09-06）：与上面接口草案的差异——`acquire_fs_fence` 多一个 `epoch` 参数（与 09 的
+  `acquire_fence` 对齐，围栏记录随身带 fs epoch，`read_fs_fence` 不必再读 `fs/<fsid>/epoch`），
+  记录格式因此为 `"<expires_at_ms> <fsid>:<epoch>[,...]"`；另加 `read_node_epoch` /
+  `read_fs_epoch` 两个只读方法。`acquire` 成功时会把该 fsid 从**其他所有** node 的记录里剥掉
+  （过期的也剥），否则旧属主回来续租心跳会让过期记录复活、出现双属主；`read_fs_fence` 在无
+  活记录时返回最近过期的那条，供控制器看到"谁失联了"。`fence.<node>` 与 09 的 `fence` 共用
+  `fence.lock`。名单/计数器的文件格式与 09 完全相同（`list_clients_in` 等按目录参数化）。
+  `tests/mem_cluster_store.hpp` 同步实现，新增 `age_out_node` / `fs_taken_by` 两个测试旋钮。
+  第二个测试 `ClusterStore.PerFsidEpochOwnerClientsAndNodes` 覆盖 node epoch、地址、fs epoch、
+  owner 记录与 per-fsid 名单（含与全局名单/摘要/围栏文件互不干扰）。
 
 **验收**：09 的 `ClusterStore.*` 测试与 `accept_failover_local.sh` 不变。
 

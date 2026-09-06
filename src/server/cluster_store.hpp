@@ -30,10 +30,39 @@ namespace lnfs::server {
 //   fence               "<epoch> <expires_at_unix_ms> <node>\n"
 //   exports.<node>      canonical export-table digest of that node
 //   epoch.lock / fence.lock   O_EXCL serialization of the two multi-writer files
+//
+// Active-active additions (design 11 §11.3, plan 12 A2) — the failover files above are
+// untouched, these live beside them:
+//   epoch.<node>        that gateway's own epoch (its clientid/stateid/verifier source)
+//   nodes/<node>        "<node_address>\n": where that gateway's fs_locations point
+//   fence.<node>        "<expires_at_unix_ms> <fsid>:<epoch>[,<fsid>:<epoch>...]\n" — every
+//                       fsid that node holds, one lease for all of them; an empty list is
+//                       the node's heartbeat.  All fence.<node> writes go under fence.lock.
+//   fs/<fsid>/epoch     that export's takeover generation, +1 per owner change
+//   fs/<fsid>/owner     "<fs_epoch> <address> <node>\n": the current owner
+//   fs/<fsid>/clients/<fnv64>   that export's reclaim list, kept by its owner
 struct FenceRecord {
   std::string node;
   uint64_t epoch = 0;
   int64_t expires_at_ms = 0;  // wall clock (CLOCK_REALTIME); gateways must run NTP
+};
+
+// The current owner of one export, as fs/<fsid>/owner records it (plan 12 A2).
+struct OwnerRecord {
+  std::string node;
+  std::string address;   // that node's `[cluster] node_address`
+  uint64_t fs_epoch = 0;
+};
+
+// One node's batched fence record: the exports it holds under one lease.
+struct NodeFences {
+  struct Hold {
+    uint32_t fsid = 0;
+    uint64_t epoch = 0;  // the fs epoch the holder took the fence with
+  };
+  std::string node;
+  int64_t expires_at_ms = 0;
+  std::vector<Hold> holds;  // sorted by fsid
 };
 
 class ClusterStore {
@@ -66,6 +95,40 @@ class ClusterStore {
   // Export-table digests: one record per node, overwritten on every start.
   virtual Result<void> put_exports_digest(std::string_view node, std::string_view digest) = 0;
   virtual Result<std::vector<std::pair<std::string, std::string>>> list_exports_digests() = 0;
+
+  // ---- active-active (design 11 §11.3, plan 12 A2) ----------------------------------
+  // Per-node: the gateway's own epoch (0 before the first bump; bumped once per process
+  // start under active-active) and its advertised address.
+  virtual Result<uint64_t> read_node_epoch(std::string_view node) = 0;
+  virtual Result<uint64_t> bump_node_epoch(std::string_view node) = 0;
+  virtual Result<void> put_node_address(std::string_view node, std::string_view address) = 0;
+  virtual Result<std::vector<std::pair<std::string, std::string>>> list_nodes() = 0;
+
+  // Per-fsid fences with a per-fsid interface over per-node records: read_fs_fence
+  // answers the record naming `fsid` (a live one first; else the latest expired one, so
+  // the caller sees who lapsed; nullopt when nobody names it).  acquire_fs_fence adds
+  // `fsid` to `node`'s record (EBUSY while another node's live record names it, unless
+  // `force`) and strips it from every other record so one export is never named by two.
+  // renew_fences rewrites `node`'s whole record with a fresh expiry — one write however
+  // many exports it holds; with no export it is a plain heartbeat.  release_fs_fence
+  // drops `fsid` from `node`'s record (EPERM when another node holds it; ok when nobody
+  // does).  list_fences returns every record, expired ones included.
+  virtual Result<std::optional<FenceRecord>> read_fs_fence(uint32_t fsid) = 0;
+  virtual Result<FenceRecord> acquire_fs_fence(uint32_t fsid, std::string_view node,
+                                               uint64_t epoch, std::chrono::milliseconds ttl,
+                                               bool force) = 0;
+  virtual Result<void> renew_fences(std::string_view node, std::chrono::milliseconds ttl) = 0;
+  virtual Result<void> release_fs_fence(uint32_t fsid, std::string_view node) = 0;
+  virtual Result<std::vector<NodeFences>> list_fences() = 0;
+
+  // Per-fsid epoch, owner record and reclaim list.
+  virtual Result<uint64_t> read_fs_epoch(uint32_t fsid) = 0;
+  virtual Result<uint64_t> bump_fs_epoch(uint32_t fsid) = 0;
+  virtual Result<std::optional<OwnerRecord>> read_owner(uint32_t fsid) = 0;
+  virtual Result<void> put_owner(uint32_t fsid, const OwnerRecord& owner) = 0;
+  virtual Result<std::vector<std::string>> list_clients(uint32_t fsid) = 0;
+  virtual Result<void> put_client(uint32_t fsid, std::string_view owner_id) = 0;
+  virtual Result<void> erase_client(uint32_t fsid, std::string_view owner_id) = 0;
 };
 
 // Clock-skew allowance applied to fence expiry checks.
