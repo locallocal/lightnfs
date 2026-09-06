@@ -532,8 +532,9 @@ int run_server(const std::string& config_path) {
       };
       (void)run_on_reactor(runtime.reactor(0), release(&plane->stack->state, fsid));
     };
-    // Storage-side eviction scoped to the export (plan 12 C2 adds LNFS_FSID to the
-    // script's environment): that backend's takeover(), then the operator's script.
+    // Storage-side eviction scoped to the export (plan 12 C2): that backend's
+    // takeover() — CephFS reclaims only `<cluster id>-<fsid>` — then the operator's
+    // script with LNFS_FSID set.
     hooks.backend_takeover = [&](uint32_t fsid, const TakeoverContext& ctx) -> Result<void> {
       const auto* entry = core->exports->by_fsid(fsid);
       if (!entry) return Err(errno_from(ENOENT));
@@ -545,7 +546,7 @@ int run_server(const std::string& config_path) {
       }
       if (!cluster_cfg.takeover_hook.empty()) {
         auto ran = run_takeover_hook(cluster_cfg.takeover_hook, ctx.identity, ctx.prev_node,
-                                     std::chrono::milliseconds(cluster_cfg.fence_lease_ms));
+                                     std::chrono::milliseconds(cluster_cfg.fence_lease_ms), fsid);
         if (!ran) outcome = Err(ran.error());
       }
       return outcome;

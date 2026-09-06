@@ -104,6 +104,7 @@ struct State {
   std::vector<std::unique_ptr<ceph_mount_info>> ghosts;
   std::vector<std::unique_ptr<Fh>> ghost_fhs;
   std::atomic<uint64_t> reclaim_calls{0};
+  std::vector<std::string> reclaimed_uuids;  // every ceph_start_reclaim argument
   std::string last_uuid;
   int fail_reclaim = 0;
 };
@@ -379,6 +380,7 @@ int f_start_reclaim(ceph_mount_info* m, const char* uuid, unsigned flags) {
   auto& s = st();
   std::lock_guard lock(s.mu);
   s.reclaim_calls.fetch_add(1);
+  s.reclaimed_uuids.emplace_back(uuid ? uuid : "");
   if (!m->inited) return -ENOTCONN;
   if (m->mounted) return -EISCONN;
   if (!uuid || !*uuid) return -EINVAL;
@@ -1021,6 +1023,11 @@ size_t FakeCephApi::stale_locks() {
   return n;
 }
 uint64_t FakeCephApi::reclaim_calls() { return st().reclaim_calls.load(); }
+std::vector<std::string> FakeCephApi::reclaimed_uuids() {
+  auto& s = st();
+  std::lock_guard lock(s.mu);
+  return s.reclaimed_uuids;
+}
 std::string FakeCephApi::last_uuid() {
   auto& s = st();
   std::lock_guard lock(s.mu);
@@ -1043,6 +1050,7 @@ void FakeCephApi::set_root(std::string dir) {
   s.ghosts.clear();
   s.ghost_fhs.clear();
   s.reclaim_calls.store(0);
+  s.reclaimed_uuids.clear();
   s.last_uuid.clear();
   s.fail_reclaim = 0;
   s.next_ino = 0x10000000000ull;

@@ -215,7 +215,9 @@ struct MemClusterStore final : server::ClusterStore {
   }
 
   // Test knobs: age one node's whole record out, or hand an fsid to another node.
-  void age_out_node(const std::string& node) { fences[node].expires_at_ms = wall_now_ms() - 10000; }
+  void age_out_node(const std::string& node, int64_t age_ms = 10000) {
+    fences[node].expires_at_ms = wall_now_ms() - age_ms;
+  }
   void fs_taken_by(uint32_t fsid, const std::string& other, uint64_t e) {
     for (auto& [n, rec] : fences) drop_hold(rec, fsid);
     auto& rec = fences[other];

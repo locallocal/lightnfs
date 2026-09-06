@@ -9,11 +9,14 @@
 //   LNFS_NODE         this gateway's node name
 //   LNFS_EPOCH        the epoch minted for this takeover
 //   LNFS_PREV_NODE    node named by the fence record we replaced ("" when there was none)
+//   LNFS_FSID         the export taken over under active-active (plan 12 C2); "" for a
+//                     failover takeover, which moves every export at once
 // It is spawned with no arguments, inherits the daemon's stdout/stderr and the rest of
 // the environment, and is killed (SIGKILL) when it outlives `timeout`.  Blocking: run
 // from the main loop or an offload thread, never on a reactor.
 
 #include <chrono>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -26,6 +29,7 @@ namespace lnfs::server {
 // signal death; the spawn errno (ENOENT, EACCES, ...) when it cannot start.  Every
 // failure is logged with the script path and what happened.
 Result<void> run_takeover_hook(const std::string& path, const backend::ClusterIdentity& id,
-                               std::string_view prev_node, std::chrono::milliseconds timeout);
+                               std::string_view prev_node, std::chrono::milliseconds timeout,
+                               uint32_t fsid = 0);  // 0 = not scoped to one export
 
 }  // namespace lnfs::server

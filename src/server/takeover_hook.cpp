@@ -20,9 +20,9 @@ namespace {
 
 // The daemon's environment minus any stale LNFS_* takeover variables, plus ours.
 std::vector<std::string> hook_environment(const backend::ClusterIdentity& id,
-                                          std::string_view prev_node) {
-  static constexpr std::string_view kOurs[] = {"LNFS_CLUSTER_ID=", "LNFS_NODE=",
-                                               "LNFS_EPOCH=", "LNFS_PREV_NODE="};
+                                          std::string_view prev_node, uint32_t fsid) {
+  static constexpr std::string_view kOurs[] = {
+      "LNFS_CLUSTER_ID=", "LNFS_NODE=", "LNFS_EPOCH=", "LNFS_PREV_NODE=", "LNFS_FSID="};
   std::vector<std::string> env;
   for (char** e = environ; e && *e; ++e) {
     std::string_view entry(*e);
@@ -34,14 +34,16 @@ std::vector<std::string> hook_environment(const backend::ClusterIdentity& id,
   env.push_back("LNFS_NODE=" + id.node);
   env.push_back("LNFS_EPOCH=" + std::to_string(id.epoch));
   env.push_back("LNFS_PREV_NODE=" + std::string(prev_node));
+  env.push_back("LNFS_FSID=" + (fsid ? std::to_string(fsid) : std::string()));
   return env;
 }
 
 }  // namespace
 
 Result<void> run_takeover_hook(const std::string& path, const backend::ClusterIdentity& id,
-                               std::string_view prev_node, std::chrono::milliseconds timeout) {
-  auto env = hook_environment(id, prev_node);
+                               std::string_view prev_node, std::chrono::milliseconds timeout,
+                               uint32_t fsid) {
+  auto env = hook_environment(id, prev_node, fsid);
   std::vector<char*> envp;
   envp.reserve(env.size() + 1);
   for (auto& e : env) envp.push_back(e.data());
@@ -56,8 +58,8 @@ Result<void> run_takeover_hook(const std::string& path, const backend::ClusterId
     LNFS_WARN("cluster: takeover hook {} cannot start: {}", path, errno_name(errno_from(rc)));
     return Err(errno_from(rc));
   }
-  LNFS_INFO("cluster: takeover hook {} started (pid {}, node={} epoch={} prev={})", path, pid,
-            id.node, id.epoch, prev_node);
+  LNFS_INFO("cluster: takeover hook {} started (pid {}, node={} epoch={} prev={} fsid={})", path,
+            pid, id.node, id.epoch, prev_node, fsid);
 
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   int status = 0;
