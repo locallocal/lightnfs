@@ -59,6 +59,9 @@ class Engine {
   // does not know the export.
   core::FsOwner owner_of(uint32_t fsid) const;
   core::FsRole role_of(uint32_t fsid) const;
+  // Referrals answered per export (plan 12 B3): NFS4ERR_MOVED replies plus absent-fs
+  // attribute answers, for lightnfs_v4_moved_total{fsid} (C4).
+  std::vector<std::pair<uint32_t, uint64_t>> moved_counts() const;
 
   // Per-client (clientid) token-bucket defaults ([limits] client_*, plan doc 10 §4.3).
   // Hot-reloadable: reconfigures every existing client bucket as well.
@@ -178,6 +181,17 @@ class Engine {
   // Shared helpers.
   rt::Task<uint32_t> attr_reply(Ctx&, const Resolved&, const Bitmap& wanted,
                                 xdr::XdrEnc&);  // GETATTR tail
+  // Ownership gate (plan 12 B3): ok when this gateway serves the export; kMoved
+  // (counted) when another gateway does, kJukebox (→ DELAY) while nobody does.
+  Result<void> ownership_gate(uint32_t fsid);
+  void note_moved(uint32_t fsid);
+  // GETATTR on an absent export (RFC 8881 §11.11.1): fs_locations / fs_locations_info
+  // / fsid / rdattr_error / mounted_on_fileid answered, everything else dropped with
+  // rdattr_error = MOVED — or the whole op MOVED when the client asked for none of the
+  // attributes that make a referral answer.  `crossing` is the export's pseudo node.
+  rt::Task<uint32_t> absent_attr_reply(Ctx&, core::ExportEntry& exp,
+                                       const core::PseudoFs::Node* crossing, const Bitmap& wanted,
+                                       xdr::XdrEnc&);
   FhBytes pseudo_fh(const core::PseudoFs::Node& node) const;
   FhBytes export_fh(const core::ExportEntry& exp, const backend::ObjId& oid) const;
   // Cached backend root oid per export (plan doc 10 §2.6): the mounted_on_fileid
@@ -193,6 +207,8 @@ class Engine {
   std::string server_owner_, server_scope_;
   bool referrals_ = false;
   const core::FsOwnerView* owners_ = nullptr;
+  mutable std::mutex moved_mu_;
+  std::unordered_map<uint32_t, uint64_t> moved_;  // fsid -> referrals answered
   std::mutex root_oid_mu_;
   std::unordered_map<uint32_t, backend::ObjId> root_oids_;  // fsid -> root oid
 

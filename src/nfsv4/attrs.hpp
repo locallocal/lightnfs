@@ -50,6 +50,9 @@ struct AttrSource {
   bool referrals = false;
   std::span<const std::string> fs_root{};
   const core::FsOwner* owner = nullptr;
+  // attr 11: non-zero when attributes were left out of the answer (an absent export
+  // answers NFS4ERR_MOVED here, RFC 8881 §11.11.1 / §18.23).
+  uint32_t rdattr_error = 0;
 };
 
 // Decodes a fattr4 carrying settable attributes (SETATTR / OPEN create / CREATE) into

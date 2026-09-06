@@ -161,11 +161,31 @@ rt::Task<Result<Engine::Resolved>> Engine::resolve(Ctx& ctx, const FhBytes& fh) 
   if (decoded->fsid == 0) {
     out.node = pseudo_.resolve(decoded->oid);
     if (!out.node) co_return Err(errno_from(ESTALE));
+    if (core::ExportEntry* exp = out.node->exp) {
+      // A crossing node's handle (minted for an export served elsewhere, plan 12
+      // B3): still MOVED / DELAY while the export is elsewhere; an alias of the
+      // export root once this gateway serves it.
+      if (auto gate = ownership_gate(exp->fsid); !gate) co_return Err(gate.error());
+      auto root = co_await root_oid_of(*exp);
+      if (!root) co_return Err(root.error());
+      auto obj = co_await exp->backend->resolve(*root);
+      if (!obj) co_return Err(obj.error());
+      out.node = nullptr;
+      out.exp = exp;
+      out.obj = std::move(*obj);
+      out.oid = *root;
+      ctx.resolved_fh = fh;
+      ctx.resolved = out;
+      co_return out;
+    }
     out.oid = decoded->oid;
     ctx.resolved_fh = fh;
     ctx.resolved = out;
     co_return out;
   }
+  // The export's owner gate (plan 12 B3) sits before any backend call: a handle into
+  // an export served elsewhere answers MOVED without touching the storage.
+  if (auto gate = ownership_gate(decoded->fsid); !gate) co_return Err(gate.error());
   out.exp = decoded->exp;
   auto obj = co_await out.exp->backend->resolve(decoded->oid);
   if (!obj) co_return Err(obj.error());
@@ -684,6 +704,14 @@ rt::Task<uint32_t> Engine::op_putrootfh(Ctx& ctx, xdr::XdrEnc& enc) {
       enc.u32(st(Status::kAccess));
       co_return st(Status::kAccess);
     }
+    if (role_of(root->exp->fsid) != core::FsRole::kActive) {
+      // Served elsewhere (plan 12 B3): the root is a referral point like any other
+      // crossing node — its own handle, no storage call; GETATTR(fs_locations) on it
+      // names the owner and every other op answers MOVED / DELAY.
+      ctx.cfh = pseudo_fh(*root);
+      enc.u32(st(Status::kOk));
+      co_return st(Status::kOk);
+    }
     auto obj = co_await root->exp->backend->root();
     if (!obj) {
       uint32_t code = st(core::to_v4(obj.error(), Op::kPutrootfh));
@@ -762,6 +790,15 @@ rt::Task<uint32_t> Engine::op_lookup(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
       if (!exports_.check_client(ctx.conn.peer.addr, *child->exp)) {
         enc.u32(st(Status::kAccess));
         co_return st(Status::kAccess);
+      }
+      if (role_of(child->exp->fsid) != core::FsRole::kActive) {
+        // An export served elsewhere (plan 12 B3): the LOOKUP succeeds with the
+        // crossing node's own handle — no storage call — so the client's next
+        // GETATTR(fs_locations) on it (RFC 8881 §11.10, the Linux referral probe)
+        // learns where the export lives.
+        ctx.cfh = pseudo_fh(*child);
+        enc.u32(st(Status::kOk));
+        co_return st(Status::kOk);
       }
       auto obj = co_await child->exp->backend->root();
       if (!obj) {
@@ -862,6 +899,93 @@ core::FsRole Engine::role_of(uint32_t fsid) const {
   return core::FsRole::kActive;
 }
 
+Result<void> Engine::ownership_gate(uint32_t fsid) {
+  switch (role_of(fsid)) {
+    case core::FsRole::kActive: return {};
+    case core::FsRole::kDraining:
+    case core::FsRole::kRemote:
+      note_moved(fsid);
+      return Err(Errno::kMoved);
+    case core::FsRole::kUnowned:
+      return Err(Errno::kJukebox);  // nobody holds the fence yet: DELAY, then retry
+  }
+  return {};
+}
+
+void Engine::note_moved(uint32_t fsid) {
+  std::lock_guard lock(moved_mu_);
+  ++moved_[fsid];
+}
+
+std::vector<std::pair<uint32_t, uint64_t>> Engine::moved_counts() const {
+  std::lock_guard lock(moved_mu_);
+  std::vector<std::pair<uint32_t, uint64_t>> out(moved_.begin(), moved_.end());
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+namespace {
+
+// The attributes an absent export can still answer (RFC 8881 §11.11.1; the same set
+// knfsd uses, plus fs_locations_info).
+bool absent_fs_attr(uint32_t bit) {
+  return bit == attr::kFsLocations || bit == attr::kFsLocationsInfo || bit == attr::kFsid ||
+         bit == attr::kRdattrError || bit == attr::kMountedOnFileid;
+}
+
+// wanted ∩ absent-fs set; `dropped` = the client asked for more than that.
+Bitmap absent_fs_mask(const Bitmap& wanted, bool& dropped) {
+  Bitmap out;
+  dropped = false;
+  for (uint32_t bit = 0; bit < 96; ++bit) {
+    if (!wanted.test(bit)) continue;
+    if (absent_fs_attr(bit))
+      out.set(bit);
+    else
+      dropped = true;
+  }
+  return out;
+}
+
+}  // namespace
+
+rt::Task<uint32_t> Engine::absent_attr_reply(Ctx& ctx, core::ExportEntry& exp,
+                                             const core::PseudoFs::Node* crossing,
+                                             const Bitmap& wanted, xdr::XdrEnc& enc) {
+  bool dropped;
+  Bitmap mask = absent_fs_mask(wanted, dropped);
+  // Only a request that names the referral attributes gets a partial answer; anything
+  // else is the plain MOVED that sends the client to fetch fs_locations.
+  if (dropped && !wanted.test(attr::kRdattrError) && !wanted.test(attr::kFsLocations) &&
+      !wanted.test(attr::kFsLocationsInfo)) {
+    note_moved(exp.fsid);
+    enc.u32(st(Status::kMoved));
+    co_return st(Status::kMoved);
+  }
+  note_moved(exp.fsid);
+  backend::Attr attr;
+  if (crossing)
+    attr = pseudo_.attr_of(*crossing);
+  else
+    attr.type = backend::FType::kDir;
+  core::FsOwner owner = owner_of(exp.fsid);
+  std::vector<std::string> fs_root;
+  if (crossing) fs_root = core::PseudoFs::path_of(*crossing);
+  AttrSource src;
+  src.referrals = true;
+  src.attr = &attr;
+  src.fsid = exp.fsid;
+  src.mounted_on_fileid = crossing ? crossing->id : 0;
+  src.fh = ctx.cfh;
+  src.lease_seconds = state_.config().lease_seconds;
+  src.owner = &owner;
+  src.fs_root = fs_root;
+  src.rdattr_error = dropped ? st(Status::kMoved) : 0;
+  enc.u32(st(Status::kOk));
+  encode_fattr(enc, mask, src);
+  co_return st(Status::kOk);
+}
+
 // ---- attributes ------------------------------------------------------------
 
 rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
@@ -942,6 +1066,28 @@ rt::Task<uint32_t> Engine::op_getattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
   if (ctx.cfh.empty()) {
     enc.u32(st(Status::kNofilehandle));
     co_return st(Status::kNofilehandle);
+  }
+  if (referrals_) {  // an absent export answers its referral attributes (plan 12 B3)
+    auto decoded = handles_.decode_v4(ctx.cfh, ctx.conn.peer.addr);
+    core::ExportEntry* absent = nullptr;
+    const core::PseudoFs::Node* crossing = nullptr;
+    if (decoded && decoded->fsid == 0) {
+      if (auto* node = pseudo_.resolve(decoded->oid);
+          node && node->exp && role_of(node->exp->fsid) != core::FsRole::kActive) {
+        absent = node->exp;
+        crossing = node;
+      }
+    } else if (decoded && role_of(decoded->fsid) != core::FsRole::kActive) {
+      absent = decoded->exp;
+      crossing = pseudo_.for_export(decoded->fsid);
+    }
+    if (absent) {
+      if (role_of(absent->fsid) == core::FsRole::kUnowned) {
+        enc.u32(st(Status::kDelay));  // nobody to name yet: the client retries
+        co_return st(Status::kDelay);
+      }
+      co_return co_await absent_attr_reply(ctx, *absent, crossing, *wanted, enc);
+    }
   }
   auto resolved = co_await resolve(ctx, ctx.cfh);
   if (!resolved) {
@@ -1339,9 +1485,17 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
   bool truncated = false;
   bool eof = false;
 
-  auto emit = [&](uint64_t entry_cookie, std::string_view name,
-                  const backend::Attr& attr, const FhBytes& fh, uint64_t fsid_val,
-                  uint64_t mounted_on, const core::FsProps* ent_fs) -> bool {
+  // Absent-export entries (plan 12 B3): a reduced mask, rdattr_error = MOVED when
+  // attributes were dropped, and the owner for fs_locations.
+  struct AbsentEntry {
+    Bitmap mask;
+    uint32_t rdattr_error = 0;
+    core::FsOwner owner;
+    std::vector<std::string> fs_root;
+  };
+  auto emit = [&](uint64_t entry_cookie, std::string_view name, const backend::Attr& attr,
+                  const FhBytes& fh, uint64_t fsid_val, uint64_t mounted_on,
+                  const core::FsProps* ent_fs, const AbsentEntry* absent = nullptr) -> bool {
     size_t name_part = 8 + 4 + ((name.size() + 3) & ~size_t(3));
     if (used_dir + name_part > *dircount) {
       truncated = true;
@@ -1362,7 +1516,12 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     src.fh = fh;
     src.fs = ent_fs;
     src.lease_seconds = state_.config().lease_seconds;
-    encode_fattr(enc, *wanted, src);
+    if (absent) {
+      src.rdattr_error = absent->rdattr_error;
+      src.owner = &absent->owner;
+      src.fs_root = absent->fs_root;
+    }
+    encode_fattr(enc, absent ? absent->mask : *wanted, src);
     const size_t entry_size = enc.size() - entry_start;
     if (used + entry_size > budget) {
       enc.rollback(entry_mark);
@@ -1381,7 +1540,21 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
       uint64_t this_cookie = index++;
       if (*cookie >= this_cookie) continue;
       bool ok;
-      if (child->exp) {
+      if (child->exp && role_of(child->exp->fsid) != core::FsRole::kActive) {
+        // Served elsewhere (or by nobody yet): listed as a referral point — the
+        // crossing node's handle and the absent-fs attributes (RFC 8881 §18.23:
+        // rdattr_error tells the client the rest is not available here).
+        if (!exports_.check_client(ctx.conn.peer.addr, *child->exp)) continue;
+        AbsentEntry absent;
+        bool dropped;
+        absent.mask = absent_fs_mask(*wanted, dropped);
+        absent.rdattr_error = dropped ? st(Status::kMoved) : 0;
+        absent.owner = owner_of(child->exp->fsid);
+        absent.fs_root = core::PseudoFs::path_of(*child);
+        auto attr = pseudo_.attr_of(*child);
+        ok = emit(this_cookie, name, attr, pseudo_fh(*child), child->exp->fsid, child->id, nullptr,
+                  &absent);
+      } else if (child->exp) {
         if (!exports_.check_client(ctx.conn.peer.addr, *child->exp)) continue;
         auto obj = co_await child->exp->backend->root();
         if (!obj) continue;

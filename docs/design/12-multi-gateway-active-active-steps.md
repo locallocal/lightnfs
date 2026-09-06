@@ -46,7 +46,7 @@
 | | A3 `StateMgr` per-fsid grace ✅ 2026-09-06 | `fsid → {deadline, reclaim_set}`；名单钩子加 fsid；`release_fsid()` | A2 | P1 |
 | B 协议面 | B1 多活身份 + `eir_flags` ✅ 2026-09-06 | `server_owner.major_id` 按 node 派生；`SUPP_MOVED_REFER\|MIGR` | A1 | P2 |
 | | B2 `fs_locations` / `fs_locations_info` 属性 ✅ 2026-09-06 | `attrs.cpp` 两属性编码；属主视图 `FsOwnerView` | A1 A2 | P2 |
-| | B3 非属主导出边界回 `NFS4ERR_MOVED` | `engine.cpp` 的 fsid 门禁；referral 例外（LOOKUP、GETATTR fs_locations） | B2 | P2 |
+| | B3 非属主导出边界回 `NFS4ERR_MOVED` ✅ 2026-09-06 | `engine.cpp` 的 fsid 门禁；referral 例外（LOOKUP、GETATTR fs_locations） | B2 | P2 |
 | C per-fsid 控制器 | C1 `ClusterController` per-fsid 角色机 + 批量续租 | 每 fsid 一个 `{Remote, Activating, Active, Draining}`；一条续租协程 | A1–A3 B1 | P3 |
 | | C2 per-fsid 自动接管 | 按 `nodes` 顺位接管过期围栏；per-fsid 后端 takeover；写 owner | C1 | P3 |
 | | C3 `SEQ4_STATUS_LEASE_MOVED` | 属主变更后一个租约期对受影响客户端置位 | A3 C1 | P3 |
@@ -336,7 +336,7 @@ flags 不含这两位。
     `node_address`），无地址或 `kUnowned` 为空列表；伪 fs 对象 `fs_root = []`、无 locations。
     READDIR 条目已设 `referrals`，`rdattr_error` / 非属主条目的处理留给 B3。
 
-### B3 非属主导出边界回 `NFS4ERR_MOVED`
+### B3 非属主导出边界回 `NFS4ERR_MOVED`（已完成，2026-09-06）
 
 **目标**：11 §11.4 / §11.9——客户端跨进非属主导出时被引导走；伪根照常。
 
@@ -368,6 +368,32 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 `Engine` 铸的）`PUTFH READ` → MOVED；fsid 3 的根 → DELAY；fsid 1 一切如常；
 `READDIR /export` 三条目 rdattr_error 正确。仿 `Nfs4.PseudoFsCrossingAndAttrs`
 （`test_nfs4.cpp:419`）的搭建方式。
+
+- 实现注（2026-09-06）：
+  - **门禁**：`Engine::ownership_gate(fsid)` 在 `resolve()` 里 `decode_v4` 之后、任何后端调用
+    之前：`kRemote` / `kDraining` → 新哨兵 `Errno::kMoved`（3004）→ `Status::kMoved`（10019，
+    `v4_error_allowed` 视为对任意 op 合法）；`kUnowned` → `Errno::kJukebox` → DELAY。所有经
+    `resolve()` 的 op（含 OPEN、LOOKUPP、SECINFO、READ 等）由此统一得到 MOVED / DELAY。
+  - **GETATTR 的缺席 fs 规则与本文原列表不同，改为与 knfsd `fattr_handle_absent_fs` 一致**
+    （RFC 8881 §11.11.1）：可答集合 = {`fs_locations`, `fs_locations_info`, `fsid`,
+    `rdattr_error`, `mounted_on_fileid`}；请求掩码若含集合外的位，且请求了 `fs_locations` /
+    `fs_locations_info` / `rdattr_error` 之一 → 只答交集、`rdattr_error = MOVED`；一个也没请求
+    → 整个 op MOVED。原因：Linux 的 referral 探测 `nfs4_fs_locations_bitmap` 把 change/size/
+    fileid/mode/… 与 `fs_locations` 一起请求，"掩码 ⊆ 集合否则 MOVED"会让内核客户端拿不到
+    referral。`supported_attrs` / `fh_expire_type` / `type` 不在集合里（对伪根照常）。
+  - **crossing 句柄的生命周期**：伪根 `LOOKUP` 跨进非属主导出返回 `pseudo_fh(child)`；该句柄在
+    导出回到本网关后仍有效——`resolve()` 把带 `exp` 的 fsid-0 伪节点句柄映射为导出根
+    （`root_oid_of`），客户端缓存的 referral 句柄不会变 STALE；导出再次离开时同一句柄又回
+    MOVED。导出内的句柄（fsid ≠ 0，由其它网关铸出）在触后端前即 MOVED，但对它的
+    `GETATTR(fs_locations)` 仍按导出的 crossing 节点答 `fs_root` / `mounted_on_fileid`。
+  - **READDIR**：非属主条目列出 crossing 句柄 + 缩减掩码，丢了属性则条目 `rdattr_error =
+    MOVED`；`kUnowned` 条目照列、`locations` 为空——这是空 locations 编码唯一被走到的地方。
+    `PUTROOTFH` 在 "/" 自身是非属主导出时把 cfh 设为根 crossing 句柄（`fs_root = []`），不触
+    后端。
+  - **计数**：`Engine::moved_counts()` 按 fsid 累计 MOVED 应答与缺席 fs 属性应答，供 C4 暴露
+    `lightnfs_v4_moved_total{fsid}`。
+  - B2 的 `Nfs4.FsLocationsEncoding` 随之调整：`supported_attrs` 改问伪根；`kUnowned` 段改断言
+    DELAY。新增 `Nfs4.MovedAtExportBoundary`、`Nfs4.MovedAtExportedRoot`。
 
 ---
 

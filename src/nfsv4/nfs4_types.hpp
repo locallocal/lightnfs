@@ -136,6 +136,7 @@ enum class Status : uint32_t {
   kWrongsec = 10016,
   kClidInuse = 10017,
   kResource = 10018,
+  kMoved = 10019,
   kNofilehandle = 10020,
   kMinorVersMismatch = 10021,
   kStaleClientid = 10022,
