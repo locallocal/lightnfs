@@ -50,7 +50,7 @@
 | C per-fsid 控制器 | C1 `ClusterController` per-fsid 角色机 + 批量续租 ✅ 2026-09-06 | 每 fsid 一个 `{Remote, Activating, Active, Draining}`；一条续租协程 | A1–A3 B1 | P3 |
 | | C2 per-fsid 自动接管 ✅ 2026-09-06 | 按 `nodes` 顺位接管过期围栏；per-fsid 后端 takeover；写 owner | C1 | P3 |
 | | C3 `SEQ4_STATUS_LEASE_MOVED` ✅ 2026-09-06 | 属主变更后一个租约期对受影响客户端置位 | A3 C1 | P3 |
-| | C4 ctl 与指标 | `cluster status` per-fsid 表；`cluster takeover/standby <fsid>`；`lightnfs_cluster_fs_*`、`lightnfs_v4_moved_total` | C1 C2 | P3 |
+| | C4 ctl 与指标 ✅ 2026-09-06 | `cluster status` per-fsid 表；`cluster takeover/standby <fsid>`；`lightnfs_cluster_fs_*`、`lightnfs_v4_moved_total` | C1 C2 | P3 |
 | D 计划内迁移 | D1 `ctl cluster migrate <fsid> <node>` | 源端 Draining → owner → 释放；目标端按 owner 接管 | C2 C3 C4 | P4 |
 | | D2 滚动升级脚本 | `scripts/cluster_roll.sh`：逐 fsid 迁出 / 迁回 | D1 | P4 |
 | E 验证与文档 | E1 `v4moved` 验收模式 + 三实例本机脚本 | 无 root 的端到端：referral、migration、单网关退化、猝死分散接管 | B3 C2 C3 D1 | P5 |
@@ -513,7 +513,7 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 有 open；`release_fsid(F1)` 后 SEQUENCE 带 0x80，F2 的 IO 正常；把时钟推过 lease 后位清零；
 未在 F1 持状态的第二个客户端不带该位。
 
-### C4 ctl 与指标
+### C4 ctl 与指标（已完成，2026-09-06）
 
 **目标**：11 §11.13 的指标；运维能看每 fsid 的角色、能手动接管 / 释放。
 

@@ -11,10 +11,12 @@ std::optional<DataPlaneInstance> activate(const core::ServerConfig& cfg,
   DataPlaneInstance inst;
   inst.stack = std::make_unique<ProtocolStack>(cfg, core);
   if (cfg.enable_v4) inst.stack->enable_v4(cfg, cluster, core, runtime);
-  inst.metrics = register_metrics_providers({.drc = inst.stack->drc,
-                                             .state = inst.stack->state,
-                                             .exports = *core.exports,
-                                             .runtime = runtime});
+  inst.metrics =
+      register_metrics_providers({.drc = inst.stack->drc,
+                                  .state = inst.stack->state,
+                                  .exports = *core.exports,
+                                  .runtime = runtime,
+                                  .nfs4 = inst.stack->nfs4 ? &*inst.stack->nfs4 : nullptr});
   if (inst.stack->nfs4)
     inst.stack->nfs4->configure_client_qos(cfg.client_read_bps, cfg.client_write_bps,
                                            cfg.client_iops);

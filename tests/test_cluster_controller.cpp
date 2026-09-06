@@ -959,3 +959,4 @@ TEST(FsClusterController, StuckUnownedFsidSkipsIdlePredecessor) {
   gw2.tick();
   EXPECT_TRUE(fs_role(gw2, 2) == server::Role::kActive);
 }
+

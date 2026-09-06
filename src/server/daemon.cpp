@@ -552,7 +552,7 @@ int run_server(const std::string& config_path) {
       return outcome;
     };
     fs_controller = std::make_unique<FsClusterController>(
-        cluster_cfg, *core->exports, *cluster_store, owner_view, std::move(hooks));
+        cluster_cfg, *core->exports, *cluster_store, owner_view, std::move(hooks), core->epoch);
   } else if (cluster_store) {
     // The controller (plan 10 C2) is built before the management plane so the ctl
     // socket can address it (`cluster *`, plan 10 C3); its timer starts after.
@@ -590,7 +590,8 @@ int run_server(const std::string& config_path) {
     controller = std::make_unique<ClusterController>(cluster_cfg, *cluster_store,
                                                      std::move(hooks));
   }
-  mgmt.emplace(Management::start(server_cfg, runtime, do_reload, {}, controller.get()));
+  mgmt.emplace(
+      Management::start(server_cfg, runtime, do_reload, {}, controller.get(), fs_controller.get()));
   apply_observability(server_cfg);
 
   if (!cluster_store || active_active) {

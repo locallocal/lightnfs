@@ -23,6 +23,9 @@ class Runtime;
 namespace lnfs::state {
 class StateMgr;
 }
+namespace lnfs::nfsv4 {
+class Engine;
+}
 
 namespace lnfs::server {
 
@@ -31,6 +34,9 @@ struct MetricsSources {
   state::StateMgr& state;
   core::ExportTable& exports;
   rt::Runtime& runtime;
+  // The v4 engine when enabled: lightnfs_v4_moved_total{fsid} (referrals answered,
+  // plan 12 B3/C4).  Null = no v4 series.
+  const nfsv4::Engine* nfs4 = nullptr;
 };
 
 // Registers one text provider per group; the registration unregisters them all when

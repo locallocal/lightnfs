@@ -1,4 +1,5 @@
 #include "server/metrics_providers.hpp"
+#include "nfsv4/engine.hpp"
 
 #include <array>
 #include <cstdint>
@@ -185,8 +186,20 @@ void append_runtime(std::string& out, rt::Runtime& runtime) {
 
 }  // namespace
 
+namespace {
+// Referrals answered per export (plan 12 B3): NFS4ERR_MOVED replies and absent-fs
+// attribute answers, so an operator sees clients being sent to another gateway.
+void append_v4_moved(std::string& out, const nfsv4::Engine& engine) {
+  for (const auto& [fsid, count] : engine.moved_counts())
+    out += std::format("lightnfs_v4_moved_total{{fsid=\"{}\"}} {}\n", fsid, count);
+}
+}  // namespace
+
 MetricsRegistration register_metrics_providers(const MetricsSources& src) {
   std::vector<obs::ProviderHandle> handles;
+  if (src.nfs4)
+    handles.push_back(obs::register_text_provider(
+        [engine = src.nfs4](std::string& out) { append_v4_moved(out, *engine); }));
   handles.push_back(obs::register_text_provider(
       [&drc = src.drc](std::string& out) { append_drc(out, drc); }));
   handles.push_back(obs::register_text_provider(

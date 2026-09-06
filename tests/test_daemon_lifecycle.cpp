@@ -115,7 +115,7 @@ TEST(DaemonLifecycle, ActivateDeactivateTwiceOverOneRuntime) {
       ASSERT_TRUE(plane->frontend.has_value());
       EXPECT_TRUE(plane->stack->nfs4.has_value());
       EXPECT_EQ(plane->stack->state.config().boot_epoch, 100u + static_cast<uint64_t>(round));
-      EXPECT_EQ(obs::text_provider_count(), providers_before + 5);  // 4 groups + pool
+      EXPECT_EQ(obs::text_provider_count(), providers_before + 6);  // 4 groups + v4 moved + pool
       // ctl now addresses this plane; the epoch shows in the state dump.
       EXPECT_TRUE(ctl(cfg.ctl_socket, "status").find("role=active") != std::string::npos);
       EXPECT_TRUE(ctl(cfg.ctl_socket, "state")

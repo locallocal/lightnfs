@@ -7,6 +7,8 @@
 #include <thread>
 #include <vector>
 
+#include "backend/memory/memory.hpp"
+#include "core/fs_owner_view.hpp"
 #include "mem_cluster_store.hpp"
 #include "mini_test.hpp"
 #include "obs/metrics.hpp"
@@ -116,6 +118,98 @@ TEST(Metrics, FlatTotalsRenderCurrentValues) {
 // plan 10 C4: the cluster controller's own text provider — role one-hot, epoch, fence
 // ownership/age, takeover counters and the activation histogram — registered for the
 // controller's lifetime and gone with it.
+// Active-active (plan 12 C4): per-export series from the FsClusterController — role
+// one-hot, the owner sample only while somebody holds the export, fs epoch and the
+// per-export counters, plus the node epoch — for the controller's lifetime.
+TEST(Metrics, ClusterFsSeries) {
+  const size_t providers_before = obs::text_provider_count();
+  {
+    test::MemClusterStore store;
+    (void)store.put_node_address("gw2", "10.0.0.2:2049");
+    core::ExportTable exports;
+    for (uint32_t fsid = 1; fsid <= 3; ++fsid) {
+      core::ExportConfig ec;
+      ec.path = "/export/" + std::to_string(fsid);
+      ec.fsid = fsid;
+      ec.clients = {"127.0.0.0/8"};
+      ec.nodes = fsid == 3 ? std::vector<std::string>{"gw2", "gw1"}
+                           : std::vector<std::string>{"gw1", "gw2"};
+      ASSERT_TRUE(exports.add(ec, std::make_unique<backend::MemoryBackend>(fsid)).has_value());
+    }
+    core::ClusterConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = "active-active";
+    cfg.id = "cluster-metrics-test";
+    cfg.node = "gw1";
+    cfg.node_address = "10.0.0.1:2049";
+    cfg.fence_lease_ms = 1000;
+    core::FsOwnerView view;
+    server::FsClusterController ctl(cfg, exports, store, view, {}, 3);
+    EXPECT_EQ(obs::text_provider_count(), providers_before + 1);
+
+    // Nothing ticked: every export unowned, no owner samples, zero counters.
+    auto text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_node_epoch"), 3);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"unowned\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"active\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"3\",role=\"remote\"}"), 0);
+    EXPECT_TRUE(text.find("lightnfs_cluster_fs_owner{") == std::string::npos);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_epoch{fsid=\"2\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_takeovers_total{fsid=\"2\"}"), 0);
+
+    // gw2 holds F3 live; one tick takes F1/F2 (ours, first in line) and leaves F3
+    // remote: two active, one remote, owners for all three, epochs minted.
+    store.fs_taken_by(3, "gw2", 4);
+    store.fs_epochs[3] = 4;
+    (void)store.put_owner(3, {"gw2", "10.0.0.2:2049", 4});
+    ctl.tick();
+    ASSERT_TRUE(ctl.role_of(1) == server::Role::kActive);
+    ASSERT_TRUE(ctl.role_of(2) == server::Role::kActive);
+    text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"active\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"unowned\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"2\",role=\"active\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"3\",role=\"remote\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"3\",role=\"active\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"1\",node=\"gw1\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"2\",node=\"gw1\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"3\",node=\"gw2\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"3\",node=\"gw1\"}"), -1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_epoch{fsid=\"1\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_epoch{fsid=\"3\"}"), 4);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_takeovers_total{fsid=\"1\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_takeovers_total{fsid=\"3\"}"), 0);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_fence_lost_total{fsid=\"1\"}"), 0);
+
+    // gw2 takes F1 by force: F1 drains (fence lost, epoch 0 for us) and is remote to
+    // gw2; gw2 then dies — F1 unowned, no owner sample for it.
+    store.fs_taken_by(1, "gw2", 9);
+    ctl.tick();
+    text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"remote\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"1\",node=\"gw2\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_epoch{fsid=\"1\"}"), 9);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_fence_lost_total{fsid=\"1\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"2\",role=\"active\"}"), 1);
+    store.age_out_node("gw2", 1000);
+    ctl.tick();  // F1 is ours again (first in line), F3 as well (gw2 gone)
+    text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"active\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_takeovers_total{fsid=\"1\"}"), 2);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"3\",role=\"active\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"3\",node=\"gw1\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"3\",node=\"gw2\"}"), -1);
+    // An export released by the operator sits unowned: role one-hot says so, no owner.
+    ASSERT_TRUE(ctl.request_release(2).has_value());
+    text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"2\",role=\"unowned\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"2\",node=\"gw1\"}"), -1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_epoch{fsid=\"2\"}"), 0);
+  }
+  EXPECT_EQ(obs::text_provider_count(), providers_before);
+  EXPECT_EQ(sample_value(obs::prometheus_text(), "lightnfs_cluster_node_epoch"), -1);
+}
+
 TEST(Metrics, ClusterSeriesRenderWithControllerLifetime) {
   const size_t providers_before = obs::text_provider_count();
   {
