@@ -429,11 +429,7 @@ int run_server(const std::string& config_path) {
   if (!config) return 1;
   const core::ServerConfig server_cfg = config->server;
   const core::ClusterConfig cluster_cfg = config->cluster;
-  if (core::cluster_active_active(cluster_cfg)) {  // plan 12: configuration lands first (A1)
-    LNFS_ERROR("[cluster] mode = \"active-active\" is accepted by --check-config but not "
-               "served yet (plan 12 C1): refusing to start as a failover gateway");
-    return 1;
-  }
+  const bool active_active = core::cluster_active_active(cluster_cfg);
   const std::string exports_digest = core::canonical_exports_digest(*config);
   apply_log_level(server_cfg);
 
@@ -449,11 +445,27 @@ int run_server(const std::string& config_path) {
   auto core = build_core_state(std::move(*config), *identity, cluster_store.get());
   if (!core) return 1;
   if (!check_cluster_backends(cluster_cfg, *core->exports)) return 1;
+  // Per-export ownership as the v4 engine sees it (plan 12 B2): published by the
+  // FsClusterController under active-active, left null (everything served here)
+  // otherwise.  Outlives the stack that reads it.
+  core::FsOwnerView owner_view;
   if (cluster_store) {
     const std::string node = core::cluster_node_name(cluster_cfg);
     if (!check_exports_consistency(*cluster_store, node, exports_digest)) return 1;
-    LNFS_INFO("cluster mode: id={} node={} shared_dir={} epoch={} exports={}", cluster_cfg.id,
-              node, cluster_cfg.shared_dir, core->epoch, exports_digest);
+    if (active_active) {
+      // Where our fs_locations point (design 11 §11.3): peers copy it into the view
+      // for the exports we own.
+      if (auto put = cluster_store->put_node_address(node, cluster_cfg.node_address); !put) {
+        LNFS_ERROR("cannot publish the node address to the cluster store: {}",
+                   errno_name(put.error()));
+        return 1;
+      }
+      core->owners = &owner_view;
+      core->active_active = true;
+    }
+    LNFS_INFO("cluster mode: id={} node={} mode={} shared_dir={} epoch={} exports={}",
+              cluster_cfg.id, node, cluster_cfg.mode, cluster_cfg.shared_dir, core->epoch,
+              exports_digest);
   }
   init_async_logging({.file = server_cfg.log_file,
                       .rotate_size = server_cfg.log_rotate_size,
@@ -476,7 +488,8 @@ int run_server(const std::string& config_path) {
   };
   MainLoop loop;
   std::optional<DataPlaneInstance> plane;
-  std::unique_ptr<ClusterController> controller;
+  std::unique_ptr<ClusterController> controller;       // failover (plan 10 C2)
+  std::unique_ptr<FsClusterController> fs_controller;  // active-active (plan 12 C1)
   std::optional<Management> mgmt;  // started below, once the controller exists
   // The data-plane hooks the single gateway and the controller share (main thread).
   auto bring_up = [&](uint64_t epoch) -> Result<void> {
@@ -496,7 +509,50 @@ int run_server(const std::string& config_path) {
     plane.reset();
   };
   const std::chrono::milliseconds drain_grace(2 * cluster_cfg.fence_lease_ms);
-  if (cluster_store) {
+  if (cluster_store && active_active) {
+    // Active-active (design 11, plan 12 C1): the stack is built once (below) and stays
+    // up; the controller moves single exports in and out of service through the
+    // state manager and the owner view.  Its ctl surface arrives with plan 12 C4.
+    FsClusterController::Hooks hooks;
+    hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
+    hooks.activate_fs = [&](uint32_t fsid, uint64_t fs_epoch) -> Result<void> {
+      if (!plane) return Err(errno_from(EIO));
+      plane->stack->state.load_grace_list(fsid);
+      LNFS_INFO("cluster: fsid {} in service (fs epoch {})", fsid, fs_epoch);
+      return {};
+    };
+    hooks.deactivate_fs = [&](uint32_t fsid) {
+      if (!plane) return;
+      // Drop the export's open/lock/delegation state (plan 12 A3): a coroutine, run to
+      // completion on reactor 0 like the backend lifecycle calls.
+      auto release = [](state::StateMgr* state, uint32_t id) -> rt::Task<Result<void>> {
+        size_t dropped = co_await state->release_fsid(id);
+        LNFS_INFO("cluster: fsid {} out of service: {} state(s) dropped", id, dropped);
+        co_return Result<void>{};
+      };
+      (void)run_on_reactor(runtime.reactor(0), release(&plane->stack->state, fsid));
+    };
+    // Storage-side eviction scoped to the export (plan 12 C2 adds LNFS_FSID to the
+    // script's environment): that backend's takeover(), then the operator's script.
+    hooks.backend_takeover = [&](uint32_t fsid, const TakeoverContext& ctx) -> Result<void> {
+      const auto* entry = core->exports->by_fsid(fsid);
+      if (!entry) return Err(errno_from(ENOENT));
+      Result<void> outcome{};
+      auto took = run_on_reactor(runtime.reactor(0), entry->backend->takeover(ctx.identity));
+      if (!took) {
+        LNFS_WARN("cluster: backend {} takeover failed: {}", entry->path, errno_name(took.error()));
+        outcome = Err(took.error());
+      }
+      if (!cluster_cfg.takeover_hook.empty()) {
+        auto ran = run_takeover_hook(cluster_cfg.takeover_hook, ctx.identity, ctx.prev_node,
+                                     std::chrono::milliseconds(cluster_cfg.fence_lease_ms));
+        if (!ran) outcome = Err(ran.error());
+      }
+      return outcome;
+    };
+    fs_controller = std::make_unique<FsClusterController>(
+        cluster_cfg, *core->exports, *cluster_store, owner_view, std::move(hooks));
+  } else if (cluster_store) {
     // The controller (plan 10 C2) is built before the management plane so the ctl
     // socket can address it (`cluster *`, plan 10 C3); its timer starts after.
     ClusterController::Hooks hooks;
@@ -536,12 +592,21 @@ int run_server(const std::string& config_path) {
   mgmt.emplace(Management::start(server_cfg, runtime, do_reload, {}, controller.get()));
   apply_observability(server_cfg);
 
-  if (!cluster_store) {
-    // 4+5. single gateway (plan 10 C1): the data plane once, for the whole process.
+  if (!cluster_store || active_active) {
+    // 4+5. single gateway (plan 10 C1) and active-active (plan 12 C1): the data plane
+    //      once, for the whole process.  Under active-active every export starts
+    //      Unowned in the view (clients wait) until the controller's first ticks have
+    //      taken over what is ours.
     if (!bring_up(core->epoch)) {
       mgmt->stop();
       runtime.stop_and_join();
       return 1;
+    }
+    if (fs_controller) {
+      fs_controller->start();
+      LNFS_INFO("lightnfs {} active-active: node={} address={} takeover={} fence_lease={}ms",
+                LIGHTNFS_VERSION, core::cluster_node_name(cluster_cfg), cluster_cfg.node_address,
+                cluster_cfg.takeover, cluster_cfg.fence_lease_ms);
     }
   } else {
     // 4+5. cluster (plan 10 C2): standby until the controller takes the fence; the
@@ -559,7 +624,11 @@ int run_server(const std::string& config_path) {
   // (detach from ctl → stop accepting → connections → lease scanner → stack) → fence
   // → backends → management → runtime → logging
   if (controller) controller->stop();
+  if (fs_controller) fs_controller->stop();
   loop.drain();
+  // Active-active: hand every export we hold back (view → Draining, state dropped,
+  // fence released) before the connections close, so clients are referred on.
+  if (fs_controller) fs_controller->shutdown();
   take_down(kShutdownDrainGrace);
   if (controller && controller->role() != Role::kStandby) {
     (void)cluster_store->release_fence(core::cluster_node_name(cluster_cfg));

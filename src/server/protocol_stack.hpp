@@ -43,6 +43,9 @@ struct CoreState {
   // Per-export ownership under active-active (plan 12 B2); null = every export is
   // served here.
   const core::FsOwnerView* owners = nullptr;
+  // `[cluster] mode = "active-active"` (plan 12 C1): the reclaim list is kept per
+  // export and grace is armed per export by the FsClusterController, never globally.
+  bool active_active = false;
 };
 
 // Protocol engines and their shared state, wired onto one dispatcher.

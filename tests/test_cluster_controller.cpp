@@ -372,3 +372,427 @@ TEST(ClusterController, PostedActivationRenewsMeanwhileAndTimerThreadRuns) {
   EXPECT_TRUE(timed.role() == server::Role::kActive);  // stop() leaves the role alone
   EXPECT_STREQ(store2.fence->node, "gw9");
 }
+
+// ---- active-active: FsClusterController (design 11 §11.3/§11.14, plan 12 C1) ----------
+//
+// Same shape as above: MemClusterStore, inline hooks that record their calls per
+// fsid, tick() by hand.  The view the controller publishes is what the v4 engine
+// reads (plan 12 B2/B3), so its roles are checked alongside the controller's own.
+
+#include "backend/memory/memory.hpp"
+#include "core/fs_owner_view.hpp"
+
+namespace {
+
+struct FsRecorder {
+  std::vector<std::string> calls;  // "takeover:F" / "activate:F" / "deactivate:F"
+  std::vector<server::TakeoverContext> takeovers;
+  Errno fail_activate = Errno::kOk;
+  server::FsClusterController::Hooks hooks() {
+    return {.post = {},
+            .activate_fs = [this](uint32_t fsid, uint64_t) -> Result<void> {
+              calls.push_back("activate:" + std::to_string(fsid));
+              if (fail_activate != Errno::kOk) return Err(fail_activate);
+              return {};
+            },
+            .deactivate_fs =
+                [this](uint32_t fsid) { calls.push_back("deactivate:" + std::to_string(fsid)); },
+            .backend_takeover = [this](uint32_t fsid,
+                                       const server::TakeoverContext& ctx) -> Result<void> {
+              calls.push_back("takeover:" + std::to_string(fsid));
+              takeovers.push_back(ctx);
+              return {};
+            }};
+  }
+};
+
+// Three exports (fsid 1, 2, 3) with the given owner lists.
+struct Exports {
+  core::ExportTable table;
+  explicit Exports(std::vector<std::vector<std::string>> nodes) {
+    for (uint32_t fsid = 1; fsid <= 3; ++fsid) {
+      core::ExportConfig cfg;
+      cfg.path = "/export/" + std::to_string(fsid);
+      cfg.fsid = fsid;
+      cfg.clients = {"127.0.0.0/8"};
+      cfg.nodes = nodes[fsid - 1];
+      auto ok = table.add(cfg, std::make_unique<backend::MemoryBackend>(fsid));
+      ASSERT_TRUE(ok.has_value());
+    }
+  }
+};
+
+core::ClusterConfig aa_config(const std::string& node, const std::string& takeover = "auto") {
+  core::ClusterConfig c = config(node, "auto", takeover);
+  c.mode = "active-active";
+  c.node_address = "10.0.0." + node.substr(2) + ":2049";  // gwN → 10.0.0.N
+  return c;
+}
+
+server::Role fs_role(const server::FsClusterController& ctl, uint32_t fsid) {
+  return ctl.role_of(fsid);
+}
+
+const core::FsOwner& view_of(const core::FsOwnerView& view, uint32_t fsid) {
+  static core::FsOwner none;
+  auto snap = view.snapshot();
+  auto it = snap->find(fsid);
+  return it == snap->end() ? none : it->second;
+}
+
+size_t count(const std::vector<std::string>& log, const std::string& entry) {
+  return static_cast<size_t>(std::count(log.begin(), log.end(), entry));
+}
+
+}  // namespace
+
+// The single-gateway degeneration gate (design 11 §11.13): one node listed for every
+// export takes them all, under one fence record, and the view says Active for each.
+TEST(FsClusterController, SingleNodeOwnsEveryFsid) {
+  MemStore store;
+  Exports exports({{"gw1"}, {"gw1"}, {"gw1"}});
+  core::FsOwnerView view;
+  FsRecorder rec;
+  server::FsClusterController ctl(aa_config("gw1"), exports.table, store, view, rec.hooks());
+  // Before the first tick nothing is served: Unowned, never silently Active.
+  for (uint32_t f = 1; f <= 3; ++f) {
+    EXPECT_TRUE(fs_role(ctl, f) == server::Role::kStandby);
+    EXPECT_TRUE(view_of(view, f).role == core::FsRole::kUnowned);
+  }
+  for (int i = 0; i < 3; ++i) ctl.tick();
+  for (uint32_t f = 1; f <= 3; ++f) {
+    EXPECT_TRUE(fs_role(ctl, f) == server::Role::kActive);
+    const auto& o = view_of(view, f);
+    EXPECT_TRUE(o.role == core::FsRole::kActive);
+    EXPECT_STREQ(o.node, "gw1");
+    EXPECT_STREQ(o.address, "10.0.0.1:2049");
+    EXPECT_EQ(o.fs_epoch, 1u);
+    // Hook order per export: storage eviction, then the grace window.
+    EXPECT_EQ(count(rec.calls, "takeover:" + std::to_string(f)), 1u);
+    EXPECT_EQ(count(rec.calls, "activate:" + std::to_string(f)), 1u);
+    // The owner record names us with our address and the minted fs epoch.
+    ASSERT_TRUE(store.owners.contains(f));
+    EXPECT_STREQ(store.owners[f].node, "gw1");
+    EXPECT_STREQ(store.owners[f].address, "10.0.0.1:2049");
+    EXPECT_EQ(store.owners[f].fs_epoch, 1u);
+    EXPECT_EQ(store.fs_epochs[f], 1u);
+  }
+  // One fence record lists all three.
+  ASSERT_TRUE(store.fences.size() == 1u);
+  ASSERT_TRUE(store.fences["gw1"].holds.size() == 3u);
+  EXPECT_EQ(store.fences["gw1"].holds[0].fsid, 1u);
+  EXPECT_EQ(store.fences["gw1"].holds[2].fsid, 3u);
+  // A free fence: no previous holder to evict.
+  ASSERT_TRUE(rec.takeovers.size() == 3u);
+  EXPECT_STREQ(rec.takeovers[0].prev_node, "");
+  EXPECT_STREQ(rec.takeovers[0].identity.node, "gw1");
+  EXPECT_EQ(rec.takeovers[0].identity.epoch, 1u);
+  auto snap = ctl.snapshot();
+  ASSERT_TRUE(snap.size() == 3u);
+  EXPECT_EQ(snap[1].fsid, 2u);
+  EXPECT_EQ(snap[1].takeovers, 1u);
+  ASSERT_TRUE(snap[1].fence.has_value());
+  EXPECT_STREQ(snap[1].fence->node, "gw1");
+  ASSERT_TRUE(snap[1].owner.has_value());
+  EXPECT_STREQ(snap[1].owner->node, "gw1");
+}
+
+// The batched lease (design 11 §11.3): holding N exports costs one store write per
+// tick, and a steady tick writes nothing else.
+TEST(FsClusterController, RenewIsOneWritePerTick) {
+  MemStore store;
+  Exports exports({{"gw1"}, {"gw1"}, {"gw1"}});
+  core::FsOwnerView view;
+  FsRecorder rec;
+  server::FsClusterController ctl(aa_config("gw1"), exports.table, store, view, rec.hooks());
+  ctl.tick();
+  ASSERT_TRUE(fs_role(ctl, 3) == server::Role::kActive);
+  // The first tick: one renew (the heartbeat, before anything is held), then per
+  // export fence + epoch + owner.
+  EXPECT_EQ(count(store.log, "renew_fences"), 1u);
+  EXPECT_EQ(count(store.log, "acquire_fs:1"), 1u);
+  EXPECT_EQ(count(store.log, "put_owner:3=gw1"), 1u);
+  store.log.clear();
+  rec.calls.clear();
+  for (int i = 0; i < 5; ++i) ctl.tick();
+  EXPECT_EQ(store.log.size(), 5u);
+  EXPECT_EQ(count(store.log, "renew_fences"), 5u);
+  EXPECT_TRUE(rec.calls.empty());
+  int64_t expires = store.fences["gw1"].expires_at_ms;
+  EXPECT_TRUE(expires > test::wall_now_ms() + 2500);  // 3 × 1 s lease, just renewed
+}
+
+// One export taken elsewhere (forced takeover or split brain) drains that export
+// alone: its state is dropped, its fence is not released (it is theirs now), and the
+// other two stay in service.
+TEST(FsClusterController, ActiveLosesOneFsidDrainsOnlyThat) {
+  MemStore store;
+  Exports exports({{"gw1", "gw2"}, {"gw1", "gw2"}, {"gw1", "gw2"}});
+  core::FsOwnerView view;
+  FsRecorder rec;
+  server::FsClusterController ctl(aa_config("gw1"), exports.table, store, view, rec.hooks());
+  ctl.tick();
+  ASSERT_TRUE(fs_role(ctl, 2) == server::Role::kActive);
+  rec.calls.clear();
+  store.log.clear();
+
+  // gw2 now lists F2 (its record live) at fs epoch 7, and has written the owner record.
+  store.fs_taken_by(2, "gw2", 7);
+  store.fs_epochs[2] = 7;
+  (void)store.put_node_address("gw2", "10.0.0.2:2049");
+  (void)store.put_owner(2, {"gw2", "10.0.0.2:2049", 7});
+  store.log.clear();
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);  // drained inline
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  EXPECT_TRUE(fs_role(ctl, 3) == server::Role::kActive);
+  EXPECT_STREQ(joined(rec.calls), "deactivate:2");
+  EXPECT_STREQ(joined(store.log), "renew_fences");  // no release of gw2's hold
+  ASSERT_TRUE(store.fences["gw2"].holds.size() == 1u);
+  ASSERT_TRUE(store.fences["gw1"].holds.size() == 2u);
+  // The view refers F2 to gw2 (owner record: address + fs epoch), serves F1/F3.
+  const auto& two = view_of(view, 2);
+  EXPECT_TRUE(two.role == core::FsRole::kRemote);
+  EXPECT_STREQ(two.node, "gw2");
+  EXPECT_STREQ(two.address, "10.0.0.2:2049");
+  EXPECT_EQ(two.fs_epoch, 7u);
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kActive);
+  EXPECT_TRUE(view_of(view, 3).role == core::FsRole::kActive);
+  auto snap = ctl.snapshot();
+  EXPECT_EQ(snap[1].fence_lost, 1u);
+  EXPECT_EQ(snap[1].fs_epoch, 0u);
+  EXPECT_EQ(snap[0].fence_lost, 0u);
+  // gw2 holds F2 live and stands ahead of nobody: F2 stays Remote on further ticks.
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);
+  EXPECT_TRUE(view_of(view, 2).role == core::FsRole::kRemote);
+
+  // gw2 dies: its record ages out — F2 is Unowned in the view, then ours again (we
+  // are first in its list) with a fresh fs epoch and gw2 named as the node to evict.
+  store.age_out_node("gw2");
+  rec.calls.clear();
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kActive);
+  EXPECT_STREQ(joined(rec.calls), "takeover:2 activate:2");
+  EXPECT_STREQ(rec.takeovers.back().prev_node, "gw2");
+  EXPECT_EQ(rec.takeovers.back().identity.epoch, 8u);
+  EXPECT_TRUE(view_of(view, 2).role == core::FsRole::kActive);
+  EXPECT_EQ(view_of(view, 2).fs_epoch, 8u);
+  EXPECT_TRUE(store.fences["gw2"].holds.empty());
+
+  // The fence store unreachable: three failed renews drain everything we hold, without
+  // releasing (the records may still be intact).
+  rec.calls.clear();
+  store.fail_renew = errno_from(EIO);
+  ctl.tick();
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  ctl.tick();
+  for (uint32_t f = 1; f <= 3; ++f) EXPECT_TRUE(fs_role(ctl, f) == server::Role::kStandby);
+  EXPECT_EQ(count(rec.calls, "deactivate:1"), 1u);
+  EXPECT_EQ(count(rec.calls, "deactivate:3"), 1u);
+  EXPECT_EQ(ctl.snapshot()[0].fence_lost, 1u);
+  EXPECT_TRUE(store.fences["gw1"].holds.size() == 3u);  // not released
+  // Still unreachable: nothing is retaken (a fence we cannot renew is not worth
+  // taking); once the store answers again our own live record makes them ours.
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kStandby);
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kUnowned);
+  store.fail_renew = Errno::kOk;
+  ctl.tick();
+  for (uint32_t f = 1; f <= 3; ++f) EXPECT_TRUE(fs_role(ctl, f) == server::Role::kActive);
+  EXPECT_STREQ(rec.takeovers.back().prev_node, "");  // our own record: nobody to evict
+}
+
+// Remote and unowned exports as the view reports them, and the node-order policy:
+// a node yields to a live predecessor, takes over once it is gone, and never takes an
+// export it is not listed for.
+TEST(FsClusterController, RemoteUnownedAndNodeOrder) {
+  MemStore store;
+  Exports exports({{"gw1", "gw2"}, {"gw2", "gw1"}, {"gw3"}});
+  (void)store.put_node_address("gw1", "10.0.0.1:2049");
+  (void)store.put_node_address("gw2", "10.0.0.2:2049");
+  core::FsOwnerView view;
+  FsRecorder rec;
+  server::FsClusterController ctl(aa_config("gw1"), exports.table, store, view, rec.hooks());
+  // gw2 is alive (heartbeat) but holds nothing yet.
+  (void)store.renew_fences("gw2", 60s);
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);   // first in line
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);  // gw2's turn: yielded
+  EXPECT_TRUE(fs_role(ctl, 3) == server::Role::kStandby);  // not ours to take
+  EXPECT_TRUE(view_of(view, 2).role == core::FsRole::kUnowned);
+  EXPECT_TRUE(view_of(view, 3).role == core::FsRole::kUnowned);
+  EXPECT_STREQ(view_of(view, 2).address, "");
+  // gw2 takes F2 (fence only, owner record not yet written): Remote, address from the
+  // node registry and the fs epoch from the fence.
+  store.fs_taken_by(2, "gw2", 3);
+  store.fs_epochs[2] = 3;
+  ctl.tick();
+  const auto& two = view_of(view, 2);
+  EXPECT_TRUE(two.role == core::FsRole::kRemote);
+  EXPECT_STREQ(two.node, "gw2");
+  EXPECT_STREQ(two.address, "10.0.0.2:2049");
+  EXPECT_EQ(two.fs_epoch, 3u);
+  // gw2 dies: F2 is second-in-line ours; F3 stays Unowned forever (gw3 only), naming
+  // nobody.
+  store.age_out_node("gw2");
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kActive);
+  EXPECT_STREQ(rec.takeovers.back().prev_node, "gw2");
+  EXPECT_EQ(view_of(view, 2).fs_epoch, 4u);
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 3) == server::Role::kStandby);
+  EXPECT_TRUE(view_of(view, 3).role == core::FsRole::kUnowned);
+  EXPECT_STREQ(view_of(view, 3).node, "");
+
+  // takeover = manual: only ever the view.
+  MemStore store2;
+  core::FsOwnerView view2;
+  FsRecorder rec2;
+  server::FsClusterController manual(aa_config("gw1", "manual"), exports.table, store2, view2,
+                                     rec2.hooks());
+  manual.tick();
+  manual.tick();
+  for (uint32_t f = 1; f <= 3; ++f) EXPECT_TRUE(fs_role(manual, f) == server::Role::kStandby);
+  EXPECT_TRUE(rec2.calls.empty());
+  EXPECT_EQ(count(store2.log, "renew_fences"), 2u);
+}
+
+// Operator requests (the ctl surface arrives with plan 12 C4): takeover of a Remote
+// export (--force over a live foreign fence), release of an Active one — which is not
+// retaken automatically until another node has held it — and the error codes.
+TEST(FsClusterController, OperatorTakeoverAndRelease) {
+  MemStore store;
+  Exports exports({{"gw1"}, {"gw2"}, {"gw1"}});
+  core::FsOwnerView view;
+  FsRecorder rec;
+  server::FsClusterController ctl(aa_config("gw1"), exports.table, store, view, rec.hooks());
+  store.fs_taken_by(2, "gw2", 5);
+  store.fs_epochs[2] = 5;
+  ctl.tick();
+  ASSERT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  ASSERT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);
+
+  // A live foreign fence: plain takeover is EBUSY, force wins and evicts gw2.
+  auto busy = ctl.request_takeover(2, false);
+  ASSERT_TRUE(!busy.has_value());
+  EXPECT_EQ(static_cast<int>(busy.error()), EBUSY);
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);
+  store.log.clear();
+  ASSERT_TRUE(ctl.request_takeover(2, true).has_value());
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kActive);
+  EXPECT_STREQ(joined(store.log), "acquire_fs:2! fs_epoch:2 put_owner:2=gw1");
+  EXPECT_STREQ(rec.takeovers.back().prev_node, "gw2");
+  EXPECT_EQ(view_of(view, 2).fs_epoch, 6u);
+  EXPECT_TRUE(store.fences["gw2"].holds.empty());
+  // Already ours / unknown fsid.
+  auto again = ctl.request_takeover(2, false);
+  ASSERT_TRUE(!again.has_value());
+  EXPECT_EQ(static_cast<int>(again.error()), EBUSY);
+  auto unknown = ctl.request_takeover(9, false);
+  ASSERT_TRUE(!unknown.has_value());
+  EXPECT_EQ(static_cast<int>(unknown.error()), EINVAL);
+
+  // Release F1: drained, fence hold dropped, and further ticks leave it alone even
+  // though we are first in its list.
+  rec.calls.clear();
+  store.log.clear();
+  ASSERT_TRUE(ctl.request_release(1).has_value());
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kStandby);
+  EXPECT_STREQ(joined(rec.calls), "deactivate:1");
+  EXPECT_STREQ(joined(store.log), "release_fs:1");
+  EXPECT_TRUE(store.fences["gw1"].holds.size() == 2u);
+  ctl.tick();
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kStandby);
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kUnowned);
+  auto not_active = ctl.request_release(1);
+  ASSERT_TRUE(!not_active.has_value());
+  EXPECT_EQ(static_cast<int>(not_active.error()), EINVAL);
+  // An explicit takeover request lifts the hold-off; so does another node holding it.
+  ASSERT_TRUE(ctl.request_takeover(1, false).has_value());
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  ASSERT_TRUE(ctl.request_release(1).has_value());
+  store.fs_taken_by(1, "gw2", 9);
+  ctl.tick();
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kRemote);
+  store.age_out_node("gw2");
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+}
+
+// Posted (not inline) data-plane work: Activating shows as Unowned in the view and
+// the batched renew keeps the fence meanwhile; a failed activation releases the
+// fence and counts; shutdown drains every Active export inline and leaves the
+// (empty) record as the heartbeat.
+TEST(FsClusterController, PostedActivationFailureAndShutdown) {
+  MemStore store;
+  Exports exports({{"gw1"}, {"gw1"}, {"gw2"}});
+  core::FsOwnerView view;
+  FsRecorder rec;
+  std::vector<std::function<void()>> queue;
+  auto hooks = rec.hooks();
+  hooks.post = [&queue](std::function<void()> fn) { queue.push_back(std::move(fn)); };
+  server::FsClusterController ctl(aa_config("gw1"), exports.table, store, view, std::move(hooks));
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActivating);
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kActivating);
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kUnowned);
+  EXPECT_TRUE(rec.calls.empty());
+  EXPECT_EQ(queue.size(), 2u);
+  ASSERT_TRUE(store.fences["gw1"].holds.size() == 2u);
+  ctl.tick();  // still Activating: renewed, not re-taken, not drained
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActivating);
+  EXPECT_EQ(queue.size(), 2u);
+  EXPECT_EQ(count(store.log, "acquire_fs:1"), 1u);
+  // F1's work fails, F2's succeeds.
+  rec.fail_activate = errno_from(EIO);
+  queue[0]();
+  rec.fail_activate = Errno::kOk;
+  queue[1]();
+  queue.clear();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kStandby);
+  EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kActive);
+  EXPECT_TRUE(view_of(view, 2).role == core::FsRole::kActive);
+  EXPECT_EQ(ctl.snapshot()[0].activation_failures, 1u);
+  EXPECT_EQ(ctl.snapshot()[0].takeovers, 0u);
+  EXPECT_EQ(ctl.snapshot()[1].takeovers, 1u);
+  ASSERT_TRUE(store.fences["gw1"].holds.size() == 1u);
+  EXPECT_EQ(store.fences["gw1"].holds[0].fsid, 2u);
+  // The next tick retries F1 with a fresh fs epoch.
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActivating);
+  queue.front()();
+  queue.clear();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  EXPECT_EQ(view_of(view, 1).fs_epoch, 2u);
+
+  // Exit: both drained inline (no post), fences released, record kept, view Unowned.
+  rec.calls.clear();
+  store.log.clear();
+  ctl.shutdown();
+  EXPECT_TRUE(queue.empty());
+  EXPECT_STREQ(joined(rec.calls), "deactivate:1 deactivate:2");
+  EXPECT_STREQ(joined(store.log), "release_fs:1 release_fs:2");
+  EXPECT_TRUE(store.fences.contains("gw1"));
+  EXPECT_TRUE(store.fences["gw1"].holds.empty());
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kStandby);
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kUnowned);
+  EXPECT_TRUE(view_of(view, 2).role == core::FsRole::kUnowned);
+  ctl.shutdown();  // idempotent
+
+  // The timer thread: with a 1 s lease it takes its exports over within a tick.
+  MemStore store2;
+  core::FsOwnerView view2;
+  FsRecorder rec2;
+  server::FsClusterController timed(aa_config("gw1"), exports.table, store2, view2, rec2.hooks());
+  timed.start();
+  auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (fs_role(timed, 2) != server::Role::kActive && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(10ms);
+  timed.stop();
+  EXPECT_TRUE(fs_role(timed, 1) == server::Role::kActive);
+  EXPECT_TRUE(fs_role(timed, 2) == server::Role::kActive);
+  EXPECT_TRUE(fs_role(timed, 3) == server::Role::kStandby);
+}
