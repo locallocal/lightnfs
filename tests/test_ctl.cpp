@@ -317,6 +317,160 @@ TEST(Ctl, ClusterConfigKeys) {
   ::unlink(tmpl);
 }
 
+TEST(Ctl, ActiveActiveConfigKeys) {
+  // Plan 12 A1: `[cluster] mode` / `node_address` and `[[export]] nodes`.
+  const std::string exp_a = "[[export]]\npath = \"/tmp\"\nfsid = 1\nclients = [\"127.0.0.0/8\"]\n";
+  const std::string exp_b = "[[export]]\npath = \"/var\"\nfsid = 2\nclients = [\"127.0.0.0/8\"]\n";
+  const std::string base =
+      "[cluster]\nenabled = true\nid = \"cluster-01\"\nshared_dir = \"/srv/shared\"\n";
+  auto parse_ok = [](const std::string& text) {
+    auto cfg = core::parse_config(text);
+    return cfg.has_value() && core::validate_config(*cfg).has_value();
+  };
+  auto rejects = [](const std::string& text) {
+    auto cfg = core::parse_config(text);
+    return cfg.has_value() && !core::validate_config(*cfg).has_value();
+  };
+
+  // Defaults: failover, no address, no owner lists; single-gateway configs untouched.
+  auto defaults = core::parse_config("[server]\n" + exp_a);
+  ASSERT_TRUE(defaults.has_value());
+  EXPECT_STREQ(defaults->cluster.mode, "failover");
+  EXPECT_TRUE(defaults->cluster.node_address.empty());
+  EXPECT_TRUE(defaults->exports[0].nodes.empty());
+  EXPECT_FALSE(core::cluster_active_active(defaults->cluster));
+  EXPECT_TRUE(core::validate_config(*defaults).has_value());
+
+  // Full active-active example (design 11 §11.10).
+  const std::string aa = base + "mode = \"active-active\"\nnode_address = \"10.0.0.11:2049\"\n";
+  auto parsed = core::parse_config(aa + exp_a + "nodes = [\"gw1\", \"gw2\", \"gw3\"]\n" + exp_b +
+                                   "nodes = [\"gw2\", \"gw3\", \"gw1\"]\n");
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_STREQ(parsed->cluster.mode, "active-active");
+  EXPECT_STREQ(parsed->cluster.node_address, "10.0.0.11:2049");
+  EXPECT_TRUE(core::cluster_active_active(parsed->cluster));
+  ASSERT_TRUE(parsed->exports.size() == 2u);
+  ASSERT_TRUE(parsed->exports[0].nodes.size() == 3u);
+  EXPECT_STREQ(parsed->exports[0].nodes[0], "gw1");
+  EXPECT_STREQ(parsed->exports[1].nodes[0], "gw2");
+  EXPECT_TRUE(core::validate_config(*parsed).has_value());
+  // The whole section takes part in the reload comparison (restart-required report).
+  auto other_addr = core::parse_config(base + "mode = \"active-active\"\n"
+                                              "node_address = \"10.0.0.12:2049\"\n" + exp_a);
+  ASSERT_TRUE(other_addr.has_value());
+  EXPECT_FALSE(parsed->cluster == other_addr->cluster);
+
+  // Type / value errors caught at parse time.
+  EXPECT_FALSE(core::parse_config("[cluster]\nmode = 1\n").has_value());
+  EXPECT_FALSE(core::parse_config("[[export]]\nnodes = \"gw1\"\n").has_value());
+
+  // Under failover the new keys are warned about and ignored, never rejected.
+  EXPECT_TRUE(parse_ok(base + "node_address = \"10.0.0.11:2049\"\n" + exp_a +
+                       "nodes = [\"gw1\"]\n"));
+  // Disabled: even a bad mode is ignored.
+  EXPECT_TRUE(parse_ok("[cluster]\nenabled = false\nmode = \"weird\"\n" + exp_a));
+
+  // Enabled: each active-active rule rejects on its own.
+  const std::string a_nodes = exp_a + "nodes = [\"gw1\", \"gw2\"]\n";
+  EXPECT_TRUE(parse_ok(aa + a_nodes));
+  EXPECT_TRUE(rejects(base + "mode = \"multi\"\n" + a_nodes));               // unknown mode
+  EXPECT_TRUE(rejects(base + "mode = \"active-active\"\n" + a_nodes));       // no node_address
+  EXPECT_TRUE(rejects(aa + exp_a));                                          // nodes missing
+  EXPECT_TRUE(rejects(aa + exp_a + "nodes = []\n"));                         // nodes empty
+  EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"gw1\", \"gw1\"]\n"));         // duplicate
+  EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"gw 1\"]\n"));                 // bad name
+  EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"a/b\"]\n"));                  // bad name
+  EXPECT_TRUE(rejects(aa + a_nodes + exp_b));                                // one export lacks nodes
+  EXPECT_TRUE(rejects(aa + "role = \"active\"\n" + a_nodes));                // role must be auto
+  EXPECT_TRUE(rejects(aa + "role = \"standby\"\n" + a_nodes));
+  EXPECT_TRUE(parse_ok(aa + "role = \"auto\"\ntakeover = \"manual\"\n" + a_nodes));
+  // node_address forms.
+  auto with_addr = [&](const std::string& addr) {
+    return base + "mode = \"active-active\"\nnode_address = \"" + addr + "\"\n" + a_nodes;
+  };
+  EXPECT_TRUE(parse_ok(with_addr("gw1.example.net:2049")));
+  EXPECT_TRUE(parse_ok(with_addr("[fd00::11]:2049")));
+  EXPECT_TRUE(rejects(with_addr("10.0.0.11")));         // no port
+  EXPECT_TRUE(rejects(with_addr("10.0.0.11:")));        // empty port
+  EXPECT_TRUE(rejects(with_addr(":2049")));             // empty host
+  EXPECT_TRUE(rejects(with_addr("10.0.0.11:0")));       // port range
+  EXPECT_TRUE(rejects(with_addr("10.0.0.11:70000")));
+  EXPECT_TRUE(rejects(with_addr("10.0.0.11:20a9")));
+  EXPECT_TRUE(rejects(with_addr("fd00::11:2049")));     // unbracketed v6
+  EXPECT_TRUE(core::valid_node_address("[::1]:1") && !core::valid_node_address("[::1]:"));
+
+  // Gluster / Lustre isolation (design 11 §11.6): exports on one volume / mount must
+  // list the same nodes; different volumes may differ; CephFS is per fsid and free.
+  auto gluster = [&](const std::string& vol, const std::string& fsid, const std::string& nodes) {
+    return "[[export]]\npath = \"/vol" + fsid + "\"\nfsid = " + fsid +
+           "\nbackend = \"gluster\"\nclients = [\"127.0.0.0/8\"]\nnodes = " + nodes +
+           "\n[export.gluster]\nvolume = \"" + vol + "\"\nhost = \"h\"\n";
+  };
+  auto lustre = [&](const std::string& mnt, const std::string& fsid, const std::string& nodes) {
+    // Lustre exports are real directories under the client mount: use ones that exist.
+    return "[[export]]\npath = \"" + (fsid == "1" ? std::string("/tmp") : std::string("/var")) +
+           "\"\nfsid = " + fsid +
+           "\nbackend = \"lustre\"\nclients = [\"127.0.0.0/8\"]\nnodes = " + nodes +
+           "\n[export.lustre]\nmount = \"" + mnt + "\"\n";
+  };
+  const std::string same = "[\"gw1\", \"gw2\"]", diff = "[\"gw2\", \"gw1\"]";
+  auto gluster_ok = core::parse_config(aa + gluster("v1", "1", same) + gluster("v1", "2", same));
+  ASSERT_TRUE(gluster_ok.has_value());
+  auto gluster_bad = core::parse_config(aa + gluster("v1", "1", same) + gluster("v1", "2", diff));
+  ASSERT_TRUE(gluster_bad.has_value());
+  auto gluster_two = core::parse_config(aa + gluster("v1", "1", same) + gluster("v2", "2", diff));
+  ASSERT_TRUE(gluster_two.has_value());
+  auto lustre_bad = core::parse_config(aa + lustre("/mnt/l", "1", same) + lustre("/mnt/l", "2", diff));
+  ASSERT_TRUE(lustre_bad.has_value());
+  auto lustre_two = core::parse_config(aa + lustre("/mnt/l", "1", same) + lustre("/mnt/m", "2", diff));
+  ASSERT_TRUE(lustre_two.has_value());
+  if (backend::find_backend("gluster")) {  // built with the Gluster backend
+    EXPECT_TRUE(core::validate_config(*gluster_ok).has_value());
+    EXPECT_FALSE(core::validate_config(*gluster_bad).has_value());
+    EXPECT_TRUE(core::validate_config(*gluster_two).has_value());
+  }
+  if (backend::find_backend("lustre")) {
+    EXPECT_FALSE(core::validate_config(*lustre_bad).has_value());
+    EXPECT_TRUE(core::validate_config(*lustre_two).has_value());
+  }
+  // The same lists under failover mode are not checked (ignored with a warning).
+  auto gluster_bad_failover =
+      core::parse_config(base + gluster("v1", "1", same) + gluster("v1", "2", diff));
+  ASSERT_TRUE(gluster_bad_failover.has_value());
+  if (backend::find_backend("gluster"))
+    EXPECT_TRUE(core::validate_config(*gluster_bad_failover).has_value());
+
+  // Export digest: the owner order is cluster identity; an absent list adds nothing,
+  // so failover digests are unchanged.
+  auto plain = core::parse_config(base + exp_a);
+  ASSERT_TRUE(plain.has_value());
+  EXPECT_STREQ(core::canonical_exports_digest(*plain), core::canonical_exports_digest(*defaults));
+  auto n1 = core::parse_config(aa + exp_a + "nodes = [\"gw1\", \"gw2\"]\n");
+  auto n2 = core::parse_config(aa + exp_a + "nodes = [\"gw2\", \"gw1\"]\n");
+  ASSERT_TRUE(n1.has_value() && n2.has_value());
+  EXPECT_TRUE(core::canonical_exports_digest(*n1) != core::canonical_exports_digest(*n2));
+  EXPECT_TRUE(core::canonical_exports_digest(*n1) != core::canonical_exports_digest(*plain));
+  EXPECT_TRUE(core::canonical_exports_text(*n1).find("  nodes=gw1,gw2\n") != std::string::npos);
+
+  // ExportTable carries the list; a changed list is a restart-required reload item.
+  core::ExportTable table;
+  core::ExportConfig cfg;
+  cfg.path = "/exp";
+  cfg.fsid = 1;
+  cfg.clients = {"127.0.0.0/8"};
+  cfg.nodes = {"gw1", "gw2"};
+  ASSERT_TRUE(table.add(cfg, std::make_unique<backend::MemoryBackend>(1)).has_value());
+  ASSERT_TRUE(table.by_fsid(1)->nodes.size() == 2u);
+  EXPECT_STREQ(table.by_fsid(1)->nodes[1], "gw2");
+  core::Config fresh;
+  fresh.exports.push_back(cfg);
+  EXPECT_TRUE(table.reload_dynamic(fresh).find("nodes changed") == std::string::npos);
+  fresh.exports[0].nodes = {"gw2", "gw1"};
+  EXPECT_TRUE(table.reload_dynamic(fresh).find("export fsid=1: nodes changed, restart required") !=
+              std::string::npos);
+  EXPECT_STREQ(table.by_fsid(1)->nodes[0], "gw1");  // never applied live
+}
+
 TEST(Ctl, ExportReloadDynamic) {
   core::ExportTable table;
   core::ExportConfig cfg;

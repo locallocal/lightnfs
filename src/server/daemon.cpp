@@ -421,6 +421,11 @@ int run_server(const std::string& config_path) {
   if (!config) return 1;
   const core::ServerConfig server_cfg = config->server;
   const core::ClusterConfig cluster_cfg = config->cluster;
+  if (core::cluster_active_active(cluster_cfg)) {  // plan 12: configuration lands first (A1)
+    LNFS_ERROR("[cluster] mode = \"active-active\" is accepted by --check-config but not "
+               "served yet (plan 12 C1): refusing to start as a failover gateway");
+    return 1;
+  }
   const std::string exports_digest = core::canonical_exports_digest(*config);
   apply_log_level(server_cfg);
 
