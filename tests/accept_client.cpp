@@ -1298,6 +1298,7 @@ struct V4Client {
   uint32_t minor = 1;    // COMPOUND minorversion (2 for the v4.2 scenario)
   std::string owner_id;  // co_ownerid: distinct per simulated client
   std::string server_owner, server_scope;  // RFC 8881 §2.10.4 identity from EXCHANGE_ID
+  uint32_t eir_flags = 0;                  // EXCHANGE_ID reply flags (SUPP_MOVED_*)
 
   explicit V4Client(const char* host, uint16_t port, std::string owner = "lightnfs-accept-v4")
       : rpc(host, port), owner_id(std::move(owner)) {}
@@ -1359,7 +1360,7 @@ struct V4Client {
     expect_op(r.dec, kOpExchangeId);
     clientid = ru64(r.dec);
     uint32_t seq = ru32(r.dec);
-    (void)ru32(r.dec);  // flags
+    eir_flags = ru32(r.dec);
     (void)ru32(r.dec);  // state_protect: SP4_NONE
     (void)ru64(r.dec);  // server_owner.minor_id
     if (auto major = r.dec.opaque(1024))
@@ -2416,6 +2417,206 @@ int cmd_v4failover(const char* host, uint16_t port_a, uint16_t port_b,
   return 0;
 }
 
+namespace v4 {
+constexpr uint32_t kAttrFsLocations = 24;
+constexpr uint32_t kMoved = 10019;  // NFS4ERR_MOVED (v4 status, not lnfs::Errno::kMoved)
+
+// One lone SEQUENCE; returns sr_status_flags (SEQ4_STATUS_* — LEASE_MOVED is 0x80).
+uint32_t v4_sequence_flags(V4Client& c) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 0);
+  auto r = c.run(ops.take().to_bytes());
+  V4Client::expect_op(r.dec, kOpSequence);
+  (void)r.dec.opaque_fixed(16);  // sessionid
+  (void)ru32(r.dec);             // seqid
+  (void)ru32(r.dec);             // slotid
+  (void)ru32(r.dec);             // highest_slotid
+  (void)ru32(r.dec);             // target_highest_slotid
+  return ru32(r.dec);            // status_flags
+}
+
+// GETATTR(fs_locations) on `fh`; returns the location server strings (empty when the
+// attribute came back empty — served here, or the pseudo root).
+std::vector<std::string> v4_fs_locations(V4Client& c, const std::vector<std::byte>& fh) {
+  XdrEnc ops(c.rpc.pool);
+  c.seq_header(ops, 2);
+  ops.u32(kOpPutfh);
+  ops.opaque(fh);
+  ops.u32(kOpGetattr);
+  ops.u32(1);                       // bitmap: one word
+  ops.u32(1u << kAttrFsLocations);  // attr 24
+  auto r = c.run(ops.take().to_bytes());
+  V4Client::skip_sequence_res(r.dec);
+  V4Client::expect_op(r.dec, kOpPutfh);
+  V4Client::expect_op(r.dec, kOpGetattr);
+  uint32_t words = ru32(r.dec);
+  uint32_t w0 = words > 0 ? ru32(r.dec) : 0;
+  for (uint32_t i = 1; i < words; ++i) (void)ru32(r.dec);
+  (void)ru32(r.dec);  // attrlist4 length
+  std::vector<std::string> servers;
+  if (w0 & (1u << kAttrFsLocations)) {
+    uint32_t root_comps = ru32(r.dec);  // fs_root: pathname4
+    for (uint32_t i = 0; i < root_comps; ++i) (void)r.dec.string(255);
+    uint32_t nloc = ru32(r.dec);
+    for (uint32_t i = 0; i < nloc; ++i) {
+      uint32_t nservers = ru32(r.dec);
+      for (uint32_t j = 0; j < nservers; ++j) {
+        auto srv = r.dec.string(255);
+        if (srv) servers.emplace_back(*srv);
+      }
+      uint32_t path_comps = ru32(r.dec);  // rootpath
+      for (uint32_t k = 0; k < path_comps; ++k) (void)r.dec.string(255);
+    }
+  }
+  return servers;
+}
+
+}  // namespace v4
+
+// v4moved (plan 12 E1): the active-active protocol face on a live three-gateway
+// cluster.  `export_path` is owned by B, not the gateway A we first contact.
+//   referral  — A advertises SUPP_MOVED_REFER|MIGR; the export answers MOVED and its
+//               fs_locations name B; B serves it under a different server_owner.major_id
+//               but the same scope.
+//   migration — `migrate_cmd` moves the export B -> C; B then reports LEASE_MOVED and
+//               MOVED for the export, its fs_locations name C, and C serves the client's
+//               reclaim (CLAIM_PREVIOUS + LOCK(reclaim), verifier changed, data re-sent).
+int cmd_v4moved(const char* host, uint16_t port_a, uint16_t port_b, uint16_t port_c,
+                const std::string& export_path, const fs::path& backing,
+                const std::string& migrate_cmd) {
+  using namespace v4;
+  const std::string owner = "moved-owner", lock_owner = "moved-lock";
+  auto payload = random_bytes(64 * 1024, 0x27);
+  auto comps = split_path(export_path);
+  comps.push_back("moved.bin");
+
+  // ---- referral: A refers the export to B --------------------------------------------
+  std::string owner_a;
+  {
+    V4Client a(host, port_a, "lightnfs-moved-a");
+    a.establish();
+    if ((a.eir_flags & 0x3u) != 0x3u)
+      fatal("v4moved: A eir_flags %#x lack SUPP_MOVED_REFER|MIGR", a.eir_flags);
+    owner_a = a.server_owner;
+    auto exp_fh = lookup_path(a, split_path(export_path));
+    // fs_locations names a host, not host:port (RFC 8881 §11.10); on this all-loopback
+    // cluster every gateway is 127.0.0.1, so the presence of a location and the MOVED
+    // is the referral signal — the owner is pinned by the port that actually serves
+    // and, after migration, reclaims below.
+    auto locs = v4_fs_locations(a, exp_fh);
+    if (locs.empty()) fatal("v4moved: A gives no fs_locations for the B-owned export");
+    uint32_t st = 0;
+    (void)v4_read(a, exp_fh, Stateid4{}, 4, &st);
+    if (st != kMoved) fatal("v4moved: READ of a B-owned export on A: expected MOVED, got %u", st);
+    std::printf("v4moved: A refers the export elsewhere (location=%s), MOVED on access\n",
+                locs.front().c_str());
+  }
+
+  // ---- B serves it: distinct major_id, same scope, a real open+lock+write ------------
+  std::string owner_b, scope_b;
+  std::vector<std::byte> fh;
+  Stateid4 open_sid, lock_sid;
+  std::array<std::byte, 8> verf_b{};
+  {
+    V4Client b(host, port_b, "lightnfs-moved-fs");
+    b.establish();
+    owner_b = b.server_owner;
+    scope_b = b.server_scope;
+    if (owner_b == owner_a) fatal("v4moved: B major_id equals A's (%s)", owner_a.c_str());
+    auto root = lookup_path(b, split_path(export_path));
+    auto o = v4_open(b, root, "moved.bin", 3, 0, owner, true, 0, 0);
+    if (o.status != 0) fatal("v4moved: OPEN(CREATE) on B: status %u", o.status);
+    fh = o.fh;
+    open_sid = o.stateid;
+    if (v4_lock_op(b, fh, 2, 0, 100, false, true, open_sid, lock_owner, &lock_sid) != 0)
+      fatal("v4moved: LOCK on B failed");
+    if (v4_write(b, fh, lock_sid, 0, payload, 0, &verf_b) != 0)
+      fatal("v4moved: WRITE(UNSTABLE) on B failed");
+    std::printf("v4moved: B serves the export: owner=%s scope=%s (A owner=%s)\n", owner_b.c_str(),
+                scope_b.c_str(), owner_a.c_str());
+    // B's connection dropped without CLOSE: the state is live for the migration.
+  }
+
+  // ---- migration: the operator moves the export B -> C -------------------------------
+  std::printf("v4moved: migrating: %s\n", migrate_cmd.c_str());
+  if (std::system(migrate_cmd.c_str()) != 0) fatal("v4moved: migrate command failed");
+
+  // B now tells the client the export moved: LEASE_MOVED, MOVED, fs_locations -> C.
+  {
+    V4Client b(host, port_b, "lightnfs-moved-fs");
+    b.establish();
+    unsigned tries = 0;
+    while (!(v4_sequence_flags(b) & 0x80u)) {  // SEQ4_STATUS_LEASE_MOVED
+      if (++tries > 100) fatal("v4moved: B never set LEASE_MOVED after the migration");
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    auto exp_fh = lookup_path(b, split_path(export_path));
+    auto locs = v4_fs_locations(b, exp_fh);
+    if (locs.empty()) fatal("v4moved: B gives no fs_locations after the migration");
+    uint32_t st = 0;
+    (void)v4_read(b, exp_fh, Stateid4{}, 4, &st);
+    if (st != kMoved) fatal("v4moved: READ on B after migration: expected MOVED, got %u", st);
+    std::printf("v4moved: B reports LEASE_MOVED and refers the export on (location=%s)\n",
+                locs.front().c_str());
+  }
+
+  // ---- C reclaims: CLAIM_PREVIOUS + LOCK(reclaim), verifier changed, data re-sent ----
+  {
+    // Same co_ownerid as B: this is the migrating client reclaiming on the new owner
+    // (a different server, so no clientid clash); C must find it on the reclaim list.
+    V4Client c(host, port_c, "lightnfs-moved-fs");
+    c.establish(false);  // listed by B -> grace, no RECLAIM_COMPLETE yet
+    auto root = lookup_path(c, split_path(export_path));
+    // C takes the export over on its own next tick after the owner record named it;
+    // until then it still answers MOVED.  Wait for it to own the export (GRACE — it is
+    // the owner and still in its reclaim window).
+    OpenOut plain;
+    unsigned waited = 0;
+    for (;;) {
+      plain = v4_open(c, root, "moved.bin", 3, 0, owner, false);
+      if (plain.status == kGrace) break;
+      // MOVED = C not yet the owner; DELAY = C activating (view Unowned): both retry.
+      if (plain.status != kMoved && plain.status != kDelay)
+        fatal("v4moved: plain OPEN on C: expected MOVED/DELAY (not yet owner) or GRACE, got %u",
+              plain.status);
+      if (++waited > 200) fatal("v4moved: C never took the migrated export over");
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    fh = lookup_path(c, comps);  // handles may not be stable across gateways
+    auto re = v4_open(c, fh, "", 3, 0, owner, false, 1);
+    if (re.status != 0) fatal("v4moved: OPEN(CLAIM_PREVIOUS) on C: status %u", re.status);
+    Stateid4 re_lock;
+    unsigned retries = 0;
+    for (;;) {
+      uint32_t code = v4_lock_op(c, re.fh, 2, 0, 100, true, true, re.stateid, lock_owner, &re_lock);
+      if (code == 0) break;
+      if (code != kDelay) fatal("v4moved: LOCK(reclaim) on C: status %u", code);
+      if (++retries > 200) fatal("v4moved: LOCK(reclaim) still DELAY after %u retries", retries);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    auto verf_c = v4_commit(c, re.fh);
+    if (verf_c == verf_b) fatal("v4moved: write verifier unchanged across the migration");
+    if (v4_write(c, re.fh, re_lock, 0, payload, 2) != 0)
+      fatal("v4moved: WRITE(FILE_SYNC) with the reclaimed lock stateid on C failed");
+    auto back = v4_read(c, re.fh, re_lock, payload.size());
+    if (back != payload) fatal("v4moved: READ after re-send on C differs from the payload");
+    if (read_local(backing / "moved.bin") != payload)
+      fatal("v4moved: backing content differs from the payload");
+    if (v4_reclaim_complete(c) != 0) fatal("v4moved: RECLAIM_COMPLETE on C failed");
+    plain = v4_open(c, root, "moved.bin", 3, 0, owner, false);
+    if (plain.status != 0)
+      fatal("v4moved: OPEN after RECLAIM_COMPLETE on C: status %u", plain.status);
+    if (v4_close(c, re.fh, plain.stateid) != 0) fatal("v4moved: CLOSE on C failed");
+    c.destroy();
+    std::printf(
+        "accept_client v4moved OK: referral A->B, migration B->C with LEASE_MOVED, "
+        "CLAIM_PREVIOUS + LOCK(reclaim) (%u DELAY retries), verifier changed, data "
+        "re-sent and byte-verified, early grace exit\n",
+        retries);
+  }
+  return 0;
+}
+
 // Lease-expiry scenario (development plan §6.3 / design 07 §7.4): a client holding a
 // deny-WRITE open vanishes (connection dropped, no CLOSE).  Inside the lease a second
 // client is SHARE_DENIED; once the lease lapses the holder is a courtesy client and the
@@ -2755,26 +2956,29 @@ int cmd_v42(const char* host, uint16_t nfs_port, const std::string& export_path,
 
 int main(int argc, char** argv) {
   auto usage = [] {
-    std::fprintf(stderr,
-                 "usage: accept_client walk   HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
-                 "       accept_client bigdir HOST NFS_PORT MOUNT_PORT EXPORT BACKING SUBDIR COUNT\n"
-                 "       accept_client stress HOST NFS_PORT MOUNT_PORT EXPORT BACKING FILE "
-                 "CONNS PIPELINE SECONDS\n"
-                 "       accept_client wtest  HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
-                 "       accept_client crash-write   HOST NFS_PORT MOUNT_PORT EXPORT STATE\n"
-                 "       accept_client crash-recover HOST NFS_PORT MOUNT_PORT EXPORT "
-                 "BACKING STATE\n"
-                 "       accept_client connstorm HOST NFS_PORT MOUNT_PORT COUNT PIPELINE\n"
-                 "       accept_client v4walk HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
-                 "       accept_client v4rw   HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
-                 "       accept_client v4reclaim HOST NFS_PORT MOUNT_PORT EXPORT BACKING "
-                 "RESTART_CMD\n"
-                 "       accept_client v4courtesy HOST NFS_PORT MOUNT_PORT EXPORT LEASE_SECS\n"
-                 "       accept_client v4failover HOST PORT_A PORT_B EXPORT BACKING "
-                 "TAKEOVER_CMD\n"
-                 "       accept_client v4lock HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
-                 "       accept_client v42    HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
-                 "       accept_client fsync-eio HOST NFS_PORT MOUNT_PORT EXPORT\n");
+    std::fprintf(
+        stderr,
+        "usage: accept_client walk   HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+        "       accept_client bigdir HOST NFS_PORT MOUNT_PORT EXPORT BACKING SUBDIR COUNT\n"
+        "       accept_client stress HOST NFS_PORT MOUNT_PORT EXPORT BACKING FILE "
+        "CONNS PIPELINE SECONDS\n"
+        "       accept_client wtest  HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+        "       accept_client crash-write   HOST NFS_PORT MOUNT_PORT EXPORT STATE\n"
+        "       accept_client crash-recover HOST NFS_PORT MOUNT_PORT EXPORT "
+        "BACKING STATE\n"
+        "       accept_client connstorm HOST NFS_PORT MOUNT_PORT COUNT PIPELINE\n"
+        "       accept_client v4walk HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+        "       accept_client v4rw   HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+        "       accept_client v4reclaim HOST NFS_PORT MOUNT_PORT EXPORT BACKING "
+        "RESTART_CMD\n"
+        "       accept_client v4courtesy HOST NFS_PORT MOUNT_PORT EXPORT LEASE_SECS\n"
+        "       accept_client v4failover HOST PORT_A PORT_B EXPORT BACKING "
+        "TAKEOVER_CMD\n"
+        "       accept_client v4moved HOST PORT_A PORT_B PORT_C EXPORT BACKING "
+        "MIGRATE_CMD\n"
+        "       accept_client v4lock HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+        "       accept_client v42    HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
+        "       accept_client fsync-eio HOST NFS_PORT MOUNT_PORT EXPORT\n");
     return 2;
   };
   if (argc < 6) return usage();
@@ -2810,6 +3014,9 @@ int main(int argc, char** argv) {
     return cmd_v4courtesy(host, nfs_port, export_path, (unsigned)atoi(argv[6]));
   if (cmd == "v4failover" && argc == 8)  // argv[4] is gateway B's port, not a mount port
     return cmd_v4failover(host, nfs_port, mount_port, export_path, argv[6], argv[7]);
+  if (cmd == "v4moved" && argc == 9)  // PORT_A PORT_B PORT_C EXPORT BACKING MIGRATE_CMD
+    return cmd_v4moved(host, nfs_port, mount_port, (uint16_t)atoi(argv[5]), argv[6], argv[7],
+                       argv[8]);
   if (cmd == "v4lock" && argc == 7)
     return cmd_v4lock(host, nfs_port, export_path, argv[6]);
   if (cmd == "v42" && argc == 7)

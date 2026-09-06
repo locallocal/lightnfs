@@ -48,6 +48,8 @@ class Engine {
 
   void register_with(rpc::Dispatcher& dispatcher);
   rt::Task<void> dispatch(transport::ConnCtx&, rpc::RpcCall&, const rpc::Cred&);
+  // Replaces the boot-epoch verifier (active-active: the node goes in, plan 12 E1).
+  void set_write_verifier(core::WriteVerf verf) { write_verf_ = verf; }
 
   // The identity EXCHANGE_ID presents (server_owner.major_id / server_scope).
   const std::string& server_owner() const { return server_owner_; }

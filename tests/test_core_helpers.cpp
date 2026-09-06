@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "backend/memory/memory.hpp"
+#include "core/boot_epoch.hpp"
 #include "core/config.hpp"
 #include "core/fs_props.hpp"
 #include "core/mutate.hpp"
@@ -141,4 +142,21 @@ TEST(CoreFsProps, NativeBitsFeedChangeAttrType) {
   fs.native_change = true;
   EXPECT_EQ(change_type(&fs), nfsv4::attr::kChangeTypeMonotonicIncr);
   EXPECT_EQ(change_type(nullptr), nfsv4::attr::kChangeTypeMonotonicIncr);  // pseudo-fs
+}
+
+// Write verifiers (plan 12 E1): failover / single gateway use the epoch alone; under
+// active-active the node name goes in, so two gateways at the same epoch differ and a
+// restart (epoch + 1) still changes a gateway's own verifier.
+TEST(CoreHelpers, WriteVerifierPerNode) {
+  using namespace lnfs::core;
+  EXPECT_TRUE(verifier_from_epoch(7) != verifier_from_epoch(8));
+  EXPECT_TRUE(verifier_for_node(1, "gw1") != verifier_for_node(1, "gw2"));
+  EXPECT_TRUE(verifier_for_node(1, "gw1") != verifier_for_node(2, "gw1"));
+  EXPECT_TRUE(verifier_for_node(1, "gw1") == verifier_for_node(1, "gw1"));
+  EXPECT_TRUE(verifier_for_node(1, "gw1") != verifier_from_epoch(1));
+  // The epoch survives in the low half: the low 32 bits are the epoch's.
+  auto v = verifier_for_node(0x12345678u, "gw1");
+  uint64_t raw = 0;
+  std::memcpy(&raw, v.data(), sizeof(raw));
+  EXPECT_EQ(raw & 0xffffffffu, 0x12345678u);
 }
