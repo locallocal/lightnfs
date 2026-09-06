@@ -179,7 +179,10 @@ LOCK 时下推被拒（EAGAIN → 现在映射为 DENIED，`state_mgr.cpp:1800`�
 
 ## 9.9 演进：多活与计划内迁移
 
-> 完整方案见 [11 册](11-multi-gateway-active-active.md)。本节是其提纲。
+> **已实现（2026-09-06）**：完整方案见 [11 册](11-multi-gateway-active-active.md)，实施步骤、
+> 代码锚点与验收见 [12 册](12-multi-gateway-active-active-steps.md)（阶段 A–D 已合并，E 验证中）；
+> 配置 / 指标 / ctl 见 08 册，部署见 `deployment.md` §6。本节只是其提纲——`[cluster] mode =
+> failover`（本册）与 `active-active`（11 册）是同一 `[cluster]` 段的两种互斥形态。
 
 主备只用了一台网关的算力。多活形态：**每个导出一个活动网关**（围栏与 epoch 按导出而非
 按网关，`shared_dir/<fsid>/…`），不同导出分布在不同网关；伪根在所有网关一致。计划内迁移

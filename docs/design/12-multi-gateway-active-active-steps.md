@@ -53,9 +53,9 @@
 | | C4 ctl 与指标 ✅ 2026-09-06 | `cluster status` per-fsid 表；`cluster takeover/standby <fsid>`；`lightnfs_cluster_fs_*`、`lightnfs_v4_moved_total` | C1 C2 | P3 |
 | D 计划内迁移 | D1 `ctl cluster migrate <fsid> <node>` ✅ 2026-09-06 | 源端 Draining → owner → 释放；目标端按 owner 接管 | C2 C3 C4 | P4 |
 | | D2 滚动升级脚本 ✅ 2026-09-06 | `scripts/cluster_roll.sh`：逐 fsid 迁出 / 迁回 | D1 | P4 |
-| E 验证与文档 | E1 `v4moved` 验收模式 + 三实例本机脚本 | 无 root 的端到端：referral、migration、单网关退化、猝死分散接管 | B3 C2 C3 D1 | P5 |
-| | E2 fake 演练 | CephFS per-fsid uuid 回收只影响该 fsid；同卷约束 | A1 C2 | P5 |
-| | E3 文档 | 08 册、deployment.md、07 §7.5、09 §9.9、11 册状态、design/README | 全部 | P5 |
+| E 验证与文档 | E1 `v4moved` 验收模式 + 三实例本机脚本 ✅ 2026-09-06 | 无 root 的端到端：referral、migration、单网关退化、猝死分散接管 | B3 C2 C3 D1 | P5 |
+| | E2 fake 演练 ✅ 2026-09-06 | CephFS per-fsid uuid 回收只影响该 fsid；同卷约束 | A1 C2 | P5 |
+| | E3 文档 ✅ 2026-09-06 | 08 册、deployment.md、07 §7.5、09 §9.9、11 册状态、design/README | 全部 | P5 |
 
 关键路径：A2 → A3 → C1 → C2 → D1 → E1。阶段 B 三步与阶段 A 并行无冲突（B2/B3 在 C1 之前用
 一个固定的属主视图做单元测试）。
@@ -592,7 +592,7 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 
 ## 阶段 E：验证与文档
 
-### E1 `v4moved` 验收模式 + 三实例本机脚本
+### E1 `v4moved` 验收模式 + 三实例本机脚本（已完成，2026-09-06）
 
 **目标**：无 root 的端到端证明，覆盖 11 §11.13 P5 的全部条目。
 
@@ -626,7 +626,7 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 **验收**：`accept_active_active_local.sh` Release + ASAN 全过；`accept_failover_local.sh`、
 `accept_m6_local.sh`、ctest 不变。
 
-### E2 fake 演练
+### E2 fake 演练（已完成，2026-09-06）
 
 - `tests/test_cephfs.cpp`：同进程两个 CephFS 导出各自 uuid；对 fsid 2 `takeover()` 后
   `cephapi_fake` 记录只有 `<cluster>-2` 被 `ceph_start_reclaim(RESET)`，fsid 1 的会话未动
@@ -637,7 +637,7 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 - 脑裂：`FsClusterController` 测试里把 `fence.gw2` 手改为列出 F1（gw1 持有）→ gw1 下一 tick
   对 F1 Draining、`fence_lost{fsid=1}=1`，F2 不受影响（同 09 E2 的围栏改写演练，scope 到 fsid）。
 
-### E3 文档
+### E3 文档（已完成，2026-09-06）
 
 - `docs/design/08-config-observability.md`：§8.1 加 `mode` / `node_address` / `[[export]] nodes`；
   §8.3 加 `lightnfs_cluster_fs_*`、`lightnfs_v4_moved_total`、`lightnfs_cluster_migrations_total`；
