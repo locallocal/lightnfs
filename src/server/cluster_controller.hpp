@@ -22,6 +22,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -30,6 +31,7 @@
 
 #include "backend/api.hpp"
 #include "core/config.hpp"
+#include "core/fs_owner_view.hpp"
 #include "obs/metrics.hpp"
 #include "server/cluster_store.hpp"
 #include "util/result.hpp"
@@ -134,6 +136,139 @@ class ClusterController {
   std::chrono::milliseconds last_activation_{0};
   obs::LatencyHistogram activation_hist_;  // Standby → Active, per completed takeover
   obs::ProviderHandle metrics_ = 0;
+
+  std::thread thread_;
+  std::mutex wake_mu_;
+  std::condition_variable wake_cv_;
+  bool stopping_ = false;
+};
+
+// ---- active-active: one role per export (design 11 §11.3/§11.14, plan 12 C1) --------
+//
+// Under `[cluster] mode = "active-active"` every gateway is its own server (plan 12 B1):
+// the protocol stack is built once at startup and stays up; what moves between
+// gateways is the ownership of single exports.  This controller runs the failover
+// machine above once per fsid —
+//
+//   Remote ──(fence free/expired and our turn, or ctl takeover)──▶ Activating ──▶ Active
+//      ▲                                                                          │
+//      └────────── Draining ◀──(fence lost, ctl standby/migrate, exit)────────────┘
+//
+// — over the per-fsid fence records of the store (one `fence.<node>` record lists every
+// export a node holds; renewing it is one write per tick however many that is, and an
+// empty record is the node's heartbeat).  Every tick renews, reads every record and
+// owner, steps each export's machine and publishes a fresh FsOwnerView for the v4
+// engine (fs_locations / NFS4ERR_MOVED, plan 12 B2/B3).  The per-export data-plane
+// work — arm that export's grace, drop its state on the way out, evict a dead
+// gateway's storage residue — goes through three hooks run on the posting thread; the
+// stack itself is never rebuilt.  tick() is public so tests drive the machine.
+class FsClusterController {
+ public:
+  struct Hooks {
+    // As ClusterController::Hooks::post.  Empty = inline.
+    std::function<void(std::function<void()>)> post;
+    // This gateway now serves `fsid` with the given fs epoch: arm the export's grace
+    // window (StateMgr::load_grace_list(fsid)).  A failure sends the export back to
+    // Remote (fence released).
+    std::function<Result<void>(uint32_t fsid, uint64_t fs_epoch)> activate_fs;
+    // This gateway stops serving `fsid`: drop its open/lock/delegation state
+    // (StateMgr::release_fsid).  The view already says Draining when this runs.
+    std::function<void(uint32_t fsid)> deactivate_fs;
+    // Storage-side eviction scoped to one export (that export's Backend::takeover()
+    // and the external hook).  Optional; a failure is logged, the activation goes on.
+    std::function<Result<void>(uint32_t fsid, const TakeoverContext&)> backend_takeover;
+  };
+
+  struct FsState {
+    uint32_t fsid = 0;
+    Role role = Role::kStandby;        // kStandby = Remote (served elsewhere or by nobody)
+    uint64_t fs_epoch = 0;             // the fs epoch we serve it with (0 unless ours)
+    std::optional<FenceRecord> fence;  // the record naming the export last seen
+    std::optional<OwnerRecord> owner;  // fs/<fsid>/owner last read
+    uint64_t takeovers = 0, fence_lost = 0, activation_failures = 0;
+  };
+
+  FsClusterController(const core::ClusterConfig& cfg, const core::ExportTable& exports,
+                      ClusterStore& store, core::FsOwnerView& view, Hooks hooks);
+  ~FsClusterController();
+
+  // Timer thread: one tick() per fence_lease.  stop() joins it and leaves every role
+  // as is; shutdown() then drains what is still Active (see below).
+  void start();
+  void stop();
+
+  // One step: renew our fence record (the heartbeat), read every record and owner,
+  // step each export's machine, publish the view.  Blocking store IO; never on a
+  // reactor.
+  void tick();
+
+  // Process exit (design 11 §11.7 "planned"): every Active export drains — view says
+  // Draining, deactivate_fs, fence released — so clients are referred on rather than
+  // left waiting; our record stays behind, empty.  Runs the hooks inline on the
+  // calling thread (the main thread, after stop()).
+  void shutdown();
+
+  // Operator requests (plan 12 C4 wires them to lightnfs-ctl).  takeover: Remote only;
+  // `force` rewrites a live fence held by another node.  release: Active only; drains
+  // and releases the fence.  EINVAL for an fsid this gateway does not export.
+  Result<void> request_takeover(uint32_t fsid, bool force);
+  Result<void> request_release(uint32_t fsid);
+
+  std::vector<FsState> snapshot() const;
+  Role role_of(uint32_t fsid) const;  // kStandby for an unknown fsid
+  const core::ClusterConfig& config() const { return cfg_; }
+
+ private:
+  struct Fs {
+    const core::ExportEntry* exp = nullptr;
+    Role role = Role::kStandby;
+    uint64_t fs_epoch = 0;
+    std::optional<FenceRecord> fence;
+    std::optional<OwnerRecord> owner;
+    uint64_t takeovers = 0, fence_lost = 0, activation_failures = 0;
+    // Released by `request_release`: no automatic re-takeover until another node has
+    // held the export (or the operator asks again).
+    bool held_off = false;
+  };
+  // What one tick learned from the store: every record, every node's address.
+  struct StoreView {
+    std::vector<NodeFences> fences;
+    std::map<std::string, std::string> addresses;
+    int64_t now_ms = 0;
+  };
+  struct Holder {
+    const NodeFences* rec;
+    uint64_t epoch;  // the fs epoch that record took the fence with
+    bool live;
+  };
+  static bool expired(const NodeFences& rec, int64_t now_ms);
+  // The live record naming `fsid`, else the latest expired one, else nullopt.
+  static std::optional<Holder> holder_of(const StoreView& sv, uint32_t fsid);
+  // Automatic takeover policy for one export: takeover = auto, we are in its `nodes`,
+  // and nobody ahead of us in that list is alive (plan 12 C2 refines this).
+  bool our_turn(const core::ExportEntry& exp, const StoreView& sv) const;
+  Result<void> begin_activation(uint32_t fsid, bool force);
+  void run_activation(uint32_t fsid, uint64_t fs_epoch, std::string prev_node);
+  void begin_draining(uint32_t fsid, const char* why, bool fence_lost, bool release);
+  void run_draining(uint32_t fsid, bool release);
+  bool renew();  // false after a failed renew (three in a row drain what we hold)
+  // Rebuilds and publishes the engine's view from the current roles and store view.
+  void publish(const StoreView* sv);
+  Fs* find(uint32_t fsid);
+  std::chrono::milliseconds ttl() const {
+    return std::chrono::milliseconds(3 * cfg_.fence_lease_ms);
+  }
+
+  core::ClusterConfig cfg_;
+  ClusterStore& store_;
+  core::FsOwnerView& view_;
+  Hooks hooks_;
+  std::string node_;
+
+  mutable std::mutex mu_;
+  std::map<uint32_t, Fs> fs_;
+  StoreView last_;  // the last successful read, for publishes between ticks
+  int renew_failures_ = 0;
 
   std::thread thread_;
   std::mutex wake_mu_;

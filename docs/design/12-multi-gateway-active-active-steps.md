@@ -47,7 +47,7 @@
 | B 协议面 | B1 多活身份 + `eir_flags` ✅ 2026-09-06 | `server_owner.major_id` 按 node 派生；`SUPP_MOVED_REFER\|MIGR` | A1 | P2 |
 | | B2 `fs_locations` / `fs_locations_info` 属性 ✅ 2026-09-06 | `attrs.cpp` 两属性编码；属主视图 `FsOwnerView` | A1 A2 | P2 |
 | | B3 非属主导出边界回 `NFS4ERR_MOVED` ✅ 2026-09-06 | `engine.cpp` 的 fsid 门禁；referral 例外（LOOKUP、GETATTR fs_locations） | B2 | P2 |
-| C per-fsid 控制器 | C1 `ClusterController` per-fsid 角色机 + 批量续租 | 每 fsid 一个 `{Remote, Activating, Active, Draining}`；一条续租协程 | A1–A3 B1 | P3 |
+| C per-fsid 控制器 | C1 `ClusterController` per-fsid 角色机 + 批量续租 ✅ 2026-09-06 | 每 fsid 一个 `{Remote, Activating, Active, Draining}`；一条续租协程 | A1–A3 B1 | P3 |
 | | C2 per-fsid 自动接管 | 按 `nodes` 顺位接管过期围栏；per-fsid 后端 takeover；写 owner | C1 | P3 |
 | | C3 `SEQ4_STATUS_LEASE_MOVED` | 属主变更后一个租约期对受影响客户端置位 | A3 C1 | P3 |
 | | C4 ctl 与指标 | `cluster status` per-fsid 表；`cluster takeover/standby <fsid>`；`lightnfs_cluster_fs_*`、`lightnfs_v4_moved_total` | C1 C2 | P3 |
@@ -399,7 +399,7 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 
 ## 阶段 C：per-fsid 控制器
 
-### C1 `ClusterController` per-fsid 角色状态机 + 批量续租
+### C1 `ClusterController` per-fsid 角色状态机 + 批量续租（已完成，2026-09-06）
 
 **目标**：11 §11.3 / §11.14——"每 fsid 一个角色 + 一条批量续租协程"；failover 模式下现有机器
 原封不动。

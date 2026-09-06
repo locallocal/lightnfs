@@ -81,7 +81,8 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
                        co_return co_await entry->backend->resolve(oid);
                      }},
              .stable = core.cluster ? cluster_stable_store(*core.cluster)
-                                    : state::StateMgr::Config::StableStore{}}) {
+                                    : state::StateMgr::Config::StableStore{},
+             .per_fsid_reclaim = core.active_active}) {
   nfs3.set_write_verifier(core::verifier_from_epoch(core.epoch));
   nfs3.set_drc(&drc);
   nfs3.register_with(dispatcher);
@@ -108,7 +109,9 @@ ServerIdentity derive_server_identity(const core::ServerConfig& cfg,
 
 void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::ClusterConfig& cluster,
                               CoreState& core, rt::Runtime& runtime) {
-  state.load_grace_list();
+  // Active-active arms grace per export when the controller takes it over (plan 12
+  // C1); the global window is the single-gateway / failover restart.
+  if (!core.active_active) state.load_grace_list();
   auto identity = derive_server_identity(cfg, cluster);
   nfs4.emplace(*core.exports, core.key, locks, pseudofs, state, std::move(identity.owner),
                std::move(identity.scope), core::cluster_active_active(cluster));
