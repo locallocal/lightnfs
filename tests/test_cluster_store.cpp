@@ -421,3 +421,220 @@ TEST(ClusterStore, ExportDigestIgnoresPerNodeKeys) {
   EXPECT_FALSE(differs("fd_cache = 1024", "fd_cache = 8"));
   EXPECT_FALSE(differs("clients = [\"10.0.0.0/8\"]", "clients = [\"127.0.0.0/8\"]"));
 }
+
+// ---- active-active (design 11 §11.3, plan 12 A2) -------------------------------------
+
+TEST(ClusterStore, FsFenceBatchedPerNode) {
+  TmpDir dir;
+  auto a = server::make_posix_cluster_store(dir.path);
+  auto b = server::make_posix_cluster_store(dir.path);
+
+  auto none = a->read_fs_fence(1);
+  ASSERT_TRUE(none.has_value());
+  EXPECT_FALSE(none->has_value());
+  auto no_records = a->list_fences();
+  ASSERT_TRUE(no_records.has_value());
+  EXPECT_EQ(no_records->size(), 0u);
+
+  // A takes F1 and F2: one record file, both exports under one lease.
+  int64_t before = now_ms();
+  auto f1 = a->acquire_fs_fence(1, "gw1", 5, 1000ms, false);
+  ASSERT_TRUE(f1.has_value());
+  EXPECT_STREQ(f1->node, "gw1");
+  EXPECT_EQ(f1->epoch, 5u);
+  EXPECT_TRUE(f1->expires_at_ms >= before + 1000);
+  ASSERT_TRUE(a->acquire_fs_fence(2, "gw1", 3, 1000ms, false).has_value());
+  EXPECT_TRUE(std::filesystem::exists(dir.path + "/fence.gw1"));
+  EXPECT_FALSE(std::filesystem::exists(dir.path + "/fence"));  // the failover file: untouched
+  auto records = a->list_fences();
+  ASSERT_TRUE(records.has_value());
+  ASSERT_TRUE(records->size() == 1u);
+  EXPECT_STREQ((*records)[0].node, "gw1");
+  ASSERT_TRUE((*records)[0].holds.size() == 2u);
+  EXPECT_EQ((*records)[0].holds[0].fsid, 1u);
+  EXPECT_EQ((*records)[0].holds[0].epoch, 5u);
+  EXPECT_EQ((*records)[0].holds[1].fsid, 2u);
+  EXPECT_EQ((*records)[0].holds[1].epoch, 3u);
+
+  // B: F1 is busy, F3 is free; B's record lists only F3.
+  auto busy = b->acquire_fs_fence(1, "gw2", 6, 1000ms, false);
+  ASSERT_TRUE(!busy.has_value());
+  EXPECT_EQ(static_cast<int>(busy.error()), EBUSY);
+  ASSERT_TRUE(b->acquire_fs_fence(3, "gw2", 1, 1000ms, false).has_value());
+  auto f1_seen = b->read_fs_fence(1);
+  ASSERT_TRUE(f1_seen.has_value() && f1_seen->has_value());
+  EXPECT_STREQ((*f1_seen)->node, "gw1");
+  EXPECT_EQ((*f1_seen)->epoch, 5u);
+  auto f3_seen = a->read_fs_fence(3);
+  ASSERT_TRUE(f3_seen.has_value() && f3_seen->has_value());
+  EXPECT_STREQ((*f3_seen)->node, "gw2");
+  // The holder itself may re-acquire (a restarted process): the epoch is refreshed.
+  auto again = a->acquire_fs_fence(1, "gw1", 7, 1000ms, false);
+  ASSERT_TRUE(again.has_value());
+  EXPECT_EQ(again->epoch, 7u);
+
+  // renew: one write covers every export A holds; the list is preserved.
+  ASSERT_TRUE(a->renew_fences("gw1", 5000ms).has_value());
+  auto renewed = b->read_fs_fence(2);
+  ASSERT_TRUE(renewed.has_value() && renewed->has_value());
+  EXPECT_TRUE((*renewed)->expires_at_ms >= now_ms() + 4000);
+  std::string raw = slurp(dir.path + "/fence.gw1");
+  EXPECT_TRUE(raw.find(" 1:7,2:3\n") != std::string::npos);
+
+  // A's lease lapses: F1 goes to B, and A's record no longer names it (so a late
+  // heartbeat from A cannot revive the hold); F2 stays listed until someone takes it.
+  write_raw(dir.path + "/fence.gw1", std::to_string(now_ms() - 1000) + " 1:7,2:3\n");
+  auto lapsed = b->read_fs_fence(1);  // the expired record is still reported
+  ASSERT_TRUE(lapsed.has_value() && lapsed->has_value());
+  EXPECT_STREQ((*lapsed)->node, "gw1");
+  auto taken = b->acquire_fs_fence(1, "gw2", 8, 1000ms, false);
+  ASSERT_TRUE(taken.has_value());
+  EXPECT_STREQ(taken->node, "gw2");
+  ASSERT_TRUE(a->renew_fences("gw1", 1000ms).has_value());  // A comes back: F2 only
+  auto f1_now = a->read_fs_fence(1);
+  ASSERT_TRUE(f1_now.has_value() && f1_now->has_value());
+  EXPECT_STREQ((*f1_now)->node, "gw2");
+  EXPECT_EQ((*f1_now)->epoch, 8u);
+  auto f2_now = b->read_fs_fence(2);
+  ASSERT_TRUE(f2_now.has_value() && f2_now->has_value());
+  EXPECT_STREQ((*f2_now)->node, "gw1");
+  // Within the skew tolerance a record still counts as live.
+  write_raw(dir.path + "/fence.gw2", std::to_string(now_ms() - 100) + " 1:8,3:1\n");
+  auto still = a->acquire_fs_fence(1, "gw1", 9, 1000ms, false);
+  ASSERT_TRUE(!still.has_value());
+  EXPECT_EQ(static_cast<int>(still.error()), EBUSY);
+
+  // release: not ours → EPERM; ours → dropped, the record stays as a heartbeat;
+  // nobody's → ok.
+  auto not_ours = a->release_fs_fence(1, "gw1");
+  ASSERT_TRUE(!not_ours.has_value());
+  EXPECT_EQ(static_cast<int>(not_ours.error()), EPERM);
+  ASSERT_TRUE(a->release_fs_fence(2, "gw1").has_value());
+  EXPECT_TRUE(std::filesystem::exists(dir.path + "/fence.gw1"));
+  auto heartbeat = a->list_fences();
+  ASSERT_TRUE(heartbeat.has_value() && heartbeat->size() == 2u);
+  EXPECT_STREQ((*heartbeat)[0].node, "gw1");
+  EXPECT_EQ((*heartbeat)[0].holds.size(), 0u);
+  auto f2_gone = b->read_fs_fence(2);
+  ASSERT_TRUE(f2_gone.has_value());
+  EXPECT_FALSE(f2_gone->has_value());
+  EXPECT_TRUE(a->release_fs_fence(2, "gw1").has_value());
+  ASSERT_TRUE(a->renew_fences("gw1", 1000ms).has_value());  // an empty record still renews
+  EXPECT_TRUE(slurp(dir.path + "/fence.gw1").find(' ') == std::string::npos);
+
+  // force: the operator's manual takeover ignores a live lease, and the previous
+  // holder's record is stripped of the export.
+  auto forced = a->acquire_fs_fence(3, "gw1", 2, 1000ms, true);
+  ASSERT_TRUE(forced.has_value());
+  auto stripped = a->list_fences();
+  ASSERT_TRUE(stripped.has_value() && stripped->size() == 2u);
+  ASSERT_TRUE((*stripped)[1].holds.size() == 1u);  // gw2: only F1 left
+  EXPECT_EQ((*stripped)[1].holds[0].fsid, 1u);
+  EXPECT_FALSE(std::filesystem::exists(dir.path + "/fence.lock"));
+  EXPECT_FALSE(has_tmp_leftovers(dir.path));
+
+  // A node that never held anything can still heart-beat, and a corrupt record is an
+  // error rather than a silent "free".
+  ASSERT_TRUE(b->renew_fences("gw3", 1000ms).has_value());
+  auto three = a->list_fences();
+  ASSERT_TRUE(three.has_value());
+  EXPECT_EQ(three->size(), 3u);
+  write_raw(dir.path + "/fence.gw3", "garbage\n");
+  EXPECT_FALSE(a->list_fences().has_value());
+  EXPECT_FALSE(a->read_fs_fence(1).has_value());
+}
+
+TEST(ClusterStore, PerFsidEpochOwnerClientsAndNodes) {
+  TmpDir dir;
+  auto a = server::make_posix_cluster_store(dir.path);
+  auto b = server::make_posix_cluster_store(dir.path);
+
+  // Node epochs: independent per node, monotonic across store objects.
+  auto e0 = a->read_node_epoch("gw1");
+  ASSERT_TRUE(e0.has_value());
+  EXPECT_EQ(*e0, 0u);
+  ASSERT_TRUE(a->bump_node_epoch("gw1").has_value());
+  auto e2 = b->bump_node_epoch("gw1");
+  ASSERT_TRUE(e2.has_value());
+  EXPECT_EQ(*e2, 2u);
+  auto other = a->bump_node_epoch("gw2");
+  ASSERT_TRUE(other.has_value());
+  EXPECT_EQ(*other, 1u);
+  EXPECT_EQ(*a->read_node_epoch("gw1"), 2u);
+  EXPECT_EQ(*a->read_epoch(), 0u);  // the failover epoch is a different counter
+  EXPECT_FALSE(std::filesystem::exists(dir.path + "/epoch.gw1.lock"));
+  // The per-node epoch files are not mistaken for export digests or fence records.
+  ASSERT_TRUE(a->put_exports_digest("gw1", "sha256:aaaa").has_value());
+  auto digests = a->list_exports_digests();
+  ASSERT_TRUE(digests.has_value());
+  EXPECT_EQ(digests->size(), 1u);
+  auto fences = a->list_fences();
+  ASSERT_TRUE(fences.has_value());
+  EXPECT_EQ(fences->size(), 0u);
+
+  // Node addresses.
+  auto no_nodes = a->list_nodes();
+  ASSERT_TRUE(no_nodes.has_value());
+  EXPECT_EQ(no_nodes->size(), 0u);
+  ASSERT_TRUE(a->put_node_address("gw2", "10.0.0.12:2049").has_value());
+  ASSERT_TRUE(b->put_node_address("gw1", "10.0.0.11:2049").has_value());
+  ASSERT_TRUE(a->put_node_address("gw1", "[fd00::11]:2049").has_value());  // overwrite
+  auto nodes = b->list_nodes();
+  ASSERT_TRUE(nodes.has_value() && nodes->size() == 2u);
+  EXPECT_STREQ((*nodes)[0].first, "gw1");
+  EXPECT_STREQ((*nodes)[0].second, "[fd00::11]:2049");
+  EXPECT_STREQ((*nodes)[1].first, "gw2");
+  EXPECT_STREQ((*nodes)[1].second, "10.0.0.12:2049");
+
+  // Per-fsid epochs.
+  EXPECT_EQ(*a->read_fs_epoch(7), 0u);
+  ASSERT_TRUE(a->bump_fs_epoch(7).has_value());
+  auto fe = b->bump_fs_epoch(7);
+  ASSERT_TRUE(fe.has_value());
+  EXPECT_EQ(*fe, 2u);
+  EXPECT_EQ(*a->bump_fs_epoch(8), 1u);
+  EXPECT_EQ(*b->read_fs_epoch(7), 2u);
+  EXPECT_TRUE(std::filesystem::exists(dir.path + "/fs/7/epoch"));
+  EXPECT_FALSE(std::filesystem::exists(dir.path + "/fs/7/epoch.lock"));
+
+  // Owner records: absent, then round-tripped; corrupt is an error.
+  auto no_owner = a->read_owner(7);
+  ASSERT_TRUE(no_owner.has_value());
+  EXPECT_FALSE(no_owner->has_value());
+  ASSERT_TRUE(a->put_owner(7, {"gw1", "[fd00::11]:2049", 2}).has_value());
+  auto owner = b->read_owner(7);
+  ASSERT_TRUE(owner.has_value() && owner->has_value());
+  EXPECT_STREQ((*owner)->node, "gw1");
+  EXPECT_STREQ((*owner)->address, "[fd00::11]:2049");
+  EXPECT_EQ((*owner)->fs_epoch, 2u);
+  EXPECT_FALSE(a->put_owner(7, {"", "x:1", 1}).has_value());
+  EXPECT_FALSE(a->put_owner(7, {"gw1", "bad address", 1}).has_value());
+  write_raw(dir.path + "/fs/7/owner", "2 only-two\n");
+  EXPECT_FALSE(a->read_owner(7).has_value());
+
+  // Per-fsid reclaim lists: separate per export and from the global list.
+  ASSERT_TRUE(a->put_client(7, "Linux NFSv4.1 host-a/1").has_value());
+  ASSERT_TRUE(a->put_client(7, "owner-b").has_value());
+  ASSERT_TRUE(a->put_client(8, "owner-c").has_value());
+  ASSERT_TRUE(a->put_client("global-owner").has_value());
+  auto seven = b->list_clients(7);
+  ASSERT_TRUE(seven.has_value());
+  std::sort(seven->begin(), seven->end());
+  ASSERT_TRUE(seven->size() == 2u);
+  EXPECT_STREQ((*seven)[0], "Linux NFSv4.1 host-a/1");
+  EXPECT_STREQ((*seven)[1], "owner-b");
+  auto eight = b->list_clients(8);
+  ASSERT_TRUE(eight.has_value() && eight->size() == 1u);
+  auto global = b->list_clients();
+  ASSERT_TRUE(global.has_value() && global->size() == 1u);
+  EXPECT_STREQ((*global)[0], "global-owner");
+  auto nine = b->list_clients(9);  // never touched: empty, not an error
+  ASSERT_TRUE(nine.has_value());
+  EXPECT_EQ(nine->size(), 0u);
+  ASSERT_TRUE(a->erase_client(7, "owner-b").has_value());
+  ASSERT_TRUE(a->erase_client(7, "never-there").has_value());
+  auto left = b->list_clients(7);
+  ASSERT_TRUE(left.has_value() && left->size() == 1u);
+  EXPECT_STREQ((*left)[0], "Linux NFSv4.1 host-a/1");
+  EXPECT_FALSE(has_tmp_leftovers(dir.path + "/fs/7/clients"));
+}
