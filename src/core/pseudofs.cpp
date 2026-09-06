@@ -1,5 +1,6 @@
 #include "core/pseudofs.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace lnfs::core {
@@ -71,6 +72,13 @@ PseudoFs::Node* PseudoFs::ensure_child(Node* parent, std::string_view name,
   by_id_[raw->id] = raw;
   parent->children.emplace(std::string(name), std::move(node));
   return raw;
+}
+
+std::vector<std::string> PseudoFs::path_of(const Node& node) {
+  std::vector<std::string> parts;
+  for (const Node* cur = &node; cur && cur->parent; cur = cur->parent) parts.push_back(cur->name);
+  std::reverse(parts.begin(), parts.end());
+  return parts;
 }
 
 PseudoFs::Node* PseudoFs::find(uint64_t id) const {

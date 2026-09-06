@@ -5,6 +5,7 @@
 // owner/owner_group are decimal strings (AUTH_SYS convention, zero idmap dependency).
 
 #include "backend/api.hpp"
+#include "core/fs_owner_view.hpp"
 #include "core/fs_props.hpp"
 #include "nfsv4/nfs4_types.hpp"
 
@@ -22,13 +23,17 @@ inline constexpr uint32_t kSupportedAttrs = 0, kType = 1, kFhExpireType = 2, kCh
     kTimeAccess = 47, kTimeAccessSet = 48, kTimeDelta = 51, kTimeMetadata = 52,
     kTimeModify = 53, kTimeModifySet = 54, kMountedOnFileid = 55,
     kSuppattrExclCreat = 75, kChangeAttrType = 79;
+// Referral attributes (RFC 8881 §11.10, plan 12 B2): supported under active-active only.
+inline constexpr uint32_t kFsLocations = 24, kFsLocationsInfo = 67;
 // change_attr_type values (RFC 7862 §12.2.3).
 inline constexpr uint32_t kChangeTypeMonotonicIncr = 0, kChangeTypeVersionCounter = 1,
     kChangeTypeVersionCounterNoPnfs = 2, kChangeTypeTimeMetadata = 3,
     kChangeTypeUndefined = 4;
 }
 
-const Bitmap& supported_attrs();
+// `referrals` (the engine's active-active flag, plan 12 B1/B2) adds fs_locations and
+// fs_locations_info to the set.
+const Bitmap& supported_attrs(bool referrals = false);
 
 // Everything the encoders may need; the engine prefetches async pieces (stats) first.
 struct AttrSource {
@@ -39,6 +44,12 @@ struct AttrSource {
   const core::FsProps* fs = nullptr;          // caps/limits derivation; null = pseudo
   const backend::FsStats* stats = nullptr;    // null -> zeros (pseudo)
   uint32_t lease_seconds = kLeaseSeconds;     // attr 10 (lease_time)
+  // Referrals (plan 12 B2): `referrals` selects the supported set; for an export-side
+  // object `fs_root` is the export's pseudo path and `owner` its owner as this gateway
+  // sees it (null: no location to name — the pseudo fs, or an unknown owner).
+  bool referrals = false;
+  std::span<const std::string> fs_root{};
+  const core::FsOwner* owner = nullptr;
 };
 
 // Decodes a fattr4 carrying settable attributes (SETATTR / OPEN create / CREATE) into

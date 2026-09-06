@@ -45,7 +45,7 @@
 | | A2 `ClusterStore` per-fsid 键空间 ✅ 2026-09-06 | `fs/<fsid>/{epoch,owner,clients/}`、批量 `fence.<node>`、`nodes/<node>`、`epoch.<node>` | — | P1 |
 | | A3 `StateMgr` per-fsid grace ✅ 2026-09-06 | `fsid → {deadline, reclaim_set}`；名单钩子加 fsid；`release_fsid()` | A2 | P1 |
 | B 协议面 | B1 多活身份 + `eir_flags` ✅ 2026-09-06 | `server_owner.major_id` 按 node 派生；`SUPP_MOVED_REFER\|MIGR` | A1 | P2 |
-| | B2 `fs_locations` / `fs_locations_info` 属性 | `attrs.cpp` 两属性编码；属主视图 `FsOwnerView` | A1 A2 | P2 |
+| | B2 `fs_locations` / `fs_locations_info` 属性 ✅ 2026-09-06 | `attrs.cpp` 两属性编码；属主视图 `FsOwnerView` | A1 A2 | P2 |
 | | B3 非属主导出边界回 `NFS4ERR_MOVED` | `engine.cpp` 的 fsid 门禁；referral 例外（LOOKUP、GETATTR fs_locations） | B2 | P2 |
 | C per-fsid 控制器 | C1 `ClusterController` per-fsid 角色机 + 批量续租 | 每 fsid 一个 `{Remote, Activating, Active, Draining}`；一条续租协程 | A1–A3 B1 | P3 |
 | | C2 per-fsid 自动接管 | 按 `nodes` 顺位接管过期围栏；per-fsid 后端 takeover；写 owner | C1 | P3 |
@@ -285,7 +285,7 @@ flags 不含这两位。
   C1 去掉守卫即接通。客户端请求里的 REFER|MIGR 位本就在 `kEidValidRequest` 内。既有
   `Nfs4.ClusterIdentityDerivation` / `ClusterIdentityAcrossProtocolStacks` 各加了多活段。
 
-### B2 `fs_locations` / `fs_locations_info` 属性与属主视图
+### B2 `fs_locations` / `fs_locations_info` 属性与属主视图（已完成，2026-09-06）
 
 **目标**：GETATTR 能对导出根回答"这个 fs 在谁那儿"。
 
@@ -320,6 +320,21 @@ flags 不含这两位。
 **测试**：`tests/test_nfs4.cpp` 加 `Nfs4.FsLocationsEncoding`——视图里 fsid 2 由 gw2 持有：
 对 `/export/b` 根 fh `GETATTR(fs_locations)` 解出 `fs_root = ["export","b"]`、server =
 `gw2 地址`；`supported_attrs` 含 24/67；单网关模式下请求 24 → 位被忽略（现有语义）。
+
+- 实现注（2026-09-06）：
+  - **`fs_locations` 的 server 只带主机部分**（`core::address_host` 去掉 `:port` 与 v6 方括号）：
+    RFC 8881 §11.10 的 server 是主机名/地址字面量，Linux 客户端（`nfs_parse_server_name`）
+    不解析端口、referral 目标固定走 2049。因此**多活部署里各网关的数据面必须监听 2049**；
+    `node_address` 的端口只供 ctl/诊断与本机验收脚本使用（E1 的 `v4moved` 客户端从命令行
+    拿端口，对属性只校验主机）。这是 11 §11.4 未写明的一条部署约束，E3 要写进 deployment.md。
+  - `FsOwnerView` 用 `std::atomic<std::shared_ptr<const Map>>`（C++20，GCC 15）；`Engine` 经
+    `set_owner_view()` 挂视图、`owner_of()/role_of()` 查询，视图为空即一切 `kActive`；
+    `CoreState::owners` 指针默认空。`supported_attrs(bool referrals)` 两张静态位图，
+    `AttrSource` 加 `referrals` / `fs_root` / `owner` 三个字段；只有掩码里请求了 24/67 才去
+    查视图和拼 `PseudoFs::path_of`。VERIFY/NVERIFY 的支持集同源。
+  - `kActive` 且视图里带自身地址时 `locations` 列出自己（C1 发布视图时对自持 fsid 填
+    `node_address`），无地址或 `kUnowned` 为空列表；伪 fs 对象 `fs_root = []`、无 locations。
+    READDIR 条目已设 `referrals`，`rdattr_error` / 非属主条目的处理留给 B3。
 
 ### B3 非属主导出边界回 `NFS4ERR_MOVED`
 

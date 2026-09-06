@@ -112,6 +112,7 @@ void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::Cluster
   auto identity = derive_server_identity(cfg, cluster);
   nfs4.emplace(*core.exports, core.key, locks, pseudofs, state, std::move(identity.owner),
                std::move(identity.scope), core::cluster_active_active(cluster));
+  nfs4->set_owner_view(core.owners);
   nfs4->register_with(dispatcher);
   // Off reactor 0 (plan doc 10 §2.6): the auxiliary tasks used to pile onto the same
   // reactor the (old, single) accept loop lived on.  The wrapper signals the future

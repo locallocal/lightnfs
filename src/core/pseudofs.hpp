@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "core/config.hpp"
 
@@ -33,6 +34,9 @@ class PseudoFs {
 
   backend::Attr attr_of(const Node& node) const;
   static backend::ObjId oid_of(const Node& node);
+  // The node's path from the pseudo root as pathname4 components (empty for the root):
+  // the fs_root of an export's fs_locations (plan 12 B2).
+  static std::vector<std::string> path_of(const Node& node);
   // Reverses oid_of; null if the id does not name a live pseudo node.
   Node* resolve(const backend::ObjId& oid) const;
 
