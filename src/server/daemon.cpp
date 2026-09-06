@@ -546,7 +546,8 @@ int run_server(const std::string& config_path) {
       }
       if (!cluster_cfg.takeover_hook.empty()) {
         auto ran = run_takeover_hook(cluster_cfg.takeover_hook, ctx.identity, ctx.prev_node,
-                                     std::chrono::milliseconds(cluster_cfg.fence_lease_ms), fsid);
+                                     std::chrono::milliseconds(cluster_cfg.fence_lease_ms), fsid,
+                                     ctx.reason);
         if (!ran) outcome = Err(ran.error());
       }
       return outcome;

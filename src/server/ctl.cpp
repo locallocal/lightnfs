@@ -96,8 +96,8 @@ const char* kHelp =
     "unknown command; available: ping|version|status|metrics|dump-errors|drc [flush]|"
     "fdcache [flush]|clear-poison|state|expire-client <clientid>|conns|kill-conn <id>|"
     "loglevel <debug|info|warn|error>|reload|drain|grace-end|"
-    "cluster <status|takeover [<fsid>] [--force]|standby [<fsid>]>  (append --json for JSON "
-    "output)\n";
+    "cluster <status|takeover [<fsid>] [--force]|standby [<fsid>]|migrate <fsid> <node>>  "
+    "(append --json for JSON output)\n";
 
 }  // namespace
 
@@ -149,7 +149,8 @@ const char* cluster_usage(bool json) {
 
 const char* cluster_fs_usage(bool json) {
   return json ? "{\"error\":\"bad subcommand\"}\n"
-              : "cluster: expected status|takeover <fsid> [--force]|standby <fsid>\n";
+              : "cluster: expected status|takeover <fsid> [--force]|standby <fsid>|migrate "
+                "<fsid> <node>\n";
 }
 
 // The fsid positional of `cluster takeover|standby <fsid>`: a decimal number.
@@ -232,7 +233,8 @@ std::string cluster_status(const ClusterController& cc,
 // export was last renewed (ours or theirs), from its expiry and the ttl; grace = the
 // export's own reclaim window on this gateway (0 when not served here).
 std::string cluster_fs_status(const FsClusterController& fc, const DataPlane* dp,
-                              const Result<std::vector<std::string>>& peers, bool json) {
+                              const Result<std::vector<std::string>>& peers,
+                              const Result<std::vector<std::string>>& alive, bool json) {
   const auto snap = fc.snapshot();
   const auto& cfg = fc.config();
   const int64_t wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -243,22 +245,29 @@ std::string cluster_fs_status(const FsClusterController& fc, const DataPlane* dp
     if (fs.role != Role::kActive || !dp || !dp->state) return 0;
     return dp->state->grace_remaining_seconds(fs.fsid);
   };
+  auto json_list = [](const Result<std::vector<std::string>>& names) {
+    if (!names) return std::string("null");
+    std::string out = "[";
+    for (size_t i = 0; i < names->size(); ++i)
+      out += std::format("{}\"{}\"", i ? "," : "", json_escape((*names)[i]));
+    return out + "]";
+  };
+  auto text_list = [](const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& n : names) out += (out.empty() ? "" : ",") + n;
+    return out.empty() ? std::string("-") : out;
+  };
   if (json) {
-    std::string peer_list = "null";
-    if (peers) {
-      peer_list = "[";
-      for (size_t i = 0; i < peers->size(); ++i)
-        peer_list += std::format("{}\"{}\"", i ? "," : "", json_escape((*peers)[i]));
-      peer_list += "]";
-    }
     std::string rows;
     for (const auto& fs : snap) {
       const bool owned = fs.view.role != core::FsRole::kUnowned && !fs.view.node.empty();
       rows += std::format(
-          "{}{{\"fsid\":{},\"role\":\"{}\",\"owner\":{},\"address\":{},\"fs_epoch\":{},"
-          "\"fence_age_ms\":{},\"fence_expires_in_ms\":{},\"grace_remaining_s\":{},"
-          "\"takeovers\":{},\"fence_lost\":{},\"activation_failures\":{}}}",
+          "{}{{\"fsid\":{},\"role\":\"{}\",\"nodes\":{},\"owner\":{},\"address\":{},"
+          "\"fs_epoch\":{},\"fence_age_ms\":{},\"fence_expires_in_ms\":{},"
+          "\"grace_remaining_s\":{},\"takeovers\":{},\"fence_lost\":{},"
+          "\"activation_failures\":{}}}",
           rows.empty() ? "" : ",", fs.fsid, FsClusterController::fs_role_label(fs),
+          json_list(Result<std::vector<std::string>>(fs.nodes)),
           owned ? std::format("\"{}\"", json_escape(fs.view.node)) : "null",
           owned && !fs.view.address.empty() ? std::format("\"{}\"", json_escape(fs.view.address))
                                             : "null",
@@ -269,28 +278,26 @@ std::string cluster_fs_status(const FsClusterController& fc, const DataPlane* dp
     }
     return std::format(
         "{{\"mode\":\"active-active\",\"node\":\"{}\",\"node_epoch\":{},\"node_address\":\"{}\","
-        "\"shared_dir\":\"{}\",\"peers\":{},\"takeover\":\"{}\",\"exports\":[{}]}}\n",
+        "\"shared_dir\":\"{}\",\"peers\":{},\"peers_alive\":{},\"takeover\":\"{}\","
+        "\"migrations\":{},\"exports\":[{}]}}\n",
         json_escape(fc.node()), fc.node_epoch(), json_escape(cfg.node_address),
-        json_escape(cfg.shared_dir), peer_list, json_escape(cfg.takeover), rows);
-  }
-  std::string peer_list = "?";
-  if (peers) {
-    peer_list.clear();
-    for (const auto& p : *peers) peer_list += (peer_list.empty() ? "" : ",") + p;
+        json_escape(cfg.shared_dir), json_list(peers), json_list(alive), json_escape(cfg.takeover),
+        fc.migrations(), rows);
   }
   std::string out = std::format(
       "mode=active-active node={} node_epoch={} node_address={} shared_dir={} peers={} "
-      "takeover={} exports={}\n",
-      fc.node(), fc.node_epoch(), cfg.node_address, cfg.shared_dir, peer_list, cfg.takeover,
-      snap.size());
+      "peers_alive={} takeover={} migrations={} exports={}\n",
+      fc.node(), fc.node_epoch(), cfg.node_address, cfg.shared_dir, peers ? text_list(*peers) : "?",
+      alive ? text_list(*alive) : "?", cfg.takeover, fc.migrations(), snap.size());
   for (const auto& fs : snap) {
     const bool owned = fs.view.role != core::FsRole::kUnowned && !fs.view.node.empty();
     out += std::format(
-        "fsid={} role={} owner={} address={} fs_epoch={} fence_age_ms={} "
+        "fsid={} role={} nodes={} owner={} address={} fs_epoch={} fence_age_ms={} "
         "fence_expires_in_ms={} grace_remaining_s={} takeovers={} fence_lost={} "
         "activation_failures={}\n",
-        fs.fsid, FsClusterController::fs_role_label(fs), owned ? fs.view.node : "none",
-        owned && !fs.view.address.empty() ? fs.view.address : "-", fs.view.fs_epoch,
+        fs.fsid, FsClusterController::fs_role_label(fs), text_list(fs.nodes),
+        owned ? fs.view.node : "none", owned && !fs.view.address.empty() ? fs.view.address : "-",
+        fs.view.fs_epoch,
         fs.fence ? std::to_string(wall_ms - (fs.fence->expires_at_ms - ttl_ms)) : "-",
         fs.fence ? std::to_string(fs.fence->expires_at_ms - wall_ms) : "-", grace_left(fs),
         fs.takeovers, fs.fence_lost, fs.activation_failures);
@@ -664,7 +671,48 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
     const auto sub = cmd.arg(1);
     if (sub == "status") {
       auto peers = co_await rt::offload([&fc] { return fc.peers(); });
-      co_return cluster_fs_status(fc, dp, peers, json);
+      auto alive = co_await rt::offload([&fc] { return fc.alive_peers(); });
+      co_return cluster_fs_status(fc, dp, peers, alive, json);
+    }
+    if (sub == "migrate") {
+      // `<fsid> <node>`: the export we serve and the live gateway to hand it to.
+      std::optional<uint32_t> fsid;
+      std::string target;
+      for (size_t i = 2; i < cmd.args.size(); ++i) {
+        if (cmd.args[i].starts_with("--")) continue;
+        if (!fsid)
+          fsid = parse_fsid(cmd.args[i]);
+        else if (target.empty())
+          target = cmd.args[i];
+      }
+      if (!fsid || target.empty()) co_return cluster_error(json, "fsid and node required");
+      auto moved =
+          co_await rt::offload([&fc, fsid, &target] { return fc.request_migrate(*fsid, target); });
+      if (moved) {
+        if (json)
+          co_return std::format("{{\"migrate\":true,\"fsid\":{},\"to\":\"{}\"}}\n", *fsid,
+                                json_escape(target));
+        co_return std::format("migrate started: fsid={} from={} to={}\n", *fsid, fc.node(), target);
+      }
+      std::string role = fs_role_of(fc, *fsid);
+      if (role == "unknown") co_return cluster_error(json, std::format("unknown fsid {}", *fsid));
+      if (moved.error() == errno_from(EINVAL))
+        co_return cluster_error(json, std::format("cannot migrate fsid {} to {}: that is this "
+                                                  "node",
+                                                  *fsid, target));
+      if (moved.error() == errno_from(EPERM)) {
+        std::string owner = "nobody";
+        for (const auto& fs : fc.snapshot())
+          if (fs.fsid == *fsid && !fs.view.node.empty() && fs.view.role != core::FsRole::kUnowned)
+            owner = fs.view.node;
+        co_return cluster_error(
+            json, std::format("fsid {} not active here (role={}, owner={})", *fsid, role, owner));
+      }
+      if (moved.error() == errno_from(EHOSTDOWN))
+        co_return cluster_error(
+            json,
+            std::format("node {} is not a live gateway (no registration or heartbeat)", target));
+      co_return cluster_error(json, std::format("migrate failed: {}", errno_name(moved.error())));
     }
     if (sub == "takeover" || sub == "standby") {
       // `<fsid>` is the first positional after the subcommand; flags may follow it.

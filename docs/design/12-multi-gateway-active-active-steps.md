@@ -51,8 +51,8 @@
 | | C2 per-fsid 自动接管 ✅ 2026-09-06 | 按 `nodes` 顺位接管过期围栏；per-fsid 后端 takeover；写 owner | C1 | P3 |
 | | C3 `SEQ4_STATUS_LEASE_MOVED` ✅ 2026-09-06 | 属主变更后一个租约期对受影响客户端置位 | A3 C1 | P3 |
 | | C4 ctl 与指标 ✅ 2026-09-06 | `cluster status` per-fsid 表；`cluster takeover/standby <fsid>`；`lightnfs_cluster_fs_*`、`lightnfs_v4_moved_total` | C1 C2 | P3 |
-| D 计划内迁移 | D1 `ctl cluster migrate <fsid> <node>` | 源端 Draining → owner → 释放；目标端按 owner 接管 | C2 C3 C4 | P4 |
-| | D2 滚动升级脚本 | `scripts/cluster_roll.sh`：逐 fsid 迁出 / 迁回 | D1 | P4 |
+| D 计划内迁移 | D1 `ctl cluster migrate <fsid> <node>` ✅ 2026-09-06 | 源端 Draining → owner → 释放；目标端按 owner 接管 | C2 C3 C4 | P4 |
+| | D2 滚动升级脚本 ✅ 2026-09-06 | `scripts/cluster_roll.sh`：逐 fsid 迁出 / 迁回 | D1 | P4 |
 | E 验证与文档 | E1 `v4moved` 验收模式 + 三实例本机脚本 | 无 root 的端到端：referral、migration、单网关退化、猝死分散接管 | B3 C2 C3 D1 | P5 |
 | | E2 fake 演练 | CephFS per-fsid uuid 回收只影响该 fsid；同卷约束 | A1 C2 | P5 |
 | | E3 文档 | 08 册、deployment.md、07 §7.5、09 §9.9、11 册状态、design/README | 全部 | P5 |
@@ -541,7 +541,7 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 
 ## 阶段 D：计划内迁移
 
-### D1 `lightnfs-ctl cluster migrate <fsid> <node>`
+### D1 `lightnfs-ctl cluster migrate <fsid> <node>`（已完成，2026-09-06）
 
 **目标**：11 §11.7 的五步，源端发起、目标端经 store 接手，全程无网关间 RPC。
 
@@ -566,7 +566,7 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 `put_owner → release_fence`，gw1 视图 F=Remote(owner gw2)；gw2 下一次 tick 接管（不等顺位），
 `activate_fs(F)` 被调；`MigrateToDeadTargetFallsBack`：gw2 记录过期 → gw1 EHOSTDOWN，不动 F。
 
-### D2 滚动升级脚本
+### D2 滚动升级脚本（已完成，2026-09-06）
 
 **目标**：11 §11.7"滚动升级一台网关"的运维封装。
 

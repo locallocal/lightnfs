@@ -72,6 +72,7 @@ fi
 run_step "errmap doc-drift check" \
   python3 "$repo/scripts/gen_errmap_cases.py" --check
 run_step "clang-format check" "$repo/scripts/format_check.sh"
+run_step "shell syntax check" bash -c 'for f in "$0"/scripts/*.sh; do bash -n "$f" || exit 1; done' "$repo"
 # libgfapi signature drift (plan doc 10 §5.3): the gluster backend loads the library
 # at runtime, so this is the only build-time check; skips where the headers are absent.
 run_step "gfapi ABI check" "$repo/scripts/check_gfapi_abi.sh"

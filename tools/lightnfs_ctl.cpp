@@ -5,7 +5,9 @@
 // Command tree (ccmd, third_party/ccmd):
 //   lightnfs-ctl <ping|metrics|dump-errors|drc|fdcache|clear-poison|state> [--socket=PATH]
 //   lightnfs-ctl expire-client <clientid> [--socket=PATH]
-//   lightnfs-ctl cluster <status|takeover [<fsid>] [--force]|standby [<fsid>]> [--socket=PATH]
+//   lightnfs-ctl cluster <status|takeover [<fsid>] [--force]|standby [<fsid>]|migrate <fsid>
+//   <node>>
+//                [--socket=PATH]
 //   lightnfs-ctl bench <echo|nullrpc|fullpath> [args...]
 //
 // Socket resolution: --socket, else $LIGHTNFS_CTL, else /tmp/lightnfs-state/ctl.sock.
@@ -108,16 +110,19 @@ void run_cluster_cmd(const Cmd& c) {
 Cmd make_cluster_leaf() {
   auto cmd = std::make_shared<ccmd::c_command>(
       "cluster", "lightnfs-ctl cluster takeover 3 --force",
-      "lightnfs-ctl cluster <status|takeover [<fsid>] [--force]|standby [<fsid>]>",
+      "lightnfs-ctl cluster <status|takeover [<fsid>] [--force]|standby [<fsid>]|migrate "
+      "<fsid> <node>>",
       "Multi-gateway failover (design 09): `status` shows this gateway's role, node, "
       "epoch, fence owner/age, shared_dir and the peer list; `takeover` asks a standby "
       "gateway to take the fence and start serving (--force takes a live fence held by "
       "another node — only when that node is known to be down); `standby` drains an "
       "active gateway and releases the fence. Active-active (design 11): `status` "
       "prints one line per export (role, owner, address, fs epoch, fence age, grace, "
-      "takeovers); `takeover <fsid>` and `standby <fsid>` move one export. Answers "
-      "`cluster: not enabled` on a single gateway.",
-      "cluster role: status / takeover [fsid] / standby [fsid]", run_cluster_cmd);
+      "takeovers); `takeover <fsid>` and `standby <fsid>` move one export; `migrate "
+      "<fsid> <node>` (on the owner) hands one export to a live peer without a client "
+      "outage. Answers `cluster: not enabled` on a single gateway.",
+      "cluster role: status / takeover [fsid] / standby [fsid] / migrate fsid node",
+      run_cluster_cmd);
   add_socket_flag(cmd);
   cmd->varp<bool>("force", "f", false,
                   "takeover: overwrite a live fence held by another node");
