@@ -18,6 +18,7 @@
 #include "backend/local/local.hpp"
 #include "backend/memory/memory.hpp"
 #include "core/config.hpp"
+#include "core/fs_owner_view.hpp"
 #include "mem_cluster_store.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
@@ -679,6 +680,150 @@ TEST(Ctl, MetricsDumpErrorsAndConnsCommands) {
 
 // plan 10 C3: `cluster status | takeover [--force] | standby` against a real controller
 // over the in-memory store (manual takeover policy, inline hooks that record their order).
+// Active-active (plan 12 C4): `cluster status` per export, `takeover <fsid>` and
+// `standby <fsid>` on one export, the fsid-less forms refused, JSON twins throughout.
+TEST(Ctl, ClusterFsCommands) {
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  {
+    test::MemClusterStore store;
+    (void)store.put_node_address("gw2", "10.0.0.2:2049");
+    (void)store.put_node_address("gw1", "10.0.0.1:2049");
+    core::ExportTable exports;
+    for (uint32_t fsid = 1; fsid <= 3; ++fsid) {
+      core::ExportConfig ec;
+      ec.path = "/export/" + std::to_string(fsid);
+      ec.fsid = fsid;
+      ec.clients = {"127.0.0.0/8"};
+      ec.nodes =
+          fsid == 3 ? std::vector<std::string>{"gw2"} : std::vector<std::string>{"gw1", "gw2"};
+      ASSERT_TRUE(exports.add(ec, std::make_unique<backend::MemoryBackend>(fsid)).has_value());
+    }
+    std::vector<std::string> calls;
+    server::FsClusterController::Hooks hooks;
+    hooks.activate_fs = [&](uint32_t fsid, uint64_t) -> Result<void> {
+      calls.push_back("activate:" + std::to_string(fsid));
+      return {};
+    };
+    hooks.deactivate_fs = [&](uint32_t fsid) {
+      calls.push_back("deactivate:" + std::to_string(fsid));
+    };
+    core::ClusterConfig cfg;
+    cfg.enabled = true;
+    cfg.mode = "active-active";
+    cfg.id = "cluster-ctl-test";
+    cfg.shared_dir = "/mnt/shared/.lightnfs-cluster";
+    cfg.node = "gw1";
+    cfg.node_address = "10.0.0.1:2049";
+    cfg.takeover = "manual";
+    cfg.fence_lease_ms = 1000;
+    core::FsOwnerView view;
+    server::FsClusterController fc(cfg, exports, store, view, std::move(hooks), 7);
+    server::CtlDeps deps{};
+    deps.fs_cluster = &fc;
+    auto ask = [&](const char* line) {
+      return run_task(runtime, server::CtlServer::answer_async(deps, line));
+    };
+
+    // Before any tick: three unowned exports, the gateway line, the peers from the
+    // node registry.
+    EXPECT_STREQ(ask("cluster status"),
+                 "mode=active-active node=gw1 node_epoch=7 node_address=10.0.0.1:2049 "
+                 "shared_dir=/mnt/shared/.lightnfs-cluster peers=gw1,gw2 takeover=manual "
+                 "exports=3\n"
+                 "fsid=1 role=unowned owner=none address=- fs_epoch=0 fence_age_ms=- "
+                 "fence_expires_in_ms=- grace_remaining_s=0 takeovers=0 fence_lost=0 "
+                 "activation_failures=0\n"
+                 "fsid=2 role=unowned owner=none address=- fs_epoch=0 fence_age_ms=- "
+                 "fence_expires_in_ms=- grace_remaining_s=0 takeovers=0 fence_lost=0 "
+                 "activation_failures=0\n"
+                 "fsid=3 role=unowned owner=none address=- fs_epoch=0 fence_age_ms=- "
+                 "fence_expires_in_ms=- grace_remaining_s=0 takeovers=0 fence_lost=0 "
+                 "activation_failures=0\n");
+    auto js = ask("cluster status --json");
+    EXPECT_TRUE(js.find("{\"mode\":\"active-active\",\"node\":\"gw1\",\"node_epoch\":7,"
+                        "\"node_address\":\"10.0.0.1:2049\","
+                        "\"shared_dir\":\"/mnt/shared/.lightnfs-cluster\","
+                        "\"peers\":[\"gw1\",\"gw2\"],\"takeover\":\"manual\",\"exports\":["
+                        "{\"fsid\":1,\"role\":\"unowned\",\"owner\":null,\"address\":null,"
+                        "\"fs_epoch\":0,\"fence_age_ms\":null,\"fence_expires_in_ms\":null,"
+                        "\"grace_remaining_s\":0,\"takeovers\":0,\"fence_lost\":0,"
+                        "\"activation_failures\":0},{\"fsid\":2,") != std::string::npos);
+    EXPECT_TRUE(server::CtlServer::answer(deps, "status").find("role=active-active") !=
+                std::string::npos);
+    // The failover forms without an fsid, a bad fsid, an unknown one, bad subcommands.
+    EXPECT_STREQ(ask("cluster takeover"), "cluster: fsid required\n");
+    EXPECT_STREQ(ask("cluster standby --json"), "{\"error\":\"fsid required\"}\n");
+    EXPECT_STREQ(ask("cluster takeover abc"), "cluster: fsid required\n");
+    EXPECT_STREQ(ask("cluster takeover 9"), "cluster: unknown fsid 9\n");
+    EXPECT_STREQ(ask("cluster standby 9 --json"), "{\"error\":\"unknown fsid 9\"}\n");
+    EXPECT_STREQ(ask("cluster bogus"),
+                 "cluster: expected status|takeover <fsid> [--force]|standby <fsid>\n");
+    EXPECT_STREQ(ask("cluster --json"), "{\"error\":\"bad subcommand\"}\n");
+
+    // gw2 holds F2 live (owner record written) and F3; manual policy: one tick only
+    // refreshes the view — F2/F3 remote with gw2's address and fs epoch, F1 unowned.
+    store.fs_taken_by(2, "gw2", 5);
+    store.fs_epochs[2] = 5;
+    (void)store.put_owner(2, {"gw2", "10.0.0.2:2049", 5});
+    store.fs_taken_by(3, "gw2", 2);
+    store.fs_epochs[3] = 2;
+    fc.tick();
+    auto st = ask("cluster status");
+    EXPECT_TRUE(st.find("fsid=1 role=unowned owner=none") != std::string::npos);
+    EXPECT_TRUE(st.find("fsid=2 role=remote owner=gw2 address=10.0.0.2:2049 fs_epoch=5 "
+                        "fence_age_ms=") != std::string::npos);
+    EXPECT_TRUE(st.find("fsid=3 role=remote owner=gw2 address=10.0.0.2:2049 fs_epoch=2 ") !=
+                std::string::npos);
+    EXPECT_TRUE(ask("cluster status --json")
+                    .find("\"fsid\":2,\"role\":\"remote\",\"owner\":\"gw2\","
+                          "\"address\":\"10.0.0.2:2049\",\"fs_epoch\":5,"
+                          "\"fence_age_ms\":") != std::string::npos);
+
+    // takeover 1: free fence, no force needed; the hook runs, the row flips to active.
+    EXPECT_STREQ(ask("cluster takeover 1"),
+                 "takeover started: fsid=1 node=gw1 fs_epoch=1 role=active\n");
+    EXPECT_STREQ(joined_calls(calls), "activate:1");
+    EXPECT_TRUE(fc.role_of(1) == server::Role::kActive);
+    st = ask("cluster status");
+    EXPECT_TRUE(st.find("fsid=1 role=active owner=gw1 address=10.0.0.1:2049 fs_epoch=1 "
+                        "fence_age_ms=") != std::string::npos);
+    EXPECT_TRUE(st.find(" grace_remaining_s=0 takeovers=1 fence_lost=0 activation_failures=0\n") !=
+                std::string::npos);
+    EXPECT_STREQ(ask("cluster takeover 1"), "cluster: fsid 1 not remote (role=active)\n");
+    EXPECT_STREQ(ask("cluster takeover 1 --json"),
+                 "{\"error\":\"fsid 1 not remote (role=active)\"}\n");
+    // takeover 2: gw2's fence is live — refused naming gw2; --force evicts it (JSON
+    // success carries the new fs epoch).
+    EXPECT_STREQ(ask("cluster takeover 2"),
+                 "cluster: fsid 2 fence held by gw2 (retry with --force to take it)\n");
+    EXPECT_STREQ(
+        ask("cluster takeover 2 --force --json"),
+        "{\"takeover\":true,\"fsid\":2,\"forced\":true,\"fs_epoch\":6,\"role\":\"active\"}\n");
+    EXPECT_STREQ(joined_calls(calls), "activate:1 activate:2");
+    EXPECT_TRUE(store.fences["gw2"].holds.size() == 1u);  // F3 only
+    // takeover 3: not in F3's node list, but ctl --force is the operator's call; without
+    // force the live fence is refused just the same.
+    EXPECT_STREQ(ask("cluster takeover 3"),
+                 "cluster: fsid 3 fence held by gw2 (retry with --force to take it)\n");
+
+    // standby 1: drained and released; standby again is refused with the role.
+    EXPECT_STREQ(ask("cluster standby 1 --json"), "{\"standby\":true,\"fsid\":1}\n");
+    EXPECT_STREQ(joined_calls(calls), "activate:1 activate:2 deactivate:1");
+    EXPECT_TRUE(fc.role_of(1) == server::Role::kStandby);
+    EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);  // F2 only
+    EXPECT_STREQ(ask("cluster standby 1"), "cluster: fsid 1 not active (role=unowned)\n");
+    EXPECT_STREQ(ask("cluster standby 2"), "standby requested: fsid=2 draining\n");
+    EXPECT_STREQ(ask("cluster standby 3 --json"),
+                 "{\"error\":\"fsid 3 not active (role=remote)\"}\n");
+    // A store that cannot list nodes still answers, with the peers unknown.
+    store.fail_list = errno_from(EIO);
+    EXPECT_TRUE(ask("cluster status").find(" peers=? ") != std::string::npos);
+    EXPECT_TRUE(ask("cluster status --json").find("\"peers\":null") != std::string::npos);
+  }
+  runtime.stop_and_join();
+}
+
 TEST(Ctl, ClusterCommands) {
   rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
   runtime.start();

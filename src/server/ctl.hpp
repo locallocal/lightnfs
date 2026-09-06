@@ -29,6 +29,7 @@ class StateMgr;
 namespace lnfs::server {
 
 class ClusterController;
+class FsClusterController;
 
 // The data plane the ctl commands address (plan 10 A4): what exists only while the
 // gateway serves — the export table, the DRC, the v4 state manager and the drain
@@ -99,6 +100,10 @@ struct CtlDeps {
   // finer `status` roles.  Null = single gateway, "cluster: not enabled".  Must outlive
   // the ctl server.
   ClusterController* cluster = nullptr;
+  // The active-active controller (plan 12 C4): `cluster status` per export,
+  // `cluster takeover <fsid> [--force]`, `cluster standby <fsid>`.  Exclusive with
+  // `cluster`; null with it = single gateway.
+  FsClusterController* fs_cluster = nullptr;
 
   // Deps over a plane that stays attached for the deps' lifetime (single gateway,
   // tests).  `plane` must outlive the deps.

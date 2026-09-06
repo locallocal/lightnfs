@@ -757,6 +757,12 @@ rt::Task<StateMgr::SeqResult> StateMgr::sequence_begin(const SessionId& id,
                         !session.cb_down.load(std::memory_order_relaxed);
         if (!cb_alive) out.status_flags |= 0x1;
       }
+      // SEQ4_STATUS_LEASE_MOVED (design 11 §11.4, plan 12 C3): an export this client
+      // held state in was handed to another gateway (release_fsid); for one lease
+      // after that every answer says so, and the client goes and reads fs_locations.
+      if (int64_t until = session.client->lease_moved_until.load(std::memory_order_relaxed);
+          until != 0 && now_coarse() < until)
+        out.status_flags |= 0x80;
       seq_new_.fetch_add(1, std::memory_order_relaxed);
       co_return out;
     }

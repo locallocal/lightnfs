@@ -186,10 +186,18 @@ class FsClusterController {
     std::optional<FenceRecord> fence;  // the record naming the export last seen
     std::optional<OwnerRecord> owner;  // fs/<fsid>/owner last read
     uint64_t takeovers = 0, fence_lost = 0, activation_failures = 0;
+    // What the v4 engine is told (plan 12 B2): active / draining / remote (+ owner
+    // node, address, fs epoch) / unowned.  Activating shows as unowned there.
+    core::FsOwner view;
   };
+  // The role as the operator sees it (plan 12 C4): "activating" while the data-plane
+  // work runs, else the view's active / draining / remote / unowned.
+  static const char* fs_role_label(const FsState& fs);
 
+  // `node_epoch` is the process's own epoch (epoch.<node>, plan 12 B1), reported only.
   FsClusterController(const core::ClusterConfig& cfg, const core::ExportTable& exports,
-                      ClusterStore& store, core::FsOwnerView& view, Hooks hooks);
+                      ClusterStore& store, core::FsOwnerView& view, Hooks hooks,
+                      uint64_t node_epoch = 0);
   ~FsClusterController();
 
   // Timer thread: one tick() per fence_lease.  stop() joins it and leaves every role
@@ -217,6 +225,15 @@ class FsClusterController {
   std::vector<FsState> snapshot() const;
   Role role_of(uint32_t fsid) const;  // kStandby for an unknown fsid
   const core::ClusterConfig& config() const { return cfg_; }
+  const std::string& node() const { return node_; }
+  uint64_t node_epoch() const { return node_epoch_; }
+  std::chrono::milliseconds fence_ttl() const { return ttl(); }
+  // Every gateway registered in the store (nodes/<node>), sorted.  Blocking store IO.
+  Result<std::vector<std::string>> peers() const;
+  // Prometheus text (plan 12 C4), registered as a provider for the controller's
+  // lifetime: lightnfs_cluster_fs_{role,owner,epoch,takeovers_total,fence_lost_total,
+  // activation_failures_total}{fsid=...} and lightnfs_cluster_node_epoch.
+  void append_metrics(std::string& out) const;
 
  private:
   struct Fs {
@@ -251,7 +268,10 @@ class FsClusterController {
   static std::optional<Holder> holder_of(const StoreView& sv, uint32_t fsid);
   // Automatic takeover policy for one export (plan 12 C2): takeover = auto, we are in
   // its `nodes`, and nobody ahead of us in that list is alive — unless the export has
-  // sat unowned for over 2 × ttl (`stuck`), when the order no longer applies.
+  // sat unowned for over 2 × ttl (`stuck`), when the order no longer applies.  A
+  // predecessor with no record at all is "not heard from yet" for our first ttl after
+  // start (gateways starting together must not race each other's exports away) and
+  // dead after that.
   bool our_turn(const core::ExportEntry& exp, const StoreView& sv, bool stuck) const;
   // 2 × ttl: how long an unowned export waits for its live predecessors.
   std::chrono::milliseconds stuck_after() const { return 2 * ttl(); }
@@ -272,6 +292,9 @@ class FsClusterController {
   core::FsOwnerView& view_;
   Hooks hooks_;
   std::string node_;
+  uint64_t node_epoch_ = 0;
+  obs::ProviderHandle metrics_ = 0;
+  int64_t started_ms_ = 0;  // wall clock at construction
 
   mutable std::mutex mu_;
   std::map<uint32_t, Fs> fs_;

@@ -40,7 +40,8 @@ struct Management {
   static Management start(const core::ServerConfig& cfg, rt::Runtime& runtime,
                           std::function<std::string()> reload,
                           std::function<std::string()> role = {},
-                          ClusterController* cluster = nullptr);
+                          ClusterController* cluster = nullptr,
+                          FsClusterController* fs_cluster = nullptr);
   // `plane` must stay valid until detach() returns: detach waits for every command
   // still using the plane (bounded; a warning names the stragglers).
   void attach(const DataPlane* plane) { this->plane->store(plane); }

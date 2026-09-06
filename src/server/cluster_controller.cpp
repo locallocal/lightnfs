@@ -330,22 +330,30 @@ int64_t wall_now_ms() {
 
 FsClusterController::FsClusterController(const core::ClusterConfig& cfg,
                                          const core::ExportTable& exports, ClusterStore& store,
-                                         core::FsOwnerView& view, Hooks hooks)
+                                         core::FsOwnerView& view, Hooks hooks, uint64_t node_epoch)
     : cfg_(cfg),
       store_(store),
       view_(view),
       hooks_(std::move(hooks)),
-      node_(core::cluster_node_name(cfg)) {
+      node_(core::cluster_node_name(cfg)),
+      node_epoch_(node_epoch) {
   if (!hooks_.post) hooks_.post = [](const std::function<void()>& fn) { fn(); };
   for (const auto& entry : exports.entries()) fs_[entry->fsid].exp = entry.get();
-  last_.now_ms = wall_now_ms();
+  last_.now_ms = started_ms_ = wall_now_ms();
   // Until the first tick has read the store nothing is known to be ours: every export
   // is Unowned in the view (clients wait), never silently served.
   publish(nullptr);
+  metrics_ = obs::register_text_provider([this](std::string& out) { append_metrics(out); });
 }
 
 FsClusterController::~FsClusterController() {
+  obs::unregister_text_provider(metrics_);
   stop();
+}
+
+const char* FsClusterController::fs_role_label(const FsState& fs) {
+  if (fs.role == Role::kActivating) return "activating";
+  return core::fs_role_name(fs.view.role);
 }
 
 void FsClusterController::start() {
@@ -400,9 +408,17 @@ bool FsClusterController::our_turn(const core::ExportEntry& exp, const StoreView
   if (stuck) return true;  // the predecessors had their 2 × ttl and did not take it
   // Everyone ahead of us in the export's list gets the first chance: their heartbeat
   // record (empty or not) still live means they are up and will take it themselves.
+  // No record at all is a node we have not heard from: dead, unless we ourselves are
+  // younger than one ttl — then it may simply not have written its first heartbeat.
+  const bool settling = sv.now_ms - started_ms_ < ttl().count();
   for (auto it = exp.nodes.begin(); it != self; ++it) {
-    for (const auto& rec : sv.fences)
-      if (rec.node == *it && !expired(rec, sv.now_ms)) return false;
+    bool heard = false;
+    for (const auto& rec : sv.fences) {
+      if (rec.node != *it) continue;
+      heard = true;
+      if (!expired(rec, sv.now_ms)) return false;
+    }
+    if (!heard && settling) return false;
   }
   return true;
 }
@@ -744,13 +760,52 @@ FsClusterController::Fs* FsClusterController::find(uint32_t fsid) {
 }
 
 std::vector<FsClusterController::FsState> FsClusterController::snapshot() const {
+  auto view = view_.snapshot();
   std::lock_guard lock(mu_);
   std::vector<FsState> out;
   out.reserve(fs_.size());
-  for (const auto& [fsid, fs] : fs_)
-    out.push_back({fsid, fs.role, fs.fs_epoch, fs.fence, fs.owner, fs.takeovers, fs.fence_lost,
-                   fs.activation_failures});
+  for (const auto& [fsid, fs] : fs_) {
+    FsState st{fsid,     fs.role,      fs.fs_epoch,   fs.fence,
+               fs.owner, fs.takeovers, fs.fence_lost, fs.activation_failures,
+               {}};
+    if (auto it = view->find(fsid); it != view->end()) st.view = it->second;
+    out.push_back(std::move(st));
+  }
   return out;
+}
+
+Result<std::vector<std::string>> FsClusterController::peers() const {
+  auto nodes = store_.list_nodes();
+  if (!nodes) return Err(nodes.error());
+  std::vector<std::string> out;
+  out.reserve(nodes->size());
+  for (auto& [node, address] : *nodes) out.push_back(node);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+void FsClusterController::append_metrics(std::string& out) const {
+  static constexpr const char* kLabels[] = {"active", "activating", "draining", "remote",
+                                            "unowned"};
+  out += std::format("lightnfs_cluster_node_epoch {}\n", node_epoch_);
+  for (const FsState& fs : snapshot()) {
+    const char* label = fs_role_label(fs);
+    for (const char* l : kLabels)
+      out += std::format("lightnfs_cluster_fs_role{{fsid=\"{}\",role=\"{}\"}} {}\n", fs.fsid, l,
+                         std::string_view(l) == label ? 1 : 0);
+    // The owner as this gateway sees it: ourselves (active / draining) or the remote
+    // holder; no sample while nobody holds the export.
+    if (fs.view.role != core::FsRole::kUnowned && !fs.view.node.empty())
+      out += std::format("lightnfs_cluster_fs_owner{{fsid=\"{}\",node=\"{}\"}} 1\n", fs.fsid,
+                         fs.view.node);
+    out += std::format(
+        "lightnfs_cluster_fs_epoch{{fsid=\"{}\"}} {}\n"
+        "lightnfs_cluster_fs_takeovers_total{{fsid=\"{}\"}} {}\n"
+        "lightnfs_cluster_fs_fence_lost_total{{fsid=\"{}\"}} {}\n"
+        "lightnfs_cluster_fs_activation_failures_total{{fsid=\"{}\"}} {}\n",
+        fs.fsid, fs.view.fs_epoch, fs.fsid, fs.takeovers, fs.fsid, fs.fence_lost, fs.fsid,
+        fs.activation_failures);
+  }
 }
 
 Role FsClusterController::role_of(uint32_t fsid) const {

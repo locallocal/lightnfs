@@ -16,15 +16,16 @@
 namespace lnfs::server {
 
 Management Management::start(const core::ServerConfig& cfg, rt::Runtime& runtime,
-                             std::function<std::string()> reload,
-                             std::function<std::string()> role, ClusterController* cluster) {
+                             std::function<std::string()> reload, std::function<std::string()> role,
+                             ClusterController* cluster, FsClusterController* fs_cluster) {
   Management mgmt;
   std::string ctl_path = cfg.ctl_socket.empty() ? cfg.state_dir + "/ctl.sock" : cfg.ctl_socket;
   auto ctl = CtlServer::create(ctl_path, {.reload = std::move(reload),
                                           .started = std::chrono::steady_clock::now(),
                                           .plane = mgmt.plane,
                                           .role = std::move(role),
-                                          .cluster = cluster});
+                                          .cluster = cluster,
+                                          .fs_cluster = fs_cluster});
   if (ctl) {
     mgmt.ctl = std::move(*ctl);
     mgmt.ctl->start(runtime.reactor(1 % runtime.reactor_count()));
