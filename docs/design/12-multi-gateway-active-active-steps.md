@@ -43,7 +43,7 @@
 |------|------|--------|------|-----------|
 | A 基础设施（无行为变化） | A1 多活配置键 ✅ 2026-09-06 | `mode` / `node_address` / `[[export]] nodes` 解析、校验、Gluster/Lustre 同卷约束 | — | P1 |
 | | A2 `ClusterStore` per-fsid 键空间 ✅ 2026-09-06 | `fs/<fsid>/{epoch,owner,clients/}`、批量 `fence.<node>`、`nodes/<node>`、`epoch.<node>` | — | P1 |
-| | A3 `StateMgr` per-fsid grace | `fsid → {deadline, reclaim_set}`；名单钩子加 fsid；`release_fsid()` | A2 | P1 |
+| | A3 `StateMgr` per-fsid grace ✅ 2026-09-06 | `fsid → {deadline, reclaim_set}`；名单钩子加 fsid；`release_fsid()` | A2 | P1 |
 | B 协议面 | B1 多活身份 + `eir_flags` | `server_owner.major_id` 按 node 派生；`SUPP_MOVED_REFER\|MIGR` | A1 | P2 |
 | | B2 `fs_locations` / `fs_locations_info` 属性 | `attrs.cpp` 两属性编码；属主视图 `FsOwnerView` | A1 A2 | P2 |
 | | B3 非属主导出边界回 `NFS4ERR_MOVED` | `engine.cpp` 的 fsid 门禁；referral 例外（LOOKUP、GETATTR fs_locations） | B2 | P2 |
@@ -185,7 +185,7 @@ failover 模式下 `nodes` 只告警。
 
 **验收**：09 的 `ClusterStore.*` 测试与 `accept_failover_local.sh` 不变。
 
-### A3 `StateMgr` per-fsid grace
+### A3 `StateMgr` per-fsid grace（已完成，2026-09-06）
 
 **目标**：11 §11.5——grace / reclaim 名单按 fsid；epoch、clientid、stateid、写验证器逻辑不动。
 
@@ -237,6 +237,23 @@ failover 模式下 `nodes` 只告警。
 
 既有 `StateMgr.GraceListPersistsAndEarlyExit`、`GraceReclaimGate`、`ReclaimLockPushDelayInGrace`
 必须不改断言地通过（`fsid = 0` 路径）。
+
+- 实现注（2026-09-06）：与上面草案的差异——
+  - 名单写点由新增的 `Config::per_fsid_reclaim`（默认 false）切换，而不是按 fsid 判断：关时
+    CREATE_SESSION 写全局名单（07 §7.5 原样）；开时全局名单不写，改为"客户端在 F 内首次铸
+    stateid（OPEN / LOCK / 委托）时 `put(F)`、最后一个状态销毁或客户端过期时 `erase(F)`"，
+    `ClientRec::fs_states` 按 fsid 计数支撑这一点。C1 在多活模式打开该开关。
+  - 无钩子时的本机 per-fsid 名单目录：`state_dir/fs/<fsid>/clients/`（全局仍是 `state_dir/clients/`）。
+  - `release_fsid` 是协程（要拿分片锁），返回丢弃的状态数；经 `unlink_state(rec, from_client,
+    handover=true)` 走既有的销毁链，但**不下推原生 unlock、不删名单记录**；同时把该 fsid 的
+    grace 窗口结束、给持有过状态的客户端置 `ClientRec::lease_moved_until`（C3 在 SEQUENCE 上
+    报告；`state` dump 已带 `lease_moved=` 字段）。
+  - `note_reclaimed(fsid, owner)` 没有单独暴露：`RECLAIM_COMPLETE` 是整 clientid 的（引擎接受
+    `rca_one_fs` 但不按 fs 处理），一次完成对所有窗口生效。
+  - `Stats::fs_grace` 列出活跃的 per-fsid 窗口；`end_grace(0)` 结束全部窗口（`grace-end` 语义
+    不变），`end_grace(F)` 只结束 F。
+  - 新增测试 `PerFsidGraceIndependent`（本机目录、两窗口并存、grace-end 分级）、
+    `StableStoreHooksPerFsid`、`ReleaseFsidDropsStateKeepsClient`。
 
 ---
 

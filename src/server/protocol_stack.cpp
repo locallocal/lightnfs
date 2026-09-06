@@ -15,30 +15,34 @@ namespace lnfs::server {
 namespace {
 
 // Reclaim-list hooks over the shared cluster store (design 09 §9.4): the list the
-// active gateway writes is the one the next active gateway arms grace from.  Write
-// failures only warn, as with state_dir/clients/ (a lost record costs one client its
-// reclaim, never the session).
+// active gateway writes is the one the next active gateway arms grace from.  fsid 0 is
+// the global (failover) list; an export's own list (design 11 §11.3, plan 12 A3) is
+// used under active-active.  Write failures only warn, as with state_dir/clients/ (a
+// lost record costs one client its reclaim, never the session).
 state::StateMgr::Config::StableStore cluster_stable_store(ClusterStore& store) {
   return {
       .load =
-          [&store]() -> std::vector<std::string> {
-            auto listed = store.list_clients();
+          [&store](uint32_t fsid) -> std::vector<std::string> {
+            auto listed = fsid == 0 ? store.list_clients() : store.list_clients(fsid);
             if (!listed) {
-              LNFS_WARN("cannot read the cluster reclaim list: {}", errno_name(listed.error()));
+              LNFS_WARN("cannot read the cluster reclaim list (fsid {}): {}", fsid,
+                        errno_name(listed.error()));
               return {};
             }
             return std::move(*listed);
           },
       .put =
-          [&store](std::string_view owner) {
-            if (auto ok = store.put_client(owner); !ok)
-              LNFS_WARN("cannot persist client record to the cluster store: {}",
+          [&store](uint32_t fsid, std::string_view owner) {
+            auto ok = fsid == 0 ? store.put_client(owner) : store.put_client(fsid, owner);
+            if (!ok)
+              LNFS_WARN("cannot persist client record to the cluster store (fsid {}): {}", fsid,
                         errno_name(ok.error()));
           },
       .erase =
-          [&store](std::string_view owner) {
-            if (auto ok = store.erase_client(owner); !ok)
-              LNFS_WARN("cannot erase client record from the cluster store: {}",
+          [&store](uint32_t fsid, std::string_view owner) {
+            auto ok = fsid == 0 ? store.erase_client(owner) : store.erase_client(fsid, owner);
+            if (!ok)
+              LNFS_WARN("cannot erase client record from the cluster store (fsid {}): {}", fsid,
                         errno_name(ok.error()));
           },
   };
