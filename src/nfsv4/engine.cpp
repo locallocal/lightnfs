@@ -32,6 +32,10 @@ uint64_t conn_id_of(ConnCtx& conn) { return reinterpret_cast<uint64_t>(&conn); }
 constexpr uint32_t kEidUpdate = 0x40000000;      // UPD_CONFIRMED_REC_A
 constexpr uint32_t kEidConfirmedR = 0x80000000;  // reply-only
 constexpr uint32_t kEidValidRequest = 0x00000103 | 0x00070000 | kEidUpdate;
+// Reply flags: SUPP_MOVED_REFER | SUPP_MOVED_MIGR (active-active, plan 12 B1) and
+// USE_NON_PNFS.
+constexpr uint32_t kEidSuppMoved = 0x00000003;
+constexpr uint32_t kEidUseNonPnfs = 0x00010000;
 
 void patch_u32(std::byte* gap, uint32_t value) {
   uint32_t be = xdr::to_be32(value);
@@ -3221,7 +3225,8 @@ rt::Task<uint32_t> Engine::op_exchange_id(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEn
   enc.u32(st(Status::kOk));
   enc.u64(result.clientid);
   enc.u32(result.sequenceid);
-  enc.u32(0x00010000 | (result.confirmed_r ? kEidConfirmedR : 0));
+  enc.u32(kEidUseNonPnfs | (referrals_ ? kEidSuppMoved : 0) |
+          (result.confirmed_r ? kEidConfirmedR : 0));
   enc.u32(0);           // SP4_NONE
   enc.u64(0);           // server_owner.minor_id
   enc.string(server_owner_);  // server_owner.major_id (stable across restarts)

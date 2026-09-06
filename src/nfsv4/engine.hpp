@@ -33,12 +33,17 @@ class Engine {
   // Distinct servers must present distinct values or clients treat them as trunking
   // paths of one server (plan doc 10 §1.7); main derives the default from
   // hostname + state_dir.  The literal fallback only serves tests.
+  // referrals: active-active (design 11 §11.2, plan 12 B1) — EXCHANGE_ID announces
+  // EXCHGID4_FLAG_SUPP_MOVED_REFER | _MIGR, so clients follow fs_locations across the
+  // gateways of one server_scope.
   Engine(core::ExportTable& exports, core::FileHandleCodec& handles,
          core::ObjLockRegistry& locks, core::PseudoFs& pseudo, state::StateMgr& state,
-         std::string server_owner = "lightnfs", std::string server_scope = "lightnfs")
+         std::string server_owner = "lightnfs", std::string server_scope = "lightnfs",
+         bool referrals = false)
       : exports_(exports), handles_(handles), locks_(locks), pseudo_(pseudo),
         state_(state), write_verf_(core::verifier_from_epoch(state.config().boot_epoch)),
-        server_owner_(std::move(server_owner)), server_scope_(std::move(server_scope)) {}
+        server_owner_(std::move(server_owner)), server_scope_(std::move(server_scope)),
+        referrals_(referrals) {}
 
   void register_with(rpc::Dispatcher& dispatcher);
   rt::Task<void> dispatch(transport::ConnCtx&, rpc::RpcCall&, const rpc::Cred&);
@@ -46,6 +51,7 @@ class Engine {
   // The identity EXCHANGE_ID presents (server_owner.major_id / server_scope).
   const std::string& server_owner() const { return server_owner_; }
   const std::string& server_scope() const { return server_scope_; }
+  bool referrals() const { return referrals_; }
 
   // Per-client (clientid) token-bucket defaults ([limits] client_*, plan doc 10 §4.3).
   // Hot-reloadable: reconfigures every existing client bucket as well.
@@ -178,6 +184,7 @@ class Engine {
   state::StateMgr& state_;
   core::WriteVerf write_verf_;
   std::string server_owner_, server_scope_;
+  bool referrals_ = false;
   std::mutex root_oid_mu_;
   std::unordered_map<uint32_t, backend::ObjId> root_oids_;  // fsid -> root oid
 

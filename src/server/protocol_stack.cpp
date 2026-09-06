@@ -92,6 +92,11 @@ ServerIdentity derive_server_identity(const core::ServerConfig& cfg,
                                       const core::ClusterConfig& cluster) {
   if (cluster.enabled) {  // config validation rejects explicit owner/scope here
     std::string derived = "lightnfs-cluster:" + cluster.id;
+    // Active-active (design 11 §11.2, plan 12 B1): one scope (one administrative
+    // domain, the precondition for referrals), but every gateway is its own server —
+    // fs_locations sends a client to a *different* server for each export it owns.
+    if (core::cluster_active_active(cluster))
+      return {derived + ":" + core::cluster_node_name(cluster), derived};
     return {derived, derived};
   }
   char host[256] = "lightnfs";
@@ -106,7 +111,7 @@ void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::Cluster
   state.load_grace_list();
   auto identity = derive_server_identity(cfg, cluster);
   nfs4.emplace(*core.exports, core.key, locks, pseudofs, state, std::move(identity.owner),
-               std::move(identity.scope));
+               std::move(identity.scope), core::cluster_active_active(cluster));
   nfs4->register_with(dispatcher);
   // Off reactor 0 (plan doc 10 §2.6): the auxiliary tasks used to pile onto the same
   // reactor the (old, single) accept loop lived on.  The wrapper signals the future

@@ -2515,6 +2515,94 @@ TEST(Nfs4, ClusterIdentityDerivation) {
   core::ClusterConfig disabled = cluster;
   disabled.enabled = false;
   EXPECT_STREQ(server::derive_server_identity(a, disabled).owner, ia.owner);
+
+  // Active-active (design 11 §11.2, plan 12 B1): one scope, one server per node.
+  core::ClusterConfig aa = cluster;
+  aa.mode = "active-active";
+  core::ClusterConfig aa_other_node = aa;
+  aa_other_node.node = "gw2";
+  auto ma = server::derive_server_identity(a, aa);
+  auto mb = server::derive_server_identity(b, aa_other_node);
+  EXPECT_STREQ(ma.scope, ca.scope);
+  EXPECT_STREQ(mb.scope, ma.scope);
+  EXPECT_STREQ(ma.owner, "lightnfs-cluster:3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f:gw1");
+  EXPECT_STREQ(mb.owner, "lightnfs-cluster:3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f:gw2");
+  EXPECT_FALSE(ma.owner == mb.owner);
+  EXPECT_FALSE(ma.owner == ma.scope);
+  // The same node restarted, or on another state_dir, keeps its identity.
+  EXPECT_STREQ(server::derive_server_identity(b, aa).owner, ma.owner);
+  // The mode key is ignored while the section is disabled.
+  core::ClusterConfig aa_disabled = aa;
+  aa_disabled.enabled = false;
+  EXPECT_STREQ(server::derive_server_identity(a, aa_disabled).owner, ia.owner);
+}
+
+// EXCHANGE_ID under active-active (plan 12 B1): the reply announces referral and
+// migration support (EXCHGID4_FLAG_SUPP_MOVED_REFER | _MIGR) and the per-node
+// server_owner; a single gateway and a failover gateway announce neither bit.
+TEST(Nfs4, ActiveActiveIdentityAndFlags) {
+  constexpr uint32_t kSuppMovedRefer = 0x1, kSuppMovedMigr = 0x2, kUseNonPnfs = 0x10000;
+  struct EidReply {
+    uint32_t flags = 0;
+    std::string owner, scope;
+  };
+  auto exchange = [](V4Fixture& f, std::string_view co_owner) {
+    xdr::XdrEnc body(f.pool);
+    body.u32(0);
+    body.u32(1);
+    body.u32(1);
+    body.u32(static_cast<uint32_t>(Op::kExchangeId));
+    std::array<std::byte, 8> verf{std::byte{9}};
+    body.opaque_fixed(verf);
+    body.string(co_owner);
+    body.u32(kSuppMovedRefer | kSuppMovedMigr);  // a referral-capable client's request
+    body.u32(0);
+    body.u32(0);
+    auto reply = f.parse(f.compound_raw(body.take()));
+    EidReply out;
+    if (reply.status != 0) return out;
+    f.expect_op(reply.dec, Op::kExchangeId, 0);
+    (void)reply.dec.u64();  // clientid
+    (void)reply.dec.u32();  // sequenceid
+    out.flags = *reply.dec.u32();
+    (void)reply.dec.u32();  // SP4_NONE
+    (void)reply.dec.u64();  // minor_id
+    out.owner = *reply.dec.string(1024);
+    out.scope = *reply.dec.string(1024);
+    return out;
+  };
+
+  V4Fixture single;  // the fixture's default engine: a single gateway
+  auto s = exchange(single, "client-s");
+  EXPECT_EQ(s.flags & (kSuppMovedRefer | kSuppMovedMigr), 0u);
+  EXPECT_EQ(s.flags & kUseNonPnfs, kUseNonPnfs);
+
+  V4Fixture failover;
+  failover.engine.emplace(failover.exports, failover.handles, failover.locks, *failover.pseudo,
+                         *failover.state, "lightnfs-cluster:c", "lightnfs-cluster:c", false);
+  auto fo = exchange(failover, "client-f");
+  EXPECT_EQ(fo.flags & (kSuppMovedRefer | kSuppMovedMigr), 0u);
+  EXPECT_STREQ(fo.owner, "lightnfs-cluster:c");
+
+  V4Fixture gw1, gw2;
+  gw1.engine.emplace(gw1.exports, gw1.handles, gw1.locks, *gw1.pseudo, *gw1.state,
+                     "lightnfs-cluster:c:gw1", "lightnfs-cluster:c", true);
+  gw2.engine.emplace(gw2.exports, gw2.handles, gw2.locks, *gw2.pseudo, *gw2.state,
+                     "lightnfs-cluster:c:gw2", "lightnfs-cluster:c", true);
+  EXPECT_TRUE(gw1.engine->referrals());
+  auto r1 = exchange(gw1, "client-a");
+  auto r2 = exchange(gw2, "client-a");
+  EXPECT_EQ(r1.flags & (kSuppMovedRefer | kSuppMovedMigr), kSuppMovedRefer | kSuppMovedMigr);
+  EXPECT_EQ(r2.flags & (kSuppMovedRefer | kSuppMovedMigr), kSuppMovedRefer | kSuppMovedMigr);
+  EXPECT_EQ(r1.flags & kUseNonPnfs, kUseNonPnfs);
+  EXPECT_EQ(r1.flags & 0x80000000u, 0u);  // not CONFIRMED_R on a first EXCHANGE_ID
+  EXPECT_STREQ(r1.scope, r2.scope);
+  EXPECT_STREQ(r1.owner, "lightnfs-cluster:c:gw1");
+  EXPECT_STREQ(r2.owner, "lightnfs-cluster:c:gw2");
+  EXPECT_FALSE(r1.owner == r2.owner);
+  // A session on the referral-capable engine works as before.
+  gw1.establish_session();
+  EXPECT_TRUE(gw1.clientid != 0);
 }
 
 TEST(Nfs4, ClusterIdentityAcrossProtocolStacks) {
@@ -2557,6 +2645,30 @@ TEST(Nfs4, ClusterIdentityAcrossProtocolStacks) {
     EXPECT_STREQ(stack_a.nfs4->server_owner(), "lightnfs-cluster:cluster-identity-test");
     EXPECT_STREQ(stack_b.nfs4->server_owner(), stack_a.nfs4->server_owner());
     EXPECT_STREQ(stack_b.nfs4->server_scope(), stack_a.nfs4->server_scope());
+    EXPECT_FALSE(stack_a.nfs4->referrals());
+
+    // Active-active (plan 12 B1): same scope, a server per node, referrals announced.
+    core::ClusterConfig aa = cluster;
+    aa.mode = "active-active";
+    aa.node = "gw1";
+    aa.node_address = "10.0.0.11:2049";
+    core::ClusterConfig aa_b = aa;
+    aa_b.node = "gw2";
+    aa_b.node_address = "10.0.0.12:2049";
+    auto core_e = make_core(15);
+    auto core_f = make_core(16);
+    server::ProtocolStack stack_e(cfg_a, core_e);
+    server::ProtocolStack stack_f(cfg_b, core_f);
+    stack_e.enable_v4(cfg_a, aa, core_e, runtime);
+    stack_f.enable_v4(cfg_b, aa_b, core_f, runtime);
+    ASSERT_TRUE(stack_e.nfs4.has_value() && stack_f.nfs4.has_value());
+    EXPECT_STREQ(stack_e.nfs4->server_scope(), stack_a.nfs4->server_scope());
+    EXPECT_STREQ(stack_f.nfs4->server_scope(), stack_e.nfs4->server_scope());
+    EXPECT_STREQ(stack_e.nfs4->server_owner(), "lightnfs-cluster:cluster-identity-test:gw1");
+    EXPECT_STREQ(stack_f.nfs4->server_owner(), "lightnfs-cluster:cluster-identity-test:gw2");
+    EXPECT_TRUE(stack_e.nfs4->referrals() && stack_f.nfs4->referrals());
+    stack_e.lease_stop.store(true);
+    stack_f.lease_stop.store(true);
     // The epochs (write verifier / stateid epoch) still differ: a takeover is a restart.
     EXPECT_FALSE(stack_a.state.config().boot_epoch == stack_b.state.config().boot_epoch);
 

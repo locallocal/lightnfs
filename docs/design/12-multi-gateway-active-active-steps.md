@@ -44,7 +44,7 @@
 | A 基础设施（无行为变化） | A1 多活配置键 ✅ 2026-09-06 | `mode` / `node_address` / `[[export]] nodes` 解析、校验、Gluster/Lustre 同卷约束 | — | P1 |
 | | A2 `ClusterStore` per-fsid 键空间 ✅ 2026-09-06 | `fs/<fsid>/{epoch,owner,clients/}`、批量 `fence.<node>`、`nodes/<node>`、`epoch.<node>` | — | P1 |
 | | A3 `StateMgr` per-fsid grace ✅ 2026-09-06 | `fsid → {deadline, reclaim_set}`；名单钩子加 fsid；`release_fsid()` | A2 | P1 |
-| B 协议面 | B1 多活身份 + `eir_flags` | `server_owner.major_id` 按 node 派生；`SUPP_MOVED_REFER\|MIGR` | A1 | P2 |
+| B 协议面 | B1 多活身份 + `eir_flags` ✅ 2026-09-06 | `server_owner.major_id` 按 node 派生；`SUPP_MOVED_REFER\|MIGR` | A1 | P2 |
 | | B2 `fs_locations` / `fs_locations_info` 属性 | `attrs.cpp` 两属性编码；属主视图 `FsOwnerView` | A1 A2 | P2 |
 | | B3 非属主导出边界回 `NFS4ERR_MOVED` | `engine.cpp` 的 fsid 门禁；referral 例外（LOOKUP、GETATTR fs_locations） | B2 | P2 |
 | C per-fsid 控制器 | C1 `ClusterController` per-fsid 角色机 + 批量续租 | 每 fsid 一个 `{Remote, Activating, Active, Draining}`；一条续租协程 | A1–A3 B1 | P3 |
@@ -259,7 +259,7 @@ failover 模式下 `nodes` 只告警。
 
 ## 阶段 B：协议面
 
-### B1 多活身份与 `eir_flags`
+### B1 多活身份与 `eir_flags`（已完成，2026-09-06）
 
 **目标**：11 §11.2——各网关是同一 `server_scope` 下的**不同** server；宣告支持 referral / migration。
 
@@ -277,6 +277,13 @@ failover 模式下 `nodes` 只告警。
 **测试**：`tests/test_nfs4.cpp` 加 `Nfs4.ActiveActiveIdentityAndFlags`——两个 `Engine`（node gw1、
 gw2）`EXCHANGE_ID` 的 major_id 不同、scope 相同、flags 含 REFER|MIGR；failover 与单网关的
 flags 不含这两位。
+
+- 实现注（2026-09-06）：`derive_server_identity` 多活时 owner 取 `cluster_node_name`（含主机名
+  默认）；`enable_v4` 用 `core::cluster_active_active(cluster)` 作为 `Engine` 的 `referrals`
+  参数。daemon 的 `cluster_identity` 加 `ClusterConfig` 参数：多活时 `bump_node_epoch(node)`
+  （A2 的 `epoch.<node>`），failover 仍只读全局 epoch——A1 的"多活拒绝启动"守卫仍在其前，
+  C1 去掉守卫即接通。客户端请求里的 REFER|MIGR 位本就在 `kEidValidRequest` 内。既有
+  `Nfs4.ClusterIdentityDerivation` / `ClusterIdentityAcrossProtocolStacks` 各加了多活段。
 
 ### B2 `fs_locations` / `fs_locations_info` 属性与属主视图
 
