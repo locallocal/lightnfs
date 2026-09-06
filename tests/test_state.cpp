@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <cstring>
 #include <format>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -262,20 +264,23 @@ TEST(StateMgr, StableStoreHooks) {
     int puts = 0, erases = 0, loads = 0;
     state::StateMgr::Config::StableStore hooks() {
       return {.load =
-                  [this] {
+                  [this](uint32_t fsid) {
                     std::lock_guard lock(mu);
+                    EXPECT_EQ(fsid, 0u);  // the global list (plan 12 A3)
                     ++loads;
                     return std::vector<std::string>(owners.begin(), owners.end());
                   },
               .put =
-                  [this](std::string_view owner) {
+                  [this](uint32_t fsid, std::string_view owner) {
                     std::lock_guard lock(mu);
+                    EXPECT_EQ(fsid, 0u);
                     ++puts;
                     owners.insert(std::string(owner));
                   },
               .erase =
-                  [this](std::string_view owner) {
+                  [this](uint32_t fsid, std::string_view owner) {
                     std::lock_guard lock(mu);
+                    EXPECT_EQ(fsid, 0u);
                     ++erases;
                     owners.erase(std::string(owner));
                   }};
@@ -1153,6 +1158,286 @@ TEST(StateMgr, NativeLockPushRollbackAndRelease) {
     EXPECT_EQ(co_await mgr.close_state(oa.stateid, a.clientid, &out), kOk);
     EXPECT_STREQ(native.calls.back(), "release");
     EXPECT_EQ(mgr.lock_table().segments(key).size(), 0u);
+  });
+  runtime.stop_and_join();
+}
+
+// ---- per-export grace (design 11 §11.5, plan 12 A3) ---------------------------------
+
+namespace {
+
+// Per-export stable store in memory: lists keyed by fsid, every hook call logged.
+struct FsMemStore {
+  std::mutex mu;
+  std::map<uint32_t, std::set<std::string>> lists;
+  std::vector<std::string> log;
+  state::StateMgr::Config::StableStore hooks() {
+    return {.load =
+                [this](uint32_t fsid) {
+                  std::lock_guard lock(mu);
+                  log.push_back(std::format("load:{}", fsid));
+                  return std::vector<std::string>(lists[fsid].begin(), lists[fsid].end());
+                },
+            .put =
+                [this](uint32_t fsid, std::string_view owner) {
+                  std::lock_guard lock(mu);
+                  log.push_back(std::format("put:{}:{}", fsid, owner));
+                  lists[fsid].insert(std::string(owner));
+                },
+            .erase =
+                [this](uint32_t fsid, std::string_view owner) {
+                  std::lock_guard lock(mu);
+                  log.push_back(std::format("erase:{}:{}", fsid, owner));
+                  lists[fsid].erase(std::string(owner));
+                }};
+  }
+  size_t count(std::string_view prefix) {
+    std::lock_guard lock(mu);
+    size_t n = 0;
+    for (const auto& line : log)
+      if (line.starts_with(prefix)) ++n;
+    return n;
+  }
+};
+
+state::StateMgr::OpenArgs open_in(uint32_t fsid, uint64_t clientid, uint8_t file,
+                                  const char* owner) {
+  auto a = open_args(clientid, file, owner, state::kShareBoth, 0);
+  a.fsid = fsid;
+  return a;
+}
+
+}  // namespace
+
+TEST(StateMgr, PerFsidGraceIndependent) {
+  // No hooks: the per-export lists live under state_dir/fs/<fsid>/clients/.
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  {
+    state::StateMgr first({.boot_epoch = 1, .state_dir = dir.path, .per_fsid_reclaim = true});
+    run_on(runtime, [&]() -> rt::Task<void> {
+      auto a = co_await connect(first, "listed", 1);
+      EXPECT_EQ((co_await first.open(open_in(1, a.clientid, 1, "oa"), nullptr)).status, kOk);
+      EXPECT_EQ((co_await first.open(open_in(2, a.clientid, 2, "oa"), nullptr)).status, kOk);
+    });
+  }
+  EXPECT_FALSE(std::filesystem::is_empty(dir.path + "/fs/1/clients"));
+  EXPECT_FALSE(std::filesystem::is_empty(dir.path + "/fs/2/clients"));
+  EXPECT_TRUE(!std::filesystem::exists(dir.path + "/clients") ||
+              std::filesystem::is_empty(dir.path + "/clients"));  // no global record
+
+  // "Takeover of export 1 only": its window is armed, export 2 keeps serving.
+  state::StateMgr second({.boot_epoch = 2, .state_dir = dir.path, .per_fsid_reclaim = true});
+  EXPECT_FALSE(second.in_grace());
+  second.load_grace_list(1);
+  EXPECT_TRUE(second.in_grace());
+  EXPECT_TRUE(second.in_grace(1));
+  EXPECT_FALSE(second.in_grace(2));
+  EXPECT_TRUE(second.in_stable_list(1, "listed"));
+  EXPECT_FALSE(second.in_stable_list(2, "listed"));
+  EXPECT_FALSE(second.in_stable_list("listed"));  // not on the global list
+  EXPECT_TRUE(second.grace_remaining_seconds(1) > 0);
+  EXPECT_EQ(second.grace_remaining_seconds(2), 0);
+  EXPECT_TRUE(second.grace_remaining_seconds() == second.grace_remaining_seconds(1));
+  auto st = second.stats();
+  EXPECT_TRUE(st.grace);
+  ASSERT_TRUE(st.fs_grace.size() == 1u);
+  EXPECT_EQ(st.fs_grace[0].first, 1u);
+
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(second, "listed", 1, false);  // reclaims first
+    auto n = co_await connect(second, "newcomer", 2);
+    // Export 2 is not in grace: new state flows, anonymous writes pass.
+    EXPECT_EQ((co_await second.open(open_in(2, n.clientid, 2, "on"), nullptr)).status, kOk);
+    nfsv4::Stateid anon{};
+    EXPECT_EQ((co_await second.check_io(anon, n.clientid, 2, oid_of(2), state::kShareWrite)).status,
+              kOk);
+    // Export 1 is: plain OPEN and anonymous WRITE wait, reads pass.
+    EXPECT_EQ((co_await second.open(open_in(1, n.clientid, 1, "on"), nullptr)).status,
+              st4(nfsv4::Status::kGrace));
+    EXPECT_EQ((co_await second.check_io(anon, n.clientid, 1, oid_of(1), state::kShareWrite)).status,
+              st4(nfsv4::Status::kGrace));
+    EXPECT_EQ((co_await second.check_io(anon, n.clientid, 1, oid_of(1), state::kShareRead)).status,
+              kOk);
+    // Reclaims: gated by the export's own list and window.
+    auto in2 = open_in(2, a.clientid, 2, "oa");
+    in2.reclaim = true;
+    EXPECT_EQ((co_await second.open(in2, nullptr)).status, st4(nfsv4::Status::kNoGrace));
+    auto bad = open_in(1, n.clientid, 1, "on");
+    bad.reclaim = true;
+    EXPECT_EQ((co_await second.open(bad, nullptr)).status, st4(nfsv4::Status::kReclaimBad));
+    auto good = open_in(1, a.clientid, 1, "oa");
+    good.reclaim = true;
+    auto reclaimed = co_await second.open(good, nullptr);
+    EXPECT_EQ(reclaimed.status, kOk);
+    EXPECT_TRUE(second.in_grace(1));
+    // A reclaim LOCK under the reclaimed open: same gate, same export.
+    state::StateMgr::LockArgs la;
+    la.clientid = a.clientid;
+    la.fsid = 1;
+    la.oid = oid_of(1);
+    la.exclusive = true;
+    la.length = 10;
+    la.new_owner = true;
+    la.open_stateid = reclaimed.stateid;
+    la.owner = "proc-a";
+    la.reclaim = true;
+    EXPECT_EQ((co_await second.lock(la)).status, kOk);
+    // Everyone listed for export 1 is done: only its window ends.
+    EXPECT_EQ(co_await second.reclaim_complete(a.clientid), kOk);
+    EXPECT_FALSE(second.in_grace(1));
+    EXPECT_FALSE(second.in_grace());
+    EXPECT_EQ((co_await second.open(open_in(1, n.clientid, 1, "on"), nullptr)).status, kOk);
+    EXPECT_EQ((co_await second.open(good, nullptr)).status, st4(nfsv4::Status::kNoGrace));
+  });
+  EXPECT_EQ(second.stats().fs_grace.size(), 0u);
+
+  // Two windows at once: the global one (a restart) plus one export's; ending the
+  // export's leaves the global one, grace-end (0) clears everything.
+  state::StateMgr third({.boot_epoch = 3, .state_dir = dir.path, .per_fsid_reclaim = true});
+  std::filesystem::create_directories(dir.path + "/clients");
+  {
+    std::ofstream(dir.path + "/clients/0000000000000001") << "global-client";
+  }
+  third.load_grace_list();
+  third.load_grace_list(2);
+  EXPECT_TRUE(third.in_grace(1));  // window 0 covers every export
+  EXPECT_TRUE(third.in_grace(2));
+  EXPECT_TRUE(third.in_stable_list(1, "global-client"));
+  EXPECT_TRUE(third.in_stable_list(2, "listed"));
+  EXPECT_TRUE(third.end_grace(2));
+  EXPECT_FALSE(third.end_grace(2));
+  EXPECT_TRUE(third.in_grace(2));  // still covered by window 0
+  EXPECT_EQ(third.stats().fs_grace.size(), 0u);
+  EXPECT_TRUE(third.end_grace());
+  EXPECT_FALSE(third.in_grace());
+  EXPECT_FALSE(third.in_grace(1));
+  runtime.stop_and_join();
+}
+
+TEST(StateMgr, StableStoreHooksPerFsid) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  FsMemStore store;
+  state::StateMgr mgr({.boot_epoch = 1, .state_dir = dir.path, .stable = store.hooks(),
+                       .per_fsid_reclaim = true});
+  mgr.load_grace_list(1);
+  EXPECT_EQ(store.count("load:1"), 1u);
+  EXPECT_FALSE(mgr.in_grace());
+  run_on(runtime, [&]() -> rt::Task<void> {
+    // CREATE_SESSION no longer lists the client anywhere.
+    auto a = co_await connect(mgr, "hooked", 1);
+    EXPECT_EQ(store.count("put:"), 0u);
+    // The first state in an export lists the client there — once.
+    auto o1 = co_await mgr.open(open_in(1, a.clientid, 1, "oa"), nullptr);
+    EXPECT_EQ(o1.status, kOk);
+    EXPECT_EQ(store.count("put:1:hooked"), 1u);
+    auto o2 = co_await mgr.open(open_in(1, a.clientid, 2, "ob"), nullptr);
+    EXPECT_EQ(o2.status, kOk);
+    state::StateMgr::LockArgs la;
+    la.clientid = a.clientid;
+    la.fsid = 1;
+    la.oid = oid_of(1);
+    la.exclusive = true;
+    la.length = 10;
+    la.new_owner = true;
+    la.open_stateid = o1.stateid;
+    la.owner = "proc-a";
+    EXPECT_EQ((co_await mgr.lock(la)).status, kOk);
+    EXPECT_EQ(store.count("put:"), 1u);
+    auto o3 = co_await mgr.open(open_in(2, a.clientid, 3, "oc"), nullptr);
+    EXPECT_EQ(o3.status, kOk);
+    EXPECT_EQ(store.count("put:2:hooked"), 1u);
+    EXPECT_TRUE(store.lists[1].contains("hooked") && store.lists[2].contains("hooked"));
+    EXPECT_TRUE(store.lists[0].empty());
+    // The last state in an export delists the client there: closing o2 leaves o1 and
+    // its lock; closing o1 takes the lock with it and delists.
+    EXPECT_EQ(co_await mgr.close_state(o2.stateid), kOk);
+    EXPECT_EQ(store.count("erase:"), 0u);
+    EXPECT_EQ(co_await mgr.close_state(o1.stateid), kOk);
+    EXPECT_EQ(store.count("erase:1:hooked"), 1u);
+    EXPECT_FALSE(store.lists[1].contains("hooked"));
+    EXPECT_TRUE(store.lists[2].contains("hooked"));
+    // Client expiry delists it from every export it was still in.
+    EXPECT_EQ(co_await mgr.expire_client(a.clientid), kOk);
+    EXPECT_EQ(store.count("erase:2:hooked"), 1u);
+    EXPECT_EQ(store.count("erase:0:"), 0u);
+    EXPECT_TRUE(store.lists[2].empty());
+  });
+  runtime.stop_and_join();
+}
+
+TEST(StateMgr, ReleaseFsidDropsStateKeepsClient) {
+  TmpDir dir;
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 1});
+  runtime.start();
+  FsMemStore store;
+  state::StateMgr mgr({.boot_epoch = 1, .state_dir = dir.path, .stable = store.hooks(),
+                       .per_fsid_reclaim = true});
+  run_on(runtime, [&]() -> rt::Task<void> {
+    auto a = co_await connect(mgr, "mover", 1);
+    auto b = co_await connect(mgr, "bystander", 2);
+    auto o1 = co_await mgr.open(open_in(1, a.clientid, 1, "oa"), nullptr);
+    auto o2 = co_await mgr.open(open_in(2, a.clientid, 2, "oa"), nullptr);
+    auto ob = co_await mgr.open(open_in(2, b.clientid, 3, "ob"), nullptr);
+    EXPECT_EQ(o1.status, kOk);
+    EXPECT_EQ(o2.status, kOk);
+    EXPECT_EQ(ob.status, kOk);
+    state::StateMgr::LockArgs la;
+    la.clientid = a.clientid;
+    la.fsid = 1;
+    la.oid = oid_of(1);
+    la.exclusive = true;
+    la.length = 10;
+    la.new_owner = true;
+    la.open_stateid = o1.stateid;
+    la.owner = "proc-a";
+    EXPECT_EQ((co_await mgr.lock(la)).status, kOk);
+    mgr.load_grace_list(1);  // pretend export 1 is mid-grace: the handover ends it
+    EXPECT_TRUE(mgr.in_grace(1));
+
+    size_t dropped = co_await mgr.release_fsid(1);
+    EXPECT_EQ(dropped, 2u);  // the open and its lock
+    EXPECT_FALSE(mgr.in_grace(1));
+    // Export 1 state is gone, export 2 state and the sessions are untouched.
+    auto gone = co_await mgr.check_io(o1.stateid, a.clientid, 1, oid_of(1), state::kShareRead);
+    EXPECT_EQ(gone.status, st4(nfsv4::Status::kBadStateid));
+    auto kept = co_await mgr.check_io(o2.stateid, a.clientid, 2, oid_of(2), state::kShareRead);
+    EXPECT_EQ(kept.status, kOk);
+    auto seq = co_await mgr.sequence_begin(a.sessionid, 0, 1, 0, false, 1);
+    EXPECT_EQ(seq.status, kOk);
+    co_await mgr.sequence_complete(a.sessionid, 0, 1, false, {});
+    auto st = mgr.stats();
+    EXPECT_EQ(st.clients, 2u);
+    EXPECT_EQ(st.sessions, 2u);
+    EXPECT_EQ(st.opens, 2u);
+    EXPECT_EQ(st.lock_states, 0u);
+    // The export's reclaim list is left for the next owner; only the mover is flagged.
+    EXPECT_TRUE(store.lists[1].contains("mover"));
+    EXPECT_EQ(store.count("erase:"), 0u);
+    std::string dump = co_await mgr.dump();
+    auto owner_key = [](std::string_view owner) {
+      std::string key = "owner=";
+      for (unsigned char ch : owner) key += std::format("{:02x}", ch);
+      return key + " ";
+    };
+    size_t mover = dump.find(owner_key("mover"));
+    size_t stander = dump.find(owner_key("bystander"));
+    EXPECT_TRUE(mover != std::string::npos && stander != std::string::npos);
+    auto flag = [&](size_t at) {
+      if (at == std::string::npos) return false;
+      size_t eol = dump.find('\n', at);
+      return dump.substr(at, eol - at).find("lease_moved=1") != std::string::npos;
+    };
+    EXPECT_TRUE(flag(mover));
+    EXPECT_FALSE(flag(stander));
+    // A second handover of an export with nothing in it is a no-op.
+    EXPECT_EQ(co_await mgr.release_fsid(1), 0u);
+    // Normal close after the handover still delists from the export the state was in.
+    EXPECT_EQ(co_await mgr.close_state(o2.stateid), kOk);
+    EXPECT_EQ(store.count("erase:2:mover"), 1u);
   });
   runtime.stop_and_join();
 }

@@ -155,14 +155,20 @@ rt::Task<std::shared_ptr<ClientRec>> StateMgr::find_client(uint64_t clientid) {
 
 // ---- grace -----------------------------------------------------------------
 
-// The single-gateway stable store: one file per client under state_dir/clients/,
-// named by fnv64(owner), holding the co_ownerid verbatim.
-std::vector<std::string> StateMgr::load_local_clients() const {
+// The single-gateway stable store: one file per client under the export's list
+// directory (state_dir/clients/ for the global list, state_dir/fs/<fsid>/clients/ for
+// an export's own), named by fnv64(owner), holding the co_ownerid verbatim.
+std::string StateMgr::local_clients_dir(uint32_t fsid) const {
+  return fsid == 0 ? cfg_.state_dir + "/clients"
+                   : cfg_.state_dir + "/fs/" + std::to_string(fsid) + "/clients";
+}
+
+std::vector<std::string> StateMgr::load_local_clients(uint32_t fsid) const {
   std::vector<std::string> owners;
   std::error_code ec;
-  std::filesystem::create_directories(cfg_.state_dir + "/clients", ec);
-  for (const auto& entry :
-       std::filesystem::directory_iterator(cfg_.state_dir + "/clients", ec)) {
+  std::string dir = local_clients_dir(fsid);
+  std::filesystem::create_directories(dir, ec);
+  for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
     std::string owner;
     if (FILE* f = fopen(entry.path().c_str(), "rb")) {
       char buf[nfsv4::kMaxOwnerId];
@@ -175,98 +181,216 @@ std::vector<std::string> StateMgr::load_local_clients() const {
   return owners;
 }
 
-void StateMgr::load_grace_list() {
-  std::vector<std::string> owners = cfg_.stable.load ? cfg_.stable.load() : load_local_clients();
+void StateMgr::arm_grace(uint32_t fsid, std::vector<std::string> owners) {
   std::lock_guard lock(grace_mu_);
+  GraceWindow& window = grace_[fsid];
   for (auto& owner : owners) {
     if (owner.empty()) continue;
-    stable_list_.insert(owner);
-    grace_pending_.insert(std::move(owner));
+    window.listed.insert(owner);
+    window.pending.insert(std::move(owner));
   }
   uint32_t grace_secs = cfg_.grace_seconds ? cfg_.grace_seconds : cfg_.lease_seconds;
-  if (!grace_pending_.empty()) {
-    grace_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(grace_secs);
-    grace_active_.store(true, std::memory_order_relaxed);
-    LNFS_INFO("grace period armed: {} clients expected to reclaim, {}s window",
-              grace_pending_.size(), grace_secs);
+  if (!window.pending.empty()) {
+    window.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(grace_secs);
+    window.active = true;
+    grace_any_.store(true, std::memory_order_relaxed);
+    if (fsid == 0)
+      LNFS_INFO("grace period armed: {} clients expected to reclaim, {}s window",
+                window.pending.size(), grace_secs);
+    else
+      LNFS_INFO("grace period armed for fsid {}: {} clients expected to reclaim, {}s window",
+                fsid, window.pending.size(), grace_secs);
   }
 }
 
-bool StateMgr::end_grace() {
+void StateMgr::load_grace_list() {
+  arm_grace(0, cfg_.stable.load ? cfg_.stable.load(0) : load_local_clients(0));
+}
+
+void StateMgr::load_grace_list(uint32_t fsid) {
+  arm_grace(fsid, cfg_.stable.load ? cfg_.stable.load(fsid) : load_local_clients(fsid));
+}
+
+bool StateMgr::end_grace(uint32_t fsid) {
   std::lock_guard lock(grace_mu_);
-  grace_pending_.clear();
-  bool was = grace_active_.exchange(false, std::memory_order_relaxed);
-  if (was) LNFS_INFO("grace period ended by operator (grace-end)");
+  bool was = false;
+  for (auto& [id, window] : grace_) {
+    if (fsid != 0 && id != fsid) continue;
+    window.pending.clear();
+    if (window.active) {
+      was = true;
+      window.active = false;
+      if (id == 0) LNFS_INFO("grace period ended by operator (grace-end)");
+      else LNFS_INFO("grace period for fsid {} ended", id);
+    }
+  }
+  if (fsid == 0) grace_any_.store(false, std::memory_order_relaxed);
   return was;
 }
 
-bool StateMgr::in_grace() const {
-  if (!grace_active_.load(std::memory_order_relaxed)) return false;
-  std::lock_guard lock(grace_mu_);
-  if (grace_pending_.empty() || std::chrono::steady_clock::now() >= grace_deadline_) {
-    if (grace_active_.exchange(false, std::memory_order_relaxed))
-      LNFS_INFO("grace period over");
+// Lazy expiry under grace_mu_: a window past its deadline, or with nobody left to
+// reclaim, is over the first time a reader looks at it.
+bool StateMgr::window_live(uint32_t fsid, GraceWindow& window) const {
+  if (!window.active) return false;
+  if (window.pending.empty() || std::chrono::steady_clock::now() >= window.deadline) {
+    window.active = false;
+    if (fsid == 0) LNFS_INFO("grace period over");
+    else LNFS_INFO("grace period over for fsid {}", fsid);
     return false;
   }
   return true;
 }
 
+bool StateMgr::in_grace() const {
+  if (!grace_any_.load(std::memory_order_relaxed)) return false;
+  std::lock_guard lock(grace_mu_);
+  bool any = false;
+  for (auto& [id, window] : grace_) any |= window_live(id, window);
+  if (!any) grace_any_.store(false, std::memory_order_relaxed);
+  return any;
+}
+
+bool StateMgr::in_grace(uint32_t fsid) const {
+  if (!grace_any_.load(std::memory_order_relaxed)) return false;
+  std::lock_guard lock(grace_mu_);
+  bool any = false, hit = false;
+  for (auto& [id, window] : grace_) {
+    bool live = window_live(id, window);
+    any |= live;
+    if (live && (id == 0 || id == fsid)) hit = true;
+  }
+  if (!any) grace_any_.store(false, std::memory_order_relaxed);
+  return hit;
+}
+
 int64_t StateMgr::grace_remaining_seconds() const {
   if (!in_grace()) return 0;
   std::lock_guard lock(grace_mu_);
-  auto left = grace_deadline_ - std::chrono::steady_clock::now();
-  return std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::seconds>(left).count());
+  int64_t best = 0;
+  auto now = std::chrono::steady_clock::now();
+  for (const auto& [id, window] : grace_) {
+    if (!window.active) continue;
+    auto left = std::chrono::duration_cast<std::chrono::seconds>(window.deadline - now).count();
+    best = std::max<int64_t>(best, left);
+  }
+  return best;
+}
+
+int64_t StateMgr::grace_remaining_seconds(uint32_t fsid) const {
+  if (!in_grace(fsid)) return 0;
+  std::lock_guard lock(grace_mu_);
+  int64_t best = 0;
+  auto now = std::chrono::steady_clock::now();
+  for (const auto& [id, window] : grace_) {
+    if (!window.active || (id != 0 && id != fsid)) continue;
+    auto left = std::chrono::duration_cast<std::chrono::seconds>(window.deadline - now).count();
+    best = std::max<int64_t>(best, left);
+  }
+  return best;
 }
 
 bool StateMgr::in_stable_list(std::string_view owner_id) const {
   std::lock_guard lock(grace_mu_);
-  return stable_list_.contains(std::string(owner_id));
+  auto it = grace_.find(0);
+  return it != grace_.end() && it->second.listed.contains(std::string(owner_id));
 }
 
+bool StateMgr::in_stable_list(uint32_t fsid, std::string_view owner_id) const {
+  std::lock_guard lock(grace_mu_);
+  std::string key(owner_id);
+  for (uint32_t id : {uint32_t{0}, fsid}) {
+    auto it = grace_.find(id);
+    if (it != grace_.end() && it->second.listed.contains(key)) return true;
+  }
+  return false;
+}
+
+// RECLAIM_COMPLETE is per clientid (the engine accepts rca_one_fs but does not scope
+// it): the owner is done in every window that expected it.
 void StateMgr::note_reclaimed(std::string_view owner_id) {
   std::lock_guard lock(grace_mu_);
-  grace_pending_.erase(std::string(owner_id));
-  if (grace_pending_.empty() && grace_active_.load(std::memory_order_relaxed)) {
-    grace_active_.store(false, std::memory_order_relaxed);
-    LNFS_INFO("all listed clients reclaimed: leaving grace early");
+  std::string key(owner_id);
+  for (auto& [id, window] : grace_) {
+    window.pending.erase(key);
+    if (window.pending.empty() && window.active) {
+      window.active = false;
+      if (id == 0) LNFS_INFO("all listed clients reclaimed: leaving grace early");
+      else LNFS_INFO("all listed clients reclaimed for fsid {}: leaving its grace early", id);
+    }
   }
 }
 
 // ---- persistence -----------------------------------------------------------
 
-void StateMgr::persist_client(const ClientRec& client) {
-  if (cfg_.stable.put) {
-    cfg_.stable.put(client.owner_id);
-    return;
-  }
-  std::string dir = cfg_.state_dir + "/clients";
+namespace {
+
+// One record file per client: "<dir>/<fnv64(owner) hex>" holding the owner verbatim.
+std::string client_record_path(const std::string& dir, std::string_view owner_id) {
+  char name[24];
+  std::snprintf(name, sizeof name, "%016llx", static_cast<unsigned long long>(fnv64(owner_id)));
+  return dir + "/" + name;
+}
+
+void write_client_record(const std::string& dir, std::string_view owner_id) {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
-  char name[24];
-  std::snprintf(name, sizeof name, "%016llx",
-                static_cast<unsigned long long>(fnv64(client.owner_id)));
-  std::string path = dir + "/" + name;
+  std::string path = client_record_path(dir, owner_id);
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   if (fd < 0) {
     LNFS_WARN("cannot persist client record {}: reclaim after restart unavailable", path);
     return;
   }
-  if (::write(fd, client.owner_id.data(), client.owner_id.size()) !=
-      static_cast<ssize_t>(client.owner_id.size()))
+  if (::write(fd, owner_id.data(), owner_id.size()) != static_cast<ssize_t>(owner_id.size()))
     LNFS_WARN("short write persisting client record {}", path);
   (void)::fsync(fd);
   ::close(fd);
 }
 
-void StateMgr::unpersist_client(const ClientRec& client) {
-  if (cfg_.stable.erase) {
-    cfg_.stable.erase(client.owner_id);
+}  // namespace
+
+void StateMgr::persist_client(const ClientRec& client) {
+  if (cfg_.per_fsid_reclaim) return;  // listed per export on its first state instead
+  if (cfg_.stable.put) {
+    cfg_.stable.put(0, client.owner_id);
     return;
   }
-  char name[24];
-  std::snprintf(name, sizeof name, "%016llx",
-                static_cast<unsigned long long>(fnv64(client.owner_id)));
-  (void)::unlink((cfg_.state_dir + "/clients/" + name).c_str());
+  write_client_record(local_clients_dir(0), client.owner_id);
+}
+
+void StateMgr::unpersist_client(ClientRec& client) {
+  if (cfg_.per_fsid_reclaim) {
+    for (const auto& [fsid, count] : client.fs_states) unpersist_fs_client(fsid, client.owner_id);
+    client.fs_states.clear();
+    return;
+  }
+  if (cfg_.stable.erase) {
+    cfg_.stable.erase(0, client.owner_id);
+    return;
+  }
+  (void)::unlink(client_record_path(local_clients_dir(0), client.owner_id).c_str());
+}
+
+void StateMgr::persist_fs_client(uint32_t fsid, std::string_view owner_id) {
+  if (cfg_.stable.put) cfg_.stable.put(fsid, owner_id);
+  else write_client_record(local_clients_dir(fsid), owner_id);
+}
+
+void StateMgr::unpersist_fs_client(uint32_t fsid, std::string_view owner_id) {
+  if (cfg_.stable.erase) cfg_.stable.erase(fsid, owner_id);
+  else (void)::unlink(client_record_path(local_clients_dir(fsid), owner_id).c_str());
+}
+
+bool StateMgr::track_state_locked(ClientRec& client, const StateRec& rec) {
+  client.states.insert(rec.other);
+  return ++client.fs_states[rec.fsid] == 1;
+}
+
+bool StateMgr::untrack_state_locked(ClientRec& client, const StateRec& rec) {
+  client.states.erase(rec.other);
+  auto it = client.fs_states.find(rec.fsid);
+  if (it == client.fs_states.end() || --it->second > 0) return false;
+  client.fs_states.erase(it);
+  return true;
 }
 
 // ---- EXCHANGE_ID -----------------------------------------------------------
@@ -697,7 +821,8 @@ rt::Task<uint32_t> StateMgr::reclaim_complete(uint64_t clientid) {
 
 // ---- open state ------------------------------------------------------------
 
-rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from_client) {
+rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from_client,
+                                                  bool handover) {
   backend::OpenPtr released;
   {
     StateShard& shard = state_shard(rec->other);
@@ -737,7 +862,8 @@ rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from
   }
   if (rec->type == StateType::kLock) {
     locks_.release_owner(key, rec->lowner);  // plain mutex table: no shard lock held
-    if (backend::LockMgr* native = native_lock_mgr(rec->fsid)) {
+    // A handover leaves the storage-side locks to the next owner's takeover hook.
+    if (backend::LockMgr* native = handover ? nullptr : native_lock_mgr(rec->fsid)) {
       // Drop the owner's native locks too (CLOSE / FREE_STATEID / expiry).  A file
       // that is already gone cannot be resolved; its descriptor is closed when the
       // backend stops (the locks die with the inode anyway).
@@ -759,11 +885,19 @@ rt::Task<backend::OpenPtr> StateMgr::unlink_state(const StateRef& rec, bool from
     rec->client->delegs.fetch_sub(1, std::memory_order_relaxed);
   }
   // CLOSE releases the byte-range locks held through this open (RFC 8881 §18.2.4).
-  for (const auto& l : dependents) (void)co_await unlink_state(l, from_client);
+  for (const auto& l : dependents) (void)co_await unlink_state(l, from_client, handover);
   if (from_client) {
-    ClientShard& shard = owner_shard(rec->client->owner_id);
-    auto lock = co_await shard.mu.lock();
-    rec->client->states.erase(rec->other);
+    bool last_in_fs;
+    {
+      ClientShard& shard = owner_shard(rec->client->owner_id);
+      auto lock = co_await shard.mu.lock();
+      last_in_fs = untrack_state_locked(*rec->client, *rec);
+    }
+    // The client's last state in the export: it has nothing left to reclaim there
+    // (plan 12 A3) — unless the export is moving, when the next owner arms its grace
+    // from this very list.
+    if (last_in_fs && cfg_.per_fsid_reclaim && !handover)
+      unpersist_fs_client(rec->fsid, rec->client->owner_id);
   }
   co_return released;  // caller drops it with no lock held
 }
@@ -792,11 +926,11 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
     held_states = client->states.size();
   }
   if (args.reclaim) {
-    if (!in_grace()) {
+    if (!in_grace(args.fsid)) {
       out.status = as_u32(Status::kNoGrace);
       co_return out;
     }
-    if (!in_stable_list(client->owner_id)) {
+    if (!in_stable_list(args.fsid, client->owner_id)) {
       out.status = as_u32(Status::kReclaimBad);
       co_return out;
     }
@@ -804,7 +938,7 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
       out.status = as_u32(Status::kNoGrace);
       co_return out;
     }
-  } else if (in_grace() || !reclaim_done) {
+  } else if (in_grace(args.fsid) || !reclaim_done) {
     out.status = as_u32(Status::kGrace);
     co_return out;
   }
@@ -908,18 +1042,19 @@ rt::Task<StateMgr::OpenResult> StateMgr::open(OpenArgs args, backend::OpenPtr bo
       shard.table[rec->other] = rec;
       open_count_.fetch_add(1, std::memory_order_relaxed);
     }
-    bool dead;
+    bool dead, first_in_fs = false;
     {
       ClientShard& shard = owner_shard(client->owner_id);
       auto lock = co_await shard.mu.lock();
       dead = client->expired.load(std::memory_order_relaxed);
-      if (!dead) client->states.insert(rec->other);
+      if (!dead) first_in_fs = track_state_locked(*client, *rec);
     }
     if (dead) {  // reclaim chain ran between arbitration and registration
       released = co_await unlink_state(rec, false);
       out.status = as_u32(Status::kExpired);
       co_return out;
     }
+    if (first_in_fs && cfg_.per_fsid_reclaim) persist_fs_client(rec->fsid, client->owner_id);
   }
   out.stateid.seqid = rec->seqid;
   out.stateid.other = rec->other;
@@ -946,7 +1081,7 @@ rt::Task<StateMgr::DelegGrant> StateMgr::maybe_grant_read_deleg(
     const backend::ObjId& oid, std::vector<std::byte> fh, uint32_t access,
     bool reclaim) {
   DelegGrant out;
-  if (!cfg_.delegations || reclaim || access != kShareRead || in_grace()) co_return out;
+  if (!cfg_.delegations || reclaim || access != kShareRead || in_grace(fsid)) co_return out;
   // The granting session must have a live backchannel: without one a recall could
   // never reach the client.
   {
@@ -1004,12 +1139,12 @@ rt::Task<StateMgr::DelegGrant> StateMgr::maybe_grant_read_deleg(
     auto lock = co_await shard.mu.lock();
     shard.table[rec->other] = rec;
   }
-  bool dead;
+  bool dead, first_in_fs = false;
   {
     ClientShard& shard = owner_shard(client->owner_id);
     auto lock = co_await shard.mu.lock();
     dead = client->expired.load(std::memory_order_relaxed);
-    if (!dead) client->states.insert(rec->other);
+    if (!dead) first_in_fs = track_state_locked(*client, *rec);
   }
   client->delegs.fetch_add(1, std::memory_order_relaxed);
   deleg_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1017,6 +1152,7 @@ rt::Task<StateMgr::DelegGrant> StateMgr::maybe_grant_read_deleg(
     (void)co_await unlink_state(rec, false);
     co_return out;
   }
+  if (first_in_fs && cfg_.per_fsid_reclaim) persist_fs_client(rec->fsid, client->owner_id);
   deleg_grants_.fetch_add(1, std::memory_order_relaxed);
   out.granted = true;
   out.stateid.seqid = rec->seqid.load(std::memory_order_relaxed);
@@ -1274,7 +1410,7 @@ rt::Task<StateMgr::IoCheck> StateMgr::check_io(const Stateid& sid, uint64_t clie
   IoCheck out;
   if (sid.is_special()) {
     out.special = true;
-    if (need == kShareWrite && in_grace()) {  // stateless writes wait for reclaim
+    if (need == kShareWrite && in_grace(fsid)) {  // stateless writes wait for reclaim
       out.status = as_u32(Status::kGrace);
       co_return out;
     }
@@ -1515,15 +1651,15 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
     held_states = client->states.size();
   }
   if (args.reclaim) {  // same grace gate as OPEN(CLAIM_PREVIOUS)
-    if (!in_grace() || reclaim_done) {
+    if (!in_grace(args.fsid) || reclaim_done) {
       out.status = as_u32(Status::kNoGrace);
       co_return out;
     }
-    if (!in_stable_list(client->owner_id)) {
+    if (!in_stable_list(args.fsid, client->owner_id)) {
       out.status = as_u32(Status::kReclaimBad);
       co_return out;
     }
-  } else if (in_grace() || !reclaim_done) {
+  } else if (in_grace(args.fsid) || !reclaim_done) {
     out.status = as_u32(Status::kGrace);
     co_return out;
   }
@@ -1660,7 +1796,7 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
       // most likely the failed gateway's own lock lingering until the storage times
       // its session out: DELAY keeps the client retrying rather than dropping the
       // lock.  Once grace is over a refusal is a real third-party holder: DENIED.
-      if (pushed.status == as_u32(Status::kDenied) && args.reclaim && in_grace()) {
+      if (pushed.status == as_u32(Status::kDenied) && args.reclaim && in_grace(args.fsid)) {
         native_lock_reclaim_delays_.fetch_add(1, std::memory_order_relaxed);
         pushed.status = as_u32(Status::kDelay);
         pushed.denied = {};
@@ -1705,18 +1841,20 @@ rt::Task<StateMgr::LockResult> StateMgr::lock(LockArgs args) {
       shard.table[lock_rec->other] = lock_rec;
       lock_count_.fetch_add(1, std::memory_order_relaxed);
     }
-    bool dead;
+    bool dead, first_in_fs = false;
     {
       ClientShard& shard = owner_shard(client->owner_id);
       auto lock = co_await shard.mu.lock();
       dead = client->expired.load(std::memory_order_relaxed);
-      if (!dead) client->states.insert(lock_rec->other);
+      if (!dead) first_in_fs = track_state_locked(*client, *lock_rec);
     }
     if (dead) {
       (void)co_await unlink_state(lock_rec, false);
       out.status = as_u32(Status::kExpired);
       co_return out;
     }
+    if (first_in_fs && cfg_.per_fsid_reclaim)
+      persist_fs_client(lock_rec->fsid, client->owner_id);
   }
   out.stateid.seqid = lock_rec->seqid;
   out.stateid.other = lock_rec->other;
@@ -1999,7 +2137,7 @@ rt::Task<uint32_t> StateMgr::expire_client_impl(uint64_t clientid, int reason) {
     if (client->courtesy.exchange(false, std::memory_order_relaxed))
       courtesy_count_.fetch_sub(1, std::memory_order_relaxed);
     states.assign(client->states.begin(), client->states.end());
-    client->states.clear();
+    client->states.clear();  // fs_states stays for unpersist_client below
     sessions = std::move(client->sessions);
     client->sessions.clear();
     auto slot_it = shard.by_owner.find(client->owner_id);
@@ -2064,6 +2202,34 @@ rt::Task<uint32_t> StateMgr::expire_client_impl(uint64_t clientid, int reason) {
   co_return 0;
 }
 
+// ---- export handover (plan 12 A3) ------------------------------------------
+
+rt::Task<size_t> StateMgr::release_fsid(uint32_t fsid) {
+  std::vector<StateRef> victims;
+  for (size_t si = 0; si < shard_count_; ++si) {
+    StateShard& shard = states_[si];
+    auto lock = co_await shard.mu.lock();
+    for (const auto& [other, rec] : shard.table)
+      if (rec->fsid == fsid && !rec->closed) victims.push_back(rec);
+  }
+  int64_t until = now_coarse() + cfg_.lease_seconds;
+  std::unordered_set<ClientRec*> moved;
+  std::vector<backend::OpenPtr> released;
+  size_t dropped = 0;
+  for (const auto& rec : victims) {
+    if (rec->closed) continue;  // an open already took this lock with it
+    rec->client->lease_moved_until.store(until, std::memory_order_relaxed);
+    moved.insert(rec->client.get());
+    released.push_back(co_await unlink_state(rec, true, /*handover=*/true));
+    ++dropped;
+  }
+  (void)end_grace(fsid);
+  LNFS_INFO("fsid {} handed over: {} states dropped, {} clients to be told LEASE_MOVED", fsid,
+            dropped, moved.size());
+  released.clear();  // backend handles drop here, outside every shard lock
+  co_return dropped;
+}
+
 // ---- observation -----------------------------------------------------------
 
 StateMgr::Stats StateMgr::stats() const {
@@ -2104,6 +2270,16 @@ StateMgr::Stats StateMgr::stats() const {
   out.cb_lock_notifies = cb_lock_notifies_.load(std::memory_order_relaxed);
   out.grace = in_grace();
   out.grace_remaining = grace_remaining_seconds();
+  if (out.grace) {
+    std::lock_guard lock(grace_mu_);
+    auto now = std::chrono::steady_clock::now();
+    for (const auto& [id, window] : grace_) {
+      if (id == 0 || !window.active) continue;
+      auto left = std::chrono::duration_cast<std::chrono::seconds>(window.deadline - now).count();
+      out.fs_grace.emplace_back(id, std::max<int64_t>(0, left));
+    }
+    std::sort(out.fs_grace.begin(), out.fs_grace.end());
+  }
   return out;
 }
 
@@ -2112,6 +2288,8 @@ rt::Task<std::string> StateMgr::dump() {
   int64_t now = now_coarse();
   out += std::format("grace={} remaining={}s boot_epoch={}\n", in_grace() ? 1 : 0,
                      grace_remaining_seconds(), cfg_.boot_epoch);
+  for (const auto& [fsid, left] : stats().fs_grace)
+    out += std::format("grace fsid={} remaining={}s\n", fsid, left);
   for (size_t si = 0; si < shard_count_; ++si) {
     auto& shard = clients_[si];
     auto lock = co_await shard.mu.lock();
@@ -2120,11 +2298,12 @@ rt::Task<std::string> StateMgr::dump() {
       for (unsigned char ch : c->owner_id) owner_hex += std::format("{:02x}", ch);
       out += std::format(
           "client {:#x} owner={} principal={} confirmed={} courtesy={} lease_left={}s "
-          "sessions={} states={} reclaim_complete={}\n",
+          "sessions={} states={} reclaim_complete={} lease_moved={}\n",
           id, owner_hex, c->principal, c->confirmed ? 1 : 0,
           c->courtesy.load(std::memory_order_relaxed) ? 1 : 0,
           c->lease_expiry.load(std::memory_order_relaxed) - now, c->sessions.size(),
-          c->states.size(), c->reclaim_complete ? 1 : 0);
+          c->states.size(), c->reclaim_complete ? 1 : 0,
+          c->lease_moved_until.load(std::memory_order_relaxed) > now ? 1 : 0);
     }
   }
   for (size_t si = 0; si < shard_count_; ++si) {

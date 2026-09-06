@@ -67,6 +67,14 @@ struct ClientRec {
   // Read delegations held (plan doc 10 §5.2); drives SEQ4_STATUS_CB_PATH_DOWN.
   std::atomic<uint32_t> delegs{0};
   std::unordered_set<StateOther, OtherHash> states;  // owned stateids (client shard)
+  // States per export (plan 12 A3), alongside `states`: the per-export reclaim list
+  // gets a put when the first state in an export is minted and an erase when the
+  // last one goes.  Client shard.
+  std::unordered_map<uint32_t, uint32_t> fs_states;
+  // Migration hint (design 11 §11.4, plan 12 A3/C3): until this coarse-seconds
+  // deadline SEQUENCE answers carry SEQ4_STATUS_LEASE_MOVED, telling the client an
+  // export it held state in moved to another gateway.  0 = none.
+  std::atomic<int64_t> lease_moved_until{0};
 };
 
 struct Slot {
@@ -192,25 +200,52 @@ class StateMgr {
     // gateway taking over reads the list the failed one wrote (design 09 §9.4).  The
     // hooks may block on IO; put/erase failures are the hooks' to log (a lost record
     // only costs that client its reclaim, it never fails the session).
+    // `fsid` selects the list (plan 12 A3): 0 is the global list every failover /
+    // single gateway uses; an export's own list (design 11 §11.3, fs/<fsid>/clients/)
+    // is used only with `per_fsid_reclaim`.  Unset hooks: state_dir/clients/ for 0,
+    // state_dir/fs/<fsid>/clients/ otherwise.
     struct StableStore {
-      std::function<std::vector<std::string>()> load;
-      std::function<void(std::string_view owner_id)> put;
-      std::function<void(std::string_view owner_id)> erase;
+      std::function<std::vector<std::string>(uint32_t fsid)> load;
+      std::function<void(uint32_t fsid, std::string_view owner_id)> put;
+      std::function<void(uint32_t fsid, std::string_view owner_id)> erase;
     } stable;
+    // Active-active (design 11 §11.5, plan 12 A3): keep the reclaim list per export —
+    // a client is listed for an export when it mints its first state there (OPEN /
+    // LOCK / delegation) and delisted when its last one goes or the client expires;
+    // the global list is not written.  Off: the global list is written at
+    // CREATE_SESSION as before.
+    bool per_fsid_reclaim = false;
   };
 
   explicit StateMgr(Config cfg);
   const Config& config() const { return cfg_; }
 
-  // ---- grace (7.5) ----
-  void load_grace_list();  // reads the stable store (state_dir/clients/), arms grace
-  // Operator override (`lightnfs-ctl grace-end`, plan doc 10 §4.2): ends the grace
-  // period immediately.  Clients that had not reclaimed yet lose their claim window.
-  // Returns whether grace was active.
-  bool end_grace();
-  bool in_grace() const;
-  bool in_stable_list(std::string_view owner_id) const;
-  int64_t grace_remaining_seconds() const;
+  // ---- grace (7.5; per export since plan 12 A3) ----
+  // Grace is a set of windows keyed by fsid.  Window 0 covers every export: the
+  // single-gateway restart and the failover takeover arm it from the global list.
+  // An export's own window (design 11 §11.5) is armed when this gateway takes that
+  // export over, from that export's list, and gates only that export — the others
+  // keep serving.  Every window ends on its deadline or when all its listed clients
+  // sent RECLAIM_COMPLETE.
+  void load_grace_list();               // arms window 0 from the global list
+  void load_grace_list(uint32_t fsid);  // arms the export's window from its list
+  // Operator override (`lightnfs-ctl grace-end`, plan doc 10 §4.2): ends grace
+  // immediately — every window for 0, one export's window otherwise.  Clients that
+  // had not reclaimed yet lose their claim window.  Returns whether grace was active.
+  bool end_grace(uint32_t fsid = 0);
+  bool in_grace() const;               // any window live
+  bool in_grace(uint32_t fsid) const;  // window 0 or the export's own
+  bool in_stable_list(std::string_view owner_id) const;  // the global list
+  bool in_stable_list(uint32_t fsid, std::string_view owner_id) const;  // global or export
+  int64_t grace_remaining_seconds() const;  // the longest live window
+  int64_t grace_remaining_seconds(uint32_t fsid) const;
+  // This gateway stops owning an export (design 11 §11.7/§11.8, plan 12 A3): every
+  // open / lock / delegation in it is dropped — no reclaim-list change (the new owner
+  // arms its grace from that list), no native unlock (the new owner's takeover hook
+  // clears the storage side), no callbacks — the clients that held state there get
+  // `lease_moved_until` armed for one lease (C3 reports it), the export's grace
+  // window ends, clientids and sessions stay.  Returns the number of states dropped.
+  rt::Task<size_t> release_fsid(uint32_t fsid);
 
   // ---- EXCHANGE_ID ----
   struct ExchangeResult {
@@ -413,6 +448,9 @@ class StateMgr {
     uint64_t cb_lock_notifies = 0;
     bool grace = false;
     int64_t grace_remaining = 0;
+    // Live per-export windows (plan 12 A3): fsid → remaining seconds; window 0 is
+    // reported through `grace` / `grace_remaining` only.
+    std::vector<std::pair<uint32_t, int64_t>> fs_grace;
   };
   Stats stats() const;
   // Human-readable table dump for lightnfs-ctl (clients, sessions, open states).
@@ -450,10 +488,20 @@ class StateMgr {
   FileShard& file_shard(const FileKey& key);
   int64_t now_coarse() const;
   void renew(ClientRec& client);
+  // Global list (fsid 0) at CREATE_SESSION / client removal; with per_fsid_reclaim
+  // the former is a no-op and the latter delists every export the client was in.
   void persist_client(const ClientRec& client);
-  void unpersist_client(const ClientRec& client);
-  std::vector<std::string> load_local_clients() const;  // state_dir/clients/ (no hooks)
+  void unpersist_client(ClientRec& client);
+  // Per-export list entries (plan 12 A3).
+  void persist_fs_client(uint32_t fsid, std::string_view owner_id);
+  void unpersist_fs_client(uint32_t fsid, std::string_view owner_id);
+  std::vector<std::string> load_local_clients(uint32_t fsid) const;  // no hooks
+  std::string local_clients_dir(uint32_t fsid) const;
   void note_reclaimed(std::string_view owner_id);  // grace early-exit bookkeeping
+  // Registers / drops a state in the client's tables (client shard held).  Returns
+  // whether that was the client's first / last state in the export.
+  static bool track_state_locked(ClientRec& client, const StateRec& rec);
+  static bool untrack_state_locked(ClientRec& client, const StateRec& rec);
   // O(1) clientid lookup via the dedicated index (plan doc 10 §2.6: replaces the
   // all-shards sequential locked scan). Sync; Task kept for call-site compatibility.
   rt::Task<std::shared_ptr<ClientRec>> find_client(uint64_t clientid);
@@ -469,8 +517,10 @@ class StateMgr {
   // Internal reclaim chain; `reason` selects the metric.
   rt::Task<uint32_t> expire_client_impl(uint64_t clientid, int reason);
   // Drops one state from the stateid table, the file index and its client.  An open
-  // state takes its lock states (and their ranges) with it.
-  rt::Task<backend::OpenPtr> unlink_state(const StateRef& rec, bool from_client);
+  // state takes its lock states (and their ranges) with it.  release_fsid passes
+  // `handover`: no native unlock and no reclaim-list erase (plan 12 A3).
+  rt::Task<backend::OpenPtr> unlink_state(const StateRef& rec, bool from_client,
+                                          bool handover = false);
   static backend::LockOwnerId make_lowner(uint64_t clientid, std::string_view owner);
   // Resolves a lock-owner id to its holder (conflict reporting / courtesy reclaim).
   struct LockOwnerRec {
@@ -513,11 +563,20 @@ class StateMgr {
   std::atomic<uint64_t> next_state_{1};
   std::atomic<uint32_t> next_session_{1};
 
+  // Grace windows (plan 12 A3): key 0 = every export, else one export.  A window is
+  // expired lazily by the readers; grace_any_ is the lock-free "nothing live" fast
+  // path the IO gates take.
+  struct GraceWindow {
+    std::unordered_set<std::string> pending;  // owner ids still expected to reclaim
+    std::unordered_set<std::string> listed;   // the stable list the window was armed from
+    std::chrono::steady_clock::time_point deadline{};
+    bool active = false;
+  };
   mutable std::mutex grace_mu_;
-  std::unordered_set<std::string> grace_pending_;  // owner ids still expected to reclaim
-  std::unordered_set<std::string> stable_list_;
-  std::chrono::steady_clock::time_point grace_deadline_{};
-  mutable std::atomic<bool> grace_active_{false};
+  mutable std::unordered_map<uint32_t, GraceWindow> grace_;
+  mutable std::atomic<bool> grace_any_{false};
+  void arm_grace(uint32_t fsid, std::vector<std::string> owners);
+  bool window_live(uint32_t fsid, GraceWindow& window) const;  // grace_mu_ held
 
   mutable std::atomic<uint64_t> seq_new_{0}, seq_replay_{0}, seq_misordered_{0},
       seq_waits_{0};
