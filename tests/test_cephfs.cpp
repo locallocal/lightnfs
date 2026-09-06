@@ -887,6 +887,105 @@ TEST(Cephfs, TakeoverIsScopedToOneExport) {
   be10.reset();
 }
 
+// ---- plan 12 E2: per-fsid takeover + reclaim, the sibling export untouched --------
+//
+// Two CephFS exports of one gateway (fsid 9 and 10), each with its own session uuid
+// ("<cluster id>-<fsid>") and a ghost lock left by the dead owner.  fsid 10's client
+// reclaims its lock inside grace through a real ReclaimProbe over backend 10's lock
+// manager: DELAY while the ghost holds the range, a takeover() of fsid 10 alone
+// reclaims cluster-x-10, and the retry wins — while fsid 9's session, uuid and ghost
+// lock never move (design 11 §11.6 "only that fsid is reclaimed").
+TEST(Cephfs, PerFsidTakeoverReclaimIsolation) {
+  Mount m;  // fsid 9
+  backend::CephBackend::Config cfg;
+  cfg.fsid = 10;
+  cfg.fs_name = "cephfs";
+  cfg.id = "lightnfs";
+  cfg.mon_host = "10.0.0.1";
+  cfg.native_locks = true;
+  auto made = backend::CephBackend::create(cfg, testing::FakeCephApi::api());
+  ASSERT_TRUE(made.has_value());
+  std::unique_ptr<backend::CephBackend> be10 = std::move(*made);
+  ASSERT_TRUE(run(m.runtime, be10->start()).has_value());
+  backend::ObjId oid10;
+  {
+    auto root9 = m.root();
+    ASSERT_TRUE(
+        run(m.runtime, root9->create(m.root_cred, "lk9", backend::SetAttr{}, nullptr)).has_value());
+    auto root10 = run(m.runtime, be10->root());
+    ASSERT_TRUE(root10.has_value());
+    auto c = run(m.runtime, (*root10)->create(m.root_cred, "lk10", backend::SetAttr{}, nullptr));
+    ASSERT_TRUE(c.has_value());
+    oid10 = c->obj->id();
+  }
+  // The dead owner of both exports left one lock per session uuid.
+  ASSERT_TRUE(testing::FakeCephApi::plant_stale_lock("lk9", "cluster-x-9", 0, 10));
+  ASSERT_TRUE(testing::FakeCephApi::plant_stale_lock("lk10", "cluster-x-10", 0, 100));
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 2u);
+  auto& mgr9 = m.be->native_locks()->get();
+  auto* mgr10 = &be10->native_locks()->get();
+  const auto a = owner_id("own1");
+  // fsid 9's ghost is in place: a direct lock on its range is refused.
+  auto ghost9_holds = [&] {
+    auto lk9 = child(m, "lk9");
+    if (!lk9) return false;
+    auto r = run(m.runtime, mgr9.lock(*lk9, a, {0, 10}, true, false));
+    return !r.has_value() && raw(r.error()) == EAGAIN;
+  };
+  EXPECT_TRUE(ghost9_holds());
+
+  {
+    TmpDir state_dir;
+    test::ReclaimProbe probe(
+        m.runtime, state_dir.path, /*fsid=*/10, oid10,
+        [mgr10](uint32_t) -> backend::LockMgr* { return mgr10; },
+        [be = be10.get()](uint32_t, const backend::ObjId& o) -> rt::Task<Result<backend::ObjPtr>> {
+          co_return co_await be->resolve(o);
+        });
+    ASSERT_TRUE(probe.in_grace());
+    EXPECT_EQ(probe.open_reclaim(), 0u);  // OPEN(CLAIM_PREVIOUS) inside grace
+
+    // While cluster-x-10's ghost holds the range the reclaim push is DELAY.
+    for (int i = 0; i < 3; ++i) {
+      EXPECT_EQ(probe.lock_reclaim(), test::ReclaimProbe::delay());
+      EXPECT_EQ(probe.reclaim_delays(), static_cast<uint64_t>(i + 1));
+      EXPECT_EQ(probe.lock_states(), 0u);
+      EXPECT_TRUE(probe.in_grace());
+    }
+    EXPECT_EQ(testing::FakeCephApi::stale_locks(), 2u);
+    EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 0u);
+    EXPECT_TRUE(testing::FakeCephApi::reclaimed_uuids().empty());
+    EXPECT_TRUE(m.be->session_uuid().empty());
+    EXPECT_TRUE(be10->session_uuid().empty());
+
+    // Takeover of fsid 10 alone: only cluster-x-10 is reclaimed, fsid 9's session,
+    // uuid and ghost lock stay exactly as they were.
+    backend::ClusterIdentity who{.cluster_id = "cluster-x", .node = "gw2", .epoch = 5};
+    ASSERT_TRUE(run(m.runtime, be10->takeover(who)).has_value());
+    EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 1u);
+    ASSERT_TRUE(testing::FakeCephApi::reclaimed_uuids().size() == 1u);
+    EXPECT_STREQ(testing::FakeCephApi::reclaimed_uuids()[0], "cluster-x-10");
+    EXPECT_STREQ(be10->session_uuid(), "cluster-x-10");
+    EXPECT_TRUE(m.be->session_uuid().empty());
+    EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);
+    EXPECT_TRUE(ghost9_holds());
+
+    // The very next reclaim wins — still in grace, the retry count stops moving.
+    EXPECT_EQ(probe.lock_reclaim(), 0u);
+    EXPECT_EQ(probe.lock_states(), 1u);
+    EXPECT_EQ(probe.reclaim_delays(), 3u);
+    EXPECT_TRUE(probe.in_grace());
+    // ... and fsid 9 is still untouched afterwards.
+    EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 1u);
+    ASSERT_TRUE(testing::FakeCephApi::reclaimed_uuids().size() == 1u);
+    EXPECT_TRUE(m.be->session_uuid().empty());
+    EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);
+    EXPECT_TRUE(ghost9_holds());
+  }
+  ASSERT_TRUE(run(m.runtime, be10->stop()).has_value());
+  be10.reset();
+}
+
 TEST(Cephfs, TakeoverExplicitUuidAndFailures) {
   const int inodes_before = testing::FakeCephApi::live_inodes();
   const int perms_before = testing::FakeCephApi::live_perms();

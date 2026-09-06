@@ -191,6 +191,7 @@ TEST(Metrics, ClusterFsSeries) {
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"1\",node=\"gw2\"}"), 1);
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_epoch{fsid=\"1\"}"), 9);
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_fence_lost_total{fsid=\"1\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_fence_lost_total{fsid=\"2\"}"), 0);
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"2\",role=\"active\"}"), 1);
     store.age_out_node("gw2", 1000);
     ctl.tick();  // F1 is ours again (first in line), F3 as well (gw2 gone)
