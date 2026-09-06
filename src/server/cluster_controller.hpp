@@ -229,6 +229,11 @@ class FsClusterController {
     // Released by `request_release`: no automatic re-takeover until another node has
     // held the export (or the operator asks again).
     bool held_off = false;
+    // Since when nobody live has held the export (the lapsed record's expiry, or the
+    // tick that first saw it free); 0 while someone holds it.  Plan 12 C2: once that
+    // exceeds 2 × ttl, a live predecessor that is not taking it (takeover = manual,
+    // or not listing it) no longer holds us back.
+    int64_t unowned_since_ms = 0;
   };
   // What one tick learned from the store: every record, every node's address.
   struct StoreView {
@@ -244,9 +249,12 @@ class FsClusterController {
   static bool expired(const NodeFences& rec, int64_t now_ms);
   // The live record naming `fsid`, else the latest expired one, else nullopt.
   static std::optional<Holder> holder_of(const StoreView& sv, uint32_t fsid);
-  // Automatic takeover policy for one export: takeover = auto, we are in its `nodes`,
-  // and nobody ahead of us in that list is alive (plan 12 C2 refines this).
-  bool our_turn(const core::ExportEntry& exp, const StoreView& sv) const;
+  // Automatic takeover policy for one export (plan 12 C2): takeover = auto, we are in
+  // its `nodes`, and nobody ahead of us in that list is alive — unless the export has
+  // sat unowned for over 2 × ttl (`stuck`), when the order no longer applies.
+  bool our_turn(const core::ExportEntry& exp, const StoreView& sv, bool stuck) const;
+  // 2 × ttl: how long an unowned export waits for its live predecessors.
+  std::chrono::milliseconds stuck_after() const { return 2 * ttl(); }
   Result<void> begin_activation(uint32_t fsid, bool force);
   void run_activation(uint32_t fsid, uint64_t fs_epoch, std::string prev_node);
   void begin_draining(uint32_t fsid, const char* why, bool fence_lost, bool release);

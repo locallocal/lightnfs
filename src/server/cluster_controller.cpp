@@ -392,10 +392,12 @@ std::optional<FsClusterController::Holder> FsClusterController::holder_of(const 
   return best;
 }
 
-bool FsClusterController::our_turn(const core::ExportEntry& exp, const StoreView& sv) const {
+bool FsClusterController::our_turn(const core::ExportEntry& exp, const StoreView& sv,
+                                   bool stuck) const {
   if (cfg_.takeover != "auto") return false;
   auto self = std::find(exp.nodes.begin(), exp.nodes.end(), node_);
   if (self == exp.nodes.end()) return false;  // not a candidate: ctl --force only
+  if (stuck) return true;  // the predecessors had their 2 × ttl and did not take it
   // Everyone ahead of us in the export's list gets the first chance: their heartbeat
   // record (empty or not) still live means they are up and will take it themselves.
   for (auto it = exp.nodes.begin(); it != self; ++it) {
@@ -484,10 +486,24 @@ void FsClusterController::tick() {
                                                        : std::string("fence lapsed")});
           break;
         case Role::kStandby: {
-          if (holder && holder->live && holder->rec->node != node_) fs.held_off = false;
+          const bool theirs = holder && holder->live && holder->rec->node != node_;
+          if (theirs) {
+            fs.held_off = false;
+            fs.unowned_since_ms = 0;
+            break;
+          }
+          if (ours) {  // our own live record still names it (drained on a renew
+                       // outage, or a restart): nobody else can take it — retake now
+            fs.unowned_since_ms = 0;
+            if (!fs.held_off && cfg_.takeover == "auto") take.push_back(fsid);
+            break;
+          }
+          // Free: lapsed (since the record's expiry) or never held (since first seen).
+          const int64_t since = holder ? holder->rec->expires_at_ms : sv.now_ms;
+          if (fs.unowned_since_ms == 0 || since < fs.unowned_since_ms) fs.unowned_since_ms = since;
           if (fs.held_off) break;  // released by the operator: not until someone else had it
-          const bool free = !holder || !holder->live || holder->rec->node == node_;
-          if (free && our_turn(*fs.exp, sv)) take.push_back(fsid);
+          const bool stuck = sv.now_ms - fs.unowned_since_ms > stuck_after().count();
+          if (our_turn(*fs.exp, sv, stuck)) take.push_back(fsid);
           break;
         }
         case Role::kDraining:
@@ -508,6 +524,7 @@ Result<void> FsClusterController::begin_activation(uint32_t fsid, bool force) {
     if (!fs) return Err(errno_from(EINVAL));
     if (fs->role != Role::kStandby) return Err(errno_from(EBUSY));
     fs->role = Role::kActivating;
+    fs->unowned_since_ms = 0;
     if (fs->fence && fs->fence->node != node_) prev_node = fs->fence->node;
   }
   auto back_to_remote = [&](Errno error, bool count) {

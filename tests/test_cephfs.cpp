@@ -815,6 +815,78 @@ TEST(Cephfs, TakeoverReclaimsStaleLocks) {
   EXPECT_EQ(testing::FakeCephApi::live_perms(), perms_before);
 }
 
+// ---- plan 12 C2: a per-fsid takeover touches only that export's session ------------
+//
+// Two CephFS exports of one gateway (fsid 9 and 10) derive different session uuids
+// ("<cluster id>-<fsid>"); taking fsid 10 over reclaims cluster-x-10 alone — the ghost
+// holding cluster-x-9's lock survives until fsid 9's own takeover.
+TEST(Cephfs, TakeoverIsScopedToOneExport) {
+  Mount m;  // fsid 9
+  backend::CephBackend::Config cfg;
+  cfg.fsid = 10;
+  cfg.fs_name = "cephfs";
+  cfg.id = "lightnfs";
+  cfg.mon_host = "10.0.0.1";
+  cfg.native_locks = true;
+  auto made = backend::CephBackend::create(cfg, testing::FakeCephApi::api());
+  ASSERT_TRUE(made.has_value());
+  std::unique_ptr<backend::CephBackend> be10 = std::move(*made);
+  ASSERT_TRUE(run(m.runtime, be10->start()).has_value());
+  {
+    auto root = m.root();
+    ASSERT_TRUE(
+        run(m.runtime, root->create(m.root_cred, "lk9", backend::SetAttr{}, nullptr)).has_value());
+    ASSERT_TRUE(
+        run(m.runtime, root->create(m.root_cred, "lk10", backend::SetAttr{}, nullptr)).has_value());
+  }
+  ASSERT_TRUE(testing::FakeCephApi::plant_stale_lock("lk9", "cluster-x-9", 0, 10));
+  ASSERT_TRUE(testing::FakeCephApi::plant_stale_lock("lk10", "cluster-x-10", 0, 10));
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 2u);
+  auto root10 = run(m.runtime, be10->root());
+  ASSERT_TRUE(root10.has_value());
+  auto lk10 = run(m.runtime, (*root10)->lookup(m.root_cred, "lk10"));
+  ASSERT_TRUE(lk10.has_value());
+  auto& mgr9 = m.be->native_locks()->get();
+  auto& mgr10 = be10->native_locks()->get();
+  const auto a = owner_id("own1");
+
+  // Takeover of fsid 10 only.
+  backend::ClusterIdentity who{.cluster_id = "cluster-x", .node = "gw2", .epoch = 5};
+  ASSERT_TRUE(run(m.runtime, be10->takeover(who)).has_value());
+  EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 1u);
+  ASSERT_TRUE(testing::FakeCephApi::reclaimed_uuids().size() == 1u);
+  EXPECT_STREQ(testing::FakeCephApi::reclaimed_uuids()[0], "cluster-x-10");
+  EXPECT_STREQ(be10->session_uuid(), "cluster-x-10");
+  EXPECT_TRUE(m.be->session_uuid().empty());           // fsid 9's session untouched
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);  // cluster-x-9's ghost lock stays
+  {
+    // fsid 10's range is free; fsid 9's is still held by the ghost.
+    auto lk10b = run(m.runtime, (*root10)->lookup(m.root_cred, "lk10"));
+    ASSERT_TRUE(lk10b.has_value());
+    ASSERT_TRUE(run(m.runtime, mgr10.lock(**lk10b, a, {0, 10}, true, false)).has_value());
+    ASSERT_TRUE(run(m.runtime, mgr10.release(**lk10b, a)).has_value());
+    auto lk9 = child(m, "lk9");
+    auto still = run(m.runtime, mgr9.lock(*lk9, a, {0, 10}, true, false));
+    ASSERT_TRUE(!still.has_value());
+    EXPECT_EQ(raw(still.error()), EAGAIN);
+  }
+  // fsid 9's own takeover reclaims its uuid and nothing else.
+  ASSERT_TRUE(run(m.runtime, m.be->takeover(who)).has_value());
+  EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 2u);
+  ASSERT_TRUE(testing::FakeCephApi::reclaimed_uuids().size() == 2u);
+  EXPECT_STREQ(testing::FakeCephApi::reclaimed_uuids()[1], "cluster-x-9");
+  EXPECT_STREQ(m.be->session_uuid(), "cluster-x-9");
+  EXPECT_STREQ(be10->session_uuid(), "cluster-x-10");
+  EXPECT_EQ(testing::FakeCephApi::stale_locks(), 0u);
+  {
+    auto lk9 = child(m, "lk9");
+    ASSERT_TRUE(run(m.runtime, mgr9.lock(*lk9, a, {0, 10}, true, false)).has_value());
+    ASSERT_TRUE(run(m.runtime, mgr9.release(*lk9, a)).has_value());
+  }
+  ASSERT_TRUE(run(m.runtime, be10->stop()).has_value());
+  be10.reset();
+}
+
 TEST(Cephfs, TakeoverExplicitUuidAndFailures) {
   const int inodes_before = testing::FakeCephApi::live_inodes();
   const int perms_before = testing::FakeCephApi::live_perms();

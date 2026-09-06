@@ -48,7 +48,7 @@
 | | B2 `fs_locations` / `fs_locations_info` 属性 ✅ 2026-09-06 | `attrs.cpp` 两属性编码；属主视图 `FsOwnerView` | A1 A2 | P2 |
 | | B3 非属主导出边界回 `NFS4ERR_MOVED` ✅ 2026-09-06 | `engine.cpp` 的 fsid 门禁；referral 例外（LOOKUP、GETATTR fs_locations） | B2 | P2 |
 | C per-fsid 控制器 | C1 `ClusterController` per-fsid 角色机 + 批量续租 ✅ 2026-09-06 | 每 fsid 一个 `{Remote, Activating, Active, Draining}`；一条续租协程 | A1–A3 B1 | P3 |
-| | C2 per-fsid 自动接管 | 按 `nodes` 顺位接管过期围栏；per-fsid 后端 takeover；写 owner | C1 | P3 |
+| | C2 per-fsid 自动接管 ✅ 2026-09-06 | 按 `nodes` 顺位接管过期围栏；per-fsid 后端 takeover；写 owner | C1 | P3 |
 | | C3 `SEQ4_STATUS_LEASE_MOVED` | 属主变更后一个租约期对受影响客户端置位 | A3 C1 | P3 |
 | | C4 ctl 与指标 | `cluster status` per-fsid 表；`cluster takeover/standby <fsid>`；`lightnfs_cluster_fs_*`、`lightnfs_v4_moved_total` | C1 C2 | P3 |
 | D 计划内迁移 | D1 `ctl cluster migrate <fsid> <node>` | 源端 Draining → owner → 释放；目标端按 owner 接管 | C2 C3 C4 | P4 |
@@ -462,7 +462,7 @@ fsid = 2；同 fh `GETATTR(size)` → MOVED；`OPEN` 在 b → MOVED；用 b 内
 
 **验收**：`accept_failover_local.sh` 不变（走的仍是 09 的 `ClusterController`）。
 
-### C2 per-fsid 自动接管
+### C2 per-fsid 自动接管（已完成，2026-09-06）
 
 **目标**：11 §11.8——按 `nodes` 顺位接管过期围栏，接管负载自然分散；接管钩子 scope 到单 fsid。
 
