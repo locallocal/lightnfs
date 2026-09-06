@@ -9,8 +9,9 @@
 
 #include <array>
 #include <cstring>
-#include <functional>
 #include <filesystem>
+#include <functional>
+#include <map>
 #include <set>
 
 #include "backend/fault.hpp"
@@ -2626,7 +2627,9 @@ TEST(Nfs4, FsLocationsEncoding) {
   auto data_fh = f.path_fh({"export", "data"});
   ASSERT_TRUE(!root_fh.empty() && !data_fh.empty());
 
-  auto sup = getattr(f, data_fh, {nfsv4::attr::kSupportedAttrs});
+  // supported_attrs is asked of the pseudo root: on the absent export only the
+  // referral attributes are answerable (plan 12 B3, Nfs4.MovedAtExportBoundary).
+  auto sup = getattr(f, root_fh, {nfsv4::attr::kSupportedAttrs});
   auto bits = *nfsv4::Bitmap::decode(sup.parsed.dec);
   EXPECT_TRUE(bits.test(nfsv4::attr::kFsLocations));
   EXPECT_TRUE(bits.test(nfsv4::attr::kFsLocationsInfo));
@@ -2677,11 +2680,21 @@ TEST(Nfs4, FsLocationsEncoding) {
   auto home = decode_locations(home_reply.parsed.dec);
   ASSERT_TRUE(home.servers.size() == 1u);
   EXPECT_STREQ(home.servers[0][0], "10.0.0.11");
+  // Nobody holds the export: DELAY rather than an empty location list (plan 12 B3;
+  // the empty-list encoding itself is exercised by the READDIR entry in
+  // Nfs4.MovedAtExportBoundary).
   view.publish({{23, {core::FsRole::kUnowned, "", "", 5}}});
-  auto nobody_reply = getattr(f, data_fh, {nfsv4::attr::kFsLocations});
-  auto nobody = decode_locations(nobody_reply.parsed.dec);
-  EXPECT_EQ(nobody.fs_root.size(), 2u);
-  EXPECT_EQ(nobody.servers.size(), 0u);
+  {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(data_fh);
+    ops.u32(static_cast<uint32_t>(Op::kGetattr));
+    nfsv4::Bitmap want;
+    want.set(nfsv4::attr::kFsLocations);
+    want.encode(ops);
+    auto nobody = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    EXPECT_EQ(nobody.status, 10008u);  // NFS4ERR_DELAY
+  }
   view.publish({});  // unknown export: served here, no address to name
   auto unknown_reply = getattr(f, data_fh, {nfsv4::attr::kFsLocations});
   auto unknown = decode_locations(unknown_reply.parsed.dec);
@@ -2692,6 +2705,348 @@ TEST(Nfs4, FsLocationsEncoding) {
   EXPECT_STREQ(core::address_host("[fd00::13]:2049"), "fd00::13");
   EXPECT_STREQ(core::address_host("gw2.example.net:2049"), "gw2.example.net");
   EXPECT_STREQ(core::address_host("gw2"), "gw2");
+}
+
+// Export boundary under active-active (design 11 §11.4/§11.9, plan 12 B3): an export
+// served by another gateway answers NFS4ERR_MOVED — except the referral probe (LOOKUP
+// into it, then GETATTR of fs_locations / fsid / rdattr_error / mounted_on_fileid on
+// the crossing handle), which tells the client where to go; an export nobody holds
+// answers DELAY; the pseudo root lists both as referral points; this gateway's own
+// exports are untouched.
+TEST(Nfs4, MovedAtExportBoundary) {
+  constexpr uint32_t kMoved = 10019, kDelay = 10008;
+  V4Fixture f;
+  // Two more exports beside the fixture's /export/data (fsid 23): b (2) and c (3).
+  auto add_export = [&](const char* path, uint32_t fsid) {
+    auto mem = std::make_unique<backend::MemoryBackend>(fsid);
+    (void)mem->add_file("/file", "payload");
+    core::ExportConfig cfg;
+    cfg.path = path;
+    cfg.fsid = fsid;
+    cfg.clients = {"127.0.0.0/8"};
+    cfg.squash = core::Squash::kNone;
+    ASSERT_TRUE(f.exports.add(cfg, std::move(mem)).has_value());
+  };
+  add_export("/export/b", 2);
+  add_export("/export/c", 3);
+  f.pseudo.emplace(f.exports);
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state, "lightnfs-cluster:c:gw1",
+                   "lightnfs-cluster:c", true);
+  core::FsOwnerView view;
+  auto publish = [&](core::FsRole role_b) {
+    view.publish({{23, {core::FsRole::kActive, "gw1", "10.0.0.11:2049", 1}},
+                  {2, {role_b, "gw2", "10.0.0.12:2049", 4}},
+                  {3, {core::FsRole::kUnowned, "", "", 2}}});
+  };
+  publish(core::FsRole::kRemote);
+  f.engine->set_owner_view(&view);
+  f.establish_session();
+
+  // One op after PUTFH: the op's status.
+  auto op_status = [&](const std::vector<std::byte>& fh, Op op,
+                       std::function<void(xdr::XdrEnc&)> args) {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(fh);
+    ops.u32(static_cast<uint32_t>(op));
+    args(ops);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+    (void)reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+    return reply.status;
+  };
+  auto getattr_status = [&](const std::vector<std::byte>& fh,
+                            std::initializer_list<uint32_t> bits) {
+    return op_status(fh, Op::kGetattr, [&](xdr::XdrEnc& e) {
+      nfsv4::Bitmap want;
+      for (uint32_t b : bits) want.set(b);
+      want.encode(e);
+    });
+  };
+  // GETATTR that must succeed: the answered mask and a decoder over the values.
+  struct Fattr {
+    nfsv4::Bitmap mask;
+    uint64_t fsid = ~0ull;
+    uint32_t rdattr_error = ~0u;
+    uint64_t mounted_on = 0;
+    std::vector<std::string> servers;
+    std::vector<std::string> fs_root;
+  };
+  auto decode_fattr = [&](xdr::XdrDec& dec) {
+    Fattr out;
+    out.mask = *nfsv4::Bitmap::decode(dec);
+    (void)dec.u32();  // attrlist length
+    // Ascending attribute order: size(4) fsid(8) rdattr_error(11) fs_locations(24)
+    // mounted_on_fileid(55).
+    if (out.mask.test(nfsv4::attr::kSize)) (void)dec.u64();
+    if (out.mask.test(nfsv4::attr::kFsid)) {
+      out.fsid = *dec.u64();
+      (void)dec.u64();
+    }
+    if (out.mask.test(nfsv4::attr::kRdattrError)) out.rdattr_error = *dec.u32();
+    if (out.mask.test(nfsv4::attr::kFsLocations)) {
+      uint32_t n = *dec.u32();
+      for (uint32_t i = 0; i < n; ++i) out.fs_root.push_back(std::string(*dec.string(1024)));
+      uint32_t locs = *dec.u32();
+      for (uint32_t i = 0; i < locs; ++i) {
+        uint32_t m = *dec.u32();
+        for (uint32_t j = 0; j < m; ++j) out.servers.push_back(std::string(*dec.string(1024)));
+        uint32_t k = *dec.u32();
+        for (uint32_t j = 0; j < k; ++j) (void)dec.string(1024);
+      }
+    }
+    if (out.mask.test(nfsv4::attr::kMountedOnFileid)) out.mounted_on = *dec.u64();
+    return out;
+  };
+  auto getattr = [&](const std::vector<std::byte>& fh, std::initializer_list<uint32_t> bits) {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(fh);
+    ops.u32(static_cast<uint32_t>(Op::kGetattr));
+    nfsv4::Bitmap want;
+    for (uint32_t b : bits) want.set(b);
+    want.encode(ops);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    Fattr out;
+    EXPECT_EQ(reply.status, 0u);
+    if (reply.status != 0) return out;
+    V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+    (void)reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(reply.dec, Op::kGetattr, 0);
+    return decode_fattr(reply.dec);
+  };
+  using nfsv4::attr::kFsid;
+  using nfsv4::attr::kFsLocations;
+  using nfsv4::attr::kMountedOnFileid;
+  using nfsv4::attr::kRdattrError;
+  using nfsv4::attr::kSize;
+
+  // This gateway's own export: everything as before.
+  auto data_fh = f.path_fh({"export", "data"});
+  ASSERT_TRUE(!data_fh.empty());
+  EXPECT_EQ(getattr_status(data_fh, {kSize}), 0u);
+  auto own = getattr(data_fh, {kFsid, kFsLocations});
+  EXPECT_EQ(own.fsid, 23u);
+  ASSERT_TRUE(own.servers.size() == 1u);
+  EXPECT_STREQ(own.servers[0], "10.0.0.11");
+
+  // The referral probe: LOOKUP into b succeeds with the crossing handle, and the
+  // Linux-shaped GETATTR on it (fsid + fs_locations + more) answers the referral
+  // attributes with the rest dropped behind rdattr_error = MOVED.
+  auto b_fh = f.path_fh({"export", "b"});
+  ASSERT_TRUE(!b_fh.empty());
+  auto probe = getattr(b_fh, {kSize, kFsid, kRdattrError, kFsLocations, kMountedOnFileid});
+  EXPECT_FALSE(probe.mask.test(kSize));
+  EXPECT_TRUE(probe.mask.test(kFsid) && probe.mask.test(kRdattrError) &&
+              probe.mask.test(kFsLocations) && probe.mask.test(kMountedOnFileid));
+  EXPECT_EQ(probe.fsid, 2u);
+  EXPECT_EQ(probe.rdattr_error, kMoved);
+  EXPECT_TRUE(probe.mounted_on != 0);
+  ASSERT_TRUE(probe.fs_root.size() == 2u && probe.servers.size() == 1u);
+  EXPECT_STREQ(probe.fs_root[1], "b");
+  EXPECT_STREQ(probe.servers[0], "10.0.0.12");
+  // Only the referral attributes: nothing dropped, rdattr_error clean.
+  auto clean = getattr(b_fh, {kFsid, kRdattrError, kFsLocations});
+  EXPECT_EQ(clean.rdattr_error, 0u);
+  EXPECT_EQ(clean.fsid, 2u);
+  // fs_locations with extra bits but no rdattr_error: still answered, reduced.
+  auto reduced = getattr(b_fh, {kSize, kFsLocations});
+  EXPECT_FALSE(reduced.mask.test(kSize));
+  EXPECT_TRUE(reduced.mask.test(kFsLocations));
+  // Nothing referral-related asked for: MOVED.
+  EXPECT_EQ(getattr_status(b_fh, {kSize}), kMoved);
+  EXPECT_EQ(getattr_status(b_fh, {kFsid, kMountedOnFileid, kSize}), kMoved);
+  // Every other op on the crossing handle: MOVED.
+  EXPECT_EQ(op_status(b_fh, Op::kAccess, [](xdr::XdrEnc& e) { e.u32(1); }), kMoved);
+  EXPECT_EQ(op_status(b_fh, Op::kLookup, [](xdr::XdrEnc& e) { e.string("file"); }), kMoved);
+  EXPECT_EQ(op_status(b_fh, Op::kLookupp, [](xdr::XdrEnc&) {}), kMoved);
+  EXPECT_EQ(op_status(b_fh, Op::kSecinfo, [](xdr::XdrEnc& e) { e.string("file"); }), kMoved);
+  EXPECT_EQ(op_status(b_fh, Op::kOpen,
+                      [](xdr::XdrEnc& e) {
+                        e.u32(0);           // seqid
+                        e.u32(1);           // OPEN4_SHARE_ACCESS_READ
+                        e.u32(0);           // deny none
+                        e.u64(0);           // open_owner4.clientid
+                        e.string("owner");  // open_owner4.owner
+                        e.u32(0);           // OPEN4_NOCREATE
+                        e.u32(0);           // CLAIM_NULL
+                        e.string("file");
+                      }),
+            kMoved);
+  EXPECT_EQ(op_status(b_fh, Op::kReaddir,
+                      [](xdr::XdrEnc& e) {
+                        e.u64(0);
+                        std::array<std::byte, 8> verf{};
+                        e.opaque_fixed(verf);
+                        e.u32(4096);
+                        e.u32(4096);
+                        nfsv4::Bitmap want;
+                        want.set(nfsv4::attr::kFileid);
+                        want.encode(e);
+                      }),
+            kMoved);
+  // A handle inside b that another gateway minted: MOVED before any storage call.
+  backend::ObjId inner;
+  inner.len = 4;
+  inner.bytes[0] = std::byte{7};
+  auto inner_fh = f.handles.encode(*f.exports.by_fsid(2), inner);
+  EXPECT_EQ(op_status(inner_fh, Op::kRead,
+                      [](xdr::XdrEnc& e) {
+                        nfsv4::Stateid anon{};
+                        anon.encode(e);
+                        e.u64(0);
+                        e.u32(16);
+                      }),
+            kMoved);
+  EXPECT_EQ(getattr_status(inner_fh, {kSize}), kMoved);
+  auto inner_probe = getattr(inner_fh, {kFsLocations, kFsid});
+  EXPECT_EQ(inner_probe.fsid, 2u);
+  ASSERT_TRUE(inner_probe.servers.size() == 1u);
+  EXPECT_STREQ(inner_probe.servers[0], "10.0.0.12");
+  auto moved = f.engine->moved_counts();
+  ASSERT_TRUE(moved.size() == 1u);
+  EXPECT_EQ(moved[0].first, 2u);
+  EXPECT_TRUE(moved[0].second >= 8u);
+
+  // An export nobody holds: DELAY, whatever is asked.
+  auto c_fh = f.path_fh({"export", "c"});
+  ASSERT_TRUE(!c_fh.empty());
+  EXPECT_EQ(getattr_status(c_fh, {kFsid, kFsLocations}), kDelay);
+  EXPECT_EQ(getattr_status(c_fh, {kSize}), kDelay);
+  EXPECT_EQ(op_status(c_fh, Op::kAccess, [](xdr::XdrEnc& e) { e.u32(1); }), kDelay);
+
+  // The pseudo directory lists all three: data with its attributes, b and c as
+  // referral points (crossing handle, fsid, rdattr_error = MOVED since size was
+  // asked for, fs_locations of the owner where there is one).
+  auto export_fh = f.path_fh({"export"});
+  ASSERT_TRUE(!export_fh.empty());
+  {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(export_fh);
+    ops.u32(static_cast<uint32_t>(Op::kReaddir));
+    ops.u64(0);
+    std::array<std::byte, 8> verf{};
+    ops.opaque_fixed(verf);
+    ops.u32(1u << 20);
+    ops.u32(1u << 20);
+    nfsv4::Bitmap want;
+    for (uint32_t b : {kSize, kFsid, kRdattrError, kFsLocations, kMountedOnFileid}) want.set(b);
+    want.encode(ops);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    ASSERT_TRUE(reply.status == 0);
+    V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+    (void)reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(reply.dec, Op::kReaddir, 0);
+    (void)reply.dec.opaque_fixed(8);
+    std::map<std::string, Fattr> entries;
+    while (*reply.dec.boolean()) {
+      (void)reply.dec.u64();
+      std::string name(*reply.dec.string(255));
+      entries[name] = decode_fattr(reply.dec);
+    }
+    EXPECT_TRUE(*reply.dec.boolean());  // eof
+    ASSERT_TRUE(entries.size() == 3u);
+    EXPECT_TRUE(entries["data"].mask.test(kSize));
+    EXPECT_EQ(entries["data"].fsid, 23u);
+    EXPECT_EQ(entries["data"].rdattr_error, 0u);
+    EXPECT_FALSE(entries["b"].mask.test(kSize));
+    EXPECT_EQ(entries["b"].fsid, 2u);
+    EXPECT_EQ(entries["b"].rdattr_error, kMoved);
+    ASSERT_TRUE(entries["b"].servers.size() == 1u);
+    EXPECT_STREQ(entries["b"].servers[0], "10.0.0.12");
+    EXPECT_EQ(entries["c"].fsid, 3u);
+    EXPECT_EQ(entries["c"].rdattr_error, kMoved);
+    EXPECT_EQ(entries["c"].servers.size(), 0u);
+  }
+
+  // b comes home: the crossing handle the client kept is now the export root, and a
+  // fresh LOOKUP yields the real root handle.
+  publish(core::FsRole::kActive);
+  EXPECT_EQ(getattr_status(b_fh, {kSize}), 0u);
+  EXPECT_EQ(op_status(b_fh, Op::kLookup, [](xdr::XdrEnc& e) { e.string("file"); }), 0u);
+  auto b_root = f.path_fh({"export", "b"});
+  ASSERT_TRUE(!b_root.empty());
+  EXPECT_TRUE(b_root != b_fh);
+  EXPECT_EQ(getattr(b_root, {kFsid}).fsid, 2u);
+  // And leaves again while draining: MOVED, fs_locations naming the new owner.
+  publish(core::FsRole::kDraining);
+  EXPECT_EQ(getattr_status(b_root, {kSize}), kMoved);
+  auto draining = getattr(b_root, {kFsLocations});
+  ASSERT_TRUE(draining.servers.size() == 1u);
+  EXPECT_STREQ(draining.servers[0], "10.0.0.12");
+
+  // The v4 error map knows MOVED as a universally legal answer.
+  EXPECT_EQ((uint32_t)core::to_v4(Errno::kMoved, Op::kRead), kMoved);
+  EXPECT_EQ((uint32_t)core::to_v4(Errno::kMoved, Op::kLookup), kMoved);
+}
+
+// "/" itself exported and served elsewhere (plan 12 B3): PUTROOTFH is the referral
+// point — it succeeds without touching storage, GETATTR(fs_locations) on it names the
+// owner with an empty fs_root, and anything else answers MOVED.
+TEST(Nfs4, MovedAtExportedRoot) {
+  constexpr uint32_t kMoved = 10019;
+  V4Fixture f;
+  {
+    auto mem = std::make_unique<backend::MemoryBackend>(5);
+    (void)mem->add_file("/file", "payload");
+    core::ExportConfig cfg;
+    cfg.path = "/";
+    cfg.fsid = 5;
+    cfg.clients = {"127.0.0.0/8"};
+    cfg.squash = core::Squash::kNone;
+    ASSERT_TRUE(f.exports.add(cfg, std::move(mem)).has_value());
+  }
+  f.pseudo.emplace(f.exports);
+  ASSERT_TRUE(f.pseudo->root()->exp != nullptr && f.pseudo->root()->exp->fsid == 5u);
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state, "lightnfs-cluster:c:gw1",
+                   "lightnfs-cluster:c", true);
+  core::FsOwnerView view;
+  view.publish({{5, {core::FsRole::kRemote, "gw2", "10.0.0.12:2049", 4}}});
+  f.engine->set_owner_view(&view);
+  f.establish_session();
+
+  // PUTROOTFH GETFH GETATTR(fsid, fs_locations): all OK, the referral names gw2.
+  xdr::XdrEnc ops(f.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutrootfh));
+  ops.u32(static_cast<uint32_t>(Op::kGetfh));
+  ops.u32(static_cast<uint32_t>(Op::kGetattr));
+  nfsv4::Bitmap want;
+  want.set(nfsv4::attr::kFsid);
+  want.set(nfsv4::attr::kFsLocations);
+  want.encode(ops);
+  auto reply = f.parse(f.compound_raw(f.session_body(3, ops.take())));
+  ASSERT_TRUE(reply.status == 0);
+  V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+  (void)reply.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(reply.dec, Op::kPutrootfh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kGetfh, 0);
+  auto root_fh = *reply.dec.opaque(128);
+  V4Fixture::expect_op(reply.dec, Op::kGetattr, 0);
+  auto mask = *nfsv4::Bitmap::decode(reply.dec);
+  EXPECT_TRUE(mask.test(nfsv4::attr::kFsid) && mask.test(nfsv4::attr::kFsLocations));
+  (void)reply.dec.u32();            // attrlist length
+  EXPECT_EQ(*reply.dec.u64(), 5u);  // fsid.major
+  (void)reply.dec.u64();
+  EXPECT_EQ(*reply.dec.u32(), 0u);  // fs_root: empty — the export is the root
+  ASSERT_TRUE(*reply.dec.u32() == 1u);
+  ASSERT_TRUE(*reply.dec.u32() == 1u);
+  EXPECT_STREQ(std::string(*reply.dec.string(64)), "10.0.0.12");
+
+  // Anything else on that handle: MOVED, with no storage call behind it.
+  xdr::XdrEnc more(f.pool);
+  more.u32(static_cast<uint32_t>(Op::kPutfh));
+  more.opaque(std::vector<std::byte>(root_fh.begin(), root_fh.end()));
+  more.u32(static_cast<uint32_t>(Op::kLookup));
+  more.string("file");
+  auto r2 = f.parse(f.compound_raw(f.session_body(2, more.take())));
+  EXPECT_EQ(r2.status, kMoved);
+  auto moved = f.engine->moved_counts();
+  ASSERT_TRUE(moved.size() == 1u);
+  EXPECT_EQ(moved[0].first, 5u);
 }
 
 // EXCHANGE_ID under active-active (plan 12 B1): the reply announces referral and

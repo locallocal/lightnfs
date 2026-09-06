@@ -134,6 +134,7 @@ using O4 = nfsv4::Op;
 S4 raw_mapping_v4(Errno error) {
   if (error == Errno::kBadHandle) return S4::kBadhandle;
   if (error == Errno::kJukebox) return S4::kDelay;
+  if (error == Errno::kMoved) return S4::kMoved;
   switch (raw(error)) {
     case EPERM: return S4::kPerm;
     case ENOENT: return S4::kNoent;
@@ -173,7 +174,7 @@ bool v4_error_allowed(O4 op, S4 status) {
   // Universally legal results (RFC 8881 §15.2 common rows).
   if (status == S4::kOk || status == S4::kIo || status == S4::kServerfault ||
       status == S4::kStale || status == S4::kBadhandle || status == S4::kAccess ||
-      status == S4::kDelay)
+      status == S4::kDelay || status == S4::kMoved)  // MOVED: any op on an absent fs
     return true;
   switch (op) {
     case O4::kLookup:

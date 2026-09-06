@@ -107,7 +107,7 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
   }
   if (ok(kUniqueHandles)) vals.boolean(true);
   if (ok(kLeaseTime)) vals.u32(src.lease_seconds);
-  if (ok(kRdattrError)) vals.u32(0);
+  if (ok(kRdattrError)) vals.u32(src.rdattr_error);
   if (ok(kCansettime)) vals.boolean(core::FsProps::kCansettime);
   if (ok(kCaseInsensitive)) vals.boolean(fs.case_insensitive);
   if (ok(kCasePreserving)) vals.boolean(core::FsProps::kCasePreserving);

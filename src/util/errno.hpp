@@ -16,6 +16,7 @@ enum class Errno : int32_t {
   kGarbage = 3001,  // XDR decode violation -> RPC GARBAGE_ARGS
   kEof = 3002,      // orderly connection shutdown (transport-internal)
   kBadHandle = 3003,  // authenticated file-handle envelope is malformed/forged
+  kMoved = 3004,      // export served by another gateway -> v4 MOVED (plan 12 B3)
 };
 
 constexpr Errno errno_from(int e) { return static_cast<Errno>(e); }
@@ -30,6 +31,7 @@ inline std::string errno_name(Errno e) {
     case Errno::kGarbage: return "GARBAGE";
     case Errno::kEof: return "EOF";
     case Errno::kBadHandle: return "BADHANDLE";
+    case Errno::kMoved: return "MOVED";
     default: return std::string(strerrorname_np(raw(e)) ? strerrorname_np(raw(e)) : "E?");
   }
 }
