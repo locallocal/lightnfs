@@ -11,6 +11,8 @@
 //   LNFS_PREV_NODE    node named by the fence record we replaced ("" when there was none)
 //   LNFS_FSID         the export taken over under active-active (plan 12 C2); "" for a
 //                     failover takeover, which moves every export at once
+//   LNFS_REASON       "takeover" (the holder is gone or was evicted) or "migrate" (the
+//                     previous owner handed the export over on purpose, plan 12 D1)
 // It is spawned with no arguments, inherits the daemon's stdout/stderr and the rest of
 // the environment, and is killed (SIGKILL) when it outlives `timeout`.  Blocking: run
 // from the main loop or an offload thread, never on a reactor.
@@ -30,6 +32,7 @@ namespace lnfs::server {
 // failure is logged with the script path and what happened.
 Result<void> run_takeover_hook(const std::string& path, const backend::ClusterIdentity& id,
                                std::string_view prev_node, std::chrono::milliseconds timeout,
-                               uint32_t fsid = 0);  // 0 = not scoped to one export
+                               uint32_t fsid = 0,  // 0 = not scoped to one export
+                               std::string_view reason = "takeover");
 
 }  // namespace lnfs::server

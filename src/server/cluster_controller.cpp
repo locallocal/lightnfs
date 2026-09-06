@@ -400,6 +400,18 @@ std::optional<FsClusterController::Holder> FsClusterController::holder_of(const 
   return best;
 }
 
+bool FsClusterController::alive(const StoreView& sv, std::string_view node) {
+  for (const auto& rec : sv.fences)
+    if (rec.node == node) return !expired(rec, sv.now_ms);
+  return false;
+}
+
+std::string FsClusterController::migration_target(const Fs& fs, const StoreView& sv) {
+  if (!fs.owner || fs.owner->node.empty() || fs.owner->node == fs.last_holder) return {};
+  if (!alive(sv, fs.owner->node)) return {};
+  return fs.owner->node;
+}
+
 bool FsClusterController::our_turn(const core::ExportEntry& exp, const StoreView& sv,
                                    bool stuck) const {
   if (cfg_.takeover != "auto") return false;
@@ -480,17 +492,23 @@ void FsClusterController::tick() {
     std::string why;
   };
   std::vector<Lost> lost;
-  std::vector<uint32_t> take;
+  struct Take {
+    uint32_t fsid;
+    const char* reason;
+  };
+  std::vector<Take> take;
   {
     std::lock_guard lock(mu_);
     last_ = sv;
     for (auto& [fsid, fs] : fs_) {
       if (auto it = owners.find(fsid); it != owners.end()) fs.owner = it->second;
       auto holder = holder_of(sv, fsid);
-      if (holder)
+      if (holder) {
         fs.fence = FenceRecord{holder->rec->node, holder->epoch, holder->rec->expires_at_ms};
-      else
+        fs.last_holder = holder->rec->node;
+      } else {
         fs.fence.reset();
+      }
       const bool ours = holder && holder->live && holder->rec->node == node_;
       switch (fs.role) {
         case Role::kActive:
@@ -511,7 +529,7 @@ void FsClusterController::tick() {
           if (ours) {  // our own live record still names it (drained on a renew
                        // outage, or a restart): nobody else can take it — retake now
             fs.unowned_since_ms = 0;
-            if (!fs.held_off && cfg_.takeover == "auto") take.push_back(fsid);
+            if (!fs.held_off && cfg_.takeover == "auto") take.push_back({fsid, "takeover"});
             break;
           }
           // Free: lapsed (since the record's expiry) or never held (since first seen).
@@ -519,7 +537,19 @@ void FsClusterController::tick() {
           if (fs.unowned_since_ms == 0 || since < fs.unowned_since_ms) fs.unowned_since_ms = since;
           if (fs.held_off) break;  // released by the operator: not until someone else had it
           const bool stuck = sv.now_ms - fs.unowned_since_ms > stuck_after().count();
-          if (our_turn(*fs.exp, sv, stuck)) take.push_back(fsid);
+          // A pending migration (plan 12 D1): the owner record names its target.  The
+          // target takes the export at once, ahead of the node order and whatever the
+          // takeover policy says (the operator asked); everyone else leaves it alone —
+          // until it has sat unowned for 2 × ttl (the target died), when the ordinary
+          // rule takes over again.
+          if (std::string target = migration_target(fs, sv); !target.empty()) {
+            if (target == node_)
+              take.push_back({fsid, "migrate"});
+            else if (stuck && our_turn(*fs.exp, sv, stuck))
+              take.push_back({fsid, "takeover"});
+            break;
+          }
+          if (our_turn(*fs.exp, sv, stuck)) take.push_back({fsid, "takeover"});
           break;
         }
         case Role::kDraining:
@@ -528,11 +558,11 @@ void FsClusterController::tick() {
     }
   }
   for (const auto& l : lost) begin_draining(l.fsid, l.why.c_str(), true, false);
-  for (uint32_t fsid : take) (void)begin_activation(fsid, false);
+  for (const auto& t : take) (void)begin_activation(t.fsid, false, t.reason);
   publish(nullptr);
 }
 
-Result<void> FsClusterController::begin_activation(uint32_t fsid, bool force) {
+Result<void> FsClusterController::begin_activation(uint32_t fsid, bool force, const char* reason) {
   std::string prev_node;
   {
     std::lock_guard lock(mu_);
@@ -542,6 +572,10 @@ Result<void> FsClusterController::begin_activation(uint32_t fsid, bool force) {
     fs->role = Role::kActivating;
     fs->unowned_since_ms = 0;
     if (fs->fence && fs->fence->node != node_) prev_node = fs->fence->node;
+    // A migration's source released its hold: no record names the export any more,
+    // but the last holder is who hands it over (its residue, if any, is ours to clear).
+    if (!fs->fence && std::string_view(reason) == "migrate" && fs->last_holder != node_)
+      prev_node = fs->last_holder;
   }
   auto back_to_remote = [&](Errno error, bool count) {
     std::lock_guard lock(mu_);
@@ -578,24 +612,30 @@ Result<void> FsClusterController::begin_activation(uint32_t fsid, bool force) {
     if (Fs* fs = find(fsid)) {
       fs->fence = *fence;
       fs->fs_epoch = *epoch;
+      fs->last_holder = node_;  // our record names it from here on
     }
   }
-  LNFS_INFO("cluster: {} taking over fsid {} (fs epoch {}, fence ttl {} ms{}{})", node_, fsid,
+  LNFS_INFO("cluster: {} taking over fsid {} (fs epoch {}, fence ttl {} ms{}{}{})", node_, fsid,
             *epoch, ttl().count(), force ? ", forced" : "",
-            prev_node.empty() ? "" : ", from " + prev_node);
+            prev_node.empty() ? "" : ", from " + prev_node,
+            std::string_view(reason) == "migrate" ? ", migrated" : "");
   publish(nullptr);  // Activating: Unowned in the view until the data plane is ready
   // 3+4. the per-export data-plane work, on its own thread; the batched renew keeps the
   //      fence alive meanwhile (our record already names the export).
   uint64_t e = *epoch;
-  hooks_.post([this, fsid, e, prev_node = std::move(prev_node)]() mutable {
-    run_activation(fsid, e, std::move(prev_node));
-  });
+  hooks_.post(
+      [this, fsid, e, prev_node = std::move(prev_node), reason = std::string(reason)]() mutable {
+        run_activation(fsid, e, std::move(prev_node), std::move(reason));
+      });
   return {};
 }
 
-void FsClusterController::run_activation(uint32_t fsid, uint64_t fs_epoch, std::string prev_node) {
+void FsClusterController::run_activation(uint32_t fsid, uint64_t fs_epoch, std::string prev_node,
+                                         std::string reason) {
   if (hooks_.backend_takeover) {
-    TakeoverContext ctx{.identity = {cfg_.id, node_, fs_epoch}, .prev_node = std::move(prev_node)};
+    TakeoverContext ctx{.identity = {cfg_.id, node_, fs_epoch},
+                        .prev_node = std::move(prev_node),
+                        .reason = std::move(reason)};
     if (auto took = hooks_.backend_takeover(fsid, ctx); !took)
       LNFS_WARN(
           "cluster: backend takeover hook for fsid {} failed: {} (reclaims will retry "
@@ -659,6 +699,7 @@ void FsClusterController::run_draining(uint32_t fsid, bool release) {
     if (Fs* fs = find(fsid)) {
       fs->role = Role::kStandby;
       fs->fs_epoch = 0;
+      if (release) fs->fence.reset();  // our record no longer names it
     }
   }
   LNFS_INFO("cluster: {} no longer serves fsid {}", node_, fsid);
@@ -712,6 +753,74 @@ Result<void> FsClusterController::request_release(uint32_t fsid) {
   return {};
 }
 
+Result<void> FsClusterController::request_migrate(uint32_t fsid, std::string_view target) {
+  uint64_t fs_epoch = 0;
+  {
+    std::lock_guard lock(mu_);
+    Fs* fs = find(fsid);
+    if (!fs) return Err(errno_from(EINVAL));
+    if (fs->role != Role::kActive) return Err(errno_from(EPERM));
+    fs_epoch = fs->fs_epoch;
+  }
+  if (target == node_ || target.empty()) return Err(errno_from(EINVAL));
+  // 1. the target is a registered gateway with a live heartbeat.
+  auto nodes = store_.list_nodes();
+  if (!nodes) return Err(nodes.error());
+  std::string address;
+  bool registered = false;
+  for (const auto& [node, addr] : *nodes)
+    if (node == target) {
+      registered = true;
+      address = addr;
+    }
+  if (!registered) return Err(errno_from(EHOSTDOWN));
+  auto fences = store_.list_fences();
+  if (!fences) return Err(fences.error());
+  StoreView sv;
+  sv.now_ms = wall_now_ms();
+  sv.fences = std::move(*fences);
+  for (auto& [node, addr] : *nodes) sv.addresses[node] = addr;
+  if (!alive(sv, target)) return Err(errno_from(EHOSTDOWN));
+  // 2. Draining: from here the engine refers clients on (still to us, for a moment).
+  //    The fresh store read replaces the last tick's, so the view that follows the
+  //    release refers to the target by this heartbeat, not a stale one.
+  {
+    std::lock_guard lock(mu_);
+    Fs* fs = find(fsid);
+    if (!fs || fs->role != Role::kActive) return Err(errno_from(EPERM));
+    fs->role = Role::kDraining;
+    last_ = std::move(sv);
+  }
+  publish(nullptr);
+  // 3. the owner record names the target before the fence goes (design 11 §11.7).
+  OwnerRecord owner{std::string(target), address, fs_epoch};
+  if (auto put = store_.put_owner(fsid, owner); !put) {
+    LNFS_WARN("cluster: cannot hand fsid {} to {}: owner record not written: {}", fsid, target,
+              errno_name(put.error()));
+    {
+      std::lock_guard lock(mu_);
+      if (Fs* fs = find(fsid); fs && fs->role == Role::kDraining) fs->role = Role::kActive;
+    }
+    publish(nullptr);
+    return Err(put.error());
+  }
+  {
+    std::lock_guard lock(mu_);
+    if (Fs* fs = find(fsid)) fs->owner = owner;
+    ++migrations_;
+  }
+  LNFS_INFO("cluster: {} migrating fsid {} to {} ({}): owner record written, draining", node_, fsid,
+            target, address);
+  // 4+5. state dropped (LEASE_MOVED armed), fence released, view Remote → target.
+  hooks_.post([this, fsid] { run_draining(fsid, true); });
+  return {};
+}
+
+uint64_t FsClusterController::migrations() const {
+  std::lock_guard lock(mu_);
+  return migrations_;
+}
+
 void FsClusterController::publish(const StoreView* sv) {
   std::lock_guard lock(mu_);
   const StoreView& v = sv ? *sv : last_;
@@ -742,6 +851,13 @@ void FsClusterController::publish(const StoreView* sv) {
             if (auto it = v.addresses.find(o.node); it != v.addresses.end()) o.address = it->second;
             o.fs_epoch = holder->epoch;
           }
+        } else if (std::string target = migration_target(fs, v); !target.empty()) {
+          // Handed over, not yet taken: refer to the target (its next tick takes it;
+          // meanwhile it answers DELAY).
+          o.role = core::FsRole::kRemote;
+          o.node = target;
+          o.address = fs.owner->address;
+          o.fs_epoch = fs.owner->fs_epoch;
         } else {
           o.role = core::FsRole::kUnowned;
           if (holder) o.node = holder->rec->node;  // who lapsed
@@ -765,10 +881,18 @@ std::vector<FsClusterController::FsState> FsClusterController::snapshot() const 
   std::vector<FsState> out;
   out.reserve(fs_.size());
   for (const auto& [fsid, fs] : fs_) {
-    FsState st{fsid,     fs.role,      fs.fs_epoch,   fs.fence,
-               fs.owner, fs.takeovers, fs.fence_lost, fs.activation_failures,
+    FsState st{fsid,
+               fs.role,
+               fs.fs_epoch,
+               fs.fence,
+               fs.owner,
+               fs.takeovers,
+               fs.fence_lost,
+               fs.activation_failures,
+               {},
                {}};
     if (auto it = view->find(fsid); it != view->end()) st.view = it->second;
+    if (fs.exp) st.nodes = fs.exp->nodes;
     out.push_back(std::move(st));
   }
   return out;
@@ -784,10 +908,22 @@ Result<std::vector<std::string>> FsClusterController::peers() const {
   return out;
 }
 
+Result<std::vector<std::string>> FsClusterController::alive_peers() const {
+  auto fences = store_.list_fences();
+  if (!fences) return Err(fences.error());
+  const int64_t now_ms = wall_now_ms();
+  std::vector<std::string> out;
+  for (const auto& rec : *fences)
+    if (!expired(rec, now_ms)) out.push_back(rec.node);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
 void FsClusterController::append_metrics(std::string& out) const {
   static constexpr const char* kLabels[] = {"active", "activating", "draining", "remote",
                                             "unowned"};
-  out += std::format("lightnfs_cluster_node_epoch {}\n", node_epoch_);
+  out += std::format("lightnfs_cluster_node_epoch {}\nlightnfs_cluster_migrations_total {}\n",
+                     node_epoch_, migrations());
   for (const FsState& fs : snapshot()) {
     const char* label = fs_role_label(fs);
     for (const char* l : kLabels)

@@ -150,6 +150,7 @@ TEST(Metrics, ClusterFsSeries) {
     // Nothing ticked: every export unowned, no owner samples, zero counters.
     auto text = obs::prometheus_text();
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_node_epoch"), 3);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_migrations_total"), 0);
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"unowned\"}"), 1);
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"active\"}"), 0);
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"3\",role=\"remote\"}"), 0);
@@ -199,6 +200,13 @@ TEST(Metrics, ClusterFsSeries) {
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"3\",role=\"active\"}"), 1);
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"3\",node=\"gw1\"}"), 1);
     EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"3\",node=\"gw2\"}"), -1);
+    // A planned migration counts (plan 12 D1): F3 handed to gw2 (registered, alive).
+    (void)store.renew_fences("gw2", std::chrono::seconds(60));
+    ASSERT_TRUE(ctl.request_migrate(3, "gw2").has_value());
+    text = obs::prometheus_text();
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_migrations_total"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"3\",role=\"remote\"}"), 1);
+    EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_owner{fsid=\"3\",node=\"gw2\"}"), 1);
     // An export released by the operator sits unowned: role one-hot says so, no owner.
     ASSERT_TRUE(ctl.request_release(2).has_value());
     text = obs::prometheus_text();

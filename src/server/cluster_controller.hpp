@@ -48,6 +48,9 @@ struct TakeoverContext {
   // residue the hooks should clear.  Empty when the fence was free (first start) or
   // was our own previous incarnation.
   std::string prev_node;
+  // Why the export moves (LNFS_REASON, plan 12 D1): "takeover" (the holder is gone
+  // or was evicted) or "migrate" (the previous owner handed it over on purpose).
+  std::string reason = "takeover";
 };
 
 class ClusterController {
@@ -189,6 +192,7 @@ class FsClusterController {
     // What the v4 engine is told (plan 12 B2): active / draining / remote (+ owner
     // node, address, fs epoch) / unowned.  Activating shows as unowned there.
     core::FsOwner view;
+    std::vector<std::string> nodes;  // the export's owner order ([[export]] nodes)
   };
   // The role as the operator sees it (plan 12 C4): "activating" while the data-plane
   // work runs, else the view's active / draining / remote / unowned.
@@ -221,6 +225,14 @@ class FsClusterController {
   // and releases the fence.  EINVAL for an fsid this gateway does not export.
   Result<void> request_takeover(uint32_t fsid, bool force);
   Result<void> request_release(uint32_t fsid);
+  // Planned migration (design 11 §11.7, plan 12 D1), run on the current owner: the
+  // view says Draining, the owner record is rewritten to name `target` (its address
+  // from nodes/<target>), the export's state is dropped and the fence released — the
+  // target's next tick takes it over ahead of the node order.  EPERM unless Active
+  // here, EHOSTDOWN unless the target is registered with a live heartbeat, EINVAL for
+  // an unknown fsid or ourselves as the target.
+  Result<void> request_migrate(uint32_t fsid, std::string_view target);
+  uint64_t migrations() const;  // request_migrate calls that got as far as the owner record
 
   std::vector<FsState> snapshot() const;
   Role role_of(uint32_t fsid) const;  // kStandby for an unknown fsid
@@ -230,6 +242,8 @@ class FsClusterController {
   std::chrono::milliseconds fence_ttl() const { return ttl(); }
   // Every gateway registered in the store (nodes/<node>), sorted.  Blocking store IO.
   Result<std::vector<std::string>> peers() const;
+  // The peers whose fence record (heartbeat) is live right now, sorted.  Blocking.
+  Result<std::vector<std::string>> alive_peers() const;
   // Prometheus text (plan 12 C4), registered as a provider for the controller's
   // lifetime: lightnfs_cluster_fs_{role,owner,epoch,takeovers_total,fence_lost_total,
   // activation_failures_total}{fsid=...} and lightnfs_cluster_node_epoch.
@@ -251,6 +265,10 @@ class FsClusterController {
     // exceeds 2 × ttl, a live predecessor that is not taking it (takeover = manual,
     // or not listing it) no longer holds us back.
     int64_t unowned_since_ms = 0;
+    // The node whose record last named the export (live or lapsed); kept once the
+    // record no longer lists it.  With the owner record it tells a pending migration
+    // (owner ≠ last holder, plan 12 D1) from an owner that released or died.
+    std::string last_holder;
   };
   // What one tick learned from the store: every record, every node's address.
   struct StoreView {
@@ -264,6 +282,11 @@ class FsClusterController {
     bool live;
   };
   static bool expired(const NodeFences& rec, int64_t now_ms);
+  // Whether `node` has a live record (its heartbeat) in the view.
+  static bool alive(const StoreView& sv, std::string_view node);
+  // The node a pending migration hands `fs` to: the owner record names a live node
+  // other than the last holder while nobody holds the fence.  Empty otherwise.
+  static std::string migration_target(const Fs& fs, const StoreView& sv);
   // The live record naming `fsid`, else the latest expired one, else nullopt.
   static std::optional<Holder> holder_of(const StoreView& sv, uint32_t fsid);
   // Automatic takeover policy for one export (plan 12 C2): takeover = auto, we are in
@@ -275,8 +298,8 @@ class FsClusterController {
   bool our_turn(const core::ExportEntry& exp, const StoreView& sv, bool stuck) const;
   // 2 × ttl: how long an unowned export waits for its live predecessors.
   std::chrono::milliseconds stuck_after() const { return 2 * ttl(); }
-  Result<void> begin_activation(uint32_t fsid, bool force);
-  void run_activation(uint32_t fsid, uint64_t fs_epoch, std::string prev_node);
+  Result<void> begin_activation(uint32_t fsid, bool force, const char* reason = "takeover");
+  void run_activation(uint32_t fsid, uint64_t fs_epoch, std::string prev_node, std::string reason);
   void begin_draining(uint32_t fsid, const char* why, bool fence_lost, bool release);
   void run_draining(uint32_t fsid, bool release);
   bool renew();  // false after a failed renew (three in a row drain what we hold)
@@ -300,6 +323,7 @@ class FsClusterController {
   std::map<uint32_t, Fs> fs_;
   StoreView last_;  // the last successful read, for publishes between ticks
   int renew_failures_ = 0;
+  uint64_t migrations_ = 0;
 
   std::thread thread_;
   std::mutex wake_mu_;
