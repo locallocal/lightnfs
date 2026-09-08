@@ -116,7 +116,7 @@ Cmd make_cluster_leaf() {
       "epoch, fence owner/age, shared_dir and the peer list; `takeover` asks a standby "
       "gateway to take the fence and start serving (--force takes a live fence held by "
       "another node — only when that node is known to be down); `standby` drains an "
-      "active gateway and releases the fence. Active-active (design 11): `status` "
+      "active gateway and releases the fence. Active-active (design 10): `status` "
       "prints one line per export (role, owner, address, fs epoch, fence age, grace, "
       "takeovers); `takeover <fsid>` and `standby <fsid>` move one export; `migrate "
       "<fsid> <node>` (on the owner) hands one export to a live peer without a client "

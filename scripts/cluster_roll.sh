@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rolling maintenance of one active-active gateway (design 11 §11.7, plan 12 D2):
+# Rolling maintenance of one active-active gateway (design 10 §10.7, plan 12 D2):
 #
 #   cluster_roll.sh evacuate <node> [--to <node>]   # migrate every export <node> serves
 #                                                    # to --to, or to the next live node

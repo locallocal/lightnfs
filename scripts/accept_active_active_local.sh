@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Multi-gateway active-active acceptance on loopback — no root, no cluster backend
-# (design 11, plan 12 E1).  Three lightnfsd processes (gw1/gw2/gw3) share one backing
+# (design 10, plan 12 E1).  Three lightnfsd processes (gw1/gw2/gw3) share one backing
 # tree and one cluster shared_dir (local backend + unsafe_skip_backend_checks); each
 # listens on its own port, which is its node_address.  Two exports own-listed so gw1
 # and gw2 each start with one, gw3 stands ready.  Per configuration (Release, ASAN):
@@ -13,7 +13,7 @@
 #   crash       kill -9 the owner of two exports; the successors in each export's list
 #               pick them up (load spreads), each reclaimed and byte-verified
 #   single      one gateway, three exports nodes=["gw1"]: v4rw + wtest match a single
-#               gateway; status shows three Active, one fence.gw1 file (11 §11.13 gate)
+#               gateway; status shows three Active, one fence.gw1 file (10 §10.13 gate)
 #   logs        no level=error, ASAN clean, every daemon exits cleanly leaving an empty
 #               fence.<node> record
 #
@@ -207,7 +207,7 @@ single_phase() {
   local sa="$work/$label/gw1" la="$work/$label/gw1.log"
   rm -rf "$work/shared" "$work/$label" "$data"
   mkdir -p "$work/shared" "$sa" "$data/e1" "$data/e2" "$data/e3"
-  echo "== [$label] single gateway, three exports nodes=[gw1] (11 §11.13 degeneration)"
+  echo "== [$label] single gateway, three exports nodes=[gw1] (10 §10.13 degeneration)"
   write_config gw1 "$sa" "$p1" "$m1" 1
   pids=("$(start_node "$build" gw1 "$sa" "$la")")
   wait_port "$p1" "$la"

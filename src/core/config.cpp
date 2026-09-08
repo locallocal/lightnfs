@@ -469,13 +469,13 @@ bool cluster_active_active(const ClusterConfig& cluster) {
 
 namespace {
 
-// Active-active rules (design 11 §11.10, plan 12 A1), applied only when the cluster
+// Active-active rules (design 10 §10.10, plan 12 A1), applied only when the cluster
 // section is enabled: under failover the per-export `nodes` and `node_address` are
 // warned about and ignored (so a fleet can be reconfigured one gateway at a time);
 // under active-active every export needs an owner list, the gateway needs an address,
 // `role` must stay "auto" (roles are per fsid now) and exports sharing one Gluster
 // volume / Lustre mount must share one owner list, because those connections are
-// per volume, not per fsid (design 11 §11.6).
+// per volume, not per fsid (design 10 §10.6).
 Result<void> validate_active_active(const Config& config) {
   const auto& c = config.cluster;
   if (!cluster_active_active(c)) {
@@ -520,8 +520,8 @@ Result<void> validate_active_active(const Config& config) {
     auto [slot, fresh] = groups.emplace(group, std::make_pair(exp.fsid, &exp.nodes));
     if (!fresh && *slot->second.second != exp.nodes) {
       LNFS_WARN("export fsid={} and fsid={} share one {} {} but list different nodes: a "
-                "{} connection is per volume, so their owner lists must match (design 11 "
-                "§11.6)",
+                "{} connection is per volume, so their owner lists must match (design 10 "
+                "§10.6)",
                 slot->second.first, exp.fsid, exp.backend, shared_key, exp.backend);
       return Err(errno_from(EINVAL));
     }

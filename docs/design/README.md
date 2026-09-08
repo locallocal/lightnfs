@@ -17,9 +17,7 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 7. [状态管理](07-state-management.md) —— v3 DRC、v4 clientid/会话/槽表/租约/宽限期、持久化
 8. [配置、可观测性与安全](08-config-observability.md) —— 导出表、日志/指标/追踪、资源限制
 9. [多网关无感故障切换（已实现）](09-multi-gateway-failover.md) —— 共享后端上的主备接管：集群身份、共享 reclaim 名单、全局 epoch 与围栏、后端接管钩子；§9.10 改动清单带代码位置；多活/计划内迁移的演进路径。实施计划（A–E 全部完成）已合入并撤下逐步文档，尚未闭环的取舍与发布前门槛见 [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)
-10. ~~多网关故障切换——实现步骤拆分~~ —— 09 的实施计划，A–E 全部完成后撤下；每步实现记录见 git 历史，待决项见 [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)
-11. [多网关多活（每导出一个活动网关，已实现）](11-multi-gateway-active-active.md) —— 09 的演进：per-fsid 围栏/epoch/grace、伪根 + fs_locations + NFS4ERR_MOVED 把客户端引到每个导出的属主网关、导出级故障接管与计划内迁移；CephFS 天生契合，v3/老客户端边界写明。`[cluster] mode = active-active`，与 09 的 failover 二选一；配置/指标/ctl 见 08 册，部署见 [../deployment.md](../deployment.md) §6
-12. ~~多网关多活——实现步骤拆分~~ —— 11 的实施计划（阶段 A–E：配置/per-fsid 存储与 grace → fs_locations 与 NFS4ERR_MOVED → per-fsid 控制器与接管 → 计划内迁移 → 三实例验收），A–E 全部完成（2026-09-06）后与 10 册同样撤下；每步实现记录见 git 历史，待决项见 [../toto/multi-gateway-active-active-followups.md](../toto/multi-gateway-active-active-followups.md)
+10. [多网关多活（每导出一个活动网关，已实现）](10-multi-gateway-active-active.md) —— 09 的演进：per-fsid 围栏/grace、按节点批量的围栏心跳、伪根 + fs_locations + NFS4ERR_MOVED 把客户端引到每个导出的属主网关、按 `nodes` 顺位的导出级故障接管与 `cluster migrate` 计划内迁移；CephFS 天生契合，v3/老客户端边界写明。`[cluster] mode = active-active`，与 09 的 failover 二选一；配置/指标/ctl 见 08 册，部署见 [../deployment.md](../deployment.md) §6。09 与本册的实施步骤文档（原 10、12 册，阶段 A–E）完成后已撤下，每步实现记录见 git 历史，待决项见 [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md) 与 [../toto/multi-gateway-active-active-followups.md](../toto/multi-gateway-active-active-followups.md)
 
 ## 一页纸架构
 

@@ -16,7 +16,7 @@ namespace {
 
 // Reclaim-list hooks over the shared cluster store (design 09 §9.4): the list the
 // active gateway writes is the one the next active gateway arms grace from.  fsid 0 is
-// the global (failover) list; an export's own list (design 11 §11.3, plan 12 A3) is
+// the global (failover) list; an export's own list (design 10 §10.3, plan 12 A3) is
 // used under active-active.  Write failures only warn, as with state_dir/clients/ (a
 // lost record costs one client its reclaim, never the session).
 state::StateMgr::Config::StableStore cluster_stable_store(ClusterStore& store) {
@@ -96,7 +96,7 @@ ServerIdentity derive_server_identity(const core::ServerConfig& cfg,
                                       const core::ClusterConfig& cluster) {
   if (cluster.enabled) {  // config validation rejects explicit owner/scope here
     std::string derived = "lightnfs-cluster:" + cluster.id;
-    // Active-active (design 11 §11.2, plan 12 B1): one scope (one administrative
+    // Active-active (design 10 §10.2, plan 12 B1): one scope (one administrative
     // domain, the precondition for referrals), but every gateway is its own server —
     // fs_locations sends a client to a *different* server for each export it owns.
     if (core::cluster_active_active(cluster))

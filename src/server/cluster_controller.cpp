@@ -792,7 +792,7 @@ Result<void> FsClusterController::request_migrate(uint32_t fsid, std::string_vie
     last_ = std::move(sv);
   }
   publish(nullptr);
-  // 3. the owner record names the target before the fence goes (design 11 §11.7).
+  // 3. the owner record names the target before the fence goes (design 10 §10.7).
   OwnerRecord owner{std::string(target), address, fs_epoch};
   if (auto put = store_.put_owner(fsid, owner); !put) {
     LNFS_WARN("cluster: cannot hand fsid {} to {}: owner record not written: {}", fsid, target,

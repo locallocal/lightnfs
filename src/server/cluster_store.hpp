@@ -31,7 +31,7 @@ namespace lnfs::server {
 //   exports.<node>      canonical export-table digest of that node
 //   epoch.lock / fence.lock   O_EXCL serialization of the two multi-writer files
 //
-// Active-active additions (design 11 §11.3, plan 12 A2) — the failover files above are
+// Active-active additions (design 10 §10.3, plan 12 A2) — the failover files above are
 // untouched, these live beside them:
 //   epoch.<node>        that gateway's own epoch (its clientid/stateid/verifier source)
 //   nodes/<node>        "<node_address>\n": where that gateway's fs_locations point
@@ -96,7 +96,7 @@ class ClusterStore {
   virtual Result<void> put_exports_digest(std::string_view node, std::string_view digest) = 0;
   virtual Result<std::vector<std::pair<std::string, std::string>>> list_exports_digests() = 0;
 
-  // ---- active-active (design 11 §11.3, plan 12 A2) ----------------------------------
+  // ---- active-active (design 10 §10.3, plan 12 A2) ----------------------------------
   // Per-node: the gateway's own epoch (0 before the first bump; bumped once per process
   // start under active-active) and its advertised address.
   virtual Result<uint64_t> read_node_epoch(std::string_view node) = 0;

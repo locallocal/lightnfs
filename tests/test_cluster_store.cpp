@@ -422,7 +422,7 @@ TEST(ClusterStore, ExportDigestIgnoresPerNodeKeys) {
   EXPECT_FALSE(differs("clients = [\"10.0.0.0/8\"]", "clients = [\"127.0.0.0/8\"]"));
 }
 
-// ---- active-active (design 11 §11.3, plan 12 A2) -------------------------------------
+// ---- active-active (design 10 §10.3, plan 12 A2) -------------------------------------
 
 TEST(ClusterStore, FsFenceBatchedPerNode) {
   TmpDir dir;

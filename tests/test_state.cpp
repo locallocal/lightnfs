@@ -1162,7 +1162,7 @@ TEST(StateMgr, NativeLockPushRollbackAndRelease) {
   runtime.stop_and_join();
 }
 
-// ---- per-export grace (design 11 §11.5, plan 12 A3) ---------------------------------
+// ---- per-export grace (design 10 §10.5, plan 12 A3) ---------------------------------
 
 namespace {
 
@@ -1369,7 +1369,7 @@ TEST(StateMgr, StableStoreHooksPerFsid) {
   runtime.stop_and_join();
 }
 
-// SEQ4_STATUS_LEASE_MOVED (design 11 §11.4, plan 12 C3): after an export is handed
+// SEQ4_STATUS_LEASE_MOVED (design 10 §10.4, plan 12 C3): after an export is handed
 // over, every client that held state in it sees the bit for one lease (coarse
 // seconds) on every SEQUENCE while its other exports keep working; a client with no
 // state there never sees it; the bit clears by itself once the lease has run out.

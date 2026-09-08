@@ -146,7 +146,7 @@ class ClusterController {
   bool stopping_ = false;
 };
 
-// ---- active-active: one role per export (design 11 §11.3/§11.14, plan 12 C1) --------
+// ---- active-active: one role per export (design 10 §10.3/§10.14, plan 12 C1) --------
 //
 // Under `[cluster] mode = "active-active"` every gateway is its own server (plan 12 B1):
 // the protocol stack is built once at startup and stays up; what moves between
@@ -214,7 +214,7 @@ class FsClusterController {
   // reactor.
   void tick();
 
-  // Process exit (design 11 §11.7 "planned"): every Active export drains — view says
+  // Process exit (design 10 §10.7 "planned"): every Active export drains — view says
   // Draining, deactivate_fs, fence released — so clients are referred on rather than
   // left waiting; our record stays behind, empty.  Runs the hooks inline on the
   // calling thread (the main thread, after stop()).
@@ -225,7 +225,7 @@ class FsClusterController {
   // and releases the fence.  EINVAL for an fsid this gateway does not export.
   Result<void> request_takeover(uint32_t fsid, bool force);
   Result<void> request_release(uint32_t fsid);
-  // Planned migration (design 11 §11.7, plan 12 D1), run on the current owner: the
+  // Planned migration (design 10 §10.7, plan 12 D1), run on the current owner: the
   // view says Draining, the owner record is rewritten to name `target` (its address
   // from nodes/<target>), the export's state is dropped and the fence released — the
   // target's next tick takes it over ahead of the node order.  EPERM unless Active

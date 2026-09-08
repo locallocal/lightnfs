@@ -107,12 +107,12 @@ state_dir/
 - 启动：epoch++ → 读 clients/ 名单 → 进入 grace（`[protocol] grace`，`auto` = lease 90s；可设更短加快恢复）。
 - grace 内：OPEN(CLAIM_PREVIOUS)/LOCK(reclaim) 仅接受名单内客户端（否则 RECLAIM_BAD）；普通新建状态操作 → GRACE；纯读操作（GETATTR/READ with 特殊 stateid）放行（实现选择：宽松放行读，兼容 v3 混布）。
 - 提前结束：名单内客户端全部 RECLAIM_COMPLETE → 立即出 grace。
-- **集群模式（`[cluster] enabled`，09 册 / 10 册）**：稳定存储从本机 `state_dir` 改到共享
+- **集群模式（`[cluster] enabled`，09 册）**：稳定存储从本机 `state_dir` 改到共享
   的 `shared_dir`——`hmac.key`、全局 `epoch`（每次接管 +1，非每次进程启动）、`clients/`
   reclaim 名单三者由 `ClusterStore` 读写，接管的网关据此进 grace 并接受故障网关客户端的
   reclaim（`state/state_mgr.cpp` 的名单读写走接口，本机实现即原 `state_dir` 语义）。
   另有 `fence`（围栏租约）与 `exports.<node>`（各节点导出摘要）也在 `shared_dir` 下。
-- **多活（`[cluster] mode = active-active`，11 册 §11.5 / 12 册 A3、C3）：grace 与名单加 fsid 维度**。
+- **多活（`[cluster] mode = active-active`，10 册 §10.5）：grace 与名单加 fsid 维度**。
   `StateMgr` 的 grace 从一个全局窗口变成按 fsid 的窗口集合（`state/state_mgr.hpp`：
   `load_grace_list(fsid)` / `in_grace(fsid)` / `end_grace(fsid)` / `in_stable_list(fsid, owner)` /
   `grace_remaining_seconds(fsid)`），**窗口 0 = 全部导出**，即单网关重启与 failover 接管的既有

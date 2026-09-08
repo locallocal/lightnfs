@@ -342,7 +342,7 @@ TEST(Ctl, ActiveActiveConfigKeys) {
   EXPECT_FALSE(core::cluster_active_active(defaults->cluster));
   EXPECT_TRUE(core::validate_config(*defaults).has_value());
 
-  // Full active-active example (design 11 §11.10).
+  // Full active-active example (design 10 §10.10).
   const std::string aa = base + "mode = \"active-active\"\nnode_address = \"10.0.0.11:2049\"\n";
   auto parsed = core::parse_config(aa + exp_a + "nodes = [\"gw1\", \"gw2\", \"gw3\"]\n" + exp_b +
                                    "nodes = [\"gw2\", \"gw3\", \"gw1\"]\n");
@@ -400,7 +400,7 @@ TEST(Ctl, ActiveActiveConfigKeys) {
   EXPECT_TRUE(rejects(with_addr("fd00::11:2049")));     // unbracketed v6
   EXPECT_TRUE(core::valid_node_address("[::1]:1") && !core::valid_node_address("[::1]:"));
 
-  // Gluster / Lustre isolation (design 11 §11.6): exports on one volume / mount must
+  // Gluster / Lustre isolation (design 10 §10.6): exports on one volume / mount must
   // list the same nodes; different volumes may differ; CephFS is per fsid and free.
   auto gluster = [&](const std::string& vol, const std::string& fsid, const std::string& nodes) {
     return "[[export]]\npath = \"/vol" + fsid + "\"\nfsid = " + fsid +

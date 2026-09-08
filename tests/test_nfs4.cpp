@@ -2517,7 +2517,7 @@ TEST(Nfs4, ClusterIdentityDerivation) {
   disabled.enabled = false;
   EXPECT_STREQ(server::derive_server_identity(a, disabled).owner, ia.owner);
 
-  // Active-active (design 11 §11.2, plan 12 B1): one scope, one server per node.
+  // Active-active (design 10 §10.2, plan 12 B1): one scope, one server per node.
   core::ClusterConfig aa = cluster;
   aa.mode = "active-active";
   core::ClusterConfig aa_other_node = aa;
@@ -2707,7 +2707,7 @@ TEST(Nfs4, FsLocationsEncoding) {
   EXPECT_STREQ(core::address_host("gw2"), "gw2");
 }
 
-// Export boundary under active-active (design 11 §11.4/§11.9, plan 12 B3): an export
+// Export boundary under active-active (design 10 §10.4/§10.9, plan 12 B3): an export
 // served by another gateway answers NFS4ERR_MOVED — except the referral probe (LOOKUP
 // into it, then GETATTR of fs_locations / fsid / rdattr_error / mounted_on_fileid on
 // the crossing handle), which tells the client where to go; an export nobody holds
