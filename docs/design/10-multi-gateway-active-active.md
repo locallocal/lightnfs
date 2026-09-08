@@ -332,7 +332,8 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
 - **不支持 referral 的老 v4 客户端**：收到 MOVED 会失败——文档要求这类客户端**直接挂到属主
   网关地址**（放弃分流的透明性），或整个部署退回 `mode = failover`（09 单 VIP 主备）。
 - **v3 客户端**：v3 **无 `fs_locations`、无 referral**。多活对 v3 只能"每导出挂到其属主网关的
-  地址"（运维/自动化按 `cluster status` 的 `owner=` / `address=` 维护导出→属主地址映射），或该
+  地址"（运维/自动化用 `lightnfs-ctl cluster exports [<node>]` 取"某网关此刻服务的 fsid / 路径 /
+  地址"，或按 `cluster status` 的 `owner=` / `address=` 列，维护导出→属主地址映射），或该
   导出退回主备单 VIP。**这是多活对 v3 的明确边界**：v3 得不到协议级分流。混挂 v3/v4 的部署，
   v3 侧要么固定挂属主、要么用 failover。
 
@@ -402,9 +403,11 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
   `lightnfs_cluster_fs_fence_lost_total{fsid}`、`lightnfs_cluster_fs_activation_failures_total{fsid}`；
   引擎侧 `lightnfs_v4_moved_total{fsid}`（Draining / Remote 的 MOVED 与缺席属性应答计数，unowned 的
   DELAY 不计）。09 的整机 `lightnfs_cluster_role/_epoch/_fence_*` 系列在多活下不出样本。
-- **ctl**（08 册）：`cluster status [--json]`（一行网关总览 + 每导出一行）、`cluster takeover <fsid>
-  [--force]`、`cluster standby <fsid>`、`cluster migrate <fsid> <node>`；09 的无参形态在多活下答
-  `fsid required`。
+- **ctl**（08 册）：`cluster status [--json]`（一行网关总览 + 每导出一行）、`cluster exports
+  [<node>]`（一个网关——默认本网关——此刻服务的导出：`node= alive= address= exports= fsids=` 一行 +
+  每导出 `fsid= path= role= fs_epoch=`；节点未登记且不在任何 `nodes` 里报 `unknown node`）、
+  `cluster takeover <fsid> [--force]`、`cluster standby <fsid>`、`cluster migrate <fsid> <node>`；
+  09 的无参形态在多活下答 `fsid required`。
 
 ## 10.14 代码锚点
 
@@ -418,7 +421,7 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
 | `server/daemon.cpp` | 按 mode 构造 `FsClusterController`，`activate_fs` / `deactivate_fs` / `backend_takeover(fsid)` 钩子接到 `StateMgr` 与后端；多活下 `core->owners` 指向视图 |
 | `server/takeover_hook.{hpp,cpp}` | `LNFS_FSID` / `LNFS_REASON` 环境变量 |
 | `server/protocol_stack.cpp` | `derive_server_identity` 的 per-node owner；引擎 `referrals` 开关与 `set_owner_view`；多活下不 arm 全局 grace；验证器换 `verifier_for_node` |
-| `server/ctl.cpp` | `cluster_fs_status` 与多活 `cluster` 分支 |
+| `server/ctl.cpp` | `cluster_fs_status` / `cluster_fs_exports` 与多活 `cluster` 分支 |
 | `server/metrics_providers.cpp` | `append_v4_moved` |
 | `state/state_mgr.{hpp,cpp}` | per-fsid `GraceWindow`、`StableStore` 钩子带 fsid、`per_fsid_reclaim` 写点、`release_fsid`、`lease_moved_until` 与 SEQUENCE 置位 |
 | `nfsv4/attrs.{hpp,cpp}` | 属性 24 / 67 编码、`AttrSource`、`supported_attrs(referrals)` |
