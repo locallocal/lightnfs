@@ -3,6 +3,7 @@
 #include <netinet/in.h>
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -142,6 +143,14 @@ struct ClusterConfig {
   uint32_t fence_lease_ms = 3000;  // fence renew period; lost after 3 missed renewals
   std::string takeover = "auto";   // auto | manual (only `lightnfs-ctl cluster takeover`)
   std::string takeover_hook;       // optional script run after the backend takeover hooks
+  // Shared export catalog (design 11 §11.2, plan 12 A1): where the export table comes
+  // from.  "local" = this file's [[export]] blocks (today); "catalog" = the cluster's
+  // shared_dir/catalog.toml, in which case this file must carry no [[export]] and may
+  // start with an empty table until one is published.  Restart-required.
+  std::string exports_source = "local";  // local | catalog
+  // catalog only: pick up a newer catalog on the fence tick ("auto") or only on
+  // `lightnfs-ctl cluster catalog apply` / `reload` / SIGHUP ("manual").  Hot-reloadable.
+  std::string catalog_refresh = "auto";  // auto | manual
   // Test-only: turn the kStableHandles/kByteLocks/native_locks requirement into a
   // warning so the two-instance local acceptance run can use the local backend.
   bool unsafe_skip_backend_checks = false;
@@ -153,6 +162,8 @@ struct ClusterConfig {
 std::string cluster_node_name(const ClusterConfig& cluster);
 // `enabled` and `mode = "active-active"`.
 bool cluster_active_active(const ClusterConfig& cluster);
+// `enabled` and `exports_source = "catalog"` (design 11).
+bool cluster_catalog_exports(const ClusterConfig& cluster);
 // Node-name syntax shared by `[cluster] node` and `[[export]] nodes`: [A-Za-z0-9_.-]{1,64}.
 bool valid_cluster_node_name(std::string_view name);
 // "host:port" / "[v6]:port" with a non-empty host and a port in 1..65535.
@@ -162,6 +173,11 @@ struct Config {
   ServerConfig server;
   ClusterConfig cluster;
   std::vector<ExportConfig> exports;
+  // `[backend_defaults.<backend>]` (design 11 §11.2, plan 12 A1): this host's per-node
+  // backend keys (kPerNodeBackendKeys only — credentials, log paths, cache sizes),
+  // merged into every catalog export of that backend.  Ignored (with a warning) under
+  // exports_source = "local".  Keyed by backend name; `path`/`fsid` unused.
+  std::map<std::string, backend::BackendConfig> backend_defaults;
 };
 
 Result<Config> parse_config(std::string_view toml);
@@ -177,6 +193,8 @@ Result<void> validate_config(const Config& config);
 inline constexpr std::string_view kPerNodeBackendKeys[] = {
     "conf", "keyring", "id", "user", "name", "log_file", "fd_cache", "mon_host"};
 std::string canonical_exports_digest(const Config& config);
+// Whether `key` is one of kPerNodeBackendKeys.
+bool per_node_backend_key(std::string_view key);
 // The text the digest is computed over (for diagnostics and tests).
 std::string canonical_exports_text(const Config& config);
 

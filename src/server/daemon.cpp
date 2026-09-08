@@ -305,7 +305,10 @@ std::string restart_required_report(const core::ServerConfig& fresh,
 // can change under a live role (plan 10 A1).
 std::string cluster_restart_required_report(const core::ClusterConfig& fresh,
                                             const core::ClusterConfig& running) {
-  return fresh == running ? "" : "cluster settings changed: restart required\n";
+  // `catalog_refresh` is the one hot key: the catalog poll reads it live (plan 12 C2).
+  core::ClusterConfig comparable = fresh;
+  comparable.catalog_refresh = running.catalog_refresh;
+  return comparable == running ? "" : "cluster settings changed: restart required\n";
 }
 
 // Re-parses the config file and applies the non-topology subset — log level,
@@ -436,6 +439,12 @@ int run_server(const std::string& config_path) {
   const core::ServerConfig server_cfg = config->server;
   const core::ClusterConfig cluster_cfg = config->cluster;
   const bool active_active = core::cluster_active_active(cluster_cfg);
+  if (core::cluster_catalog_exports(cluster_cfg)) {
+    // Plan 12 A1 ships the keys; booting from the catalog is C1.  Refuse rather than run
+    // a gateway with an empty export table nobody can fill yet.
+    LNFS_WARN("[cluster] exports_source = \"catalog\" is not implemented yet (plan 12 C1)");
+    return 1;
+  }
   const std::string exports_digest = core::canonical_exports_digest(*config);
   apply_log_level(server_cfg);
 

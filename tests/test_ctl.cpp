@@ -472,6 +472,94 @@ TEST(Ctl, ActiveActiveConfigKeys) {
   EXPECT_STREQ(table.by_fsid(1)->nodes[0], "gw1");  // never applied live
 }
 
+TEST(Ctl, CatalogConfigKeys) {
+  // Plan 12 A1: `[cluster] exports_source` / `catalog_refresh` and `[backend_defaults.*]`.
+  const std::string exp_a = "[[export]]\npath = \"/tmp\"\nfsid = 1\nclients = [\"127.0.0.0/8\"]\n";
+  const std::string cluster =
+      "[cluster]\nenabled = true\nid = \"cluster-01\"\nshared_dir = \"/srv/shared\"\n";
+  auto parse_ok = [](const std::string& text) {
+    auto cfg = core::parse_config(text);
+    return cfg.has_value() && core::validate_config(*cfg).has_value();
+  };
+  auto rejects = [](const std::string& text) {
+    auto cfg = core::parse_config(text);
+    return cfg.has_value() && !core::validate_config(*cfg).has_value();
+  };
+
+  // Defaults: local exports, auto refresh, no defaults table; today's configs untouched.
+  auto defaults = core::parse_config("[server]\n" + exp_a);
+  ASSERT_TRUE(defaults.has_value());
+  EXPECT_STREQ(defaults->cluster.exports_source, "local");
+  EXPECT_STREQ(defaults->cluster.catalog_refresh, "auto");
+  EXPECT_TRUE(defaults->backend_defaults.empty());
+  EXPECT_FALSE(core::cluster_catalog_exports(defaults->cluster));
+  EXPECT_TRUE(core::validate_config(*defaults).has_value());
+  EXPECT_TRUE(rejects("[server]\n"));  // local mode still insists on exports
+
+  // Catalog mode: cluster on, no local exports, an empty table is fine before the
+  // first publish; the per-node defaults table is parsed and kept.
+  const std::string catalog = cluster +
+                              "exports_source = \"catalog\"\ncatalog_refresh = \"manual\"\n"
+                              "[backend_defaults.cephfs]\nconf = \"/etc/ceph/ceph.conf\"\n"
+                              "keyring = \"/etc/ceph/gw1.keyring\"\nfd_cache = 4096\n"
+                              "[backend_defaults.gluster]\nlog_file = \"/var/log/gfapi.log\"\n";
+  auto cat = core::parse_config(catalog);
+  ASSERT_TRUE(cat.has_value());
+  EXPECT_TRUE(core::validate_config(*cat).has_value());
+  EXPECT_TRUE(core::cluster_catalog_exports(cat->cluster));
+  EXPECT_STREQ(cat->cluster.catalog_refresh, "manual");
+  EXPECT_TRUE(cat->exports.empty());
+  ASSERT_TRUE(cat->backend_defaults.size() == 2u);
+  EXPECT_STREQ(cat->backend_defaults.at("cephfs").values.at("conf"), "/etc/ceph/ceph.conf");
+  EXPECT_STREQ(cat->backend_defaults.at("cephfs").values.at("fd_cache"), "4096");
+  EXPECT_STREQ(cat->backend_defaults.at("gluster").values.at("log_file"), "/var/log/gfapi.log");
+  // Design 11 §11.2's local example validates as a whole.
+  EXPECT_TRUE(parse_ok(cluster + "mode = \"active-active\"\nnode = \"gw1\"\n"
+                                 "node_address = \"10.0.0.11:2049\"\n"
+                                 "exports_source = \"catalog\"\ncatalog_refresh = \"auto\"\n"
+                                 "[backend_defaults.cephfs]\nconf = \"/etc/ceph/ceph.conf\"\n"
+                                 "name = \"client.gw1\"\n"));
+
+  // Rejected: a local [[export]] beside the catalog (two sources of truth), catalog
+  // without the cluster section, bad enum values.
+  EXPECT_TRUE(rejects(cluster + "exports_source = \"catalog\"\n" + exp_a));
+  EXPECT_TRUE(rejects("[cluster]\nexports_source = \"catalog\"\n"));
+  EXPECT_TRUE(rejects(cluster + "exports_source = \"shared\"\n" + exp_a));
+  EXPECT_TRUE(rejects(cluster + "catalog_refresh = \"bogus\"\n" + exp_a));
+  // Rejected at parse time: a cluster-wide key in [backend_defaults], an empty backend
+  // name, a defaults table with no section name at all.
+  EXPECT_FALSE(
+      core::parse_config(catalog + "[backend_defaults.cephfs]\nfs_name = \"x\"\n").has_value());
+  EXPECT_FALSE(core::parse_config(catalog + "[backend_defaults.]\nconf = \"x\"\n").has_value());
+  EXPECT_FALSE(core::parse_config("[backend_defaults]\nconf = \"x\"\n").has_value());
+  EXPECT_TRUE(core::per_node_backend_key("keyring"));
+  EXPECT_FALSE(core::per_node_backend_key("volume"));
+
+  // Local mode with a defaults table: ignored with a warning, not an error.
+  EXPECT_TRUE(parse_ok(cluster + exp_a + "[backend_defaults.cephfs]\nconf = \"/x\"\n"));
+  auto local_with_defaults =
+      core::parse_config("[server]\n" + exp_a + "[backend_defaults.local]\nfd_cache = 1\n");
+  ASSERT_TRUE(local_with_defaults.has_value());
+  EXPECT_FALSE(core::cluster_catalog_exports(local_with_defaults->cluster));
+  EXPECT_TRUE(core::validate_config(*local_with_defaults).has_value());
+
+  // The [backend_defaults] section does not leak into the export that precedes it, and
+  // an [export.*] table after it still binds to the export (section switching).
+  auto mixed =
+      core::parse_config("[server]\n" + exp_a + "[backend_defaults.local]\nfd_cache = 1\n" +
+                         "[[export]]\npath = \"/var\"\nfsid = 2\n[export.local]\nfd_cache = 2\n");
+  ASSERT_TRUE(mixed.has_value());
+  EXPECT_TRUE(mixed->exports[0].backend_config.values.empty());
+  EXPECT_STREQ(mixed->exports[1].backend_config.values.at("fd_cache"), "2");
+  // Neither key nor table enters the export digest (they are not export identity).
+  auto plain = core::parse_config(cluster + exp_a);
+  ASSERT_TRUE(plain.has_value());
+  EXPECT_STREQ(core::canonical_exports_digest(*plain),
+               core::canonical_exports_digest(
+                   *core::parse_config(cluster + "catalog_refresh = \"manual\"\n" + exp_a +
+                                       "[backend_defaults.local]\nfd_cache = 1\n")));
+}
+
 TEST(Ctl, ExportReloadDynamic) {
   core::ExportTable table;
   core::ExportConfig cfg;

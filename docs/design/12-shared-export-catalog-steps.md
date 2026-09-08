@@ -65,7 +65,7 @@
 
 ## 阶段 A：清单文档与存储（无行为变化）
 
-### A1 配置键
+### A1 配置键 ✅ 2026-09-08
 
 **目标**：解析并校验 11 §11.2 的三个新键；`exports_source = "local"`（默认）时后两者被忽略。
 
@@ -94,6 +94,13 @@
 `[backend_defaults.cephfs]` 里放 `fs_name` 被拒、放 `conf` 通过；`catalog_refresh = bogus` 被拒。
 
 **验收**：`lightnfsd --check-config` 对 11 §11.2 的本地示例返回 0；10 册示例结果不变。
+
+**实现注**（2026-09-08）：`Config::backend_defaults` 为 `map<backend, BackendConfig>`；`[backend_defaults.<name>]`
+的键在**解析期**就按 `kPerNodeBackendKeys` 过滤（`per_node_backend_key()`），值解析与 `[export.<name>]`
+共用 `backend_value`；`cluster_catalog_exports()` 供 daemon / C1 判定。`run_server` 在 C1 落地前对
+`exports_source = "catalog"` 直接拒绝启动（`--check-config` 仍通过），避免跑一台空导出表的网关。
+`cluster_restart_required_report` 比较前把 `catalog_refresh` 抹平，其余 `[cluster]` 键（含
+`exports_source`）仍是 restart required。测试 `Ctl.CatalogConfigKeys`（`tests/test_ctl.cpp`）。
 
 ### A2 `core/catalog.*`：清单文档
 
