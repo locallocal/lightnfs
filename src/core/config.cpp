@@ -1,16 +1,18 @@
 #include "core/config.hpp"
+#include "core/config_parse.hpp"
 
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <charconv>
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 
@@ -19,7 +21,7 @@
 #include "util/sha256.hpp"
 
 namespace lnfs::core {
-namespace {
+namespace detail {
 
 std::string_view trim(std::string_view value) {
   while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
@@ -132,7 +134,103 @@ std::string normalize_path(std::string path) {
   return path;
 }
 
-}  // namespace
+Result<std::string> backend_value(std::string_view value) {
+  if (!value.empty() && value.front() == '"') return string_value(value);
+  if (value == "true" || value == "false") return std::string(value);
+  return std::to_string(LNFS_TRY(uint_value(value)));
+}
+
+std::string quote(std::string_view value) {
+  std::string out = "\"";
+  for (char ch : value) {
+    if (ch == '"' || ch == '\\') out += '\\';
+    if (ch == '\n')
+      out += "\\n";
+    else if (ch == '\t')
+      out += "\\t";
+    else
+      out += ch;
+  }
+  return out + "\"";
+}
+
+std::string quote_array(const std::vector<std::string>& values) {
+  std::string out = "[";
+  for (size_t i = 0; i < values.size(); ++i) out += (i ? ", " : "") + quote(values[i]);
+  return out + "]";
+}
+
+std::string backend_value_text(std::string_view value) {
+  if (value == "true" || value == "false") return std::string(value);
+  auto n = uint_value(value);
+  if (n && std::to_string(*n) == value) return std::string(value);
+  return quote(value);
+}
+
+Result<bool> ExportBlockParser::line(std::string_view line) {
+  if (line.front() == '[') {
+    if (!line.starts_with("[export.") || line.back() != ']') return false;
+    backend_table_ = true;
+    return true;
+  }
+  size_t equal = line.find('=');
+  if (equal == std::string_view::npos) return Err(errno_from(EINVAL));
+  std::string key(trim(line.substr(0, equal)));
+  std::string_view value = trim(line.substr(equal + 1));
+  if (backend_table_) {
+    exp_.backend_config.values[key] = LNFS_TRY(backend_value(value));
+    return true;
+  }
+  auto u32 = [&](uint32_t& slot) -> Result<void> {
+    uint64_t n = LNFS_TRY(uint_value(value));
+    if (n > UINT32_MAX) return Err(errno_from(EINVAL));
+    slot = static_cast<uint32_t>(n);
+    return {};
+  };
+  if (key == "path")
+    exp_.path = normalize_path(LNFS_TRY(string_value(value)));
+  else if (key == "backend")
+    exp_.backend = LNFS_TRY(string_value(value));
+  else if (key == "fsid")
+    LNFS_TRY(u32(exp_.fsid));
+  else if (key == "clients")
+    exp_.clients = LNFS_TRY(string_array(value));
+  else if (key == "nodes")
+    exp_.nodes = LNFS_TRY(string_array(value));
+  else if (key == "readonly")
+    exp_.readonly = LNFS_TRY(bool_value(value));
+  else if (key == "anon_uid")
+    LNFS_TRY(u32(exp_.anon_uid));
+  else if (key == "anon_gid")
+    LNFS_TRY(u32(exp_.anon_gid));
+  else if (key == "squash") {
+    std::string s = LNFS_TRY(string_value(value));
+    if (s == "none")
+      exp_.squash = Squash::kNone;
+    else if (s == "root")
+      exp_.squash = Squash::kRoot;
+    else if (s == "all")
+      exp_.squash = Squash::kAll;
+    else
+      return Err(errno_from(EINVAL));
+  } else if (key == "read_bps")
+    exp_.read_bps = LNFS_TRY(size_value(value));
+  else if (key == "write_bps")
+    exp_.write_bps = LNFS_TRY(size_value(value));
+  else if (key == "iops")
+    LNFS_TRY(u32(exp_.iops));
+  else if (key == "disabled" && disabled_)
+    *disabled_ = LNFS_TRY(bool_value(value));
+  else {
+    LNFS_WARN("export fsid={}: unknown key \"{}\"", exp_.fsid, key);
+    return Err(errno_from(EINVAL));
+  }
+  return true;
+}
+
+}  // namespace detail
+
+using namespace detail;  // NOLINT(google-build-using-namespace): the helpers above
 
 Result<Cidr> Cidr::parse(std::string_view value) {
   Cidr out;
@@ -180,36 +278,26 @@ bool Cidr::contains(const sockaddr_storage& peer) const {
 
 Result<Config> parse_config(std::string_view text) {
   Config config;
-  enum class Section {
-    kNone,
-    kServer,
-    kLimits,
-    kProtocol,
-    kTls,
-    kCluster,
-    kExport,
-    kExportBackend,
-    kBackendDefaults
-  };
+  enum class Section { kNone, kServer, kLimits, kProtocol, kTls, kCluster, kBackendDefaults };
   Section section = Section::kNone;
-  ExportConfig* exp = nullptr;
+  // The `[[export]]` block being filled (keys + `[export.<backend>]`), shared with the
+  // catalog parser; a vector push only happens while no block is open.
+  std::optional<ExportBlockParser> block;
   backend::BackendConfig* defaults = nullptr;  // the [backend_defaults.<name>] being filled
-  // A backend subtable value: quoted string, bare bool, or unsigned number (as text).
-  auto backend_value = [](std::string_view value) -> Result<std::string> {
-    if (!value.empty() && value.front() == '"') return string_value(value);
-    if (value == "true" || value == "false") return std::string(value);
-    return std::to_string(LNFS_TRY(uint_value(value)));
-  };
   std::istringstream input{std::string(text)};
   std::string raw_line;
   while (std::getline(input, raw_line)) {
     std::string clean = strip_comment(raw_line);
     std::string_view line = trim(clean);
     if (line.empty()) continue;
+    if (block) {
+      if (LNFS_TRY(block->line(line))) continue;
+      block.reset();
+    }
     if (line == "[[export]]") {
       config.exports.emplace_back();
-      exp = &config.exports.back();
-      section = Section::kExport;
+      block.emplace(config.exports.back());
+      section = Section::kNone;
       continue;
     }
     if (line.front() == '[' && line.back() == ']') {
@@ -218,7 +306,6 @@ Result<Config> parse_config(std::string_view text) {
       else if (line == "[protocol]") section = Section::kProtocol;
       else if (line == "[tls]") section = Section::kTls;
       else if (line == "[cluster]") section = Section::kCluster;
-      else if (line.starts_with("[export.") && exp) section = Section::kExportBackend;
       else if (line.starts_with("[backend_defaults.")) {
         // [backend_defaults.<backend>]: per-node keys for that backend (plan 12 A1).
         std::string_view name = line.substr(sizeof("[backend_defaults.") - 1);
@@ -414,42 +501,6 @@ Result<Config> parse_config(std::string_view text) {
         config.server.drc_mem = LNFS_TRY(size_value(value));
       else
         return Err(errno_from(EINVAL));
-    } else if (section == Section::kExport && exp) {
-      if (key == "path") exp->path = normalize_path(LNFS_TRY(string_value(value)));
-      else if (key == "backend") exp->backend = LNFS_TRY(string_value(value));
-      else if (key == "fsid") {
-        uint64_t n = LNFS_TRY(uint_value(value));
-        if (n > UINT32_MAX) return Err(errno_from(EINVAL));
-        exp->fsid = static_cast<uint32_t>(n);
-      }
-      else if (key == "clients") exp->clients = LNFS_TRY(string_array(value));
-      else if (key == "nodes") exp->nodes = LNFS_TRY(string_array(value));
-      else if (key == "readonly") exp->readonly = LNFS_TRY(bool_value(value));
-      else if (key == "anon_uid") {
-        uint64_t n = LNFS_TRY(uint_value(value));
-        if (n > UINT32_MAX) return Err(errno_from(EINVAL));
-        exp->anon_uid = static_cast<uint32_t>(n);
-      } else if (key == "anon_gid") {
-        uint64_t n = LNFS_TRY(uint_value(value));
-        if (n > UINT32_MAX) return Err(errno_from(EINVAL));
-        exp->anon_gid = static_cast<uint32_t>(n);
-      }
-      else if (key == "squash") {
-        std::string s = LNFS_TRY(string_value(value));
-        if (s == "none") exp->squash = Squash::kNone;
-        else if (s == "root") exp->squash = Squash::kRoot;
-        else if (s == "all") exp->squash = Squash::kAll;
-        else return Err(errno_from(EINVAL));
-      }
-      else if (key == "read_bps") exp->read_bps = LNFS_TRY(size_value(value));
-      else if (key == "write_bps") exp->write_bps = LNFS_TRY(size_value(value));
-      else if (key == "iops") {
-        uint64_t n = LNFS_TRY(uint_value(value));
-        if (n > UINT32_MAX) return Err(errno_from(EINVAL));
-        exp->iops = static_cast<uint32_t>(n);
-      }
-    } else if (section == Section::kExportBackend && exp) {
-      exp->backend_config.values[key] = LNFS_TRY(backend_value(value));
     } else if (section == Section::kBackendDefaults && defaults) {
       // Only per-node keys belong here; cluster-wide keys (volume, fs_name, subdir, ...)
       // are export identity and live in the catalog (design 11 §11.2).
@@ -541,41 +592,71 @@ Result<void> validate_active_active(const Config& config) {
     LNFS_WARN("[cluster] node_address must be \"host:port\" under active-active");
     return Err(errno_from(EINVAL));
   }
-  // Isolation constraint: key → (fsid, nodes) of the first export seen in that group.
-  std::map<std::string, std::pair<uint32_t, const std::vector<std::string>*>> groups;
+  std::vector<const ExportConfig*> exports;
   for (const auto& exp : config.exports) {
     if (exp.nodes.empty()) {
       LNFS_WARN("export fsid={}: nodes is required under active-active", exp.fsid);
       return Err(errno_from(EINVAL));
     }
-    std::set<std::string_view> seen;
-    for (const auto& node : exp.nodes) {
-      if (!valid_cluster_node_name(node) || !seen.insert(node).second) {
-        LNFS_WARN("export fsid={}: nodes has an invalid or duplicate entry \"{}\"", exp.fsid,
-                  node);
-        return Err(errno_from(EINVAL));
-      }
-    }
-    const char* shared_key = exp.backend == "gluster"  ? "volume"
-                             : exp.backend == "lustre" ? "mount"
-                                                       : nullptr;
-    if (!shared_key) continue;
-    auto it = exp.backend_config.values.find(shared_key);
-    std::string group =
-        exp.backend + ":" + (it == exp.backend_config.values.end() ? "" : it->second);
-    auto [slot, fresh] = groups.emplace(group, std::make_pair(exp.fsid, &exp.nodes));
-    if (!fresh && *slot->second.second != exp.nodes) {
-      LNFS_WARN("export fsid={} and fsid={} share one {} {} but list different nodes: a "
-                "{} connection is per volume, so their owner lists must match (design 10 "
-                "§10.6)",
-                slot->second.first, exp.fsid, exp.backend, shared_key, exp.backend);
+    std::string why;
+    if (!valid_export_nodes(exp, why)) {
+      LNFS_WARN("{}", why);
       return Err(errno_from(EINVAL));
     }
+    exports.push_back(&exp);
+  }
+  std::string why;
+  if (!check_same_volume_nodes(exports, why)) {
+    LNFS_WARN("{}", why);
+    return Err(errno_from(EINVAL));
   }
   return {};
 }
 
 }  // namespace
+
+bool valid_export_nodes(const ExportConfig& exp, std::string& why) {
+  std::set<std::string_view> seen;
+  for (const auto& node : exp.nodes) {
+    if (!valid_cluster_node_name(node) || !seen.insert(node).second) {
+      why = std::format("export fsid={}: nodes has an invalid or duplicate entry \"{}\"", exp.fsid,
+                        node);
+      return false;
+    }
+  }
+  return true;
+}
+
+std::map<std::string, std::vector<const ExportConfig*>> same_volume_groups(
+    const std::vector<const ExportConfig*>& exports) {
+  std::map<std::string, std::vector<const ExportConfig*>> groups;
+  for (const ExportConfig* exp : exports) {
+    const char* shared_key = exp->backend == "gluster"  ? "volume"
+                             : exp->backend == "lustre" ? "mount"
+                                                        : nullptr;
+    if (!shared_key) continue;
+    auto it = exp->backend_config.values.find(shared_key);
+    groups[exp->backend + ":" + (it == exp->backend_config.values.end() ? "" : it->second)]
+        .push_back(exp);
+  }
+  return groups;
+}
+
+bool check_same_volume_nodes(const std::vector<const ExportConfig*>& exports, std::string& why) {
+  for (const auto& [group, members] : same_volume_groups(exports)) {
+    const ExportConfig* first = members.front();
+    for (const ExportConfig* exp : members) {
+      if (exp->nodes == first->nodes) continue;
+      std::string_view key = first->backend == "gluster" ? "volume" : "mount";
+      why = std::format(
+          "export fsid={} and fsid={} share one {} {} but list different nodes: a {} "
+          "connection is per volume, so their owner lists must match (design 10 §10.6)",
+          first->fsid, exp->fsid, first->backend, key, first->backend);
+      return false;
+    }
+  }
+  return true;
+}
 
 Result<void> validate_config(const Config& config) {
   backend::register_builtin_backends();

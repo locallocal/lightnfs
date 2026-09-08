@@ -124,6 +124,8 @@ struct ExportConfig {
   // `[cluster] mode = "active-active"`; a restart-required change.
   std::vector<std::string> nodes;
   backend::BackendConfig backend_config;
+
+  friend bool operator==(const ExportConfig&, const ExportConfig&) = default;
 };
 
 // Multi-gateway failover (design 09 §9.3, plan 10 A1): the [cluster] section.  Every
@@ -168,6 +170,18 @@ bool cluster_catalog_exports(const ClusterConfig& cluster);
 bool valid_cluster_node_name(std::string_view name);
 // "host:port" / "[v6]:port" with a non-empty host and a port in 1..65535.
 bool valid_node_address(std::string_view address);
+// `[[export]] nodes` syntax: every entry a valid node name, no duplicates (an empty list
+// passes; whether one is required depends on the cluster mode).  `why` explains a false.
+bool valid_export_nodes(const ExportConfig& exp, std::string& why);
+// Exports whose backend connection is per volume rather than per fsid (design 10 §10.6):
+// "<backend>:<volume>" → the exports (input order) sharing that Gluster `volume` /
+// Lustre `mount`.  Other backends are absent.  Shared by the local active-active
+// validation and the catalog validation (plan 12 A2).
+std::map<std::string, std::vector<const ExportConfig*>> same_volume_groups(
+    const std::vector<const ExportConfig*>& exports);
+// The rule on top of that grouping: every export of a group lists the same `nodes`.
+// `why` names the two fsids on a false.
+bool check_same_volume_nodes(const std::vector<const ExportConfig*>& exports, std::string& why);
 
 struct Config {
   ServerConfig server;

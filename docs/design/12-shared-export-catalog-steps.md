@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施计划，未开始**。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（A1、A2 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -102,7 +102,7 @@
 `cluster_restart_required_report` 比较前把 `catalog_refresh` 抹平，其余 `[cluster]` 键（含
 `exports_source`）仍是 restart required。测试 `Ctl.CatalogConfigKeys`（`tests/test_ctl.cpp`）。
 
-### A2 `core/catalog.*`：清单文档
+### A2 `core/catalog.*`：清单文档 ✅ 2026-09-09
 
 **目标**：清单的解析、序列化、与本地合并、集群级校验、diff，全部纯函数，不碰共享目录。
 
@@ -143,6 +143,21 @@
 合并把 `[backend_defaults.cephfs] conf` 注入每个 cephfs 导出、不注入 local 导出；`validate_catalog`
 的每条规则各一例（fsid 重复、path 互为前缀、`nodes` 重复、同卷不同 `nodes`、未知后端）；
 `diff_catalog` 覆盖七类变化；`catalog_from_config` 去掉本机键且 `canonical_exports_text` 相等。
+
+**实现注**（2026-09-09）：TOML 子集的值解析器与导出块解析器抽到内部头 `src/core/config_parse.hpp`
+（`detail::` 命名空间，仅 `src/core` 内使用）：`ExportBlockParser` 逐行吃一个 `[[export]]` 块（键 +
+`[export.<backend>]` 子表），`parse_config` 与 `parse_catalog` 共用，未知导出键一律 EINVAL（原先静默
+忽略）；`disabled` 只在给了槽位（清单）时接受，本地文件里出现即 EINVAL；`[export.<backend>]` 子表必须紧跟其
+`[[export]]` 块（中间隔了别的段再出现，原先会挂到上一个导出上，现在 EINVAL）。清单文件**一键一行**（08 册示例
+里 `a = 1; b = 2` 的分号写法只是文档缩写，解析器不认）。`parse_catalog` 要求 `[catalog]` 头与 `version`
+键，导出按 fsid 稳定排序，子表里的本机键告警丢弃（§11.2 的向前兼容）；`validate_catalog` 对内存里构造的
+清单拒绝本机键，并多一个可选 `std::string* why` 出参（D1/D3 的错误文案），不给时走 WARN 日志。
+`serialize_catalog` 写全部标量键（含默认值）、`nodes = []`、子表键排序，字符串转义与 `string_value`
+互逆，子表值仅在与 `backend_value` 逐字互逆时才裸写（`"007"` 仍带引号）。`merge_with_local` 跳过
+`disabled` 导出，结果按 fsid 升序。`diff_catalog` 的 `rejected` 独占，其余四类按字段独立（一个 fsid
+可同时在 `enabled` 与 `nodes_changed`）。同卷同进退抽成 `same_volume_groups` +
+`check_same_volume_nodes`，`validate_active_active` 改为复用；`nodes` 语法抽成 `valid_export_nodes`。
+`ExportConfig` / `BackendConfig` 加默认 `operator==`。测试 `tests/test_catalog.cpp`（8 例）。
 
 ### A3 `ClusterStore` 清单键
 

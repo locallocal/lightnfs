@@ -287,6 +287,8 @@ struct BackendConfig {
   std::string path;
   uint64_t fsid = 0;
   std::unordered_map<std::string, std::string> values;
+
+  friend bool operator==(const BackendConfig&, const BackendConfig&) = default;
 };
 
 struct BackendFactory {
