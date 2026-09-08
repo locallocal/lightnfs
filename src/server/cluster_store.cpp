@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "core/atomic_file.hpp"
+#include "core/catalog.hpp"
 #include "core/file_handle.hpp"
 #include "util/log.hpp"
 
@@ -330,7 +331,127 @@ class PosixClusterStore final : public ClusterStore {
     return erase_client_in(fs_dir(fsid) + "/clients", owner_id);
   }
 
+  // ---- shared export catalog (plan 12 A3) --------------------------------------------
+
+  Result<std::optional<CatalogDoc>> read_catalog() override {
+    auto text = LNFS_TRY(core::read_file_if_exists(dir_ + "/catalog.toml"));
+    if (!text) return std::optional<CatalogDoc>{};
+    uint64_t version = LNFS_TRY(core::peek_catalog_version(*text));
+    return std::optional<CatalogDoc>{CatalogDoc{version, std::move(*text)}};
+  }
+
+  Result<uint64_t> write_catalog(uint64_t expected, std::string_view text) override {
+    uint64_t version = LNFS_TRY(core::peek_catalog_version(text));
+    if (version != expected + 1) return Err(errno_from(EINVAL));
+    LNFS_TRY(ensure_layout());
+    auto guard = LNFS_TRY(lock("catalog"));
+    auto current = LNFS_TRY(read_catalog());  // a corrupt current file is EINVAL: fix it first
+    if ((current ? current->version : 0) != expected) return Err(errno_from(EAGAIN));
+    if (current) {
+      LNFS_TRY(ensure_dir(history_dir()));
+      LNFS_TRY(core::atomic_write_file(history_path(current->version), current->text));
+    }
+    LNFS_TRY(core::atomic_write_file(dir_ + "/catalog.toml", text));
+    prune_history();
+    return version;
+  }
+
+  Result<std::vector<uint64_t>> list_catalog_history() override {
+    std::vector<uint64_t> out;
+    std::error_code ec;
+    std::filesystem::directory_iterator it(history_dir(), ec);
+    if (ec == std::errc::no_such_file_or_directory) return out;
+    if (ec) return Err(errno_from(ec.value()));
+    for (const auto& entry : it) {
+      auto name = entry.path().filename().string();
+      if (!name.ends_with(".toml") || name.find(".tmp.") != std::string::npos ||
+          !entry.is_regular_file(ec))
+        continue;
+      std::string_view stem(name);
+      stem.remove_suffix(sizeof(".toml") - 1);
+      if (auto version = parse_u64(stem); version && std::to_string(*version) == stem)
+        out.push_back(*version);
+    }
+    if (ec) return Err(errno_from(ec.value()));
+    std::sort(out.begin(), out.end());
+    return out;
+  }
+
+  Result<CatalogDoc> read_catalog_history(uint64_t version) override {
+    auto text = LNFS_TRY(core::read_file_if_exists(history_path(version)));
+    if (!text) return Err(errno_from(ENOENT));
+    return CatalogDoc{LNFS_TRY(core::peek_catalog_version(*text)), std::move(*text)};
+  }
+
+  Result<void> put_catalog_applied(const CatalogApplied& applied) override {
+    if (!valid_applied_node(applied.node) || applied.digest.empty() ||
+        applied.digest.find(' ') != std::string::npos || applied.status.empty() ||
+        applied.status.find('\n') != std::string::npos)
+      return Err(errno_from(EINVAL));
+    LNFS_TRY(ensure_layout());
+    return core::atomic_write_file(dir_ + "/catalog." + applied.node,
+                                   std::to_string(applied.version) + " " + applied.digest + " " +
+                                       std::to_string(applied.applied_at_ms) + " " +
+                                       applied.status + "\n");
+  }
+
+  Result<std::vector<CatalogApplied>> list_catalog_applied() override {
+    std::vector<CatalogApplied> out;
+    std::error_code ec;
+    std::filesystem::directory_iterator it(dir_, ec);
+    if (ec == std::errc::no_such_file_or_directory) return out;
+    if (ec) return Err(errno_from(ec.value()));
+    for (const auto& entry : it) {
+      auto name = entry.path().filename().string();
+      if (!name.starts_with("catalog.") || name.find(".tmp.") != std::string::npos ||
+          !entry.is_regular_file(ec))
+        continue;
+      std::string node = name.substr(sizeof("catalog.") - 1);
+      if (!valid_applied_node(node)) continue;  // catalog.toml / catalog.lock
+      auto text = core::read_file_if_exists(entry.path().string());
+      if (!text || !*text) continue;
+      out.push_back(LNFS_TRY(parse_catalog_applied(std::move(node), **text)));
+    }
+    if (ec) return Err(errno_from(ec.value()));
+    std::sort(out.begin(), out.end(),
+              [](const CatalogApplied& a, const CatalogApplied& b) { return a.node < b.node; });
+    return out;
+  }
+
  private:
+  std::string history_dir() const { return dir_ + "/catalog.history"; }
+  std::string history_path(uint64_t version) const {
+    return history_dir() + "/" + std::to_string(version) + ".toml";
+  }
+  // Best effort, under catalog.lock: drop the oldest beyond kCatalogHistoryKeep.
+  void prune_history() {
+    auto versions = list_catalog_history();
+    if (!versions || versions->size() <= kCatalogHistoryKeep) return;
+    for (size_t i = 0; i + kCatalogHistoryKeep < versions->size(); ++i)
+      (void)::unlink(history_path((*versions)[i]).c_str());
+  }
+  // catalog.<node> must not collide with the catalog's own files.
+  static bool valid_applied_node(std::string_view node) {
+    return !node.empty() && node != "toml" && node != "lock" && node != "history" &&
+           node.find('/') == std::string_view::npos && node.find(' ') == std::string_view::npos;
+  }
+  // "<version> <digest> <applied_at_ms> <status>": the status is the rest of the line.
+  static Result<CatalogApplied> parse_catalog_applied(std::string node, std::string_view text) {
+    std::string_view line = trim(text);
+    size_t a = line.find(' ');
+    size_t b = a == std::string_view::npos ? a : line.find(' ', a + 1);
+    size_t c = b == std::string_view::npos ? b : line.find(' ', b + 1);
+    if (c == std::string_view::npos) return Err(errno_from(EINVAL));
+    CatalogApplied rec;
+    rec.node = std::move(node);
+    rec.version = LNFS_TRY(parse_u64(line.substr(0, a)));
+    rec.digest = std::string(line.substr(a + 1, b - a - 1));
+    rec.applied_at_ms = static_cast<int64_t>(LNFS_TRY(parse_u64(line.substr(b + 1, c - b - 1))));
+    rec.status = std::string(line.substr(c + 1));
+    if (rec.status.empty()) return Err(errno_from(EINVAL));
+    return rec;
+  }
+
   // Releases the O_EXCL lock file when the owning operation returns.
   struct LockGuard {
     std::string path;

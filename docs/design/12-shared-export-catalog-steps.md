@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（A1、A2 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -159,7 +159,7 @@
 `check_same_volume_nodes`，`validate_active_active` 改为复用；`nodes` 语法抽成 `valid_export_nodes`。
 `ExportConfig` / `BackendConfig` 加默认 `operator==`。测试 `tests/test_catalog.cpp`（8 例）。
 
-### A3 `ClusterStore` 清单键
+### A3 `ClusterStore` 清单键 ✅ 2026-09-09
 
 **目标**：11 §11.3 的四个文件，**只加不改**。
 
@@ -192,6 +192,16 @@
 **测试**：`tests/test_cluster_store.cpp` 加 `ClusterStore.CatalogCasAndHistory`（首写 expected=0；
 版本错 → EAGAIN；history 内容 = 上一版；修剪；损坏的头 → EINVAL）、`CatalogAppliedPerNode`
 （覆盖写、列出、不被当作 `exports.` 摘要——扩 `:566-570` 的断言）。
+
+**实现注**（2026-09-09）：`write_catalog(expected, text)` **不改写文档**：`text` 的 `[catalog] version`
+必须等于 `expected + 1`（否则 EINVAL），存储侧只做 CAS（当前版本 ≠ `expected` → EAGAIN；当前文件头损坏
+→ EINVAL，先修复再提交）；调用方（D1/D3）用 A2 的 `serialize_catalog` 填好版本再写。轮询用的头解析是
+`core::peek_catalog_version`（A2 文件里新增，只扫 `[catalog]` 段的 `version` 键，不解析导出）。历史保留
+份数是 `server::kCatalogHistoryKeep = 32`，修剪在锁内尽力而为。`catalog.<node>` 的 status 是行尾剩余部分
+（可含空格），digest 不得含空格；节点名 `toml` / `lock` / `history` 与清单自身文件重名，`put_catalog_applied`
+拒绝（EINVAL），列出时也跳过。`MemClusterStore`：`catalog_docs`（version → text，最大者为当前版）、
+`catalog_applied`、`fail_write_catalog` 注入。测试 `ClusterStore.CatalogCasAndHistory` /
+`CatalogAppliedPerNode` / `MemCatalogMirrorsPosix`，`Catalog.PeekVersion`。
 
 ---
 

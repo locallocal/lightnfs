@@ -50,6 +50,9 @@ Result<Catalog> parse_catalog(std::string_view toml);
 // Canonical text: fixed key order, every scalar written out, exports fsid ascending,
 // subtable keys sorted.  parse_catalog(serialize_catalog(c)) == c for a valid c.
 std::string serialize_catalog(const Catalog& catalog);
+// Only `[catalog] version`, without parsing the exports: what the store's poll and its
+// CAS compare (plan 12 A3).  EINVAL when the header or the key is missing.
+Result<uint64_t> peek_catalog_version(std::string_view toml);
 
 // Catalog → this host's export table input: every enabled export with the local
 // `[backend_defaults.<its backend>]` keys merged in.  Catalog keys win; per-node keys

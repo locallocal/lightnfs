@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "core/catalog.hpp"
 #include "server/cluster_store.hpp"
 
 namespace lnfs::test {
@@ -212,6 +213,57 @@ struct MemClusterStore final : server::ClusterStore {
   Result<void> erase_client(uint32_t fsid, std::string_view o) override {
     fs_clients[fsid].erase(std::string(o));
     return {};
+  }
+
+  // ---- shared export catalog (plan 12 A3): version → text, the highest is current ----
+  std::map<uint64_t, std::string> catalog_docs;
+  std::map<std::string, server::CatalogApplied> catalog_applied;
+  Errno fail_write_catalog = Errno::kOk;
+
+  uint64_t catalog_version() const {
+    return catalog_docs.empty() ? 0 : catalog_docs.rbegin()->first;
+  }
+  Result<std::optional<server::CatalogDoc>> read_catalog() override {
+    if (fail_read != Errno::kOk) return Err(fail_read);
+    if (catalog_docs.empty()) return std::optional<server::CatalogDoc>{};
+    return std::optional<server::CatalogDoc>{
+        server::CatalogDoc{catalog_version(), catalog_docs.rbegin()->second}};
+  }
+  Result<uint64_t> write_catalog(uint64_t expected, std::string_view text) override {
+    log.push_back("write_catalog:" + std::to_string(expected));
+    if (fail_write_catalog != Errno::kOk) return Err(fail_write_catalog);
+    uint64_t version = LNFS_TRY(core::peek_catalog_version(text));
+    if (version != expected + 1) return Err(errno_from(EINVAL));
+    if (catalog_version() != expected) return Err(errno_from(EAGAIN));
+    catalog_docs[version] = std::string(text);
+    while (catalog_docs.size() > server::kCatalogHistoryKeep + 1)
+      catalog_docs.erase(catalog_docs.begin());
+    return version;
+  }
+  Result<std::vector<uint64_t>> list_catalog_history() override {
+    std::vector<uint64_t> out;
+    for (const auto& [version, text] : catalog_docs)
+      if (version != catalog_version()) out.push_back(version);
+    return out;
+  }
+  Result<server::CatalogDoc> read_catalog_history(uint64_t version) override {
+    auto it = catalog_docs.find(version);
+    if (it == catalog_docs.end() || version == catalog_version()) return Err(errno_from(ENOENT));
+    return server::CatalogDoc{version, it->second};
+  }
+  Result<void> put_catalog_applied(const server::CatalogApplied& applied) override {
+    log.push_back("catalog_applied:" + applied.node + "=" + std::to_string(applied.version));
+    if (applied.node.empty() || applied.node == "toml" || applied.node == "lock" ||
+        applied.node == "history" || applied.digest.find(' ') != std::string::npos)
+      return Err(errno_from(EINVAL));
+    catalog_applied[applied.node] = applied;
+    return {};
+  }
+  Result<std::vector<server::CatalogApplied>> list_catalog_applied() override {
+    if (fail_list != Errno::kOk) return Err(fail_list);
+    std::vector<server::CatalogApplied> out;
+    for (const auto& [node, rec] : catalog_applied) out.push_back(rec);
+    return out;
   }
 
   // Test knobs: age one node's whole record out, or hand an fsid to another node.
