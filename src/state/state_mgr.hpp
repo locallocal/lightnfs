@@ -71,7 +71,7 @@ struct ClientRec {
   // gets a put when the first state in an export is minted and an erase when the
   // last one goes.  Client shard.
   std::unordered_map<uint32_t, uint32_t> fs_states;
-  // Migration hint (design 11 §11.4, plan 12 A3/C3): until this coarse-seconds
+  // Migration hint (design 10 §10.4, plan 12 A3/C3): until this coarse-seconds
   // deadline SEQUENCE answers carry SEQ4_STATUS_LEASE_MOVED, telling the client an
   // export it held state in moved to another gateway.  0 = none.
   std::atomic<int64_t> lease_moved_until{0};
@@ -201,7 +201,7 @@ class StateMgr {
     // hooks may block on IO; put/erase failures are the hooks' to log (a lost record
     // only costs that client its reclaim, it never fails the session).
     // `fsid` selects the list (plan 12 A3): 0 is the global list every failover /
-    // single gateway uses; an export's own list (design 11 §11.3, fs/<fsid>/clients/)
+    // single gateway uses; an export's own list (design 10 §10.3, fs/<fsid>/clients/)
     // is used only with `per_fsid_reclaim`.  Unset hooks: state_dir/clients/ for 0,
     // state_dir/fs/<fsid>/clients/ otherwise.
     struct StableStore {
@@ -209,7 +209,7 @@ class StateMgr {
       std::function<void(uint32_t fsid, std::string_view owner_id)> put;
       std::function<void(uint32_t fsid, std::string_view owner_id)> erase;
     } stable;
-    // Active-active (design 11 §11.5, plan 12 A3): keep the reclaim list per export —
+    // Active-active (design 10 §10.5, plan 12 A3): keep the reclaim list per export —
     // a client is listed for an export when it mints its first state there (OPEN /
     // LOCK / delegation) and delisted when its last one goes or the client expires;
     // the global list is not written.  Off: the global list is written at
@@ -223,7 +223,7 @@ class StateMgr {
   // ---- grace (7.5; per export since plan 12 A3) ----
   // Grace is a set of windows keyed by fsid.  Window 0 covers every export: the
   // single-gateway restart and the failover takeover arm it from the global list.
-  // An export's own window (design 11 §11.5) is armed when this gateway takes that
+  // An export's own window (design 10 §10.5) is armed when this gateway takes that
   // export over, from that export's list, and gates only that export — the others
   // keep serving.  Every window ends on its deadline or when all its listed clients
   // sent RECLAIM_COMPLETE.
@@ -239,7 +239,7 @@ class StateMgr {
   bool in_stable_list(uint32_t fsid, std::string_view owner_id) const;  // global or export
   int64_t grace_remaining_seconds() const;  // the longest live window
   int64_t grace_remaining_seconds(uint32_t fsid) const;
-  // This gateway stops owning an export (design 11 §11.7/§11.8, plan 12 A3): every
+  // This gateway stops owning an export (design 10 §10.7/§10.8, plan 12 A3): every
   // open / lock / delegation in it is dropped — no reclaim-list change (the new owner
   // arms its grace from that list), no native unlock (the new owner's takeover hook
   // clears the storage side), no callbacks — the clients that held state there get

@@ -384,7 +384,7 @@ TEST(ClusterController, PostedActivationRenewsMeanwhileAndTimerThreadRuns) {
   EXPECT_STREQ(store2.fence->node, "gw9");
 }
 
-// ---- active-active: FsClusterController (design 11 §11.3/§11.14, plan 12 C1) ----------
+// ---- active-active: FsClusterController (design 10 §10.3/§10.14, plan 12 C1) ----------
 //
 // Same shape as above: MemClusterStore, inline hooks that record their calls per
 // fsid, tick() by hand.  The view the controller publishes is what the v4 engine
@@ -457,7 +457,7 @@ size_t count(const std::vector<std::string>& log, const std::string& entry) {
 
 }  // namespace
 
-// The single-gateway degeneration gate (design 11 §11.13): one node listed for every
+// The single-gateway degeneration gate (design 10 §10.13): one node listed for every
 // export takes them all, under one fence record, and the view says Active for each.
 TEST(FsClusterController, SingleNodeOwnsEveryFsid) {
   MemStore store;
@@ -508,7 +508,7 @@ TEST(FsClusterController, SingleNodeOwnsEveryFsid) {
   EXPECT_STREQ(snap[1].owner->node, "gw1");
 }
 
-// The batched lease (design 11 §11.3): holding N exports costs one store write per
+// The batched lease (design 10 §10.3): holding N exports costs one store write per
 // tick, and a steady tick writes nothing else.
 TEST(FsClusterController, RenewIsOneWritePerTick) {
   MemStore store;
@@ -854,7 +854,7 @@ TEST(FsClusterController, TakeoverFollowsNodeOrder) {
   EXPECT_STREQ(rec.takeovers[1].prev_node, "");
 }
 
-// A dead gateway's exports spread over its successors (design 11 §11.8): gw1 held F1
+// A dead gateway's exports spread over its successors (design 10 §10.8): gw1 held F1
 // (list [gw1, gw2, gw3]) and F2 (list [gw1, gw3, gw2]); after it lapses gw2 takes F1
 // and gw3 takes F2, each yielding to the other on the export where it is next.
 TEST(FsClusterController, DeadNodeSpreadsAcrossSuccessors) {
@@ -967,7 +967,7 @@ TEST(FsClusterController, StuckUnownedFsidSkipsIdlePredecessor) {
   EXPECT_TRUE(fs_role(gw2, 2) == server::Role::kActive);
 }
 
-// Gateways starting together (design 11 §11.8): a predecessor that has not written
+// Gateways starting together (design 10 §10.8): a predecessor that has not written
 // any record yet is not dead — for one ttl after our own start we leave its exports
 // alone; once it has heartbeated we keep yielding, and only silence past that window
 // counts as dead.  An expired record is dead at once.

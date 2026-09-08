@@ -95,7 +95,7 @@ sudo systemctl enable --now lightnfs
   `conns` / `kill-conn <id>`（连接列表与强制断开）、`loglevel <lv>`、`reload`
   （热重载，见下）、`drain`（停止接受新连接、存量继续服务——从 LB 优雅摘流，重启前
   不可逆）、`grace-end`（提前结束 grace）、`cluster status|takeover [--force]|standby`
-  （多网关主备，09/10 册：`status` 一行给出 `role= node= epoch= fence_owner= fence_age_ms=
+  （多网关主备，09 册：`status` 一行给出 `role= node= epoch= fence_owner= fence_age_ms=
   shared_dir= peers=` 及接管计数；`takeover` 让 standby 网关取围栏并开始服务，`--force`
   覆盖他人仍有效的围栏——仅在确认对方已死时使用；`standby` 让 active 网关排空连接并释放围栏。
   单网关答 `cluster: not enabled`）。所有命令加 `--json` 输出机器可读 JSON。
@@ -126,7 +126,7 @@ sudo systemctl enable --now lightnfs
   `lightnfs_cluster_{takeovers,fence_lost,activation_failures}_total` 与
   `lightnfs_cluster_activation_seconds` 直方图——告警建议：`fence_age_seconds` 超过
   `fence_lease` 的 2 倍、`fence_lost_total` 增长、`role{role="active"}` 在集群内之和 ≠ 1。
-- **接管钩子**（`[cluster] takeover_hook`，10 册 D1）：接管时先对每个导出调后端的
+- **接管钩子**（`[cluster] takeover_hook`，09 §9.7）：接管时先对每个导出调后端的
   `takeover()`（默认空操作；CephFS 的会话回收见 D2），再以进程身份执行该脚本，环境变量
   `LNFS_CLUSTER_ID`、`LNFS_NODE`、`LNFS_EPOCH`、`LNFS_PREV_NODE`（被替换的围栏记录所属节点，
   首次启动为空）；多活（§6）下每次只接管一个导出，再加 `LNFS_FSID`（该导出的 fsid，主备接管为空）
@@ -146,7 +146,7 @@ sudo systemctl enable --now lightnfs
 
 多个 lightnfsd 网关共挂同一个共享后端（GlusterFS / Lustre / CephFS）时，`[cluster]`
 段开启后一个网关故障、客户端切到另一个网关**不重挂载、不重建应用状态**：打开的文件、
-字节锁、未提交的写由 NFSv4.1 的 grace/reclaim 机制恢复（设计见 09 册，实现见 10 册）。
+字节锁、未提交的写由 NFSv4.1 的 grace/reclaim 机制恢复（设计与改动清单见 09 册）。
 
 **二选一**：同一个 `[cluster]` 段有两种互斥的形态，由 `mode` 选择——`mode = "failover"`
 （默认，本节：一个 VIP、整机一个角色、一个网关服务全部导出）或 `mode = "active-active"`
@@ -209,14 +209,14 @@ keepalived 只管地址漂移（两者可叠加：VIP 是第一反应，围栏�
 - **委托随故障网关消亡**：故障网关授予的读委托不迁移；客户端用 CLAIM_DELEG_PREV_FH
   被接受为普通 open 状态（名单 + grace 门禁），在 grace 内重新打开，grace 期不再授新委托。
 - **每进程一个角色**：failover 模式下一个网关要么整体 active 要么整体 standby；要"按导出
-  分角色"、让多台网关同时服务，用 `mode = "active-active"`（§6，设计见 11 册）。
+  分角色"、让多台网关同时服务，用 `mode = "active-active"`（§6，设计见 10 册）。
 - **接管耗时**：铸新 epoch + 重建协议栈 + 进 grace 通常 < 1s（`lightnfs_cluster_activation_seconds`
   指标覆盖）；客户端感知到的中断还包含 VIP 漂移与 TCP 重连时间，由 keepalived 与客户端
   `timeo`/`retrans` 决定。
 
 ## 6. 多网关多活（每导出一个属主网关）
 
-`[cluster] mode = "active-active"`（设计见 11 册）让 N 个网关同时对外
+`[cluster] mode = "active-active"`（设计见 10 册）让 N 个网关同时对外
 服务：**每个导出（fsid）有且只有一个属主网关**在服务，不同导出可落在不同网关；属主猝死时
 它的每个导出各自迁到各自的备选网关（负载自然分散），计划内迁移把一个导出平滑交给指定网关。
 客户端由 NFSv4.1 协议本身引导到属主：伪根 `/` 在所有网关一致，跨进一个导出的边界时，非属主
@@ -390,7 +390,7 @@ takeovers fence_lost activation_failures`；`--json` 时 `exports` 为数组）�
   `lightnfs_cephfs_blocklisted_total`——出现即需重启网关重连。`lightnfs-ctl fdcache` 对
   cephfs 导出显示 Fh/inode 缓存/jukebox/黑名单/锁句柄计数；`clear-poison` 同样适用；
   `scripts/check_cephapi_abi.sh` 在有 `cephfs/libcephfs.h` 的主机上校验绑定签名与结构布局。
-  多网关接管（10 册 D2）：新网关以同一会话 uuid（`[export.cephfs] uuid`，默认
+  多网关接管（09 §9.7）：新网关以同一会话 uuid（`[export.cephfs] uuid`，默认
   `<cluster id>-<fsid>`）`ceph_start_reclaim(…, RESET)`，MDS 立即驱逐故障网关的会话并释放其
   caps/锁，客户端在 grace 内的 reclaim 不再被残留锁挡住；standby 会话不带 uuid。MDS 不支持
   （EOPNOTSUPP）或 libcephfs 太旧（缺 `ceph_start_reclaim`）只告警，残留按 MDS 自身会话超时

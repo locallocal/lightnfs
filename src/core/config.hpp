@@ -118,7 +118,7 @@ struct ExportConfig {
   uint64_t read_bps = 0;
   uint64_t write_bps = 0;
   uint32_t iops = 0;
-  // Active-active owner priority list (design 11 §11.3/§11.10, plan 12 A1): the first
+  // Active-active owner priority list (design 10 §10.3/§10.10, plan 12 A1): the first
   // live node serves this fsid, the rest take over in order.  Empty outside
   // `[cluster] mode = "active-active"`; a restart-required change.
   std::vector<std::string> nodes;
@@ -133,7 +133,7 @@ struct ClusterConfig {
   std::string shared_dir;    // absolute path on the shared filesystem (design 09 §9.4)
   std::string node;          // this gateway's name; empty = gethostname() at startup
   std::string role = "auto"; // active | standby | auto (active-active: auto only)
-  // failover (design 09: one active gateway behind one VIP) | active-active (design 11:
+  // failover (design 09: one active gateway behind one VIP) | active-active (design 10:
   // one owner gateway per export, clients referred with fs_locations).  Plan 12 A1.
   std::string mode = "failover";
   // active-active: this gateway's own "host:port" ("[v6]:port" for IPv6), the address

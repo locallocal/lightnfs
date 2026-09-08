@@ -155,7 +155,7 @@ public:
     virtual Task<Result<void>> start();                // 挂载/连接（gluster: glfs_init）
     virtual Task<Result<void>> stop();
     virtual std::optional<LockMgrRef> native_locks();  // kByteLocks 时提供（5.8）
-    virtual Task<Result<void>> takeover(const ClusterIdentity&);  // 多网关接管钩子（09 §9.7，10 册 D1）：默认空操作且成功；不加 Cap 位、api_version 不变
+    virtual Task<Result<void>> takeover(const ClusterIdentity&);  // 多网关接管钩子（09 §9.7，09 实施步骤 D1）：默认空操作且成功；不加 Cap 位、api_version 不变
 };
 
 // 工厂注册：配置驱动实例化

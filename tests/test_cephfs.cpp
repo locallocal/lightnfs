@@ -894,7 +894,7 @@ TEST(Cephfs, TakeoverIsScopedToOneExport) {
 // reclaims its lock inside grace through a real ReclaimProbe over backend 10's lock
 // manager: DELAY while the ghost holds the range, a takeover() of fsid 10 alone
 // reclaims cluster-x-10, and the retry wins — while fsid 9's session, uuid and ghost
-// lock never move (design 11 §11.6 "only that fsid is reclaimed").
+// lock never move (design 10 §10.6 "only that fsid is reclaimed").
 TEST(Cephfs, PerFsidTakeoverReclaimIsolation) {
   Mount m;  // fsid 9
   backend::CephBackend::Config cfg;

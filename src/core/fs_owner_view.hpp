@@ -1,5 +1,5 @@
 #pragma once
-// Per-export ownership as this gateway sees it (design 11 §11.3/§11.4, plan 12 B2):
+// Per-export ownership as this gateway sees it (design 10 §10.3/§10.4, plan 12 B2):
 // the cluster controller publishes a fresh snapshot whenever a fence, an owner record
 // or one of its own roles changes; the v4 engine reads one snapshot per operation to
 // decide between serving an export, referring the client to its owner (fs_locations /

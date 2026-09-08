@@ -34,7 +34,7 @@ class Engine {
   // Distinct servers must present distinct values or clients treat them as trunking
   // paths of one server (plan doc 10 §1.7); main derives the default from
   // hostname + state_dir.  The literal fallback only serves tests.
-  // referrals: active-active (design 11 §11.2, plan 12 B1) — EXCHANGE_ID announces
+  // referrals: active-active (design 10 §10.2, plan 12 B1) — EXCHANGE_ID announces
   // EXCHGID4_FLAG_SUPP_MOVED_REFER | _MIGR, so clients follow fs_locations across the
   // gateways of one server_scope.
   Engine(core::ExportTable& exports, core::FileHandleCodec& handles,

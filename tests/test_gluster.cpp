@@ -698,7 +698,7 @@ TEST(Gluster, ConfigFactory) {
   runtime.stop_and_join();
 }
 
-// plan 12 A1 (design 11 §11.6): under active-active, exports sharing one
+// plan 12 A1 (design 10 §10.6): under active-active, exports sharing one
 // `[export.gluster] volume` ride one libgfapi connection, so they must list the same
 // owner nodes.  The validator reads the section's real `volume` key — the same key the
 // factory turns into GlusterBackend::Config::volume.

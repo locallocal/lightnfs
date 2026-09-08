@@ -1,13 +1,14 @@
-# 多网关多活（12 册）——收尾项
+# 多网关多活（10 册）——收尾项
 
-> 12 册（原 `docs/design/12-multi-gateway-active-active-steps.md`）的 A1–E3 已全部实现并合并
-> （每步标 ✅ 2026-09-06），该实施步骤文档随之与 10 册同样撤下，每步实现记录见 git 历史。本文件
-> 按其 §E3 的约定收口未闭环项，供后续处理。设计见 11 册。
+> 多活的实施步骤文档（原 `docs/design/12-multi-gateway-active-active-steps.md`）的 A1–E3 已全部
+> 实现并合并（每步标 ✅ 2026-09-06），随之与 09 的步骤文档（原 10 册）同样撤下，每步实现记录见
+> git 历史。本文件按其 §E3 的约定收口未闭环项，供后续处理。设计与实现见
+> [../design/10-multi-gateway-active-active.md](../design/10-multi-gateway-active-active.md)（原 11 册）。
 
 ## 1. VM（root）端到端未跑
 
 `scripts/accept_active_active_local.sh` 的四段（referral / migration / 猝死分散接管 / 单网关
-退化）在本机 loopback + local 后端上 Release 与 ASAN 各跑一轮通过。12 册 §E1 还提到给
+退化）在本机 loopback + local 后端上 Release 与 ASAN 各跑一轮通过。原步骤文档 §E1 还提到给
 `scripts/accept_failover_vm.sh` 加 `LNFS_MODE=active-active` 轮：真内核客户端
 `mount -o vers=4.1` 走入口地址、`ls` 触发子挂载、`cat /proc/self/mountinfo` 断言子挂载目标、
 `migrate` 中跑 fsx 不中断。本机无 root、无 `mount.nfs`，未实现；留待有 root 的 CI/VM。
@@ -31,6 +32,6 @@ MOVED（尚未属主）。`scripts/cluster_roll.sh` 的 `migrate()` 因此轮询
 
 ## 4. 全仓库既有 clang-format/clang-tidy 漂移
 
-沿用 10 册的处理：新增代码的 format/tidy 无新增问题，但全仓库既有漂移未在本特性里顺手改
+沿用 09 实施时的处理：新增代码的 format/tidy 无新增问题，但全仓库既有漂移未在本特性里顺手改
 （见 `docs/toto/multi-gateway-failover-followups.md` §3）。`src/core/boot_epoch.cpp` 的
 `fscanf`（`bugprone-unchecked-string-to-number-conversion`）等既有告警不属于本册改动。

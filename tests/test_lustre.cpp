@@ -607,7 +607,7 @@ TEST(Lustre, ConfigFactory) {
   made->reset();
 }
 
-// plan 12 A1 (design 11 §11.6): under active-active, exports sharing one
+// plan 12 A1 (design 10 §10.6): under active-active, exports sharing one
 // `[export.lustre] mount` ride one client connection, so they must list the same owner
 // nodes — the validator reads the section's real `mount` key.
 TEST(Lustre, SameMountExportsShareOwnerList) {

@@ -18,7 +18,7 @@ Result<uint64_t> bump_boot_epoch(const std::string& state_dir);
 
 using WriteVerf = std::array<std::byte, 8>;
 WriteVerf verifier_from_epoch(uint64_t epoch);
-// Active-active (design 11 §11.5, plan 12 E1): every gateway keeps its own epoch
+// Active-active (design 10 §10.5, plan 12 E1): every gateway keeps its own epoch
 // (epoch.<node>), so two gateways can share an epoch value — and a client whose export
 // migrated between them must still see the verifier change and resend UNSTABLE data.
 // The node name goes into the high half; the epoch stays in the low half (a restart

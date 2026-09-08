@@ -106,7 +106,7 @@ std::optional<Identity> local_identity(const std::string& state_dir) {
 // Cluster mode (design 09 §9.3/§9.5): the key is shared.  Failover: the epoch is the
 // global one — advanced by the ClusterController when this gateway takes over (plan
 // 10 C2), never at process start; the value read here only labels the standby and the
-// stack is built with the epoch the takeover minted.  Active-active (design 11 §11.5,
+// stack is built with the epoch the takeover minted.  Active-active (design 10 §10.5,
 // plan 12 B1): every gateway is its own server, so the epoch is the node's own
 // (epoch.<node>), advanced once per process start like a single gateway's boot epoch
 // — the stack is built once and stays up while exports come and go.
@@ -459,7 +459,7 @@ int run_server(const std::string& config_path) {
     const std::string node = core::cluster_node_name(cluster_cfg);
     if (!check_exports_consistency(*cluster_store, node, exports_digest)) return 1;
     if (active_active) {
-      // Where our fs_locations point (design 11 §11.3): peers copy it into the view
+      // Where our fs_locations point (design 10 §10.3): peers copy it into the view
       // for the exports we own.
       if (auto put = cluster_store->put_node_address(node, cluster_cfg.node_address); !put) {
         LNFS_ERROR("cannot publish the node address to the cluster store: {}",
@@ -517,7 +517,7 @@ int run_server(const std::string& config_path) {
   };
   const std::chrono::milliseconds drain_grace(2 * cluster_cfg.fence_lease_ms);
   if (cluster_store && active_active) {
-    // Active-active (design 11, plan 12 C1): the stack is built once (below) and stays
+    // Active-active (design 10, plan 12 C1): the stack is built once (below) and stays
     // up; the controller moves single exports in and out of service through the
     // state manager and the owner view.  Its ctl surface arrives with plan 12 C4.
     FsClusterController::Hooks hooks;
