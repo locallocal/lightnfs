@@ -20,6 +20,7 @@
 #include "core/atomic_file.hpp"
 #include "core/boot_epoch.hpp"
 #include "core/config.hpp"
+#include "mem_cluster_store.hpp"
 #include "server/cluster_store.hpp"
 #include "util/sha256.hpp"
 
@@ -563,8 +564,11 @@ TEST(ClusterStore, PerFsidEpochOwnerClientsAndNodes) {
   EXPECT_EQ(*a->read_node_epoch("gw1"), 2u);
   EXPECT_EQ(*a->read_epoch(), 0u);  // the failover epoch is a different counter
   EXPECT_FALSE(std::filesystem::exists(dir.path + "/epoch.gw1.lock"));
-  // The per-node epoch files are not mistaken for export digests or fence records.
+  // The per-node epoch files — and the catalog's files (plan 12 A3) — are not mistaken
+  // for export digests or fence records.
   ASSERT_TRUE(a->put_exports_digest("gw1", "sha256:aaaa").has_value());
+  ASSERT_TRUE(a->write_catalog(0, "[catalog]\nversion = 1\n").has_value());
+  ASSERT_TRUE(a->put_catalog_applied({"gw1", 1, "sha256:aaaa", now_ms(), "ok"}).has_value());
   auto digests = a->list_exports_digests();
   ASSERT_TRUE(digests.has_value());
   EXPECT_EQ(digests->size(), 1u);
@@ -637,4 +641,182 @@ TEST(ClusterStore, PerFsidEpochOwnerClientsAndNodes) {
   ASSERT_TRUE(left.has_value() && left->size() == 1u);
   EXPECT_STREQ((*left)[0], "Linux NFSv4.1 host-a/1");
   EXPECT_FALSE(has_tmp_leftovers(dir.path + "/fs/7/clients"));
+}
+
+// ---- shared export catalog (design 11 §11.3, plan 12 A3) ------------------------------
+
+namespace {
+
+std::string catalog_text(uint64_t version, const std::string& tag = "") {
+  return "[catalog]\nversion = " + std::to_string(version) + "\ncomment = \"" + tag +
+         "\"\n[[export]]\npath = \"/export/a\"\nfsid = 1\nbackend = \"local\"\n";
+}
+
+}  // namespace
+
+TEST(ClusterStore, CatalogCasAndHistory) {
+  TmpDir dir;
+  auto a = server::make_posix_cluster_store(dir.path);
+  auto b = server::make_posix_cluster_store(dir.path);
+
+  // Nothing published yet: nullopt, no history, a stale expectation is EAGAIN.
+  auto none = a->read_catalog();
+  ASSERT_TRUE(none.has_value());
+  EXPECT_FALSE(none->has_value());
+  auto no_history = a->list_catalog_history();
+  ASSERT_TRUE(no_history.has_value() && no_history->empty());
+  auto early = a->write_catalog(1, catalog_text(2));
+  ASSERT_TRUE(!early.has_value());
+  EXPECT_TRUE(early.error() == errno_from(EAGAIN));
+  // The text must say expected + 1 and must have a header at all.
+  auto wrong = a->write_catalog(0, catalog_text(5));
+  ASSERT_TRUE(!wrong.has_value());
+  EXPECT_TRUE(wrong.error() == errno_from(EINVAL));
+  auto headless = a->write_catalog(0, "[[export]]\npath = \"/a\"\nfsid = 1\n");
+  ASSERT_TRUE(!headless.has_value());
+  EXPECT_TRUE(headless.error() == errno_from(EINVAL));
+  EXPECT_FALSE(std::filesystem::exists(dir.path + "/catalog.toml"));
+
+  // First commit: expected 0 → version 1, read back verbatim, lock released.
+  auto v1 = a->write_catalog(0, catalog_text(1, "first"));
+  ASSERT_TRUE(v1.has_value());
+  EXPECT_EQ(*v1, 1u);
+  auto doc = b->read_catalog();
+  ASSERT_TRUE(doc.has_value() && doc->has_value());
+  EXPECT_EQ((*doc)->version, 1u);
+  EXPECT_STREQ((*doc)->text, catalog_text(1, "first"));
+  EXPECT_STREQ(slurp(dir.path + "/catalog.toml"), catalog_text(1, "first"));
+  EXPECT_FALSE(std::filesystem::exists(dir.path + "/catalog.lock"));
+  EXPECT_TRUE(a->list_catalog_history()->empty());  // nothing was replaced yet
+
+  // Second commit from the other store object: history holds the replaced content.
+  auto v2 = b->write_catalog(1, catalog_text(2, "second"));
+  ASSERT_TRUE(v2.has_value());
+  EXPECT_EQ(*v2, 2u);
+  auto history = a->list_catalog_history();
+  ASSERT_TRUE(history.has_value());
+  EXPECT_TRUE(*history == std::vector<uint64_t>{1});
+  auto old = a->read_catalog_history(1);
+  ASSERT_TRUE(old.has_value());
+  EXPECT_EQ(old->version, 1u);
+  EXPECT_STREQ(old->text, catalog_text(1, "first"));
+  auto missing = a->read_catalog_history(2);  // the current version is not history
+  ASSERT_TRUE(!missing.has_value());
+  EXPECT_TRUE(missing.error() == errno_from(ENOENT));
+  // The loser of a race sees EAGAIN and the file is untouched.
+  auto lost = a->write_catalog(1, catalog_text(2, "lost"));
+  ASSERT_TRUE(!lost.has_value());
+  EXPECT_TRUE(lost.error() == errno_from(EAGAIN));
+  EXPECT_STREQ(slurp(dir.path + "/catalog.toml"), catalog_text(2, "second"));
+
+  // History is pruned to the newest kCatalogHistoryKeep versions.
+  for (uint64_t v = 3; v <= server::kCatalogHistoryKeep + 5; ++v) {
+    auto r = (v % 2 ? a : b)->write_catalog(v - 1, catalog_text(v));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, v);
+  }
+  const uint64_t current = server::kCatalogHistoryKeep + 5;
+  EXPECT_EQ((*a->read_catalog())->version, current);
+  history = a->list_catalog_history();
+  ASSERT_TRUE(history.has_value());
+  ASSERT_TRUE(history->size() == server::kCatalogHistoryKeep);
+  EXPECT_EQ(history->front(), current - server::kCatalogHistoryKeep);
+  EXPECT_EQ(history->back(), current - 1);
+  EXPECT_TRUE(!a->read_catalog_history(current - server::kCatalogHistoryKeep - 1).has_value());
+  EXPECT_FALSE(has_tmp_leftovers(dir.path));
+  EXPECT_FALSE(has_tmp_leftovers(dir.path + "/catalog.history"));
+
+  // A corrupt header is EINVAL for readers and blocks commits until it is repaired.
+  write_raw(dir.path + "/catalog.toml", "[catalog]\ncomment = \"no version\"\n");
+  auto corrupt = a->read_catalog();
+  ASSERT_TRUE(!corrupt.has_value());
+  EXPECT_TRUE(corrupt.error() == errno_from(EINVAL));
+  auto blocked = a->write_catalog(current, catalog_text(current + 1));
+  ASSERT_TRUE(!blocked.has_value());
+  EXPECT_TRUE(blocked.error() == errno_from(EINVAL));
+  EXPECT_FALSE(std::filesystem::exists(dir.path + "/catalog.lock"));
+}
+
+TEST(ClusterStore, CatalogAppliedPerNode) {
+  TmpDir dir;
+  auto a = server::make_posix_cluster_store(dir.path);
+  auto b = server::make_posix_cluster_store(dir.path);
+  auto none = a->list_catalog_applied();
+  ASSERT_TRUE(none.has_value() && none->empty());
+
+  const int64_t t0 = now_ms();
+  ASSERT_TRUE(a->put_catalog_applied({"gw2", 3, "sha256:bbbb", t0, "ok"}).has_value());
+  ASSERT_TRUE(b->put_catalog_applied({"gw1", 2, "sha256:aaaa", t0 - 5, "ok"}).has_value());
+  // Overwrite, with a status that has spaces in it.
+  ASSERT_TRUE(
+      a->put_catalog_applied({"gw1", 2, "sha256:aaaa", t0 + 5,
+                              "error:merge failed: fsid 3 has no [backend_defaults.cephfs]"})
+          .has_value());
+  EXPECT_STREQ(slurp(dir.path + "/catalog.gw2"), "3 sha256:bbbb " + std::to_string(t0) + " ok\n");
+  auto listed = b->list_catalog_applied();
+  ASSERT_TRUE(listed.has_value() && listed->size() == 2u);
+  EXPECT_STREQ((*listed)[0].node, "gw1");
+  EXPECT_EQ((*listed)[0].version, 2u);
+  EXPECT_STREQ((*listed)[0].digest, "sha256:aaaa");
+  EXPECT_EQ((*listed)[0].applied_at_ms, t0 + 5);
+  EXPECT_STREQ((*listed)[0].status, "error:merge failed: fsid 3 has no [backend_defaults.cephfs]");
+  EXPECT_STREQ((*listed)[1].node, "gw2");
+  EXPECT_EQ((*listed)[1].version, 3u);
+  EXPECT_STREQ((*listed)[1].status, "ok");
+
+  // Not confused with the catalog's own files, and never counted as an export digest
+  // or a fence record (the `exports.` / `fence.` prefix filters).
+  ASSERT_TRUE(a->write_catalog(0, catalog_text(1)).has_value());
+  ASSERT_TRUE(a->write_catalog(1, catalog_text(2)).has_value());
+  ASSERT_TRUE(a->put_exports_digest("gw1", "sha256:aaaa").has_value());
+  EXPECT_EQ(a->list_catalog_applied()->size(), 2u);
+  auto digests = a->list_exports_digests();
+  ASSERT_TRUE(digests.has_value());
+  EXPECT_EQ(digests->size(), 1u);
+  EXPECT_STREQ((*digests)[0].first, "gw1");
+  EXPECT_EQ(a->list_fences()->size(), 0u);
+  EXPECT_EQ(a->list_nodes()->size(), 0u);
+  // Reserved node names and unstorable fields are refused.
+  for (const char* node : {"toml", "lock", "history", "", "a/b", "a b"})
+    EXPECT_FALSE(a->put_catalog_applied({node, 1, "sha256:x", t0, "ok"}).has_value());
+  EXPECT_FALSE(a->put_catalog_applied({"gw3", 1, "sha 256", t0, "ok"}).has_value());
+  EXPECT_FALSE(a->put_catalog_applied({"gw3", 1, "sha256:x", t0, ""}).has_value());
+  EXPECT_FALSE(a->put_catalog_applied({"gw3", 1, "sha256:x", t0, "ok\nmore"}).has_value());
+  EXPECT_EQ(a->list_catalog_applied()->size(), 2u);
+  // A corrupt record is an error for the listing; a stray in-flight temp file is skipped.
+  write_raw(dir.path + "/catalog.gw3.tmp.1.2", "garbage");
+  EXPECT_EQ(a->list_catalog_applied()->size(), 2u);
+  write_raw(dir.path + "/catalog.gw3", "3 sha256:cccc\n");
+  EXPECT_FALSE(a->list_catalog_applied().has_value());
+}
+
+TEST(ClusterStore, MemCatalogMirrorsPosix) {
+  // The in-memory double keeps the CAS, history and per-node semantics the controller
+  // and ctl tests rely on.
+  test::MemClusterStore mem;
+  EXPECT_FALSE(mem.read_catalog()->has_value());
+  EXPECT_TRUE(mem.write_catalog(1, catalog_text(2)).error() == errno_from(EAGAIN));
+  EXPECT_TRUE(mem.write_catalog(0, catalog_text(3)).error() == errno_from(EINVAL));
+  EXPECT_EQ(*mem.write_catalog(0, catalog_text(1)), 1u);
+  EXPECT_EQ(*mem.write_catalog(1, catalog_text(2)), 2u);
+  EXPECT_TRUE(mem.write_catalog(1, catalog_text(2)).error() == errno_from(EAGAIN));
+  EXPECT_EQ((*mem.read_catalog())->version, 2u);
+  EXPECT_TRUE(*mem.list_catalog_history() == std::vector<uint64_t>{1});
+  EXPECT_STREQ(mem.read_catalog_history(1)->text, catalog_text(1));
+  EXPECT_TRUE(mem.read_catalog_history(2).error() == errno_from(ENOENT));
+  for (uint64_t v = 3; v <= server::kCatalogHistoryKeep + 5; ++v)
+    ASSERT_TRUE(mem.write_catalog(v - 1, catalog_text(v)).has_value());
+  EXPECT_EQ(mem.list_catalog_history()->size(), server::kCatalogHistoryKeep);
+  EXPECT_EQ(mem.list_catalog_history()->front(), 5u);
+  mem.fail_write_catalog = errno_from(EIO);
+  EXPECT_TRUE(mem.write_catalog(server::kCatalogHistoryKeep + 5, catalog_text(99)).error() ==
+              errno_from(EIO));
+  ASSERT_TRUE(mem.put_catalog_applied({"gw2", 3, "sha256:b", 1, "ok"}).has_value());
+  ASSERT_TRUE(mem.put_catalog_applied({"gw1", 2, "sha256:a", 1, "error:x y"}).has_value());
+  EXPECT_FALSE(mem.put_catalog_applied({"toml", 1, "sha256:a", 1, "ok"}).has_value());
+  auto listed = mem.list_catalog_applied();
+  ASSERT_TRUE(listed.has_value() && listed->size() == 2u);
+  EXPECT_STREQ((*listed)[0].node, "gw1");
+  EXPECT_STREQ((*listed)[1].status, "ok");
+  EXPECT_TRUE(mem.log.back() == "catalog_applied:toml=1");
 }

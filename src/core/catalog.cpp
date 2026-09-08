@@ -110,6 +110,25 @@ Result<Catalog> parse_catalog(std::string_view text) {
   return catalog;
 }
 
+Result<uint64_t> peek_catalog_version(std::string_view text) {
+  bool in_header = false;
+  std::istringstream input{std::string(text)};
+  std::string raw_line;
+  while (std::getline(input, raw_line)) {
+    std::string clean = strip_comment(raw_line);
+    std::string_view line = trim(clean);
+    if (line.empty()) continue;
+    if (line.front() == '[') {
+      in_header = line == "[catalog]";
+      continue;
+    }
+    size_t equal = line.find('=');
+    if (!in_header || equal == std::string_view::npos) continue;
+    if (trim(line.substr(0, equal)) == "version") return uint_value(line.substr(equal + 1));
+  }
+  return Err(errno_from(EINVAL));
+}
+
 std::string serialize_catalog(const Catalog& catalog) {
   const auto& meta = catalog.meta;
   std::string out = std::format(

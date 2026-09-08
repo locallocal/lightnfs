@@ -134,6 +134,24 @@ TEST(Catalog, ParseAndRoundTrip) {
   EXPECT_TRUE(*empty_back == empty);
 }
 
+TEST(Catalog, PeekVersion) {
+  // The store's poll reads only the header (plan 12 A3): no export parsing, so a
+  // catalog with exports it cannot parse still answers its version.
+  EXPECT_EQ(*core::peek_catalog_version(kSample), 7u);
+  EXPECT_EQ(*core::peek_catalog_version("[catalog]\nversion=3\n"), 3u);
+  EXPECT_EQ(*core::peek_catalog_version("# c\n\n[catalog]\ncomment = \"x\"\nversion = 12 # v\n"),
+            12u);
+  EXPECT_EQ(*core::peek_catalog_version("[catalog]\nversion = 4\n[[export]]\nbogus = ??\n"), 4u);
+  EXPECT_EQ(*core::peek_catalog_version(core::serialize_catalog(core::Catalog{})), 0u);
+  auto bad = [](const char* text) { return !core::peek_catalog_version(text).has_value(); };
+  EXPECT_TRUE(bad(""));
+  EXPECT_TRUE(bad("[[export]]\nversion = 1\n"));  // wrong section
+  EXPECT_TRUE(bad("[catalog]\ncomment = \"no version\"\n"));
+  EXPECT_TRUE(bad("[catalog]\nversion = \"7\"\n"));
+  EXPECT_TRUE(bad("version = 7\n[catalog]\n"));  // before the header
+  EXPECT_TRUE(bad("[catalog]\n[[export]]\nversion = 7\n"));
+}
+
 TEST(Catalog, ParseRejects) {
   auto bad = [](const std::string& text) { return !core::parse_catalog(text).has_value(); };
   const std::string header = "[catalog]\nversion = 1\n";

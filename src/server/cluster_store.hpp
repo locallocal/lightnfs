@@ -41,6 +41,14 @@ namespace lnfs::server {
 //   fs/<fsid>/epoch     that export's takeover generation, +1 per owner change
 //   fs/<fsid>/owner     "<fs_epoch> <address> <node>\n": the current owner
 //   fs/<fsid>/clients/<fnv64>   that export's reclaim list, kept by its owner
+//
+// Shared export catalog (design 11 §11.3, plan 12 A3), beside the above:
+//   catalog.toml                the current catalog: whole-file atomic replace, the
+//                               version inside its [catalog] header
+//   catalog.history/<version>.toml   the content each commit replaced, newest 32 kept
+//   catalog.lock                writer serialization (write_catalog's CAS)
+//   catalog.<node>              "<applied_version> <digest> <applied_at_ms> <status>\n":
+//                               what that gateway runs and how its last apply went
 struct FenceRecord {
   std::string node;
   uint64_t epoch = 0;
@@ -52,6 +60,23 @@ struct OwnerRecord {
   std::string node;
   std::string address;   // that node's `[cluster] node_address`
   uint64_t fs_epoch = 0;
+};
+
+// The catalog document as stored: its text verbatim plus the version peeked from the
+// [catalog] header (plan 12 A3).
+struct CatalogDoc {
+  uint64_t version = 0;
+  std::string text;
+};
+
+// One gateway's catalog.<node> record: the version it last applied (or last tried),
+// the export digest it runs, when, and "ok" | "error:<text>".
+struct CatalogApplied {
+  std::string node;
+  uint64_t version = 0;
+  std::string digest;
+  int64_t applied_at_ms = 0;
+  std::string status;
 };
 
 // One node's batched fence record: the exports it holds under one lease.
@@ -129,7 +154,29 @@ class ClusterStore {
   virtual Result<std::vector<std::string>> list_clients(uint32_t fsid) = 0;
   virtual Result<void> put_client(uint32_t fsid, std::string_view owner_id) = 0;
   virtual Result<void> erase_client(uint32_t fsid, std::string_view owner_id) = 0;
+
+  // ---- shared export catalog (design 11 §11.3, plan 12 A3) ---------------------------
+  // read_catalog: nullopt before the first publish; EINVAL when the file carries no
+  // parseable [catalog] version.  write_catalog is the CAS commit: `text` must carry
+  // version expected + 1 in its header (EINVAL otherwise — the store never edits the
+  // document), the stored version must equal `expected` (0 = none yet; EAGAIN
+  // otherwise, the loser re-reads and retries), the replaced content is copied to
+  // catalog.history/<version>.toml first and the history pruned to the newest 32.
+  // Returns the new version.
+  virtual Result<std::optional<CatalogDoc>> read_catalog() = 0;
+  virtual Result<uint64_t> write_catalog(uint64_t expected, std::string_view text) = 0;
+  // History: the versions kept, ascending (the current one is not among them);
+  // read_catalog_history is ENOENT for a version not kept.
+  virtual Result<std::vector<uint64_t>> list_catalog_history() = 0;
+  virtual Result<CatalogDoc> read_catalog_history(uint64_t version) = 0;
+  // catalog.<node>: one record per node, overwritten on every apply; listed by node.
+  // The node names "toml", "lock" and "history" are reserved (EINVAL).
+  virtual Result<void> put_catalog_applied(const CatalogApplied& applied) = 0;
+  virtual Result<std::vector<CatalogApplied>> list_catalog_applied() = 0;
 };
+
+// How many replaced catalog versions write_catalog keeps under catalog.history/.
+inline constexpr size_t kCatalogHistoryKeep = 32;
 
 // Clock-skew allowance applied to fence expiry checks.
 inline constexpr std::chrono::milliseconds kFenceSkewTolerance{500};
