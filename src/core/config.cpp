@@ -181,10 +181,25 @@ bool Cidr::contains(const sockaddr_storage& peer) const {
 Result<Config> parse_config(std::string_view text) {
   Config config;
   enum class Section {
-    kNone, kServer, kLimits, kProtocol, kTls, kCluster, kExport, kExportBackend
+    kNone,
+    kServer,
+    kLimits,
+    kProtocol,
+    kTls,
+    kCluster,
+    kExport,
+    kExportBackend,
+    kBackendDefaults
   };
   Section section = Section::kNone;
   ExportConfig* exp = nullptr;
+  backend::BackendConfig* defaults = nullptr;  // the [backend_defaults.<name>] being filled
+  // A backend subtable value: quoted string, bare bool, or unsigned number (as text).
+  auto backend_value = [](std::string_view value) -> Result<std::string> {
+    if (!value.empty() && value.front() == '"') return string_value(value);
+    if (value == "true" || value == "false") return std::string(value);
+    return std::to_string(LNFS_TRY(uint_value(value)));
+  };
   std::istringstream input{std::string(text)};
   std::string raw_line;
   while (std::getline(input, raw_line)) {
@@ -204,7 +219,15 @@ Result<Config> parse_config(std::string_view text) {
       else if (line == "[tls]") section = Section::kTls;
       else if (line == "[cluster]") section = Section::kCluster;
       else if (line.starts_with("[export.") && exp) section = Section::kExportBackend;
-      else return Err(errno_from(EINVAL));
+      else if (line.starts_with("[backend_defaults.")) {
+        // [backend_defaults.<backend>]: per-node keys for that backend (plan 12 A1).
+        std::string_view name = line.substr(sizeof("[backend_defaults.") - 1);
+        name.remove_suffix(1);
+        if (name.empty()) return Err(errno_from(EINVAL));
+        defaults = &config.backend_defaults[std::string(name)];
+        section = Section::kBackendDefaults;
+      } else
+        return Err(errno_from(EINVAL));
       continue;
     }
     size_t equal = line.find('=');
@@ -337,6 +360,10 @@ Result<Config> parse_config(std::string_view text) {
       else if (key == "takeover_hook") c.takeover_hook = LNFS_TRY(string_value(value));
       else if (key == "mode") c.mode = LNFS_TRY(string_value(value));
       else if (key == "node_address") c.node_address = LNFS_TRY(string_value(value));
+      else if (key == "exports_source")
+        c.exports_source = LNFS_TRY(string_value(value));
+      else if (key == "catalog_refresh")
+        c.catalog_refresh = LNFS_TRY(string_value(value));
       else if (key == "fence_lease") {
         uint64_t ms = LNFS_TRY(duration_ms_value(value));
         if (ms < 500 || ms > 60000) return Err(errno_from(EINVAL));
@@ -422,9 +449,18 @@ Result<Config> parse_config(std::string_view text) {
         exp->iops = static_cast<uint32_t>(n);
       }
     } else if (section == Section::kExportBackend && exp) {
-      if (!value.empty() && value.front() == '"') exp->backend_config.values[key] = LNFS_TRY(string_value(value));
-      else if (value == "true" || value == "false") exp->backend_config.values[key] = value;
-      else exp->backend_config.values[key] = std::to_string(LNFS_TRY(uint_value(value)));
+      exp->backend_config.values[key] = LNFS_TRY(backend_value(value));
+    } else if (section == Section::kBackendDefaults && defaults) {
+      // Only per-node keys belong here; cluster-wide keys (volume, fs_name, subdir, ...)
+      // are export identity and live in the catalog (design 11 §11.2).
+      if (!per_node_backend_key(key)) {
+        LNFS_WARN(
+            "[backend_defaults] key \"{}\" is not a per-node key: put it in the "
+            "catalog's [export.<backend>] table",
+            key);
+        return Err(errno_from(EINVAL));
+      }
+      defaults->values[key] = LNFS_TRY(backend_value(value));
     } else {
       return Err(errno_from(EINVAL));
     }
@@ -461,6 +497,16 @@ bool valid_node_address(std::string_view address) {
     return false;
   unsigned long n = std::stoul(std::string(port));
   return n >= 1 && n <= 65535;
+}
+
+bool cluster_catalog_exports(const ClusterConfig& cluster) {
+  return cluster.enabled && cluster.exports_source == "catalog";
+}
+
+bool per_node_backend_key(std::string_view key) {
+  for (auto k : kPerNodeBackendKeys)
+    if (k == key) return true;
+  return false;
 }
 
 bool cluster_active_active(const ClusterConfig& cluster) {
@@ -533,9 +579,42 @@ Result<void> validate_active_active(const Config& config) {
 
 Result<void> validate_config(const Config& config) {
   backend::register_builtin_backends();
-  if (config.exports.empty() || config.server.offload_threads <= 0 ||
-      config.server.max_connections <= 0 || config.server.inflight_per_conn <= 0)
+  if (config.server.offload_threads <= 0 || config.server.max_connections <= 0 ||
+      config.server.inflight_per_conn <= 0)
     return Err(errno_from(EINVAL));
+  {  // Export source (design 11 §11.2, plan 12 A1): local [[export]] blocks or the
+     // shared catalog.  A catalog gateway starts with whatever the catalog holds — an
+     // empty table before the first publish — so only "local" insists on exports here.
+    const auto& c = config.cluster;
+    if (c.exports_source != "local" && c.exports_source != "catalog") {
+      LNFS_WARN("[cluster] exports_source must be \"local\" or \"catalog\"");
+      return Err(errno_from(EINVAL));
+    }
+    if (c.catalog_refresh != "auto" && c.catalog_refresh != "manual") {
+      LNFS_WARN("[cluster] catalog_refresh must be \"auto\" or \"manual\"");
+      return Err(errno_from(EINVAL));
+    }
+    if (c.exports_source == "catalog") {
+      if (!c.enabled) {
+        LNFS_WARN("[cluster] exports_source = \"catalog\" needs [cluster] enabled = true");
+        return Err(errno_from(EINVAL));
+      }
+      if (!config.exports.empty()) {
+        LNFS_WARN(
+            "[cluster] exports_source = \"catalog\": exports come from the catalog, "
+            "remove the {} local [[export]] block(s)",
+            config.exports.size());
+        return Err(errno_from(EINVAL));
+      }
+    } else {
+      if (config.exports.empty()) return Err(errno_from(EINVAL));
+      for (const auto& [name, unused] : config.backend_defaults)
+        LNFS_WARN("[backend_defaults.{}] is ignored under exports_source = \"local\"", name);
+    }
+    for (const auto& [name, unused] : config.backend_defaults)
+      if (!backend::find_backend(name))
+        LNFS_WARN("[backend_defaults.{}]: no such backend in this build", name);
+  }
   for (const auto& cidr : config.server.metrics_allow)
     if (!Cidr::parse(cidr)) return Err(errno_from(EINVAL));
   if (!config.server.bind.empty()) {  // listener bind must be an address literal

@@ -59,7 +59,12 @@ takeover = "auto"            # auto | manual；多活下按导出生效：manual
 takeover_hook = ""           # 可选可执行脚本，接管时在后端钩子之后运行（超时 fence_lease；环境变量 LNFS_CLUSTER_ID/NODE/EPOCH/PREV_NODE；多活另有 LNFS_FSID、LNFS_REASON=takeover|migrate）
 mode = "failover"            # failover（09 主备，默认）| active-active（10 册多活，每导出一个属主网关）
 node_address = ""            # 多活必填：本网关自有地址 "host:port" / "[v6]:port"，写入 owner 记录、作为 fs_locations 指向本网关的地址；failover 下忽略
+exports_source = "local"     # local（本文件的 [[export]]，默认）| catalog（共享目录 catalog.toml，11 册；本文件不得再有 [[export]]，首版发布前可空表启动；改动需重启）
+catalog_refresh = "auto"     # 仅 catalog：auto = 围栏 tick 上发现新版即应用 | manual = 只记待应用，`ctl cluster catalog apply` / reload / SIGHUP 触发；可热改
 # unsafe_skip_backend_checks = false   # 仅测试：后端能力不达标只告警
+
+[backend_defaults.cephfs]    # 仅 catalog：本机键（conf/keyring/id/user/name/log_file/fd_cache/mon_host）合并进清单里每个该后端的导出；出现集群键报错；local 模式下告警忽略
+conf = "/etc/ceph/ceph.conf"; keyring = "/etc/ceph/ceph.client.gw1.keyring"
 
 [[export]]                   # 见 06 分册 6.7；后端子表 [export.local|gluster|lustre|cephfs]
 # [export.cephfs] uuid = ""  # 多网关接管回收的会话 uuid（09 实施步骤 D2）；空 = <cluster id>-<fsid>，各网关相同
