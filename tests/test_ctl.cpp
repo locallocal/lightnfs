@@ -761,8 +761,19 @@ TEST(Ctl, ClusterFsCommands) {
     EXPECT_STREQ(ask("cluster takeover 9"), "cluster: unknown fsid 9\n");
     EXPECT_STREQ(ask("cluster standby 9 --json"), "{\"error\":\"unknown fsid 9\"}\n");
     EXPECT_STREQ(ask("cluster bogus"),
-                 "cluster: expected status|takeover <fsid> [--force]|standby <fsid>|migrate "
-                 "<fsid> <node>\n");
+                 "cluster: expected status|exports [<node>]|takeover <fsid> [--force]|standby "
+                 "<fsid>|migrate <fsid> <node>\n");
+    // exports: nobody serves anything yet; us (not heartbeating), registered gw2, a node
+    // only named in an export list, and a stranger.
+    EXPECT_STREQ(ask("cluster exports"),
+                 "node=gw1 alive=no address=10.0.0.1:2049 exports=0 fsids=-\n");
+    EXPECT_STREQ(ask("cluster exports gw2 --json"),
+                 "{\"node\":\"gw2\",\"alive\":true,\"address\":\"10.0.0.2:2049\",\"fsids\":[],"
+                 "\"exports\":[]}\n");
+    EXPECT_STREQ(ask("cluster exports gw9"),
+                 "cluster: unknown node gw9 (not registered, not in any export's nodes)\n");
+    EXPECT_STREQ(ask("cluster exports gw9 --json"),
+                 "{\"error\":\"unknown node gw9 (not registered, not in any export's nodes)\"}\n");
     EXPECT_STREQ(ask("cluster migrate 1"), "cluster: fsid and node required\n");
     EXPECT_STREQ(ask("cluster migrate --json"), "{\"error\":\"fsid and node required\"}\n");
     EXPECT_STREQ(ask("cluster migrate 9 gw2"), "cluster: unknown fsid 9\n");
@@ -790,6 +801,16 @@ TEST(Ctl, ClusterFsCommands) {
                           "\"fence_age_ms\":") != std::string::npos);
     EXPECT_STREQ(ask("cluster migrate 2 gw1 --json"),
                  "{\"error\":\"fsid 2 not active here (role=remote, owner=gw2)\"}\n");
+    // exports gw2: the two it holds, with paths, as this gateway sees them.
+    EXPECT_STREQ(ask("cluster exports gw2"),
+                 "node=gw2 alive=yes address=10.0.0.2:2049 exports=2 fsids=2,3\n"
+                 "fsid=2 path=/export/2 role=remote fs_epoch=5\n"
+                 "fsid=3 path=/export/3 role=remote fs_epoch=2\n");
+    EXPECT_STREQ(ask("cluster exports gw2 --json"),
+                 "{\"node\":\"gw2\",\"alive\":true,\"address\":\"10.0.0.2:2049\",\"fsids\":[2,3],"
+                 "\"exports\":[{\"fsid\":2,\"path\":\"/export/2\",\"role\":\"remote\","
+                 "\"fs_epoch\":5},{\"fsid\":3,\"path\":\"/export/3\",\"role\":\"remote\","
+                 "\"fs_epoch\":2}]}\n");
 
     // takeover 1: free fence, no force needed; the hook runs, the row flips to active.
     EXPECT_STREQ(ask("cluster takeover 1"),
@@ -802,6 +823,10 @@ TEST(Ctl, ClusterFsCommands) {
     EXPECT_TRUE(st.find(" grace_remaining_s=0 takeovers=1 fence_lost=0 activation_failures=0\n") !=
                 std::string::npos);
     EXPECT_STREQ(ask("cluster takeover 1"), "cluster: fsid 1 not remote (role=active)\n");
+    // exports (ours): the export we just took, active; taking it wrote our heartbeat.
+    EXPECT_STREQ(ask("cluster exports gw1"),
+                 "node=gw1 alive=yes address=10.0.0.1:2049 exports=1 fsids=1\n"
+                 "fsid=1 path=/export/1 role=active fs_epoch=1\n");
     // migrate 1: to ourselves, to a stranger, to a dead peer — refused; to live gw2 —
     // the owner record names it and the export drains (plan 12 D1).
     EXPECT_STREQ(ask("cluster migrate 1 gw1"),

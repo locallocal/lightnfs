@@ -275,8 +275,8 @@ nodes = ["gw2", "gw3", "gw1"]         # b 的属主优先 gw2 → 负载分摊
 - **不支持 referral 的老 v4 客户端**收到 MOVED 会失败：**直接挂到属主网关的 `node_address`**
   （`mount gw2:/export/b`），放弃分流透明性；属主变了要手工换挂。
 - **NFSv3 客户端**：v3 没有 `fs_locations`，多活对 v3 只能"每导出挂到其属主网关的地址"，
-  由运维/自动化维护导出 → 属主地址的映射（`lightnfs-ctl cluster status` 的 `owner=` /
-  `address=` 列）。这是多活对 v3 的明确边界；混挂 v3/v4 的部署，v3 侧要么固定挂属主，
+  由运维/自动化维护导出 → 属主地址的映射（`lightnfs-ctl cluster exports <node>` 列出该网关
+  此刻服务的 fsid / 路径 / 地址；或 `cluster status` 的 `owner=` / `address=` 列）。这是多活对 v3 的明确边界；混挂 v3/v4 的部署，v3 侧要么固定挂属主，
   要么整个部署退回 `mode = "failover"`。
 - **无属主的导出**（全部备选都不在）：状态类操作回 `NFS4ERR_DELAY`，客户端按 grace 语义
   重试直到某个备选接管；`lightnfs_cluster_fs_owner{fsid}` 无样本、`cluster status` 里

@@ -193,6 +193,7 @@ class FsClusterController {
     // node, address, fs epoch) / unowned.  Activating shows as unowned there.
     core::FsOwner view;
     std::vector<std::string> nodes;  // the export's owner order ([[export]] nodes)
+    std::string path;                // the export path, for `cluster exports`
   };
   // The role as the operator sees it (plan 12 C4): "activating" while the data-plane
   // work runs, else the view's active / draining / remote / unowned.
@@ -244,6 +245,8 @@ class FsClusterController {
   Result<std::vector<std::string>> peers() const;
   // The peers whose fence record (heartbeat) is live right now, sorted.  Blocking.
   Result<std::vector<std::string>> alive_peers() const;
+  // Every registered gateway with its node_address (nodes/<node>), sorted.  Blocking.
+  Result<std::vector<std::pair<std::string, std::string>>> registry() const;
   // Prometheus text (plan 12 C4), registered as a provider for the controller's
   // lifetime: lightnfs_cluster_fs_{role,owner,epoch,takeovers_total,fence_lost_total,
   // activation_failures_total}{fsid=...} and lightnfs_cluster_node_epoch.

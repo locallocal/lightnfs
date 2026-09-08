@@ -96,8 +96,8 @@ const char* kHelp =
     "unknown command; available: ping|version|status|metrics|dump-errors|drc [flush]|"
     "fdcache [flush]|clear-poison|state|expire-client <clientid>|conns|kill-conn <id>|"
     "loglevel <debug|info|warn|error>|reload|drain|grace-end|"
-    "cluster <status|takeover [<fsid>] [--force]|standby [<fsid>]|migrate <fsid> <node>>  "
-    "(append --json for JSON output)\n";
+    "cluster <status|exports [<node>]|takeover [<fsid>] [--force]|standby [<fsid>]|"
+    "migrate <fsid> <node>>  (append --json for JSON output)\n";
 
 }  // namespace
 
@@ -149,8 +149,8 @@ const char* cluster_usage(bool json) {
 
 const char* cluster_fs_usage(bool json) {
   return json ? "{\"error\":\"bad subcommand\"}\n"
-              : "cluster: expected status|takeover <fsid> [--force]|standby <fsid>|migrate "
-                "<fsid> <node>\n";
+              : "cluster: expected status|exports [<node>]|takeover <fsid> [--force]|standby "
+                "<fsid>|migrate <fsid> <node>\n";
 }
 
 // The fsid positional of `cluster takeover|standby <fsid>`: a decimal number.
@@ -302,6 +302,62 @@ std::string cluster_fs_status(const FsClusterController& fc, const DataPlane* dp
         fs.fence ? std::to_string(fs.fence->expires_at_ms - wall_ms) : "-", grace_left(fs),
         fs.takeovers, fs.fence_lost, fs.activation_failures);
   }
+  return out;
+}
+
+// `cluster exports [<node>]` under active-active: the exports one gateway serves right
+// now, as this gateway sees the store — "what does gw2 hold" for an operator, and the
+// export → owner-address map v3 clients need (design 10 §10.11).  <node> defaults to
+// this gateway.  A node counts as known when it is us, registered in nodes/<node>, or
+// named in some export's `nodes`; an export belongs to it when the view names it as
+// owner (plus our own exports still activating, which the view shows as unowned).
+std::string cluster_fs_exports(const FsClusterController& fc, std::string_view node,
+                               const Result<std::vector<std::pair<std::string, std::string>>>& reg,
+                               const Result<std::vector<std::string>>& alive, bool json) {
+  const auto snap = fc.snapshot();
+  const bool self = node == fc.node();
+  bool known = self;
+  std::string address = self ? fc.config().node_address : std::string();
+  if (reg)
+    for (const auto& [name, addr] : *reg)
+      if (name == node) {
+        known = true;
+        if (address.empty()) address = addr;
+      }
+  for (const auto& fs : snap)
+    for (const auto& name : fs.nodes)
+      if (name == node) known = true;
+  if (!known)
+    return cluster_error(
+        json, std::format("unknown node {} (not registered, not in any export's nodes)", node));
+  std::vector<const FsClusterController::FsState*> owned;
+  for (const auto& fs : snap) {
+    const bool named = fs.view.role != core::FsRole::kUnowned && fs.view.node == node;
+    if (named || (self && fs.role == Role::kActivating)) owned.push_back(&fs);
+    if (named && address.empty()) address = fs.view.address;
+  }
+  std::string fsids;
+  for (const auto* fs : owned) fsids += std::format("{}{}", fsids.empty() ? "" : ",", fs->fsid);
+  const char* alive_text = "?";
+  if (alive)
+    alive_text = std::find(alive->begin(), alive->end(), node) != alive->end() ? "yes" : "no";
+  if (json) {
+    std::string rows;
+    for (const auto* fs : owned)
+      rows += std::format("{}{{\"fsid\":{},\"path\":\"{}\",\"role\":\"{}\",\"fs_epoch\":{}}}",
+                          rows.empty() ? "" : ",", fs->fsid, json_escape(fs->path),
+                          FsClusterController::fs_role_label(*fs), fs->view.fs_epoch);
+    return std::format(
+        "{{\"node\":\"{}\",\"alive\":{},\"address\":{},\"fsids\":[{}],\"exports\":[{}]}}\n",
+        json_escape(node), !alive ? "null" : (alive_text[0] == 'y' ? "true" : "false"),
+        address.empty() ? "null" : std::format("\"{}\"", json_escape(address)), fsids, rows);
+  }
+  std::string out =
+      std::format("node={} alive={} address={} exports={} fsids={}\n", node, alive_text,
+                  address.empty() ? "-" : address, owned.size(), fsids.empty() ? "-" : fsids);
+  for (const auto* fs : owned)
+    out += std::format("fsid={} path={} role={} fs_epoch={}\n", fs->fsid, fs->path,
+                       FsClusterController::fs_role_label(*fs), fs->view.fs_epoch);
   return out;
 }
 
@@ -673,6 +729,18 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
       auto peers = co_await rt::offload([&fc] { return fc.peers(); });
       auto alive = co_await rt::offload([&fc] { return fc.alive_peers(); });
       co_return cluster_fs_status(fc, dp, peers, alive, json);
+    }
+    if (sub == "exports") {
+      // `[<node>]`: the first positional after the subcommand, default this gateway.
+      std::string node = fc.node();
+      for (size_t i = 2; i < cmd.args.size(); ++i)
+        if (!cmd.args[i].starts_with("--")) {
+          node = cmd.args[i];
+          break;
+        }
+      auto reg = co_await rt::offload([&fc] { return fc.registry(); });
+      auto alive = co_await rt::offload([&fc] { return fc.alive_peers(); });
+      co_return cluster_fs_exports(fc, node, reg, alive, json);
     }
     if (sub == "migrate") {
       // `<fsid> <node>`: the export we serve and the live gateway to hand it to.

@@ -890,9 +890,13 @@ std::vector<FsClusterController::FsState> FsClusterController::snapshot() const 
                fs.fence_lost,
                fs.activation_failures,
                {},
+               {},
                {}};
     if (auto it = view->find(fsid); it != view->end()) st.view = it->second;
-    if (fs.exp) st.nodes = fs.exp->nodes;
+    if (fs.exp) {
+      st.nodes = fs.exp->nodes;
+      st.path = fs.exp->path;
+    }
     out.push_back(std::move(st));
   }
   return out;
@@ -906,6 +910,13 @@ Result<std::vector<std::string>> FsClusterController::peers() const {
   for (auto& [node, address] : *nodes) out.push_back(node);
   std::sort(out.begin(), out.end());
   return out;
+}
+
+Result<std::vector<std::pair<std::string, std::string>>> FsClusterController::registry() const {
+  auto nodes = store_.list_nodes();
+  if (!nodes) return Err(nodes.error());
+  std::sort(nodes->begin(), nodes->end());
+  return std::move(*nodes);
 }
 
 Result<std::vector<std::string>> FsClusterController::alive_peers() const {
