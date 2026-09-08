@@ -75,6 +75,7 @@ read_bps = "0"; write_bps = "0"; iops = 0       # per-export 令牌桶
 ```
 
 rsize/wsize/dtpref 不是配置项：由后端 `FsLimits`（05 分册）推导为 FSINFO / v4 属性。
+`[[export]]` 块只认上面列出的键，未知键报错（12 册 A2 起；此前静默忽略）；`disabled` 是清单（11 册）专用键，本地文件里出现同样报错。
 校验规则启动时全量执行（fsid 唯一、路径存在——集群后端 `virtual_path` 跳过本机 stat、网段格式、TLS 证书文件），错即拒起——配置错误绝不带病运行。
 `[cluster] enabled` 时另有：`id`/`shared_dir` 非空且后者为绝对路径、`role`/`takeover` 取值合法、
 `server_owner`/`server_scope` 不得显式设置（身份由 `id` 派生）、`takeover_hook` 须为可执行文件；

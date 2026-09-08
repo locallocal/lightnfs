@@ -74,6 +74,7 @@ add_library(lnfs_core STATIC
   src/backend/memory/memory.cpp
   src/core/atomic_file.cpp
   src/core/boot_epoch.cpp
+  src/core/catalog.cpp
   src/core/config.cpp
   src/core/file_handle.cpp
   src/core/obj_lock.cpp
@@ -186,6 +187,7 @@ add_executable(lnfs_tests
   tests/test_state.cpp
   tests/test_lock_mgr.cpp
   tests/test_ctl.cpp
+  tests/test_catalog.cpp
   tests/test_cluster_controller.cpp
   tests/test_cluster_store.cpp
   tests/test_daemon_lifecycle.cpp
