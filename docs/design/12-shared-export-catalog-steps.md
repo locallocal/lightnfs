@@ -1,0 +1,457 @@
+# 12. 共享导出清单——实现步骤拆分
+
+> 状态：**实施计划，未开始**。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
+> "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
+> 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
+> `docs/toto/shared-export-catalog-followups.md`。
+>
+> 前置：10 册全部已实现：`ClusterStore` 多活键空间（`server/cluster_store.*`）、
+> `FsClusterController`（`server/cluster_controller.*`）、`FsOwnerView`（`core/fs_owner_view.hpp`）、
+> `cluster migrate` / `cluster exports`（`server/ctl.cpp`）、`scripts/accept_active_active_local.sh`。
+
+## 12.0 总原则
+
+1. **默认零行为变化**：新键 `[cluster] exports_source` 默认 `local`，今天的一切逐字节不变；本册
+   全部改动挂在 `exports_source = "catalog"` 之后。回归门：现有 `lnfs_tests` +
+   `scripts/accept_m6_local.sh`（单网关）+ `scripts/accept_failover_local.sh`（主备）+
+   `scripts/accept_active_active_local.sh`（多活）在每一步合并后原样通过。
+2. **一步一个 PR，可单独回滚**：步骤之间只允许向前依赖（§12.1）。
+3. **先做快照、再做变更**：阶段 B 先把导出表改成不可变快照 + RCU 发布而**不改任何行为**（B1
+   合并后只有一版快照、永不换版），换版能力（B2/B3）在此之上单独证明。
+4. **每步自带测试**：单元测试进 `tests/`（共享目录用 `tests/mem_cluster_store.hpp`），跨进程场景进
+   `lnfs_accept_client` + `scripts/`；没有测试的步骤不合并。
+5. **可用性里程碑优先**：A → C → D 先交付"集中配置 + 管理命令 + `nodes` / clients / QoS 在线"，
+   C 的应用器先以 `reload_dynamic` 的口径对增删导出报 `restart required`；B 落地后 C2 换成真正
+   的换版。B 与 A/C/D 并行开发无冲突。
+
+### 本册对 11 册的实现细化
+
+| 点 | 决定 | 依据 |
+|----|------|------|
+| 清单文件格式 | TOML，`[[export]]` / `[export.<backend>]` 语法与本地文件**完全相同**，外加 `[catalog]` 头；解析复用 `parse_config` 的导出段分支（抽成 `parse_export_sections`） | 管理员可以把本地文件直接 `import`；不引入第二种语法 |
+| 版本号存哪 | 在 `catalog.toml` 的 `[catalog] version` 里，**不**单独放 version 文件 | 一个文件原子替换 = 读者永远看到自洽的一版，无需双读校验 |
+| 轮询在哪 | `FsClusterController::tick()` 末尾（多活）/ `ClusterController` 围栏线程（failover），周期 = `fence_lease`；不加新线程 | 已有周期性共享目录 IO，加一次小文件读 |
+| 应用在哪个线程 | 主循环（`Hooks::post` → `MainLoop::post`，`daemon.cpp`）；后端 `start()`/`stop()` 用 `run_on_reactor(0)` | 与接管 / 启动同一线程纪律；`reload` 今天在 ctl reactor 跑文件 IO，本册顺手把它也投递到主循环 |
+| 条目跨版共享 | `shared_ptr<ExportEntry>`，未变化的导出复用同一对象 | 后端实例 / fd 缓存 / 指标 / QoS 桶 / clients 指针延续；控制器与伪根的裸指针不失效 |
+| 退休条目何时 `stop()` | 主循环上的退休队列，每 tick 检查 `use_count()==1` 后 `stop()`；超过 10 × lease 仍被持有则告警 | `stop()` 是协程，不能放析构 |
+| `readonly`/`squash`/`anon_*` 在线生效 | 仅清单模式；本地模式 `reload_dynamic` 口径不变 | 零默认行为变化 |
+| ctl 引号 | `parse_command` 支持 `"…"` 与 `\"` / `\\`；ctl 客户端对含空白 / 引号的参数自动加引号 | `--path` / `--clients` / `--comment` 需要 |
+| `import` 的文件 | 网关侧路径（同 `--config`）；离线形态 `lightnfs-ctl catalog … --shared-dir` 直接写共享目录 | 线协议不传文件内容 |
+| 一致性校验 | 清单模式：只记录 / 告警版本差异，不拒绝启动；`exports.<node>` 摘要照写 | 11 §11.4 第 5 条、§11.9 过渡期保护 |
+
+## 12.1 阶段与依赖
+
+| 阶段 | 步骤 | 交付物 | 依赖 | 11 册阶段 |
+|------|------|--------|------|-----------|
+| A 清单文档与存储 | A1 配置键 | `exports_source` / `catalog_refresh` / `[backend_defaults.<backend>]`；清单模式下本地 `[[export]]` 为 EINVAL、空导出表放行 | — | A |
+| | A2 `core/catalog.*` | `Catalog{version, meta, exports}`、`parse_catalog` / `serialize_catalog` / `merge_with_local` / `validate_catalog` / `diff_catalog` | A1 | A |
+| | A3 `ClusterStore` 清单键 | `read_catalog` / `write_catalog(expected)` / `list_catalog_history` / `read_catalog_history` / `put_catalog_applied` / `list_catalog_applied` | — | A |
+| B 运行期可变导出集 | B1 `ExportSet` 快照 + RCU 发布（无行为变化） | `core::ExportSet`；`ExportTable::snapshot()/publish()`；读者改取快照；`PseudoFs` 随集 | — | B |
+| | B2 换版：新增 / 就地更新 / 退休 | `ExportTable::apply(ExportSetPlan)`；退休队列；伪根 change 单调 | B1 | B |
+| | B3 控制器 `sync_exports` | 新 fsid 加 `Fs`、`nodes` 换、属主不在名单 → migrate、删除 → drain | B2 | B |
+| C 启动与跟进 | C1 清单模式启动 | `daemon.cpp` 从清单建表；空表引导；`catalog.<node>` 登记；一致性校验改口径 | A1–A3 | C |
+| | C2 轮询 + auto / manual 应用 | tick 轮询；`apply_catalog(v)` 流水线；`ctl cluster catalog apply` / `reload` / SIGHUP | C1 B3（或桩） | C |
+| | C3 状态与指标 | `cluster status` 的 `catalog=` 字段；`lightnfs_cluster_catalog_*` | C2 | C |
+| D 管理命令 | D1 ctl 引号 + `cluster catalog show/status/history/diff/import/rollback/apply` | 线协议引号；读类命令；`import` / `rollback` 的 CAS 写 | A2 A3 C1 | D |
+| | D2 `cluster export list/add/set/remove` | 单导出增删改；护栏 | D1 | D |
+| | D3 离线 `lightnfs-ctl catalog …` | 不经网关直接读写 `--shared-dir`（引导 / 救援） | A2 A3 | D |
+| E 验收与文档 | E1 三实例脚本"清单"段 + `v4catalog` 验收模式 | 引导 → 在线加导出 → referral 可见 → 改 `nodes` 迁移 → 删除 STALE | C2 D2 B3 | E |
+| | E2 文档 | 08 册、deployment.md §6、10 册、09 §9.3、design/README；followups | 全部 | E |
+
+关键路径：A2 → A3 → C1 → C2 → D1 → D2 → E1；B1 → B2 → B3 → C2（真换版）。
+
+---
+
+## 阶段 A：清单文档与存储（无行为变化）
+
+### A1 配置键
+
+**目标**：解析并校验 11 §11.2 的三个新键；`exports_source = "local"`（默认）时后两者被忽略。
+
+**改动点**
+
+- `src/core/config.hpp`：`ClusterConfig`（`config.hpp:130`）新增
+
+  ```cpp
+  std::string exports_source = "local";   // local | catalog
+  std::string catalog_refresh = "auto";   // auto | manual（仅 catalog）
+  ```
+
+  `Config`（`config.hpp:161`）新增 `std::map<std::string, backend::BackendConfig> backend_defaults;`
+  （键 = 后端名）。
+- `src/core/config.cpp` `parse_config`：`[cluster]` 段分发（`config.cpp:328`）加两键；新增段
+  `[backend_defaults.<name>]`（仿 `[export.<name>]` 的子表分支 `config.cpp:206` / `:424`），只接受
+  `kPerNodeBackendKeys`（`config.hpp:177`）里的键，其他键 EINVAL 并提示"put it in the catalog"。
+- `validate_config`（`config.cpp:534`）：`exports_source` 取值；`catalog` 时 `cluster.enabled` 必须为
+  真、本地 `exports` 必须为空（EINVAL："exports come from the catalog"）、`exports.empty()` 的
+  既有拒绝（`config.cpp:536` 附近）放开；`local` 时出现 `[backend_defaults]` 只告警。
+- `restart_required_report` / `cluster_restart_required_report`（`daemon.cpp:287` / `:306`）：
+  `exports_source` 变化 → restart required；`catalog_refresh` 可热改（C2 读的是当前值）。
+
+**测试**：`tests/test_ctl.cpp` 仿 `Ctl.ActiveActiveConfigKeys`（`test_ctl.cpp:321`）加
+`Ctl.CatalogConfigKeys`：默认 local；catalog 下本地 `[[export]]` 被拒、空导出放行；
+`[backend_defaults.cephfs]` 里放 `fs_name` 被拒、放 `conf` 通过；`catalog_refresh = bogus` 被拒。
+
+**验收**：`lightnfsd --check-config` 对 11 §11.2 的本地示例返回 0；10 册示例结果不变。
+
+### A2 `core/catalog.*`：清单文档
+
+**目标**：清单的解析、序列化、与本地合并、集群级校验、diff，全部纯函数，不碰共享目录。
+
+**改动点**
+
+- 新文件 `src/core/catalog.hpp/.cpp`：
+
+  ```cpp
+  struct CatalogMeta { uint64_t version = 0; std::string updated_at, updated_by, comment; };
+  struct CatalogExport {            // = ExportConfig 去掉本机键，加 disabled
+    ExportConfig cfg;               // backend_config.values 里不含 kPerNodeBackendKeys
+    bool disabled = false;
+  };
+  struct Catalog { CatalogMeta meta; std::vector<CatalogExport> exports; };  // 按 fsid 有序
+
+  Result<Catalog> parse_catalog(std::string_view toml);   // [catalog] 头 + [[export]] 段
+  std::string serialize_catalog(const Catalog&);          // 规范格式：键序固定、fsid 升序
+  // 清单 → 本机 Config.exports：清单键优先，本机键只来自 backend_defaults[backend]
+  Result<std::vector<ExportConfig>> merge_with_local(const Catalog&, const Config& local);
+  // 集群级校验：fsid/path 唯一且不互为前缀、nodes 语法与去重、后端类型存在（find_backend）、
+  // 同卷同进退（复用 validate_active_active 的分组逻辑，抽成 same_volume_groups）、
+  // 本机键不得出现、disabled 导出仍占 fsid
+  Result<void> validate_catalog(const Catalog&, bool active_active);
+  struct CatalogDiff { std::vector<uint32_t> added, removed, disabled, enabled;
+                       std::vector<uint32_t> nodes_changed, dynamic_changed, rejected; };
+  CatalogDiff diff_catalog(const Catalog& from, const Catalog& to);   // rejected = path/backend/集群键变了
+  // 从本地 Config 剥出清单（import 与 §11.9 迁移用）：去本机键、version 由调用方填
+  Catalog catalog_from_config(const Config&);
+  ```
+
+- `parse_config` 的 `[[export]]` / `[export.<name>]` 分支抽成 `parse_export_sections(...)`
+  （`config.cpp:194-206`、`:390-427`），两处共用；未知导出键从"静默忽略"改为 EINVAL（今天
+  `:390-423` 无 else 分支，本册顺手收紧——只影响拼错的键）。
+- `canonical_exports_text`（`config.cpp:614`）不改：合并后的 `ExportConfig` 走同一摘要，本地模式
+  与清单模式对同一内容得到同一摘要（11 §11.9）。
+
+**测试**：新 `tests/test_catalog.cpp`：往返（parse → serialize → parse 相等）；本机键出现被拒；
+合并把 `[backend_defaults.cephfs] conf` 注入每个 cephfs 导出、不注入 local 导出；`validate_catalog`
+的每条规则各一例（fsid 重复、path 互为前缀、`nodes` 重复、同卷不同 `nodes`、未知后端）；
+`diff_catalog` 覆盖七类变化；`catalog_from_config` 去掉本机键且 `canonical_exports_text` 相等。
+
+### A3 `ClusterStore` 清单键
+
+**目标**：11 §11.3 的四个文件，**只加不改**。
+
+**改动点**
+
+- `src/server/cluster_store.hpp`（接口 `cluster_store.hpp:68-132`）新增：
+
+  ```cpp
+  struct CatalogDoc { uint64_t version = 0; std::string text; };       // version 从 [catalog] 头解出
+  struct CatalogApplied { std::string node; uint64_t version; std::string digest;
+                          int64_t applied_at_ms; std::string status; };  // "ok" | "error:<text>"
+  virtual Result<std::optional<CatalogDoc>> read_catalog() = 0;          // 不存在 → nullopt
+  // CAS：当前版本 != expected → EAGAIN；写前把当前文件复制到 catalog.history/<version>.toml
+  virtual Result<uint64_t> write_catalog(uint64_t expected, std::string_view text) = 0;
+  virtual Result<std::vector<uint64_t>> list_catalog_history() = 0;
+  virtual Result<CatalogDoc> read_catalog_history(uint64_t version) = 0;
+  virtual Result<void> put_catalog_applied(const CatalogApplied&) = 0;   // catalog.<node>
+  virtual Result<std::vector<CatalogApplied>> list_catalog_applied() = 0;
+  ```
+
+- `PosixClusterStore`（`cluster_store.cpp:62-521`）：`write_catalog` 在 `lock("catalog")`
+  （`cluster_store.cpp:475` 的 O_EXCL 锁，陈旧回收）下：读当前 → 比版本 → 复制到 history →
+  `atomic_write_file`（`core/atomic_file.hpp:20`）→ 修剪 history 到 32 份。`read_catalog` 用
+  `read_file_if_exists` 后只解 `[catalog] version`（不整份解析，轮询要便宜）。
+  `list_exports_digests`（`cluster_store.cpp:141-157`）的 `exports.` 前缀过滤与新文件名无交集，
+  加一条测试钉住。
+- `tests/mem_cluster_store.hpp`：同名内存实现，`catalog_docs` / `catalog_applied` 两个 map，
+  `fail_write_catalog` 注入。
+
+**测试**：`tests/test_cluster_store.cpp` 加 `ClusterStore.CatalogCasAndHistory`（首写 expected=0；
+版本错 → EAGAIN；history 内容 = 上一版；修剪；损坏的头 → EINVAL）、`CatalogAppliedPerNode`
+（覆盖写、列出、不被当作 `exports.` 摘要——扩 `:566-570` 的断言）。
+
+---
+
+## 阶段 B：运行期可变导出集
+
+### B1 `ExportSet` 快照 + RCU 发布（无行为变化）
+
+**目标**：把"导出表 + 伪根"变成不可变快照，读者每请求取一次；这一步**永不换版**，行为与今天
+逐字节相同。
+
+**改动点**
+
+- `src/core/config.hpp` `ExportTable`（`config.hpp:229`）：
+
+  ```cpp
+  struct ExportSet {                       // 不可变
+    uint64_t generation = 0;               // 集版本（B2 起每次换版 +1）
+    std::vector<std::shared_ptr<ExportEntry>> entries;   // fsid 升序
+    std::unique_ptr<const PseudoFs> pseudo;              // 由 entries 建
+    const ExportEntry* by_fsid(uint32_t) const;          // 二分
+    const ExportEntry* for_mount_path(std::string_view, std::string& rel) const;
+  };
+  class ExportTable {
+   public:
+    std::shared_ptr<const ExportSet> snapshot() const;   // atomic load
+    // 既有 by_fsid / for_mount_path / entries() 保留为 snapshot() 上的便捷转发（过渡期），
+    // 逐个调用点改成显式持快照后删除
+  };
+  ```
+
+  `entries_` 改为 `std::atomic<std::shared_ptr<const ExportSet>>`；`build()` / `add()` 只在发布前
+  操作一个可变的构建器（`ExportSetBuilder`）。`PseudoFs` 的构造从 `ProtocolStack`
+  （`protocol_stack.cpp:57`）移到 `ExportSetBuilder::finish(epoch)`；`PseudoFs` 持
+  `const ExportEntry*` 不变（条目由集持有）。
+- 读者改成显式持快照（每处一个 `auto set = exports.snapshot();`，生命周期 = 一次请求 / 一次
+  枚举）：`FileHandleCodec`（`core/file_handle.hpp:34/62/68`，解码 `file_handle.cpp:154/191`）、
+  `nfsv3::Engine`（`nfsv3/engine.hpp:68`）、`nfsv4::Engine::resolve`（`nfsv4/engine.hpp:203`）、
+  `mountd::Mount3` EXPORT 枚举（`mount3.cpp:88`）、`MutateGuard`（`core/mutate.hpp:56/84`）、
+  指标遍历（`metrics_providers.cpp:138-160`）、`DataPlane::exports`（`ctl.hpp:41`）与
+  `CoreState::exports`（`protocol_stack.hpp:39`）。v4 引擎的 `resolve()` 把快照挂在请求上下文里，
+  一个 COMPOUND 内不换版。
+- `FsClusterController::Fs::exp`（`cluster_controller.hpp:257`）暂不动（B3 改）。
+
+**测试**：全部既有测试原样通过是主要门槛；`tests/test_config.cpp`（或新 `test_export_set.cpp`）
+加 `ExportSet.SnapshotIsStable`（快照取到后 `by_fsid` 结果不随后续发布变化——B2 之前用
+`ExportTable` 的测试钩子 `publish_for_test`）。基准 `tools/bench/bench_fullpath.cpp:66` 改用
+构建器；`fuzz/fuzz_file_handle.cpp:25`、`fuzz/fuzz_handle_request.cpp:96` 同。
+
+**验收**：`scripts/accept_m6_local.sh` 与 `bench fullpath` 吞吐无回退（快照取用是一次 atomic
+load + shared_ptr 拷贝）。
+
+### B2 换版：新增 / 就地更新 / 退休
+
+**目标**：`ExportTable::apply(plan)` 发布新集，条目跨版共享，删除的条目退休后 `stop()`。
+
+**改动点**
+
+- `core/config.hpp`：
+
+  ```cpp
+  struct ExportSetPlan {                       // 由 diff_catalog + merge_with_local 生成
+    std::vector<ExportConfig> add;             // 新 fsid（含 enabled 回来的）
+    std::vector<ExportConfig> update;          // 同 fsid：clients/qos/readonly/squash/anon/nodes
+    std::vector<uint32_t> remove;              // 删除 / disabled
+  };
+  // 主循环线程调。add 的后端由调用方先 make + start()（run_on_reactor(0)）再传入。
+  std::shared_ptr<const ExportSet> apply(ExportSetPlan, std::vector<std::unique_ptr<backend::Backend>> started, uint64_t epoch);
+  // 退休队列：apply 后被移出集的条目；tick 上调，use_count()==1 的条目 stop() 并释放
+  std::vector<std::shared_ptr<ExportEntry>> take_retired();
+  ```
+
+- `ExportEntry`：`readonly` / `squash` / `anon_uid` / `anon_gid` 改成 `std::atomic`（读点都是每请求
+  读一次标量：`squash_cred` `config.cpp`、引擎的 ROFS 判定）；`nodes` 改成与 `clients_` 相同的
+  原子指针 + 退休列表（`config.hpp:198-205` 的写法），控制器 tick 线程读它。
+- 伪根：`ExportSetBuilder::finish` 用 `epoch << 32 | generation` 做伪根目录的 change 属性基值
+  （`pseudofs.cpp` 目前用启动 epoch），保证换版后递增。
+- `reload_dynamic`（`config.cpp:728`）改为在当前快照的条目上就地更新（语义不变），供本地模式
+  继续用。
+
+**测试**：`ExportSet.ApplyAddsRemovesAndSharesEntries`（新增 fsid 出现在新集与伪根；未变的条目
+是同一指针；删除的条目在旧快照释放前 `take_retired()` 为空、释放后返回它）；
+`ExportSet.PseudoChangeMonotonic`；`ExportSet.DynamicFieldsUpdateInPlace`（readonly 翻转后同一条目
+的读值变化）。
+
+### B3 控制器 `sync_exports`
+
+**目标**：11 §11.7。
+
+**改动点**
+
+- `server/cluster_controller.hpp`：`FsClusterController` 新增
+  `void sync_exports(const std::shared_ptr<const core::ExportSet>&)`（主循环线程调，持 `mu_`）；
+  `Fs::exp` 改为 `std::shared_ptr<const core::ExportEntry>`（`cluster_controller.hpp:257`）；构造
+  函数从 `exports.snapshot()` 建 `fs_`（`cluster_controller.cpp:341`）。
+- 实现：新 fsid → `fs_[fsid] = Fs{entry, kStandby}`；`nodes` 变 → 换 `exp`，若 `role == kActive` 且
+  `node_` 不在新 `nodes` 且有活着的候选 → `request_migrate(fsid, 首个活着的)`（复用 `:756`），无
+  候选 → 每 tick 告警一次；fsid 消失 → Active/Activating → `begin_draining(fsid, "removed from
+  catalog", fence_lost=false, release=true)`，Standby → 直接 erase；drain 完成（`run_draining`
+  `:693-707`）后 erase。`publish()` 随之。
+- failover 的 `ClusterController` 不需要 per-fsid 逻辑；其 `activate` 重建协议栈时自然用最新集。
+
+**测试**：`tests/test_cluster_controller.cpp` 加 `FsClusterController.SyncExportsAddsAndTakes`
+（新 fsid 下一 tick 被 `nodes[0]` 接管）、`SyncExportsNodesChangeMigratesOwner`（属主不在新名单
+→ owner 记录指向名单首个活着的、本机 drain）、`SyncExportsRemovalDrainsOwner`（Active 的被删
+fsid → deactivate 钩子被调、围栏释放、`fs_` 里消失）、`SyncExportsNodesChangeNoCandidateKeeps`。
+
+---
+
+## 阶段 C：启动与跟进
+
+### C1 清单模式启动
+
+**目标**：11 §11.4 的启动流程与空表引导。
+
+**改动点**
+
+- `server/daemon.cpp` `run_server`（`daemon.cpp:432-653`）：`exports_source == "catalog"` 时在
+  `make_posix_cluster_store`（`:444`）之后、`build_core_state`（`:451`）之前：`read_catalog()` →
+  有 → `parse_catalog` + `validate_catalog` + `merge_with_local` → 填 `config->exports` → 既有路径
+  （`ExportTable::build`、`check_cluster_backends` `:453`、`start_backends` `:484`）；无 → 空表
+  启动并 `LNFS_WARN("catalog: none yet; serving no exports until one is published")`。
+  记录 `applied_catalog_version`；`put_catalog_applied({node, v, digest, now, "ok"})`。
+- `check_exports_consistency`（`:185-207`）：清单模式下不 refuse，只 `list_catalog_applied()` 打印
+  同伴版本并对落后 / 领先者告警；`put_exports_digest` 照写。
+- `build_core_state`（`:132`）保留 `Config` 的本地部分（`backend_defaults`、`cluster`）供 C2 合并
+  用——今天 `Config` 在 `:451` 被 move 进 `build` 后丢弃，改为 `core.local_config` 持有本机部分。
+- 空导出表：`ProtocolStack` / `PseudoFs` / `Mount3` 对零导出的路径加测试（伪根只有 `/`）。
+
+**测试**：`tests/test_daemon_lifecycle.cpp` 加 `CatalogBootFromStore`（内存 store 里放 v3 清单 →
+表有其导出、`catalog.<node>` = 3 ok）、`CatalogBootEmpty`（无清单 → 零导出、伪根可 PUTROOTFH）、
+`CatalogBootLocalMergeFails`（缺 `[backend_defaults.cephfs]` → 启动 EINVAL 指出 fsid 与键）。
+
+### C2 轮询 + auto / manual 应用
+
+**目标**：11 §11.4 的跟进流水线。
+
+**改动点**
+
+- `server/cluster_controller.cpp` `tick()`（`:459-563`）末尾：`store_.read_catalog()`（只解版本）；
+  `> applied_` → `catalog_refresh == "auto"` ? `hooks_.post(apply_catalog(v))` : `pending_ = v`。
+  同一 tick 只投递一次；应用中不重复投递（`applying_` 标志）。failover 的 `ClusterController`
+  围栏线程同样处理。
+- 新 `server/catalog_applier.{hpp,cpp}`（主循环线程）：
+
+  ```cpp
+  class CatalogApplier {  // 持 ClusterStore&, ExportTable&, local Config, FsClusterController*, runtime
+    Result<uint64_t> apply_latest();   // 读 → 解析 → 校验 → merge → diff → plan → 后端 make+start →
+                                       // ExportTable::apply → sync_exports → put_catalog_applied
+    uint64_t applied() const; uint64_t pending() const; std::string last_error() const;
+  };
+  ```
+
+  B 未落地时的桩：`diff.added/removed` 非空 → 返回 `EBUSY` 并报 `restart required: fsid=…`，
+  其余（`nodes` / dynamic）就地应用——与 `reload_dynamic` 的口径一致；B3 合并后换成真换版。
+- 触发点统一：`CtlDeps::reload`（`ctl.hpp:92`，今天在 ctl reactor 直接跑 `do_reload`
+  `daemon.cpp:492`）改为投递到主循环并等待结果（`MainLoop::post` + promise），顺带修掉
+  "ctl reactor 上做阻塞文件 IO"；`do_reload` 在清单模式下末尾调 `applier.apply_latest()`；
+  SIGHUP（`daemon.cpp:631`）同。新 ctl `cluster catalog apply` 只调 `apply_latest()`。
+- 退休队列：`ExportTable::take_retired()` 在主循环上由 tick 投递的 `retire_exports()` 处理，
+  `stop()` 走 `run_on_reactor(0)`。
+
+**测试**：`tests/test_cluster_controller.cpp` 加 `CatalogAutoApplyOnTick`（store 里版本 +1 → post
+被调一次 → 应用后 `catalog.<node>` 更新）、`CatalogManualLeavesPending`（manual → `pending()` = v、
+不 post；`apply_latest()` 后清零）、`CatalogApplyFailureKeepsOld`（合并失败 → 旧集不变、
+`catalog.<node>` = old error:…、`last_error()`）。`tests/test_ctl.cpp` 加 `reload` 经主循环的断言
+（`AnswerCommandSurface` `:518` 的 reload 钩子改为主循环投递后行为不变）。
+
+### C3 状态与指标
+
+- `cluster_fs_status`（`ctl.cpp:235`）网关行加 `catalog=<applied|none> catalog_latest=<seen|none>
+  catalog_refresh=auto|manual catalog_error=-|<text>`；JSON 同名字段；failover 的 `cluster_status`
+  （`:177`）同。
+- `FsClusterController::append_metrics`（`cluster_controller.cpp:922`）加
+  `lightnfs_cluster_catalog_version`、`lightnfs_cluster_catalog_latest_version`、
+  `lightnfs_cluster_catalog_pending`（0/1）、`lightnfs_cluster_catalog_applies_total`、
+  `lightnfs_cluster_catalog_apply_failures_total`；failover 控制器同一组。
+- 测试：`tests/test_ctl.cpp` `ClusterFsCommands`（`:685`）与 `tests/test_metrics.cpp`
+  `ClusterFsSeries`（`:124`）各加断言。
+
+---
+
+## 阶段 D：管理命令
+
+### D1 ctl 引号与 `cluster catalog …`
+
+**改动点**
+
+- `server/ctl.cpp` `parse_command`（`:67-77`）：支持 `"…"`（内部 `\"`、`\\`），空白切分在引号外；
+  `--json` 仍可在任意位置。`tools/lightnfs_ctl.cpp` `run_cluster_cmd`（`:99-107`）对含空白 / 引号 /
+  反斜杠的参数自动加引号。
+- `ctl.cpp` 多活分支（`:724`）与 failover 分支都接 `cluster catalog <sub>`（清单与 mode 无关，
+  抽成 `cluster_catalog_cmd(deps, cmd, json)`，两处调）：
+  - `show`：`read_catalog` → `parse_catalog` → 头一行 `version= updated_at= updated_by= exports=` +
+    每导出 `fsid= path= backend= nodes= disabled= clients= readonly= squash= …`；
+  - `status`：`list_catalog_applied()` × `alive_peers()` → 每网关 `node= applied= status= alive=`，
+    末行 `latest=`；
+  - `history`：版本 / 时间 / 更新者 / comment；
+  - `diff [v1] [v2]`：`diff_catalog` 的七类各一行；
+  - `import <file> [--dry-run] [--comment …]`：`load_config(file)` 或直接 `parse_catalog`（文件可以
+    是本地 TOML 或清单 TOML）→ `catalog_from_config` → `validate_catalog` → `write_catalog(expected
+    = 当前版本)`，`EAGAIN` 重试 3 次；`--dry-run` 只报 diff；
+  - `rollback <version>`：`read_catalog_history(v)` → 以新版本提交；
+  - `apply`：C2 的 `apply_latest()`。
+  所有共享目录 IO 走 `rt::offload`（既有模式 `:687` 等）；`apply` 投递主循环。
+  `updated_by` = `node + " uid=" + SO_PEERCRED`（`CtlServer` 的 accept 处取一次）。
+- `tools/lightnfs_ctl.cpp` `make_cluster_leaf`（`:110`）：帮助文本与 `--dry-run` / `--comment` 标志；
+  `CtlDeps` 加 `CatalogApplier*` 与 `ClusterStore*`。
+
+**测试**：`tests/test_ctl.cpp` 加 `Ctl.ParseCommandQuotes`、`Ctl.ClusterCatalogCommands`（内存
+store：无清单时 `show` 答 `catalog: none`；`import` 建 v1 并写 history；`status` 列出 applied；
+并发写模拟：store 版本被改 → EAGAIN 重试成功；`rollback` 产生 v3 内容 = v1；`--json` 同形）。
+
+### D2 `cluster export list/add/set/remove`
+
+**改动点**
+
+- `ctl.cpp`：`cluster export <sub>`（同样与 mode 无关）：
+  - `add`：标志解析（`--path --fsid --backend --nodes a,b --clients c1,c2 --readonly --squash
+    root|all|none --anon-uid --anon-gid --read-bps --write-bps --iops --opt k=v（可重复）
+    --disabled --comment`）→ `CatalogExport` → 追加 → `validate_catalog`（含 fsid 复用规则：历史
+    32 版内同 fsid 但 path/backend/集群键不同 → 拒绝，`--force` 覆盖）→ CAS 写；
+  - `set <fsid>`：只接受在线可变标志；`--path` / `--backend` / `--opt` → `EINVAL "remove and re-add,
+    or use a new fsid"`；
+  - `remove <fsid> [--force]`：按本网关 `FsOwnerView` 的属主视图（多活）/ 本机是否 active
+    （failover）判断"正在被服务" → 无 `--force` 拒绝；
+  - `list` = `catalog show` 的导出部分。
+- 服务端做的是**集群级**校验；本机 `[backend_defaults]` 合并留给各网关应用时（11 §11.8）。
+
+**测试**：`Ctl.ClusterExportCommands`：`add` 后 v+1 且 `show` 可见；重复 fsid / path 前缀 / 本机键
+`--opt conf=…` / 未知后端各被拒；`set --nodes` 改顺位；`set --path` 被拒；`remove` 被属主护栏
+拒、`--force` 通过；fsid 复用规则。
+
+### D3 离线 `lightnfs-ctl catalog … --shared-dir <dir>`
+
+**目标**：不经网关直接操作共享目录（首次引导、所有网关都起不来时的救援）。
+
+**改动点**：`tools/lightnfs_ctl.cpp` 加根级 `catalog <show|import|history|rollback>` 叶子，链接
+`lnfs_core` + `PosixClusterStore`（`make_posix_cluster_store`，`cluster_store.hpp:140`），复用 D1 的
+纯函数；`updated_by = "offline uid=<getuid>"`。`import` 支持 `--from-local <lightnfs.toml>`
+（`catalog_from_config`）。
+
+**测试**：`tests/test_ctl.cpp` 里对纯函数的覆盖已足够；离线路径在 E1 脚本里用于引导。
+
+---
+
+## 阶段 E：验收与文档
+
+### E1 三实例脚本"清单"段 + `v4catalog` 验收模式
+
+**改动点**
+
+- `scripts/accept_active_active_local.sh`：`write_config`（`:53-120`）加 `LNFS_EXPORTS=catalog` 分支：
+  本地文件无 `[[export]]`、`exports_source = "catalog"`；启动前用 D3 的离线 `catalog import
+  --from-local` 引导 v1（三台 `nodes` 顺位与今天相同）。新段 `catalog`：
+  1. 三台 `cluster catalog status` 都在 v1、既有四段（status / v4moved / roll / crash）原样通过；
+  2. 对 gw1 发 `cluster export add --path … --fsid 3 --nodes gw3,gw1`；等 gw3 `cluster exports gw3`
+     含 fsid 3；`lnfs_accept_client v4catalog` 对 gw1：伪根 READDIR 出现新导出、进入即
+     MOVED + `fs_locations` 指向 gw3、change 属性比加之前大；
+  3. `export set 3 --nodes gw2,gw1`：等 gw2 接管（属主 gw3 不在名单 → migrate），客户端在 gw3 收
+     `LEASE_MOVED`；
+  4. `export set 3 --disabled=true`：所有网关 `role=` 行消失、客户端对旧句柄收 STALE；
+     `export remove 3` 通过；`--force` 路径单独一遍；
+  5. `catalog_refresh = manual` 的一台：`status` 显示 `pending`、`cluster catalog apply` 后追平；
+  6. `catalog rollback 1` 后全部回到 v1 的导出集。
+  Release 与 ASAN 各一轮；`level=error` 为零。
+- `tests/accept_client.cpp` 加 `v4catalog` 模式（伪根 READDIR 断言 + change 单调 + STALE）。
+
+### E2 文档
+
+- 08 册：`[cluster] exports_source / catalog_refresh`、`[backend_defaults]`、`cluster catalog|export`
+  命令、`lightnfs_cluster_catalog_*` 指标、热重载口径（清单模式下 readonly/squash/anon 在线）。
+- `deployment.md` §6：加"清单模式"小节与 §11.9 的迁移步骤；`cluster_roll.sh` 说明不变。
+- 10 册：§10.10 指向 11 册；§10.3 键空间表加 `catalog.*`；09 §9.3 摘要说明加清单模式口径。
+- `design/README.md`：11、12 条目；11 册状态改"已实现"；本册撤下，未闭环项进
+  `docs/toto/shared-export-catalog-followups.md`。
+
+## 12.2 每步的通用验收清单
+
+- [ ] `exports_source = "local"`（默认）下：`lnfs_tests`、三个 accept 脚本、`bench fullpath` 结果与
+      合并前一致。
+- [ ] 新增代码 clang-format / clang-tidy 无新告警（全仓库既有漂移不在本册范围）。
+- [ ] 共享目录新文件名不与 `exports.` 前缀过滤、`fence.` / `epoch.` 命名冲突（A3 测试钉住）。
+- [ ] 主循环线程纪律：后端 `start()`/`stop()`、`ExportTable::apply`、`sync_exports` 只在主循环 /
+      reactor 0 上跑；tick 线程只读共享目录与投递。
+- [ ] 每个 ctl 新命令有文本与 `--json` 两种断言，错误路径有明确文案。
