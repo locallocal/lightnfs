@@ -15,20 +15,19 @@
 using namespace lnfs;
 
 extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
-  auto oid = backend::ObjId::from(
-      std::span<const std::byte>(reinterpret_cast<const std::byte*>(data), size));
-  if (!oid) return;
-  auto fid = backend::LustreBackend::fid_from_oid(*oid);
-  if (!fid) return;
-  auto back = backend::LustreBackend::oid_from_fid(*fid);
-  if (!(back == *oid)) std::abort();
-  auto text = backend::llapi::fid_to_string(*fid);
-  if (text.empty() || text.size() > 40 || text.find('[') != std::string::npos) std::abort();
+    auto oid = backend::ObjId::from(std::span<const std::byte>(reinterpret_cast<const std::byte*>(data), size));
+    if (!oid) return;
+    auto fid = backend::LustreBackend::fid_from_oid(*oid);
+    if (!fid) return;
+    auto back = backend::LustreBackend::oid_from_fid(*fid);
+    if (!(back == *oid)) std::abort();
+    auto text = backend::llapi::fid_to_string(*fid);
+    if (text.empty() || text.size() > 40 || text.find('[') != std::string::npos) std::abort();
 }
 
 #ifndef LNFS_FUZZ_REGRESS
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  lnfs_fuzz_entry(data, size);
-  return 0;
+    lnfs_fuzz_entry(data, size);
+    return 0;
 }
 #endif

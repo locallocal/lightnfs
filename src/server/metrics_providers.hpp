@@ -30,13 +30,13 @@ class Engine;
 namespace lnfs::server {
 
 struct MetricsSources {
-  rpc::Drc& drc;
-  state::StateMgr& state;
-  core::ExportTable& exports;
-  rt::Runtime& runtime;
-  // The v4 engine when enabled: lightnfs_v4_moved_total{fsid} (referrals answered,
-  // plan 12 B3/C4).  Null = no v4 series.
-  const nfsv4::Engine* nfs4 = nullptr;
+    rpc::Drc& drc;
+    state::StateMgr& state;
+    core::ExportTable& exports;
+    rt::Runtime& runtime;
+    // The v4 engine when enabled: lightnfs_v4_moved_total{fsid} (referrals answered,
+    // plan 12 B3/C4).  Null = no v4 series.
+    const nfsv4::Engine* nfs4 = nullptr;
 };
 
 // Registers one text provider per group; the registration unregisters them all when
@@ -44,28 +44,25 @@ struct MetricsSources {
 // is torn down and rebuilt on a takeover, plan 10 C1).
 class MetricsRegistration {
  public:
-  MetricsRegistration() = default;
-  explicit MetricsRegistration(std::vector<obs::ProviderHandle> handles)
-      : handles_(std::move(handles)) {}
-  MetricsRegistration(MetricsRegistration&& o) noexcept : handles_(std::move(o.handles_)) {
-    o.handles_.clear();
-  }
-  MetricsRegistration& operator=(MetricsRegistration&& o) noexcept {
-    if (this != &o) {
-      reset();
-      handles_ = std::move(o.handles_);
-      o.handles_.clear();
+    MetricsRegistration() = default;
+    explicit MetricsRegistration(std::vector<obs::ProviderHandle> handles) : handles_(std::move(handles)) {}
+    MetricsRegistration(MetricsRegistration&& o) noexcept : handles_(std::move(o.handles_)) { o.handles_.clear(); }
+    MetricsRegistration& operator=(MetricsRegistration&& o) noexcept {
+        if (this != &o) {
+            reset();
+            handles_ = std::move(o.handles_);
+            o.handles_.clear();
+        }
+        return *this;
     }
-    return *this;
-  }
-  ~MetricsRegistration() { reset(); }
-  void reset() {
-    for (auto h : handles_) obs::unregister_text_provider(h);
-    handles_.clear();
-  }
+    ~MetricsRegistration() { reset(); }
+    void reset() {
+        for (auto h : handles_) obs::unregister_text_provider(h);
+        handles_.clear();
+    }
 
  private:
-  std::vector<obs::ProviderHandle> handles_;
+    std::vector<obs::ProviderHandle> handles_;
 };
 
 MetricsRegistration register_metrics_providers(const MetricsSources& sources);

@@ -10,8 +10,8 @@
 namespace lnfs::core {
 
 struct DecodedHandle {
-  ExportEntry* export_entry = nullptr;
-  backend::ObjId oid;
+    ExportEntry* export_entry = nullptr;
+    backend::ObjId oid;
 };
 
 // The 16-byte handle HMAC key at `path`: read when present, otherwise generated
@@ -22,44 +22,44 @@ Result<std::array<std::byte, 16>> load_or_create_hmac_key(const std::string& pat
 
 class FileHandleCodec {
  public:
-  static constexpr uint8_t kVersion = 1;
-  static Result<FileHandleCodec> load_or_create(const std::string& state_dir);
-  static FileHandleCodec from_key(std::array<std::byte, 16> key) { return FileHandleCodec(key); }
+    static constexpr uint8_t kVersion = 1;
+    static Result<FileHandleCodec> load_or_create(const std::string& state_dir);
+    static FileHandleCodec from_key(std::array<std::byte, 16> key) { return FileHandleCodec(key); }
 
-  std::vector<std::byte> encode(const ExportEntry& exp, const backend::ObjId& oid) const;
-  // Decodes against one export-set snapshot (plan 12 B1): the caller takes it and keeps
-  // it alive for as long as it uses the returned entry.
-  Result<DecodedHandle> decode(std::span<const std::byte> fh, const sockaddr_storage& peer,
-                               const ExportSet& exports) const;
+    std::vector<std::byte> encode(const ExportEntry& exp, const backend::ObjId& oid) const;
+    // Decodes against one export-set snapshot (plan 12 B1): the caller takes it and keeps
+    // it alive for as long as it uses the returned entry.
+    Result<DecodedHandle> decode(std::span<const std::byte> fh, const sockaddr_storage& peer,
+                                 const ExportSet& exports) const;
 
-  // v4 namespace decode (design 04 §4.3): fsid 0 is the pseudo-fs — browsable from any
-  // source, no export/IP check (that happens when crossing into an export); fsid != 0
-  // resolves the export and enforces the client CIDR like v3.
-  struct DecodedV4 {
-    uint32_t fsid = 0;
-    backend::ObjId oid;
-    ExportEntry* exp = nullptr;  // null for pseudo handles
-  };
-  Result<DecodedV4> decode_v4(std::span<const std::byte> fh, const sockaddr_storage& peer,
-                              const ExportSet& exports) const;
-  // Encode with an explicit fsid (0 = pseudo).
-  std::vector<std::byte> encode_raw(uint32_t fsid, const backend::ObjId& oid) const;
+    // v4 namespace decode (design 04 §4.3): fsid 0 is the pseudo-fs — browsable from any
+    // source, no export/IP check (that happens when crossing into an export); fsid != 0
+    // resolves the export and enforces the client CIDR like v3.
+    struct DecodedV4 {
+        uint32_t fsid = 0;
+        backend::ObjId oid;
+        ExportEntry* exp = nullptr;  // null for pseudo handles
+    };
+    Result<DecodedV4> decode_v4(std::span<const std::byte> fh, const sockaddr_storage& peer,
+                                const ExportSet& exports) const;
+    // Encode with an explicit fsid (0 = pseudo).
+    std::vector<std::byte> encode_raw(uint32_t fsid, const backend::ObjId& oid) const;
 
-  // Offline decode for lightnfs-fh (design 08 §8.6): no export table, no IP checks.
-  struct Inspection {
-    uint8_t version = 0;
-    uint32_t fsid = 0;
-    backend::ObjId oid;
-    bool hmac_ok = false;
-  };
-  static FileHandleCodec from_key_only(std::array<std::byte, 16> key) { return from_key(key); }
-  Result<Inspection> inspect(std::span<const std::byte> fh) const;
+    // Offline decode for lightnfs-fh (design 08 §8.6): no export table, no IP checks.
+    struct Inspection {
+        uint8_t version = 0;
+        uint32_t fsid = 0;
+        backend::ObjId oid;
+        bool hmac_ok = false;
+    };
+    static FileHandleCodec from_key_only(std::array<std::byte, 16> key) { return from_key(key); }
+    Result<Inspection> inspect(std::span<const std::byte> fh) const;
 
  private:
-  explicit FileHandleCodec(std::array<std::byte, 16> key) : key_(key) {}
-  uint64_t tag(std::span<const std::byte> bytes) const;
+    explicit FileHandleCodec(std::array<std::byte, 16> key) : key_(key) {}
+    uint64_t tag(std::span<const std::byte> bytes) const;
 
-  std::array<std::byte, 16> key_{};
+    std::array<std::byte, 16> key_{};
 };
 
 }  // namespace lnfs::core

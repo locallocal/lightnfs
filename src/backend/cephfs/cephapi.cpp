@@ -10,14 +10,20 @@ namespace lnfs::backend::cephapi {
 namespace {
 
 struct Sym {
-  const char* name;
-  size_t offset;  // of the member in Api
-  bool optional = false;  // missing in older libraries: left null, not an error
+    const char* name;
+    size_t offset;          // of the member in Api
+    bool optional = false;  // missing in older libraries: left null, not an error
 };
 
 // libcephfs exports unversioned symbols (no version script), so plain dlsym.
-#define LNFS_CEPH_SYM(fn) Sym{#fn, offsetof(Api, fn)}
-#define LNFS_CEPH_OPT_SYM(fn) Sym{#fn, offsetof(Api, fn), true}
+#define LNFS_CEPH_SYM(fn)      \
+    Sym {                      \
+        #fn, offsetof(Api, fn) \
+    }
+#define LNFS_CEPH_OPT_SYM(fn)        \
+    Sym {                            \
+        #fn, offsetof(Api, fn), true \
+    }
 constexpr Sym kSyms[] = {
     LNFS_CEPH_SYM(ceph_version),
     LNFS_CEPH_SYM(ceph_create),
@@ -73,61 +79,61 @@ constexpr Sym kSyms[] = {
 #undef LNFS_CEPH_OPT_SYM
 
 bool present(const Api& api, const Sym& s) {
-  void* fn = nullptr;
-  std::memcpy(&fn, reinterpret_cast<const char*>(&api) + s.offset, sizeof fn);
-  return fn != nullptr;
+    void* fn = nullptr;
+    std::memcpy(&fn, reinterpret_cast<const char*>(&api) + s.offset, sizeof fn);
+    return fn != nullptr;
 }
 
 }  // namespace
 
 bool complete(const Api& api) {
-  for (const Sym& s : kSyms)
-    if (!s.optional && !present(api, s)) return false;
-  return true;
+    for (const Sym& s : kSyms)
+        if (!s.optional && !present(api, s)) return false;
+    return true;
 }
 
 bool reclaim_supported(const Api& api) {
-  return api.ceph_set_uuid && api.ceph_start_reclaim && api.ceph_finish_reclaim;
+    return api.ceph_set_uuid && api.ceph_start_reclaim && api.ceph_finish_reclaim;
 }
 
 Result<std::shared_ptr<const Api>> load_system_api(std::string* detail) {
-  static std::mutex mu;
-  static std::shared_ptr<const Api> cached;
-  static Errno cached_error = Errno::kOk;
-  static std::string cached_detail;
-  std::lock_guard lock(mu);
-  if (cached) return cached;
-  if (cached_error != Errno::kOk) {
-    if (detail) *detail = cached_detail;
-    return Err(cached_error);
-  }
-  const char* candidates[] = {"libcephfs.so.2", "libcephfs.so"};
-  void* handle = nullptr;
-  for (const char* name : candidates) {
-    handle = ::dlopen(name, RTLD_NOW | RTLD_LOCAL);
-    if (handle) break;
-  }
-  if (!handle) {
-    cached_error = errno_from(ENOENT);
-    const char* err = ::dlerror();
-    cached_detail = err ? err : "dlopen failed";
-    if (detail) *detail = cached_detail;
-    return Err(cached_error);
-  }
-  auto api = std::make_shared<Api>();
-  for (const Sym& s : kSyms) {
-    void* fn = ::dlsym(handle, s.name);
-    if (!fn && s.optional) continue;
-    if (!fn) {
-      cached_error = errno_from(ENOEXEC);
-      cached_detail = std::string("missing symbol ") + s.name + " (Ceph >= 15 required)";
-      if (detail) *detail = cached_detail;
-      return Err(cached_error);
+    static std::mutex mu;
+    static std::shared_ptr<const Api> cached;
+    static Errno cached_error = Errno::kOk;
+    static std::string cached_detail;
+    std::lock_guard lock(mu);
+    if (cached) return cached;
+    if (cached_error != Errno::kOk) {
+        if (detail) *detail = cached_detail;
+        return Err(cached_error);
     }
-    std::memcpy(reinterpret_cast<char*>(api.get()) + s.offset, &fn, sizeof fn);
-  }
-  cached = api;
-  return cached;
+    const char* candidates[] = {"libcephfs.so.2", "libcephfs.so"};
+    void* handle = nullptr;
+    for (const char* name : candidates) {
+        handle = ::dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (handle) break;
+    }
+    if (!handle) {
+        cached_error = errno_from(ENOENT);
+        const char* err = ::dlerror();
+        cached_detail = err ? err : "dlopen failed";
+        if (detail) *detail = cached_detail;
+        return Err(cached_error);
+    }
+    auto api = std::make_shared<Api>();
+    for (const Sym& s : kSyms) {
+        void* fn = ::dlsym(handle, s.name);
+        if (!fn && s.optional) continue;
+        if (!fn) {
+            cached_error = errno_from(ENOEXEC);
+            cached_detail = std::string("missing symbol ") + s.name + " (Ceph >= 15 required)";
+            if (detail) *detail = cached_detail;
+            return Err(cached_error);
+        }
+        std::memcpy(reinterpret_cast<char*>(api.get()) + s.offset, &fn, sizeof fn);
+    }
+    cached = api;
+    return cached;
 }
 
 }  // namespace lnfs::backend::cephapi

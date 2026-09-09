@@ -5,10 +5,10 @@
 // crash right after the write.  Blocking syscalls: call from the main thread or an
 // offload thread, never on a reactor.
 
+#include <sys/types.h>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <sys/types.h>
 
 #include "util/result.hpp"
 
@@ -17,8 +17,7 @@ namespace lnfs::core {
 // Replaces `path` with `bytes` (the temp file is `<path>.tmp.<pid>.<n>`, unique per
 // call; a failure leaves the old content untouched).  `mode` applies to a newly
 // created file.
-Result<void> atomic_write_file(const std::string& path, std::string_view bytes,
-                               mode_t mode = 0600);
+Result<void> atomic_write_file(const std::string& path, std::string_view bytes, mode_t mode = 0600);
 
 // `<path>.tmp.<pid>.<n>`: a temp name no other thread or process is using.
 std::string unique_temp_name(const std::string& path);

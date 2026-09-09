@@ -10,12 +10,15 @@ namespace lnfs::backend::gfapi {
 namespace {
 
 struct Sym {
-  const char* name;
-  const char* version;  // GFAPI_x.y.z default version in GlusterFS 11's map file
-  size_t offset;        // of the member in Api
+    const char* name;
+    const char* version;  // GFAPI_x.y.z default version in GlusterFS 11's map file
+    size_t offset;        // of the member in Api
 };
 
-#define LNFS_GFAPI_SYM(fn, ver) Sym{#fn, "GFAPI_" ver, offsetof(Api, fn)}
+#define LNFS_GFAPI_SYM(fn, ver)              \
+    Sym {                                    \
+        #fn, "GFAPI_" ver, offsetof(Api, fn) \
+    }
 constexpr Sym kSyms[] = {
     LNFS_GFAPI_SYM(glfs_new, "3.4.0"),
     LNFS_GFAPI_SYM(glfs_set_volfile_server, "3.4.0"),
@@ -70,52 +73,52 @@ constexpr Sym kSyms[] = {
 }  // namespace
 
 bool complete(const Api& api) {
-  for (const Sym& s : kSyms) {
-    void* fn = nullptr;
-    std::memcpy(&fn, reinterpret_cast<const char*>(&api) + s.offset, sizeof fn);
-    if (!fn) return false;
-  }
-  return true;
+    for (const Sym& s : kSyms) {
+        void* fn = nullptr;
+        std::memcpy(&fn, reinterpret_cast<const char*>(&api) + s.offset, sizeof fn);
+        if (!fn) return false;
+    }
+    return true;
 }
 
 Result<std::shared_ptr<const Api>> load_system_api(std::string* detail) {
-  static std::mutex mu;
-  static std::shared_ptr<const Api> cached;
-  static Errno cached_error = Errno::kOk;
-  static std::string cached_detail;
-  std::lock_guard lock(mu);
-  if (cached) return cached;
-  if (cached_error != Errno::kOk) {
-    if (detail) *detail = cached_detail;
-    return Err(cached_error);
-  }
-  const char* candidates[] = {"libgfapi.so.0", "libgfapi.so"};
-  void* handle = nullptr;
-  for (const char* name : candidates) {
-    handle = ::dlopen(name, RTLD_NOW | RTLD_LOCAL);
-    if (handle) break;
-  }
-  if (!handle) {
-    cached_error = errno_from(ENOENT);
-    const char* err = ::dlerror();
-    cached_detail = err ? err : "dlopen failed";
-    if (detail) *detail = cached_detail;
-    return Err(cached_error);
-  }
-  auto api = std::make_shared<Api>();
-  for (const Sym& s : kSyms) {
-    void* fn = ::dlvsym(handle, s.name, s.version);
-    if (!fn) fn = ::dlsym(handle, s.name);
-    if (!fn) {
-      cached_error = errno_from(ENOEXEC);
-      cached_detail = std::string("missing symbol ") + s.name + " (GlusterFS >= 6 required)";
-      if (detail) *detail = cached_detail;
-      return Err(cached_error);
+    static std::mutex mu;
+    static std::shared_ptr<const Api> cached;
+    static Errno cached_error = Errno::kOk;
+    static std::string cached_detail;
+    std::lock_guard lock(mu);
+    if (cached) return cached;
+    if (cached_error != Errno::kOk) {
+        if (detail) *detail = cached_detail;
+        return Err(cached_error);
     }
-    std::memcpy(reinterpret_cast<char*>(api.get()) + s.offset, &fn, sizeof fn);
-  }
-  cached = api;
-  return cached;
+    const char* candidates[] = {"libgfapi.so.0", "libgfapi.so"};
+    void* handle = nullptr;
+    for (const char* name : candidates) {
+        handle = ::dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (handle) break;
+    }
+    if (!handle) {
+        cached_error = errno_from(ENOENT);
+        const char* err = ::dlerror();
+        cached_detail = err ? err : "dlopen failed";
+        if (detail) *detail = cached_detail;
+        return Err(cached_error);
+    }
+    auto api = std::make_shared<Api>();
+    for (const Sym& s : kSyms) {
+        void* fn = ::dlvsym(handle, s.name, s.version);
+        if (!fn) fn = ::dlsym(handle, s.name);
+        if (!fn) {
+            cached_error = errno_from(ENOEXEC);
+            cached_detail = std::string("missing symbol ") + s.name + " (GlusterFS >= 6 required)";
+            if (detail) *detail = cached_detail;
+            return Err(cached_error);
+        }
+        std::memcpy(reinterpret_cast<char*>(api.get()) + s.offset, &fn, sizeof fn);
+    }
+    cached = api;
+    return cached;
 }
 
 }  // namespace lnfs::backend::gfapi

@@ -21,40 +21,39 @@
 namespace lnfs::testing {
 
 struct FakeCephApi {
-  // The table every fake-backed CephBackend uses.
-  static std::shared_ptr<const backend::cephapi::Api> api();
+    // The table every fake-backed CephBackend uses.
+    static std::shared_ptr<const backend::cephapi::Api> api();
 
-  // The directory that stands in for the filesystem root (ceph_mount binds to it).
-  static void set_root(std::string dir);
-  // ceph_mount fails with -err when non-zero.
-  static void fail_mount(int err);
-  // The next `count` calls (metadata or data) fail with -err — transport-error tests.
-  static void fail_next(int err, int count = 1);
-  // Identity the last call ran under (from its UserPerm).
-  static uint32_t last_uid();
-  static uint32_t last_gid();
-  // Leak assertions: live Inode / Fh / dir handle / UserPerm counts.
-  static int live_inodes();
-  static int live_fhs();
-  static int live_dirs();
-  static int live_perms();
-  // Number of ceph_ll_getattr calls (round-trip accounting).
-  static uint64_t getattr_calls();
+    // The directory that stands in for the filesystem root (ceph_mount binds to it).
+    static void set_root(std::string dir);
+    // ceph_mount fails with -err when non-zero.
+    static void fail_mount(int err);
+    // The next `count` calls (metadata or data) fail with -err — transport-error tests.
+    static void fail_next(int err, int count = 1);
+    // Identity the last call ran under (from its UserPerm).
+    static uint32_t last_uid();
+    static uint32_t last_gid();
+    // Leak assertions: live Inode / Fh / dir handle / UserPerm counts.
+    static int live_inodes();
+    static int live_fhs();
+    static int live_dirs();
+    static int live_perms();
+    // Number of ceph_ll_getattr calls (round-trip accounting).
+    static uint64_t getattr_calls();
 
-  // Session reclaim (plan 10 D2).  The same table minus the three reclaim entries
-  // (an old libcephfs).
-  static std::shared_ptr<const backend::cephapi::Api> api_without_reclaim();
-  // A failed gateway's residue: an exclusive lock on `rel_path` (relative to the
-  // root) held by a ghost session carrying `uuid`; false when the file is missing.
-  static bool plant_stale_lock(const std::string& rel_path, const std::string& uuid,
-                               uint64_t start, uint64_t len);
-  static size_t stale_locks();  // ghost-held segments still in the table
-  static uint64_t reclaim_calls();  // ceph_start_reclaim calls
-  // Every uuid ceph_start_reclaim was called with, in order (plan 12 C2).
-  static std::vector<std::string> reclaimed_uuids();
-  static std::string last_uuid();  // the last ceph_set_uuid value
-  // ceph_start_reclaim fails with -err (ENOTRECOVERABLE, EOPNOTSUPP) until cleared.
-  static void fail_reclaim(int err);
+    // Session reclaim (plan 10 D2).  The same table minus the three reclaim entries
+    // (an old libcephfs).
+    static std::shared_ptr<const backend::cephapi::Api> api_without_reclaim();
+    // A failed gateway's residue: an exclusive lock on `rel_path` (relative to the
+    // root) held by a ghost session carrying `uuid`; false when the file is missing.
+    static bool plant_stale_lock(const std::string& rel_path, const std::string& uuid, uint64_t start, uint64_t len);
+    static size_t stale_locks();      // ghost-held segments still in the table
+    static uint64_t reclaim_calls();  // ceph_start_reclaim calls
+    // Every uuid ceph_start_reclaim was called with, in order (plan 12 C2).
+    static std::vector<std::string> reclaimed_uuids();
+    static std::string last_uuid();  // the last ceph_set_uuid value
+    // ceph_start_reclaim fails with -err (ENOTRECOVERABLE, EOPNOTSUPP) until cleared.
+    static void fail_reclaim(int err);
 };
 
 }  // namespace lnfs::testing

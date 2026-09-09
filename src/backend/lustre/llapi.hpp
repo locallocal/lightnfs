@@ -24,10 +24,10 @@
 namespace lnfs::backend::llapi {
 
 struct Fid {
-  uint64_t seq = 0;
-  uint32_t oid = 0;
-  uint32_t ver = 0;
-  friend bool operator==(const Fid&, const Fid&) = default;
+    uint64_t seq = 0;
+    uint32_t oid = 0;
+    uint32_t ver = 0;
+    friend bool operator==(const Fid&, const Fid&) = default;
 };
 static_assert(sizeof(Fid) == 16, "struct lu_fid layout");
 
@@ -53,10 +53,10 @@ inline constexpr uint32_t kHpsRunning = 2;
 inline constexpr uint32_t kHpsDone = 3;
 
 struct HsmState {
-  uint32_t states = 0;              // kHs* bits
-  uint32_t archive_id = 0;
-  uint32_t in_progress_state = 0;   // kHps*
-  uint32_t in_progress_action = 0;  // kHua*
+    uint32_t states = 0;  // kHs* bits
+    uint32_t archive_id = 0;
+    uint32_t in_progress_state = 0;   // kHps*
+    uint32_t in_progress_action = 0;  // kHua*
 };
 
 // "0x200000401:0x1:0x0" — the DFID_NOBRACE form .lustre/fid accepts.
@@ -64,21 +64,21 @@ std::string fid_to_string(const Fid& fid);
 
 class Ops {
  public:
-  virtual ~Ops() = default;
-  // `fd` is an O_RDONLY directory fd on the candidate mount root.
-  virtual bool is_lustre(int fd) const = 0;
-  // FID of the object behind `fd` (O_PATH is fine).
-  virtual Result<Fid> fid_of(int fd) const = 0;
-  // openat(mount_fd, ".lustre/fid/<fid>", flags): ENOENT means the object is gone.
-  virtual Result<int> open_by_fid(int mount_fd, const Fid& fid, int flags) const = 0;
-  // HSM state of an open regular file (data fd, not O_PATH).  ENOTTY / EOPNOTSUPP
-  // when the client has no HSM (the caller treats that as "not released").
-  virtual Result<HsmState> hsm_state(int fd) const = 0;
-  // Queues an HSM RESTORE for the whole file (asynchronous; the coordinator drives it).
-  virtual Result<void> hsm_restore(int mount_fd, const Fid& fid) const = 0;
-  // Default stripe size of the directory/file behind `fd` (data fd); ENODATA when no
-  // layout is set (the filesystem default applies).
-  virtual Result<uint32_t> stripe_size(int fd) const = 0;
+    virtual ~Ops() = default;
+    // `fd` is an O_RDONLY directory fd on the candidate mount root.
+    virtual bool is_lustre(int fd) const = 0;
+    // FID of the object behind `fd` (O_PATH is fine).
+    virtual Result<Fid> fid_of(int fd) const = 0;
+    // openat(mount_fd, ".lustre/fid/<fid>", flags): ENOENT means the object is gone.
+    virtual Result<int> open_by_fid(int mount_fd, const Fid& fid, int flags) const = 0;
+    // HSM state of an open regular file (data fd, not O_PATH).  ENOTTY / EOPNOTSUPP
+    // when the client has no HSM (the caller treats that as "not released").
+    virtual Result<HsmState> hsm_state(int fd) const = 0;
+    // Queues an HSM RESTORE for the whole file (asynchronous; the coordinator drives it).
+    virtual Result<void> hsm_restore(int mount_fd, const Fid& fid) const = 0;
+    // Default stripe size of the directory/file behind `fd` (data fd); ENODATA when no
+    // layout is set (the filesystem default applies).
+    virtual Result<uint32_t> stripe_size(int fd) const = 0;
 };
 
 // The real kernel client.

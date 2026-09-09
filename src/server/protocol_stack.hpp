@@ -35,58 +35,58 @@ class ClusterStore;
 // `cluster` (design 09 §9.4, plan 10 A3) is the shared store the key and epoch came
 // from and where the reclaim list goes; null in single-gateway mode (state_dir/).
 struct CoreState {
-  std::unique_ptr<core::ExportTable> exports;
-  core::FileHandleCodec key;
-  uint64_t epoch = 0;
-  ClusterStore* cluster = nullptr;
-  // Per-export ownership under active-active (plan 12 B2); null = every export is
-  // served here.
-  const core::FsOwnerView* owners = nullptr;
-  // `[cluster] mode = "active-active"` (plan 12 C1): the reclaim list is kept per
-  // export and grace is armed per export by the FsClusterController, never globally.
-  bool active_active = false;
-  std::string node;  // this gateway's node name under active-active (verifier, logs)
-  // This host's side of the configuration (plan 12 C1): [server], [cluster] and
-  // [backend_defaults.*] without the exports, kept for merging later catalog versions
-  // (C2).  Empty exports in local mode too; the table holds the running set.
-  core::Config local_config;
-  // exports_source = "catalog" (plan 12 C1): the catalog version the table was built
-  // from (0 = none published yet), for `cluster status` (C3) and the apply pipeline
-  // (C2), which replaces it.
-  bool catalog_exports = false;
-  uint64_t applied_catalog_version = 0;
+    std::unique_ptr<core::ExportTable> exports;
+    core::FileHandleCodec key;
+    uint64_t epoch = 0;
+    ClusterStore* cluster = nullptr;
+    // Per-export ownership under active-active (plan 12 B2); null = every export is
+    // served here.
+    const core::FsOwnerView* owners = nullptr;
+    // `[cluster] mode = "active-active"` (plan 12 C1): the reclaim list is kept per
+    // export and grace is armed per export by the FsClusterController, never globally.
+    bool active_active = false;
+    std::string node;  // this gateway's node name under active-active (verifier, logs)
+    // This host's side of the configuration (plan 12 C1): [server], [cluster] and
+    // [backend_defaults.*] without the exports, kept for merging later catalog versions
+    // (C2).  Empty exports in local mode too; the table holds the running set.
+    core::Config local_config;
+    // exports_source = "catalog" (plan 12 C1): the catalog version the table was built
+    // from (0 = none published yet), for `cluster status` (C3) and the apply pipeline
+    // (C2), which replaces it.
+    bool catalog_exports = false;
+    uint64_t applied_catalog_version = 0;
 };
 
 // Protocol engines and their shared state, wired onto one dispatcher.
 struct ProtocolStack {
-  rpc::Dispatcher dispatcher;
-  core::ObjLockRegistry locks;
-  rpc::Drc drc;
-  nfsv3::Engine nfs3;
-  mountd::Mount3 mount;
-  // v4.1 stack: session state + COMPOUND engine (enable_v4); the pseudo-fs namespace
-  // lives in the export set (plan 12 B1).
-  state::StateMgr state;
-  std::optional<nfsv4::Engine> nfs4;
-  std::atomic<bool> lease_stop{false};
-  // Set when the lease scanner coroutine has exited (plan 10 C1): the stack may only
-  // be destroyed once nothing on a reactor still references `state`.
-  std::future<void> lease_exited;
+    rpc::Dispatcher dispatcher;
+    core::ObjLockRegistry locks;
+    rpc::Drc drc;
+    nfsv3::Engine nfs3;
+    mountd::Mount3 mount;
+    // v4.1 stack: session state + COMPOUND engine (enable_v4); the pseudo-fs namespace
+    // lives in the export set (plan 12 B1).
+    state::StateMgr state;
+    std::optional<nfsv4::Engine> nfs4;
+    std::atomic<bool> lease_stop{false};
+    // Set when the lease scanner coroutine has exited (plan 10 C1): the stack may only
+    // be destroyed once nothing on a reactor still references `state`.
+    std::future<void> lease_exited;
 
-  // Builds the v3 side (engine + MOUNT registered on the dispatcher, DRC attached,
-  // write verifier from the boot epoch) and the StateMgr, including the native
-  // byte-range lock push-down hooks for exports whose backend has native_locks().
-  // Republishes the export set with the pseudo tree's change base at `core.epoch`.
-  ProtocolStack(const core::ServerConfig& cfg, CoreState& core);
+    // Builds the v3 side (engine + MOUNT registered on the dispatcher, DRC attached,
+    // write verifier from the boot epoch) and the StateMgr, including the native
+    // byte-range lock push-down hooks for exports whose backend has native_locks().
+    // Republishes the export set with the pseudo tree's change base at `core.epoch`.
+    ProtocolStack(const core::ServerConfig& cfg, CoreState& core);
 
-  // Grace list + COMPOUND engine registration + the lease scanner coroutine
-  // (design 07 §7.4: expiry → courtesy → conflict/timeout reclaim) on the last reactor.
-  void enable_v4(const core::ServerConfig& cfg, const core::ClusterConfig& cluster,
-                 CoreState& core, rt::Runtime& runtime);
-  // Asks the lease scanner to stop and blocks (not on a reactor) until it has exited;
-  // a no-op when v4 was never enabled.  Idempotent.
-  void stop_lease_scanner();
-  ~ProtocolStack() { stop_lease_scanner(); }
+    // Grace list + COMPOUND engine registration + the lease scanner coroutine
+    // (design 07 §7.4: expiry → courtesy → conflict/timeout reclaim) on the last reactor.
+    void enable_v4(const core::ServerConfig& cfg, const core::ClusterConfig& cluster, CoreState& core,
+                   rt::Runtime& runtime);
+    // Asks the lease scanner to stop and blocks (not on a reactor) until it has exited;
+    // a no-op when v4 was never enabled.  Idempotent.
+    void stop_lease_scanner();
+    ~ProtocolStack() { stop_lease_scanner(); }
 };
 
 // RFC 8881 §2.10.4 identity presented by EXCHANGE_ID (server_owner.major_id and
@@ -96,10 +96,9 @@ struct ProtocolStack {
 // alone, so every gateway of the cluster is the same server to its clients and a
 // takeover reads as that server restarting.
 struct ServerIdentity {
-  std::string owner;
-  std::string scope;
+    std::string owner;
+    std::string scope;
 };
-ServerIdentity derive_server_identity(const core::ServerConfig& cfg,
-                                      const core::ClusterConfig& cluster);
+ServerIdentity derive_server_identity(const core::ServerConfig& cfg, const core::ClusterConfig& cluster);
 
 }  // namespace lnfs::server

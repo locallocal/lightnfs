@@ -16,29 +16,29 @@ namespace lnfs::core {
 // The `[catalog]` header.  `version` is the CAS token (design 11 §11.3); the rest is
 // audit trail filled in by the gateway that commits.
 struct CatalogMeta {
-  uint64_t version = 0;
-  std::string updated_at, updated_by, comment;
+    uint64_t version = 0;
+    std::string updated_at, updated_by, comment;
 
-  friend bool operator==(const CatalogMeta&, const CatalogMeta&) = default;
+    friend bool operator==(const CatalogMeta&, const CatalogMeta&) = default;
 };
 
 // One `[[export]]` of the catalog: an ExportConfig minus this host's keys
 // (kPerNodeBackendKeys never appear in `cfg.backend_config.values`), plus `disabled`:
 // the fsid stays reserved but the export is not served (design 11 §11.5).
 struct CatalogExport {
-  ExportConfig cfg;
-  bool disabled = false;
+    ExportConfig cfg;
+    bool disabled = false;
 
-  friend bool operator==(const CatalogExport&, const CatalogExport&) = default;
+    friend bool operator==(const CatalogExport&, const CatalogExport&) = default;
 };
 
 struct Catalog {
-  CatalogMeta meta;
-  std::vector<CatalogExport> exports;  // fsid ascending
+    CatalogMeta meta;
+    std::vector<CatalogExport> exports;  // fsid ascending
 
-  const CatalogExport* by_fsid(uint32_t fsid) const;
+    const CatalogExport* by_fsid(uint32_t fsid) const;
 
-  friend bool operator==(const Catalog&, const Catalog&) = default;
+    friend bool operator==(const Catalog&, const Catalog&) = default;
 };
 
 // `[catalog]` header (required, with `version`) + `[[export]]` / `[export.<backend>]`
@@ -67,8 +67,7 @@ Result<std::vector<ExportConfig>> merge_with_local(const Catalog& catalog, const
 // active-active) presence, same-volume exports sharing one owner list (design 10
 // §10.6), a parseable non-empty client list.  Disabled exports count for every rule.
 // `why` (when given) receives the reason; otherwise it is logged at WARN.
-Result<void> validate_catalog(const Catalog& catalog, bool active_active,
-                              std::string* why = nullptr);
+Result<void> validate_catalog(const Catalog& catalog, bool active_active, std::string* why = nullptr);
 
 // Export-level differences between two versions, each list fsid ascending.  `rejected`
 // holds fsids whose identity changed (path, backend, or a cluster-wide backend key —
@@ -77,11 +76,11 @@ Result<void> validate_catalog(const Catalog& catalog, bool active_active,
 // (e.g. `enabled` and `nodes_changed`).  `dynamic_changed` covers clients / QoS /
 // readonly / squash / anon_*.
 struct CatalogDiff {
-  std::vector<uint32_t> added, removed, disabled, enabled;
-  std::vector<uint32_t> nodes_changed, dynamic_changed, rejected;
+    std::vector<uint32_t> added, removed, disabled, enabled;
+    std::vector<uint32_t> nodes_changed, dynamic_changed, rejected;
 
-  bool empty() const;
-  friend bool operator==(const CatalogDiff&, const CatalogDiff&) = default;
+    bool empty() const;
+    friend bool operator==(const CatalogDiff&, const CatalogDiff&) = default;
 };
 CatalogDiff diff_catalog(const Catalog& from, const Catalog& to);
 

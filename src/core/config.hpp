@@ -23,143 +23,143 @@ enum class Squash { kNone, kRoot, kAll };
 
 class Cidr {
  public:
-  static Result<Cidr> parse(std::string_view text);
-  bool contains(const sockaddr_storage& peer) const;
-  const std::string& text() const { return text_; }
+    static Result<Cidr> parse(std::string_view text);
+    bool contains(const sockaddr_storage& peer) const;
+    const std::string& text() const { return text_; }
 
  private:
-  int family_ = AF_UNSPEC;
-  std::array<uint8_t, 16> address_{};
-  uint8_t prefix_ = 0;
-  std::string text_;
+    int family_ = AF_UNSPEC;
+    std::array<uint8_t, 16> address_{};
+    uint8_t prefix_ = 0;
+    std::string text_;
 };
 
 struct ServerConfig {
-  int reactors = 0;
-  int offload_threads = 16;
-  // Offload pool shaping (plan doc 10 §2.5): threads reserved for heavy (fsync/
-  // fallocate/copy-grade) jobs — 0 = max(1, offload_threads/4) — and the per-class
-  // queued-job cap before admissions wait.
-  int offload_heavy_threads = 0;
-  uint32_t offload_queue_cap = 4096;
-  // Ring backend (plan doc 10 §2.3): "auto" probes io_uring and falls back to epoll;
-  // ring_sqpoll enables IORING_SETUP_SQPOLL kernel-thread submission (design 02 §2.63).
-  std::string ring = "auto";
-  bool ring_sqpoll = false;
-  // Listen address for the NFS/MOUNT listeners (plan doc 10 §4.4): IPv4/IPv6 literal;
-  // empty = all interfaces (dual-stack).
-  std::string bind;
-  uint16_t port = 2049;
-  uint16_t mount_port = 20048;
-  bool rpcbind = true;
-  bool builtin_portmap = false;
-  std::string state_dir = "/var/lib/lightnfs";
-  int max_connections = 4096;
-  uint32_t max_request_size = (1u << 20) + (64u << 10);
-  int inflight_per_conn = 64;
-  int per_peer_limit = 128;
-  uint64_t drc_ttl_ms = 120000;
-  uint64_t drc_mem = 64u << 20;
-  bool enable_v4 = true;
-  // Read delegations (plan doc 10 §5.2): granted only to sessions with a live
-  // backchannel; this is the operator kill switch.
-  bool delegations = true;
-  uint32_t lease_seconds = 90;   // v4 lease
-  // Grace window after restart, decoupled from the lease (plan doc 10 §4.4):
-  // 0 = "auto" = lease; operators often want grace < lease for faster recovery.
-  uint32_t grace_seconds = 0;
-  uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
-  uint32_t state_shards = 16;         // v4 state table shards (plan doc 10 §2.6)
-  std::string ctl_socket;   // default: <state_dir>/ctl.sock; "" resolves at startup
-  uint16_t metrics_port = 0;  // 0 = disabled
-  // Metrics exposure (plan doc 10 §1.8): loopback by default; widening the bind and
-  // the CIDR allowlist are both explicit choices.  Empty allowlist = no per-peer
-  // filtering beyond the bind address.
-  std::string metrics_bind = "127.0.0.1";
-  std::vector<std::string> metrics_allow;
-  // NFSv4.1 server identity (RFC 8881 §2.10.4): distinct servers must present
-  // distinct owner/scope or clients will treat them as trunking paths of one server.
-  // Empty = derived from hostname + state_dir at startup.
-  std::string server_owner;
-  std::string server_scope;
-  std::string log_level = "info";  // debug enables the per-request summary line (08 §8.2)
-  // Observability knobs (plan doc 10 §3.6/§3.7): requests slower than this warn-log a
-  // per-op time breakdown (0 disables); error_ring sizes the dump-errors sampling ring.
-  uint32_t slow_request_ms = 1000;
-  uint32_t error_ring = 64;
-  // Log sink (plan doc 10 §4.4): empty = stderr; otherwise a rotating file.
-  std::string log_file;
-  uint64_t log_rotate_size = 50u << 20;
-  uint32_t log_rotate_keep = 5;
-  // Per-client (v4 clientid) token-bucket defaults, [limits] section (plan doc 10
-  // §4.3).  0 = unlimited.  Hot-reloadable.
-  uint64_t client_read_bps = 0;
-  uint64_t client_write_bps = 0;
-  uint32_t client_iops = 0;
-  // RPC-over-TLS (RFC 9289), [tls] section (design 09 §"长期观察项", plan doc 10 §5.4).
-  // mode: "off" (default) | "optional" (offer STARTTLS, still serve cleartext) |
-  // "required" (offer STARTTLS, refuse cleartext NFS ops).  cert/key are PEM paths; ca
-  // (optional) enables client-certificate verification (mutual TLS with client_cert).
-  std::string tls_mode = "off";
-  std::string tls_cert;
-  std::string tls_key;
-  std::string tls_ca;
-  bool tls_require_client_cert = false;
+    int reactors = 0;
+    int offload_threads = 16;
+    // Offload pool shaping (plan doc 10 §2.5): threads reserved for heavy (fsync/
+    // fallocate/copy-grade) jobs — 0 = max(1, offload_threads/4) — and the per-class
+    // queued-job cap before admissions wait.
+    int offload_heavy_threads = 0;
+    uint32_t offload_queue_cap = 4096;
+    // Ring backend (plan doc 10 §2.3): "auto" probes io_uring and falls back to epoll;
+    // ring_sqpoll enables IORING_SETUP_SQPOLL kernel-thread submission (design 02 §2.63).
+    std::string ring = "auto";
+    bool ring_sqpoll = false;
+    // Listen address for the NFS/MOUNT listeners (plan doc 10 §4.4): IPv4/IPv6 literal;
+    // empty = all interfaces (dual-stack).
+    std::string bind;
+    uint16_t port = 2049;
+    uint16_t mount_port = 20048;
+    bool rpcbind = true;
+    bool builtin_portmap = false;
+    std::string state_dir = "/var/lib/lightnfs";
+    int max_connections = 4096;
+    uint32_t max_request_size = (1u << 20) + (64u << 10);
+    int inflight_per_conn = 64;
+    int per_peer_limit = 128;
+    uint64_t drc_ttl_ms = 120000;
+    uint64_t drc_mem = 64u << 20;
+    bool enable_v4 = true;
+    // Read delegations (plan doc 10 §5.2): granted only to sessions with a live
+    // backchannel; this is the operator kill switch.
+    bool delegations = true;
+    uint32_t lease_seconds = 90;  // v4 lease
+    // Grace window after restart, decoupled from the lease (plan doc 10 §4.4):
+    // 0 = "auto" = lease; operators often want grace < lease for faster recovery.
+    uint32_t grace_seconds = 0;
+    uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
+    uint32_t state_shards = 16;         // v4 state table shards (plan doc 10 §2.6)
+    std::string ctl_socket;             // default: <state_dir>/ctl.sock; "" resolves at startup
+    uint16_t metrics_port = 0;          // 0 = disabled
+    // Metrics exposure (plan doc 10 §1.8): loopback by default; widening the bind and
+    // the CIDR allowlist are both explicit choices.  Empty allowlist = no per-peer
+    // filtering beyond the bind address.
+    std::string metrics_bind = "127.0.0.1";
+    std::vector<std::string> metrics_allow;
+    // NFSv4.1 server identity (RFC 8881 §2.10.4): distinct servers must present
+    // distinct owner/scope or clients will treat them as trunking paths of one server.
+    // Empty = derived from hostname + state_dir at startup.
+    std::string server_owner;
+    std::string server_scope;
+    std::string log_level = "info";  // debug enables the per-request summary line (08 §8.2)
+    // Observability knobs (plan doc 10 §3.6/§3.7): requests slower than this warn-log a
+    // per-op time breakdown (0 disables); error_ring sizes the dump-errors sampling ring.
+    uint32_t slow_request_ms = 1000;
+    uint32_t error_ring = 64;
+    // Log sink (plan doc 10 §4.4): empty = stderr; otherwise a rotating file.
+    std::string log_file;
+    uint64_t log_rotate_size = 50u << 20;
+    uint32_t log_rotate_keep = 5;
+    // Per-client (v4 clientid) token-bucket defaults, [limits] section (plan doc 10
+    // §4.3).  0 = unlimited.  Hot-reloadable.
+    uint64_t client_read_bps = 0;
+    uint64_t client_write_bps = 0;
+    uint32_t client_iops = 0;
+    // RPC-over-TLS (RFC 9289), [tls] section (design 09 §"长期观察项", plan doc 10 §5.4).
+    // mode: "off" (default) | "optional" (offer STARTTLS, still serve cleartext) |
+    // "required" (offer STARTTLS, refuse cleartext NFS ops).  cert/key are PEM paths; ca
+    // (optional) enables client-certificate verification (mutual TLS with client_cert).
+    std::string tls_mode = "off";
+    std::string tls_cert;
+    std::string tls_key;
+    std::string tls_ca;
+    bool tls_require_client_cert = false;
 };
 
 struct ExportConfig {
-  std::string path;
-  std::string backend = "local";
-  uint32_t fsid = 0;
-  std::vector<std::string> clients{"0.0.0.0/0", "::/0"};
-  Squash squash = Squash::kRoot;
-  uint32_t anon_uid = 65534;
-  uint32_t anon_gid = 65534;
-  bool readonly = false;
-  // Per-export token buckets (plan doc 10 §4.3): bytes/s for READ and WRITE plus an
-  // IO ops/s cap.  0 = unlimited.  Hot-reloadable.
-  uint64_t read_bps = 0;
-  uint64_t write_bps = 0;
-  uint32_t iops = 0;
-  // Active-active owner priority list (design 10 §10.3/§10.10, plan 12 A1): the first
-  // live node serves this fsid, the rest take over in order.  Empty outside
-  // `[cluster] mode = "active-active"`; a restart-required change.
-  std::vector<std::string> nodes;
-  backend::BackendConfig backend_config;
+    std::string path;
+    std::string backend = "local";
+    uint32_t fsid = 0;
+    std::vector<std::string> clients{"0.0.0.0/0", "::/0"};
+    Squash squash = Squash::kRoot;
+    uint32_t anon_uid = 65534;
+    uint32_t anon_gid = 65534;
+    bool readonly = false;
+    // Per-export token buckets (plan doc 10 §4.3): bytes/s for READ and WRITE plus an
+    // IO ops/s cap.  0 = unlimited.  Hot-reloadable.
+    uint64_t read_bps = 0;
+    uint64_t write_bps = 0;
+    uint32_t iops = 0;
+    // Active-active owner priority list (design 10 §10.3/§10.10, plan 12 A1): the first
+    // live node serves this fsid, the rest take over in order.  Empty outside
+    // `[cluster] mode = "active-active"`; a restart-required change.
+    std::vector<std::string> nodes;
+    backend::BackendConfig backend_config;
 
-  friend bool operator==(const ExportConfig&, const ExportConfig&) = default;
+    friend bool operator==(const ExportConfig&, const ExportConfig&) = default;
 };
 
 // Multi-gateway failover (design 09 §9.3, plan 10 A1): the [cluster] section.  Every
 // field is ignored while `enabled` is false; the section is not hot-reloadable.
 struct ClusterConfig {
-  bool enabled = false;
-  std::string id;            // shared by every gateway; [A-Za-z0-9_-]{8,64} (a UUID fits)
-  std::string shared_dir;    // absolute path on the shared filesystem (design 09 §9.4)
-  std::string node;          // this gateway's name; empty = gethostname() at startup
-  std::string role = "auto"; // active | standby | auto (active-active: auto only)
-  // failover (design 09: one active gateway behind one VIP) | active-active (design 10:
-  // one owner gateway per export, clients referred with fs_locations).  Plan 12 A1.
-  std::string mode = "failover";
-  // active-active: this gateway's own "host:port" ("[v6]:port" for IPv6), the address
-  // its fs_locations answers carry for the exports it owns.  Ignored under failover.
-  std::string node_address;
-  uint32_t fence_lease_ms = 3000;  // fence renew period; lost after 3 missed renewals
-  std::string takeover = "auto";   // auto | manual (only `lightnfs-ctl cluster takeover`)
-  std::string takeover_hook;       // optional script run after the backend takeover hooks
-  // Shared export catalog (design 11 §11.2, plan 12 A1): where the export table comes
-  // from.  "local" = this file's [[export]] blocks (today); "catalog" = the cluster's
-  // shared_dir/catalog.toml, in which case this file must carry no [[export]] and may
-  // start with an empty table until one is published.  Restart-required.
-  std::string exports_source = "local";  // local | catalog
-  // catalog only: pick up a newer catalog on the fence tick ("auto") or only on
-  // `lightnfs-ctl cluster catalog apply` / `reload` / SIGHUP ("manual").  Hot-reloadable.
-  std::string catalog_refresh = "auto";  // auto | manual
-  // Test-only: turn the kStableHandles/kByteLocks/native_locks requirement into a
-  // warning so the two-instance local acceptance run can use the local backend.
-  bool unsafe_skip_backend_checks = false;
+    bool enabled = false;
+    std::string id;             // shared by every gateway; [A-Za-z0-9_-]{8,64} (a UUID fits)
+    std::string shared_dir;     // absolute path on the shared filesystem (design 09 §9.4)
+    std::string node;           // this gateway's name; empty = gethostname() at startup
+    std::string role = "auto";  // active | standby | auto (active-active: auto only)
+    // failover (design 09: one active gateway behind one VIP) | active-active (design 10:
+    // one owner gateway per export, clients referred with fs_locations).  Plan 12 A1.
+    std::string mode = "failover";
+    // active-active: this gateway's own "host:port" ("[v6]:port" for IPv6), the address
+    // its fs_locations answers carry for the exports it owns.  Ignored under failover.
+    std::string node_address;
+    uint32_t fence_lease_ms = 3000;  // fence renew period; lost after 3 missed renewals
+    std::string takeover = "auto";   // auto | manual (only `lightnfs-ctl cluster takeover`)
+    std::string takeover_hook;       // optional script run after the backend takeover hooks
+    // Shared export catalog (design 11 §11.2, plan 12 A1): where the export table comes
+    // from.  "local" = this file's [[export]] blocks (today); "catalog" = the cluster's
+    // shared_dir/catalog.toml, in which case this file must carry no [[export]] and may
+    // start with an empty table until one is published.  Restart-required.
+    std::string exports_source = "local";  // local | catalog
+    // catalog only: pick up a newer catalog on the fence tick ("auto") or only on
+    // `lightnfs-ctl cluster catalog apply` / `reload` / SIGHUP ("manual").  Hot-reloadable.
+    std::string catalog_refresh = "auto";  // auto | manual
+    // Test-only: turn the kStableHandles/kByteLocks/native_locks requirement into a
+    // warning so the two-instance local acceptance run can use the local backend.
+    bool unsafe_skip_backend_checks = false;
 
-  friend bool operator==(const ClusterConfig&, const ClusterConfig&) = default;
+    friend bool operator==(const ClusterConfig&, const ClusterConfig&) = default;
 };
 
 // `node` with the hostname default applied.
@@ -186,18 +186,18 @@ std::map<std::string, std::vector<const ExportConfig*>> same_volume_groups(
 bool check_same_volume_nodes(const std::vector<const ExportConfig*>& exports, std::string& why);
 
 struct Config {
-  ServerConfig server;
-  ClusterConfig cluster;
-  std::vector<ExportConfig> exports;
-  // `[backend_defaults.<backend>]` (design 11 §11.2, plan 12 A1): this host's per-node
-  // backend keys (kPerNodeBackendKeys only — credentials, log paths, cache sizes),
-  // merged into every catalog export of that backend.  Ignored (with a warning) under
-  // exports_source = "local".  Keyed by backend name; `path`/`fsid` unused.
-  std::map<std::string, backend::BackendConfig> backend_defaults;
-  // Set when `exports` were filled from the shared catalog (plan 12 C1): under
-  // exports_source = "catalog" a local [[export]] block is an error, a merged catalog
-  // export is what validate_config / ExportTable::build are meant to see.
-  bool exports_from_catalog = false;
+    ServerConfig server;
+    ClusterConfig cluster;
+    std::vector<ExportConfig> exports;
+    // `[backend_defaults.<backend>]` (design 11 §11.2, plan 12 A1): this host's per-node
+    // backend keys (kPerNodeBackendKeys only — credentials, log paths, cache sizes),
+    // merged into every catalog export of that backend.  Ignored (with a warning) under
+    // exports_source = "local".  Keyed by backend name; `path`/`fsid` unused.
+    std::map<std::string, backend::BackendConfig> backend_defaults;
+    // Set when `exports` were filled from the shared catalog (plan 12 C1): under
+    // exports_source = "catalog" a local [[export]] block is an error, a merged catalog
+    // export is what validate_config / ExportTable::build are meant to see.
+    bool exports_from_catalog = false;
 };
 
 Result<Config> parse_config(std::string_view toml);
@@ -210,8 +210,8 @@ Result<void> validate_config(const Config& config);
 // every backend subtable key except the per-node ones below (credentials, log paths,
 // cache sizes: legitimately different per host).  Client allowlists and QoS are not
 // identity and are hot-reloadable, so they are left out.  "sha256:<64 hex>".
-inline constexpr std::string_view kPerNodeBackendKeys[] = {
-    "conf", "keyring", "id", "user", "name", "log_file", "fd_cache", "mon_host"};
+inline constexpr std::string_view kPerNodeBackendKeys[] = {"conf", "keyring",  "id",       "user",
+                                                           "name", "log_file", "fd_cache", "mon_host"};
 std::string canonical_exports_digest(const Config& config);
 // Whether `key` is one of kPerNodeBackendKeys.
 bool per_node_backend_key(std::string_view key);
@@ -219,67 +219,63 @@ bool per_node_backend_key(std::string_view key);
 std::string canonical_exports_text(const Config& config);
 
 struct ExportEntry {
-  std::string path;
-  uint32_t fsid = 0;
-  // Hot-updatable scalars (plan 12 B2): ExportTable::apply() flips them in place on the
-  // shared entry; every read point loads once per request (squash_cred, the ROFS gates).
-  std::atomic<Squash> squash{Squash::kRoot};
-  std::atomic<uint32_t> anon_uid{65534};
-  std::atomic<uint32_t> anon_gid{65534};
-  std::atomic<bool> readonly{false};
-  std::unique_ptr<backend::Backend> backend;
-  // Per-export data-path counters (plan doc 10 §3.3), exported with export/fsid labels.
-  obs::ExportMetrics metrics;
+    std::string path;
+    uint32_t fsid = 0;
+    // Hot-updatable scalars (plan 12 B2): ExportTable::apply() flips them in place on the
+    // shared entry; every read point loads once per request (squash_cred, the ROFS gates).
+    std::atomic<Squash> squash{Squash::kRoot};
+    std::atomic<uint32_t> anon_uid{65534};
+    std::atomic<uint32_t> anon_gid{65534};
+    std::atomic<bool> readonly{false};
+    std::unique_ptr<backend::Backend> backend;
+    // Per-export data-path counters (plan doc 10 §3.3), exported with export/fsid labels.
+    obs::ExportMetrics metrics;
 
-  ExportEntry() {
-    set_clients({});
-    set_nodes({});
-  }
-
-  // Client allowlist, hot-reloadable (plan doc 10 §4.1): readers load one atomic
-  // pointer; set_clients publishes a fresh list and retires the old one until the
-  // entry dies (reloads are rare and serialized, so the retirement list stays tiny).
-  const std::vector<Cidr>& client_list() const {
-    return *clients_.load(std::memory_order_acquire);
-  }
-  void set_clients(std::vector<Cidr> list) {
-    auto owned = std::make_unique<const std::vector<Cidr>>(std::move(list));
-    clients_.store(owned.get(), std::memory_order_release);
-    retired_clients_.push_back(std::move(owned));
-  }
-  // Active-active owner priority list (plan 12 A1), published the same way (plan 12
-  // B2): the controller's tick thread reads it while apply() replaces it.
-  const std::vector<std::string>& node_list() const {
-    return *nodes_.load(std::memory_order_acquire);
-  }
-  void set_nodes(std::vector<std::string> list) {
-    auto owned = std::make_unique<const std::vector<std::string>>(std::move(list));
-    nodes_.store(owned.get(), std::memory_order_release);
-    retired_nodes_.push_back(std::move(owned));
-  }
-
-  // Per-export QoS buckets (plan doc 10 §4.3), enforced at the engine entry for
-  // READ/WRITE before any object lock is taken.
-  struct Qos {
-    rt::TokenBucket read_bytes, write_bytes, ops;
-    rt::Task<void> throttle(bool write, uint64_t bytes) {
-      co_await ops.acquire(1);
-      co_await (write ? write_bytes : read_bytes).acquire(bytes);
+    ExportEntry() {
+        set_clients({});
+        set_nodes({});
     }
-  } qos;
+
+    // Client allowlist, hot-reloadable (plan doc 10 §4.1): readers load one atomic
+    // pointer; set_clients publishes a fresh list and retires the old one until the
+    // entry dies (reloads are rare and serialized, so the retirement list stays tiny).
+    const std::vector<Cidr>& client_list() const { return *clients_.load(std::memory_order_acquire); }
+    void set_clients(std::vector<Cidr> list) {
+        auto owned = std::make_unique<const std::vector<Cidr>>(std::move(list));
+        clients_.store(owned.get(), std::memory_order_release);
+        retired_clients_.push_back(std::move(owned));
+    }
+    // Active-active owner priority list (plan 12 A1), published the same way (plan 12
+    // B2): the controller's tick thread reads it while apply() replaces it.
+    const std::vector<std::string>& node_list() const { return *nodes_.load(std::memory_order_acquire); }
+    void set_nodes(std::vector<std::string> list) {
+        auto owned = std::make_unique<const std::vector<std::string>>(std::move(list));
+        nodes_.store(owned.get(), std::memory_order_release);
+        retired_nodes_.push_back(std::move(owned));
+    }
+
+    // Per-export QoS buckets (plan doc 10 §4.3), enforced at the engine entry for
+    // READ/WRITE before any object lock is taken.
+    struct Qos {
+        rt::TokenBucket read_bytes, write_bytes, ops;
+        rt::Task<void> throttle(bool write, uint64_t bytes) {
+            co_await ops.acquire(1);
+            co_await (write ? write_bytes : read_bytes).acquire(bytes);
+        }
+    } qos;
 
  private:
-  std::atomic<const std::vector<Cidr>*> clients_{nullptr};
-  std::vector<std::unique_ptr<const std::vector<Cidr>>> retired_clients_;
-  std::atomic<const std::vector<std::string>*> nodes_{nullptr};
-  std::vector<std::unique_ptr<const std::vector<std::string>>> retired_nodes_;
+    std::atomic<const std::vector<Cidr>*> clients_{nullptr};
+    std::vector<std::unique_ptr<const std::vector<Cidr>>> retired_clients_;
+    std::atomic<const std::vector<std::string>*> nodes_{nullptr};
+    std::vector<std::unique_ptr<const std::vector<std::string>>> retired_nodes_;
 };
 
 struct MappedCred {
-  uint32_t uid = 65534;
-  uint32_t gid = 65534;
-  std::vector<uint32_t> groups;
-  backend::Cred view() const { return {uid, gid, groups}; }
+    uint32_t uid = 65534;
+    uint32_t gid = 65534;
+    std::vector<uint32_t> groups;
+    backend::Cred view() const { return {uid, gid, groups}; }
 };
 
 class PseudoFs;
@@ -293,49 +289,49 @@ class PseudoFs;
 // membership is frozen; the entries' own runtime state stays mutable through the
 // pointers handed out here, which is why they are not const.
 struct ExportSet {
-  uint64_t generation = 0;  // +1 on every publish
-  uint64_t epoch = 1;       // the boot epoch the set serves under
-  // The pseudo tree's change attribute (plan 12 B2): epoch << 32 | generation, so it
-  // moves on every publish and never repeats across restarts.
-  uint64_t pseudo_change() const { return (epoch << 32) | generation; }
-  std::vector<std::shared_ptr<ExportEntry>> entries;  // fsid ascending, unique
-  std::unique_ptr<const PseudoFs> pseudo;             // built over `entries`
+    uint64_t generation = 0;  // +1 on every publish
+    uint64_t epoch = 1;       // the boot epoch the set serves under
+    // The pseudo tree's change attribute (plan 12 B2): epoch << 32 | generation, so it
+    // moves on every publish and never repeats across restarts.
+    uint64_t pseudo_change() const { return (epoch << 32) | generation; }
+    std::vector<std::shared_ptr<ExportEntry>> entries;  // fsid ascending, unique
+    std::unique_ptr<const PseudoFs> pseudo;             // built over `entries`
 
-  ExportSet();
-  ~ExportSet();
-  ExportSet(const ExportSet&) = delete;
-  ExportSet& operator=(const ExportSet&) = delete;
+    ExportSet();
+    ~ExportSet();
+    ExportSet(const ExportSet&) = delete;
+    ExportSet& operator=(const ExportSet&) = delete;
 
-  ExportEntry* by_fsid(uint32_t fsid) const;  // binary search
-  // Longest export path prefix, component-boundary checked.
-  ExportEntry* for_mount_path(std::string_view path, std::string& relative) const;
+    ExportEntry* by_fsid(uint32_t fsid) const;  // binary search
+    // Longest export path prefix, component-boundary checked.
+    ExportEntry* for_mount_path(std::string_view path, std::string& relative) const;
 };
 
 // Assembles the next ExportSet: from nothing or from an existing set (whose entries
 // it shares), then finish() sorts the entries, builds the pseudo tree and freezes it.
 class ExportSetBuilder {
  public:
-  ExportSetBuilder() = default;
-  explicit ExportSetBuilder(const ExportSet& base) : entries_(base.entries) {}
+    ExportSetBuilder() = default;
+    explicit ExportSetBuilder(const ExportSet& base) : entries_(base.entries) {}
 
-  // A fresh entry from its config: EINVAL for fsid 0, a duplicate fsid or no backend.
-  Result<void> add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend);
-  // An existing entry carried over as the same object (plan 12 B2).
-  void keep(std::shared_ptr<ExportEntry> entry) { entries_.push_back(std::move(entry)); }
-  // `epoch` feeds the pseudo tree's change attribute; `generation` is the set version.
-  std::shared_ptr<const ExportSet> finish(uint64_t epoch, uint64_t generation);
+    // A fresh entry from its config: EINVAL for fsid 0, a duplicate fsid or no backend.
+    Result<void> add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend);
+    // An existing entry carried over as the same object (plan 12 B2).
+    void keep(std::shared_ptr<ExportEntry> entry) { entries_.push_back(std::move(entry)); }
+    // `epoch` feeds the pseudo tree's change attribute; `generation` is the set version.
+    std::shared_ptr<const ExportSet> finish(uint64_t epoch, uint64_t generation);
 
  private:
-  std::vector<std::shared_ptr<ExportEntry>> entries_;
+    std::vector<std::shared_ptr<ExportEntry>> entries_;
 };
 
 // One export-set change (plan 12 B2), produced by diff_catalog + merge_with_local
 // (C2) or by the ctl export commands (D2).
 struct ExportSetPlan {
-  std::vector<ExportConfig> add;     // new fsids (an export coming back enabled too)
-  std::vector<ExportConfig> update;  // same fsid: clients / qos / readonly / squash /
-                                     // anon / nodes applied in place
-  std::vector<uint32_t> remove;      // deleted or disabled
+    std::vector<ExportConfig> add;     // new fsids (an export coming back enabled too)
+    std::vector<ExportConfig> update;  // same fsid: clients / qos / readonly / squash /
+                                       // anon / nodes applied in place
+    std::vector<uint32_t> remove;      // deleted or disabled
 };
 
 // The published export set (RCU, plan 12 B1): one atomic pointer to the current
@@ -345,70 +341,71 @@ struct ExportSetPlan {
 // writers, all on the main-loop thread.
 class ExportTable {
  public:
-  ExportTable();  // an empty set
-  explicit ExportTable(std::shared_ptr<const ExportSet> initial);
+    ExportTable();  // an empty set
+    explicit ExportTable(std::shared_ptr<const ExportSet> initial);
 
-  static Result<std::unique_ptr<ExportTable>> build(Config config);
-  // Publishes a new set with `cfg` added (startup and tests; the runtime path is B2's
-  // apply()).  EINVAL for fsid 0, a duplicate fsid or no backend.
-  Result<void> add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend);
+    static Result<std::unique_ptr<ExportTable>> build(Config config);
+    // Publishes a new set with `cfg` added (startup and tests; the runtime path is B2's
+    // apply()).  EINVAL for fsid 0, a duplicate fsid or no backend.
+    Result<void> add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend);
 
-  // The current set: one atomic load plus one shared_ptr copy.
-  std::shared_ptr<const ExportSet> snapshot() const { return set_.load(std::memory_order_acquire); }
-  // Republishes the current entries with the pseudo tree's change base moved to
-  // `epoch`: the boot epoch is only known when the gateway activates, after the table
-  // was built.  A no-op when the epoch is already that.
-  void set_epoch(uint64_t epoch);
-  // Test hook (plan 12 B1): publish an arbitrary set — apply() is the real path.
-  void publish_for_test(std::shared_ptr<const ExportSet> set);
+    // The current set: one atomic load plus one shared_ptr copy.
+    std::shared_ptr<const ExportSet> snapshot() const { return set_.load(std::memory_order_acquire); }
+    // Republishes the current entries with the pseudo tree's change base moved to
+    // `epoch`: the boot epoch is only known when the gateway activates, after the table
+    // was built.  A no-op when the epoch is already that.
+    void set_epoch(uint64_t epoch);
+    // Test hook (plan 12 B1): publish an arbitrary set — apply() is the real path.
+    void publish_for_test(std::shared_ptr<const ExportSet> set);
 
-  // Publishes the set after `plan` (plan 12 B2), main-loop thread only.  `started`
-  // carries one already started backend per plan.add, in that order; it is consumed
-  // on success and left untouched on failure.  Entries the plan does not remove are
-  // the same objects in the new set; updates land on those objects in place, so a
-  // reader on an older snapshot sees them too.  Removed entries go to the retirement
-  // queue.  EINVAL, with nothing published or changed, when the backend count does
-  // not match, an add's fsid is 0 or already in the set (unless the plan also removes
-  // it), an fsid is listed twice, an update or remove names an unknown fsid, an
-  // update changes the path, or a client CIDR does not parse.
-  Result<std::shared_ptr<const ExportSet>> apply(
-      ExportSetPlan plan, std::vector<std::unique_ptr<backend::Backend>>& started, uint64_t epoch);
-  // Retirement queue (plan 12 B2): entries apply() removed.  Returns — and forgets —
-  // the ones nothing else references any more (use_count() == 1: every snapshot that
-  // listed them is gone), for the caller to stop() their backends and drop; the rest
-  // stay queued until a later call.  Main-loop thread.
-  std::vector<std::shared_ptr<ExportEntry>> take_retired();
-  // Entries still waiting in the queue, and since when the oldest has been waiting
-  // (C2 warns past 10 × lease).
-  size_t retired_pending() const;
-  std::optional<std::chrono::steady_clock::time_point> oldest_retired() const;
+    // Publishes the set after `plan` (plan 12 B2), main-loop thread only.  `started`
+    // carries one already started backend per plan.add, in that order; it is consumed
+    // on success and left untouched on failure.  Entries the plan does not remove are
+    // the same objects in the new set; updates land on those objects in place, so a
+    // reader on an older snapshot sees them too.  Removed entries go to the retirement
+    // queue.  EINVAL, with nothing published or changed, when the backend count does
+    // not match, an add's fsid is 0 or already in the set (unless the plan also removes
+    // it), an fsid is listed twice, an update or remove names an unknown fsid, an
+    // update changes the path, or a client CIDR does not parse.
+    Result<std::shared_ptr<const ExportSet>> apply(ExportSetPlan plan,
+                                                   std::vector<std::unique_ptr<backend::Backend>>& started,
+                                                   uint64_t epoch);
+    // Retirement queue (plan 12 B2): entries apply() removed.  Returns — and forgets —
+    // the ones nothing else references any more (use_count() == 1: every snapshot that
+    // listed them is gone), for the caller to stop() their backends and drop; the rest
+    // stay queued until a later call.  Main-loop thread.
+    std::vector<std::shared_ptr<ExportEntry>> take_retired();
+    // Entries still waiting in the queue, and since when the oldest has been waiting
+    // (C2 warns past 10 × lease).
+    size_t retired_pending() const;
+    std::optional<std::chrono::steady_clock::time_point> oldest_retired() const;
 
-  // Convenience over snapshot() for startup code and tests.  The pointer is only as
-  // stable as the entry's membership: a request-path reader holds the snapshot itself.
-  ExportEntry* by_fsid(uint32_t fsid) const { return snapshot()->by_fsid(fsid); }
-  size_t size() const { return snapshot()->entries.size(); }
+    // Convenience over snapshot() for startup code and tests.  The pointer is only as
+    // stable as the entry's membership: a request-path reader holds the snapshot itself.
+    ExportEntry* by_fsid(uint32_t fsid) const { return snapshot()->by_fsid(fsid); }
+    size_t size() const { return snapshot()->entries.size(); }
 
-  // Per-entry rules that need no table state.
-  static bool check_client(const sockaddr_storage& peer, const ExportEntry& entry);
-  static MappedCred squash_cred(const rpc::Cred& cred, const ExportEntry& entry);
+    // Per-entry rules that need no table state.
+    static bool check_client(const sockaddr_storage& peer, const ExportEntry& entry);
+    static MappedCred squash_cred(const rpc::Cred& cred, const ExportEntry& entry);
 
-  // Hot reload, step 1 (plan doc 10 §4.1): re-applies the non-topology per-export
-  // settings (client CIDR allowlist, QoS rates) from a freshly validated config,
-  // matching entries by fsid.  Topology changes (exports added/removed, path/backend/
-  // squash changed) are reported as restart-required, never applied.  Returns the
-  // human-readable report.  Must not run concurrently with itself.
-  std::string reload_dynamic(const Config& fresh);
+    // Hot reload, step 1 (plan doc 10 §4.1): re-applies the non-topology per-export
+    // settings (client CIDR allowlist, QoS rates) from a freshly validated config,
+    // matching entries by fsid.  Topology changes (exports added/removed, path/backend/
+    // squash changed) are reported as restart-required, never applied.  Returns the
+    // human-readable report.  Must not run concurrently with itself.
+    std::string reload_dynamic(const Config& fresh);
 
  private:
-  void publish(std::shared_ptr<const ExportSet> set);
+    void publish(std::shared_ptr<const ExportSet> set);
 
-  std::atomic<std::shared_ptr<const ExportSet>> set_;
-  struct Retired {
-    std::shared_ptr<ExportEntry> entry;
-    std::chrono::steady_clock::time_point since;
-  };
-  mutable std::mutex retired_mu_;
-  std::vector<Retired> retired_;
+    std::atomic<std::shared_ptr<const ExportSet>> set_;
+    struct Retired {
+        std::shared_ptr<ExportEntry> entry;
+        std::chrono::steady_clock::time_point since;
+    };
+    mutable std::mutex retired_mu_;
+    std::vector<Retired> retired_;
 };
 
 }  // namespace lnfs::core

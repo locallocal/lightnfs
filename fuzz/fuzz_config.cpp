@@ -9,13 +9,13 @@
 #include "core/config.hpp"
 
 extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
-  std::string_view text(reinterpret_cast<const char*>(data), size);
-  (void)lnfs::core::parse_config(text);
+    std::string_view text(reinterpret_cast<const char*>(data), size);
+    (void)lnfs::core::parse_config(text);
 }
 
 #ifndef LNFS_FUZZ_REGRESS
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  lnfs_fuzz_entry(data, size);
-  return 0;
+    lnfs_fuzz_entry(data, size);
+    return 0;
 }
 #endif
