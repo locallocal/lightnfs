@@ -29,15 +29,18 @@ struct glfs {
 
 struct glfs_object {
     glfs* fs = nullptr;
-    int fd = -1;  // O_PATH
+    // O_PATH
+    int fd = -1;
     uint64_t ino = 0;
     uint64_t gen = 0;
 };
 
 struct glfs_fd {
     glfs* fs = nullptr;
-    int fd = -1;         // data fd (regular files)
-    DIR* dir = nullptr;  // directories
+    // data fd (regular files)
+    int fd = -1;
+    // directories
+    DIR* dir = nullptr;
     uint64_t ino = 0;
     std::string lkowner;
 };
@@ -70,7 +73,8 @@ struct State {
     struct Seg {
         uint64_t ino;
         std::string owner;
-        uint64_t start, end;  // end exclusive, UINT64_MAX = EOF
+        // end exclusive, UINT64_MAX = EOF
+        uint64_t start, end;
         bool excl;
     };
     std::vector<Seg> locks;
@@ -392,7 +396,8 @@ int f_h_rename(glfs*, glfs_object* olddir, const char* oldname, glfs_object* new
     // keep the inode table pointing at the new name
     struct stat sb{};
     if (fstatat(newdir->fd, newname, &sb, AT_SYMLINK_NOFOLLOW) == 0) {
-        std::string moved = join(path_of(newdir->ino), newname);  // path_of takes the lock
+        // path_of takes the lock
+        std::string moved = join(path_of(newdir->ino), newname);
         auto& s = st();
         std::lock_guard lock(s.mu);
         s.paths[sb.st_ino] = moved;

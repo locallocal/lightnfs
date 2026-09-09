@@ -28,7 +28,8 @@ class TokenBucket {
         tokens_ = std::min(tokens_, static_cast<double>(burst_));
         if (rate_.exchange(rate_per_s, std::memory_order_relaxed) == 0) {
             tokens_ = static_cast<double>(burst_);
-            last_valid_ = false;  // stamp the refill clock on the next acquire
+            // stamp the refill clock on the next acquire
+            last_valid_ = false;
         }
     }
     uint64_t rate() const { return rate_.load(std::memory_order_relaxed); }
@@ -43,7 +44,8 @@ class TokenBucket {
             {
                 std::lock_guard lock(mu_);
                 uint64_t rate = rate_.load(std::memory_order_relaxed);
-                if (rate == 0) co_return;  // disabled while we slept
+                // disabled while we slept
+                if (rate == 0) co_return;
                 TimePoint now = current_reactor().now();
                 if (last_valid_ && now > last_)
                     tokens_ = std::min(
@@ -68,8 +70,10 @@ class TokenBucket {
  private:
     std::mutex mu_;
     std::atomic<uint64_t> rate_{0};
-    uint64_t burst_ = 0;  // guarded by mu_
-    double tokens_ = 0;   // guarded by mu_
+    // guarded by mu_
+    uint64_t burst_ = 0;
+    // guarded by mu_
+    double tokens_ = 0;
     bool last_valid_ = false;
     TimePoint last_{};
 };

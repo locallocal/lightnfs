@@ -11,8 +11,10 @@ namespace {
 
 struct Sym {
     const char* name;
-    size_t offset;          // of the member in Api
-    bool optional = false;  // missing in older libraries: left null, not an error
+    // of the member in Api
+    size_t offset;
+    // missing in older libraries: left null, not an error
+    bool optional = false;
 };
 
 // libcephfs exports unversioned symbols (no version script), so plain dlsym.

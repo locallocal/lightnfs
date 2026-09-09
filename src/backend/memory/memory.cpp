@@ -241,7 +241,8 @@ class MemoryBackend::MemoryObject final : public Object {
         auto dst_it = dst->node_->children.find(to);
         if (dst_it != dst->node_->children.end()) {
             auto existing = dst_it->second.node;
-            if (existing == moving) co_return Result<void>{};  // same link: POSIX no-op
+            // same link: POSIX no-op
+            if (existing == moving) co_return Result<void>{};
             bool src_dir = moving->attr.type == FType::kDir;
             bool dst_is_dir = existing->attr.type == FType::kDir;
             if (src_dir && !dst_is_dir) co_return Err(errno_from(ENOTDIR));
@@ -299,7 +300,8 @@ class MemoryBackend::MemoryObject final : public Object {
     }
 
     rt::Task<Result<void>> commit(OpenCtx, uint64_t, uint64_t) override {
-        co_return Result<void>{};  // memory is as stable as it gets
+        // memory is as stable as it gets
+        co_return Result<void>{};
     }
 
     // ---- v4.2 sweets (design 05 §5.x: kSparseOps / kCopyRange / kCloneRange) ----
@@ -359,7 +361,8 @@ class MemoryBackend::MemoryObject final : public Object {
         if (!dgate) co_return Err(dgate.error());
         std::lock_guard lock(backend_.mu_);
         uint64_t ssize = node_->data.size();
-        if (soff >= ssize) co_return 0;  // nothing to copy at/after EOF
+        // nothing to copy at/after EOF
+        if (soff >= ssize) co_return 0;
         uint64_t n = std::min<uint64_t>(len, ssize - soff);
         std::vector<std::byte> chunk(node_->data.begin() + static_cast<size_t>(soff),
                                      node_->data.begin() + static_cast<size_t>(soff + n));
@@ -382,7 +385,8 @@ class MemoryBackend::MemoryObject final : public Object {
             co_return Err(errno_from(EACCES));
         co_return Result<void>{};
     }
-    void touch() {  // callers hold backend_.mu_
+    // callers hold backend_.mu_
+    void touch() {
         node_->attr.size = node_->data.size();
         node_->attr.used = node_->data.size();
         node_->attr.mtime = node_->attr.ctime = backend_.now();
@@ -411,7 +415,8 @@ Caps MemoryBackend::caps() const {
         .set(Cap::kSparseOps)
         .set(Cap::kCopyRange)
         .set(Cap::kCloneRange)
-        .set(Cap::kJukebox);  // kJukebox: via fault injection
+        // kJukebox: via fault injection
+        .set(Cap::kJukebox);
 }
 
 Timespec MemoryBackend::now() {

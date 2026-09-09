@@ -20,9 +20,11 @@ TEST(BufferPool, SizeClassesAndReuse) {
     auto b3c = pool.alloc(300000);
     EXPECT_EQ(b3c.capacity(), BufferPool::kLarge);
     std::byte* p1 = b1.data();
-    b1 = Buffer();  // release -> this thread's magazine
+    // release -> this thread's magazine
+    b1 = Buffer();
     auto b4 = pool.alloc(50);
-    EXPECT_TRUE(b4.data() == p1);  // reused without touching the global freelist
+    // reused without touching the global freelist
+    EXPECT_TRUE(b4.data() == p1);
 }
 
 TEST(BufferPool, OversizeUnpooled) {
@@ -30,7 +32,8 @@ TEST(BufferPool, OversizeUnpooled) {
     auto b = pool.alloc(3 * 1024 * 1024);
     EXPECT_EQ(b.capacity(), 3u * 1024 * 1024);
     b = Buffer();
-    EXPECT_EQ(pool.free_bytes(), 0u);  // not cached
+    // not cached
+    EXPECT_EQ(pool.free_bytes(), 0u);
 }
 
 TEST(BufferPool, MagazineOverflowSpillsToGlobal) {
@@ -56,7 +59,8 @@ TEST(BufferPool, CrossThreadRecycle) {
     BufferPool pool;
     auto b = pool.alloc(10);
     std::thread t([moved = std::move(b)]() mutable { moved = Buffer(); });
-    t.join();  // freed on the other thread; its magazine flushed back at thread exit
+    // freed on the other thread; its magazine flushed back at thread exit
+    t.join();
     EXPECT_EQ(pool.free_bytes(), BufferPool::kSmall);
 }
 
@@ -82,7 +86,8 @@ TEST(BufferChain, IovecsWithSkip) {
     chain.append(b, 0, 4);
     chain.append(b, 4, 4);
     std::vector<iovec> iov;
-    chain.to_iovecs(iov, 6);  // skip first seg entirely + 2 bytes of second
+    // skip first seg entirely + 2 bytes of second
+    chain.to_iovecs(iov, 6);
     ASSERT_TRUE(iov.size() == 1);
     EXPECT_EQ(iov[0].iov_len, 2u);
     EXPECT_EQ(static_cast<char*>(iov[0].iov_base)[0], 'g');

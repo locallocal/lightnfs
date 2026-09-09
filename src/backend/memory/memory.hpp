@@ -53,7 +53,8 @@ class MemoryBackend final : public Backend {
                            std::string_view link);
     ObjPtr wrap(const std::shared_ptr<Node>& node);
 
-    Timespec now();  // logical clock; callers hold mu_
+    // logical clock; callers hold mu_
+    Timespec now();
     std::shared_ptr<Node> new_child(const std::shared_ptr<Node>& parent, std::string name, FType type, uint32_t mode,
                                     const Cred& cred);
     void erase_child(const std::shared_ptr<Node>& parent, std::string_view name);

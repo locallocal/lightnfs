@@ -79,8 +79,10 @@ class Engine {
 
     // Resolution of a filehandle into either a pseudo node or an export object.
     struct Resolved {
-        core::PseudoFs::Node* node = nullptr;  // pseudo (fsid 0)
-        core::ExportEntry* exp = nullptr;      // export side
+        // pseudo (fsid 0)
+        core::PseudoFs::Node* node = nullptr;
+        // export side
+        core::ExportEntry* exp = nullptr;
         backend::ObjPtr obj;
         backend::ObjId oid;
         bool pseudo() const { return node != nullptr; }
@@ -93,13 +95,15 @@ class Engine {
         // every op — and the pseudo nodes in `resolved` — sees one version.
         std::shared_ptr<const core::ExportSet> set;
         FhBytes cfh{}, sfh{};
-        uint32_t minor = 1;  // 1 or 2; gates the v4.2 opcode range
+        // 1 or 2; gates the v4.2 opcode range
+        uint32_t minor = 1;
         bool session = false;
         state::SessionId sessionid{};
         uint32_t slotid = 0, seqid = 0;
         bool cachethis = false;
         uint64_t clientid = 0;
-        size_t max_response = 1u << 20;  // effective reply budget for this compound
+        // effective reply budget for this compound
+        size_t max_response = 1u << 20;
         // Current stateid (RFC 8881 §16.2.3.1.2): set by OPEN/OPEN_DOWNGRADE/CLOSE,
         // consumed by ops given {seqid=1, other=0}, saved/restored with the filehandle,
         // cleared by ops that replace the current filehandle.
@@ -186,7 +190,8 @@ class Engine {
 
     // Shared helpers.
     rt::Task<uint32_t> attr_reply(Ctx&, const Resolved&, const Bitmap& wanted,
-                                  xdr::XdrEnc&);  // GETATTR tail
+                                  // GETATTR tail
+                                  xdr::XdrEnc&);
     // Ownership gate (plan 12 B3): ok when this gateway serves the export; kMoved
     // (counted) when another gateway does, kJukebox (→ DELAY) while nobody does.
     Result<void> ownership_gate(uint32_t fsid);
@@ -212,9 +217,11 @@ class Engine {
     bool referrals_ = false;
     const core::FsOwnerView* owners_ = nullptr;
     mutable std::mutex moved_mu_;
-    std::unordered_map<uint32_t, uint64_t> moved_;  // fsid -> referrals answered
+    // fsid -> referrals answered
+    std::unordered_map<uint32_t, uint64_t> moved_;
     std::mutex root_oid_mu_;
-    std::unordered_map<uint32_t, backend::ObjId> root_oids_;  // fsid -> root oid
+    // fsid -> root oid
+    std::unordered_map<uint32_t, backend::ObjId> root_oids_;
 
     // Per-client QoS (plan doc 10 §4.3): buckets created lazily per clientid, bounded by
     // the state manager's max_clients; rates 0/0/0 (the default) short-circuits to null.

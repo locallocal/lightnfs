@@ -13,9 +13,11 @@ namespace {
 // The tracked half of a callback send: runs on the connection's reactor, counted by
 // the connection's drain counter so teardown waits for it (see connection_main).
 rt::Task<void> send_on_conn(CbChannel* chan, std::shared_ptr<CbChannel> keep, std::vector<std::byte> record) {
-    (void)keep;  // pins the channel while this task lives
+    // pins the channel while this task lives
+    (void)keep;
     ConnCtx* c = chan->conn_for_send();
-    if (!c) co_return;  // detach won the race: connection is gone
+    // detach won the race: connection is gone
+    if (!c) co_return;
     ++c->live;
     auto buf = c->pool.alloc(record.size());
     std::memcpy(buf.data(), record.data(), record.size());
@@ -50,7 +52,8 @@ rt::Task<Result<std::vector<std::byte>>> CbChannel::call(uint32_t xid, std::vect
 
 ConnCtx* CbChannel::conn_for_send() {
     std::lock_guard lock(mu_);
-    return conn_;  // non-null implies the connection has not begun teardown (same thread)
+    // non-null implies the connection has not begun teardown (same thread)
+    return conn_;
 }
 
 bool CbChannel::route_reply(uint32_t xid, std::vector<std::byte> record) {

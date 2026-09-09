@@ -28,7 +28,8 @@ struct HsmEntry {
 
 struct State {
     std::mutex mu;
-    std::unordered_map<Fid, int, FidHash> pins;  // FID → O_PATH fd on the inode
+    // FID → O_PATH fd on the inode
+    std::unordered_map<Fid, int, FidHash> pins;
     std::unordered_map<Fid, HsmEntry, FidHash> hsm;
     std::vector<Fid> restores;
     bool auto_restore = false;
@@ -89,7 +90,8 @@ class FakeOps final : public backend::llapi::Ops {
             if (inode_alive(it->second, &pinned) && ::fstat(fd, &now) == 0 && pinned.st_dev == now.st_dev &&
                 pinned.st_ino == now.st_ino)
                 return *fid;
-            ::close(it->second);  // stale pin (inode recycled): re-pin below
+            // stale pin (inode recycled): re-pin below
+            ::close(it->second);
             s.pins.erase(it);
         }
         int pin = ::open(proc_fd_path(fd).c_str(), O_PATH | O_CLOEXEC);

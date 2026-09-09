@@ -52,16 +52,22 @@ class GlusterBackend final : public Backend {
     };
     struct Config {
         std::string volume;
-        std::string subdir = "/";     // export root inside the volume ("/" = volume root)
-        std::vector<Server> servers;  // volfile servers, tried in order; empty = localhost
+        // export root inside the volume ("/" = volume root)
+        std::string subdir = "/";
+        // volfile servers, tried in order; empty = localhost
+        std::vector<Server> servers;
         std::string transport = "tcp";
-        std::string log_file;  // empty: libgfapi's own default (usually unwritable unprivileged)
-        int log_level = 4;     // gluster log levels: 0 EMERG … 4 ERROR … 7 INFO … 9 TRACE
+        // empty: libgfapi's own default (usually unwritable unprivileged)
+        std::string log_file;
+        // gluster log levels: 0 EMERG … 4 ERROR … 7 INFO … 9 TRACE
+        int log_level = 4;
         uint64_t fsid = 0;
         size_t fd_cache = 1024;
         bool enrich_readdir = true;
-        bool jukebox = true;       // transport-class errors → kJukebox (else EIO)
-        bool native_locks = true;  // glfs_posix_lock → kByteLocks / native_locks()
+        // transport-class errors → kJukebox (else EIO)
+        bool jukebox = true;
+        // glfs_posix_lock → kByteLocks / native_locks()
+        bool native_locks = true;
     };
 
     // `api` null: dlopen the system libgfapi at start().  Construction never touches the
@@ -88,11 +94,14 @@ class GlusterBackend final : public Backend {
         size_t fd_entries = 0;
         uint64_t obj_hits = 0, obj_misses = 0;
         size_t obj_entries = 0;
-        uint64_t jukebox = 0;  // transport errors surfaced as kJukebox
-        size_t lock_fds = 0;   // glfds pinned by native byte-range locks
+        // transport errors surfaced as kJukebox
+        uint64_t jukebox = 0;
+        // glfds pinned by native byte-range locks
+        size_t lock_fds = 0;
     };
     Stats stats() const;
-    size_t flush_fd_cache();  // `lightnfs-ctl fdcache flush`: drops unpinned entries
+    // `lightnfs-ctl fdcache flush`: drops unpinned entries
+    size_t flush_fd_cache();
 
     // Sticky fsync failure per design 06 §6.2 (same contract as the local backend).
     void poison(const ObjId& oid);
@@ -123,13 +132,15 @@ class GlusterBackend final : public Backend {
     explicit GlusterBackend(Config cfg, std::shared_ptr<const gfapi::Api> api);
 
     // Offload-thread helpers (blocking libgfapi calls).
-    Errno map_errno(int e) const;  // transport-class errors → kJukebox
+    // transport-class errors → kJukebox
+    Errno map_errno(int e) const;
     Result<Attr> attr_from_stat(const struct stat& st) const;
     Result<Attr> stat_sync(glfs_object* obj) const;
     Result<ObjId> oid_of(glfs_object* obj) const;
     Result<ObjRef> handle_from_oid_sync(const ObjId& oid, struct stat* st);
     ObjPtr wrap(ObjRef ref, const ObjId& oid, FType type);
-    Result<ObjPtr> wrap_new(glfs_object* obj, const struct stat& st);  // adopts obj
+    // adopts obj
+    Result<ObjPtr> wrap_new(glfs_object* obj, const struct stat& st);
     static bool valid_name(std::string_view name, bool allow_dotdot = false);
 
     Config cfg_;
@@ -211,7 +222,8 @@ class GlusterLockMgr final : public LockMgr {
     rt::Task<Result<std::optional<LockConflict>>> test(Object&, LockRange, bool exclusive) override;
     rt::Task<Result<void>> release(Object&, const LockOwnerId&) override;
     size_t fds() const;
-    void close_all();  // backend stop
+    // backend stop
+    void close_all();
 
  private:
     struct Key {

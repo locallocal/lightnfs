@@ -17,11 +17,13 @@ namespace lnfs::core {
 class PseudoFs {
  public:
     struct Node {
-        uint64_t id = 0;  // fileid and ObjId payload
+        // fileid and ObjId payload
+        uint64_t id = 0;
         std::string name;
         Node* parent = nullptr;
         std::map<std::string, std::unique_ptr<Node>, std::less<>> children;
-        ExportEntry* exp = nullptr;  // set: this node crosses into that export
+        // set: this node crosses into that export
+        ExportEntry* exp = nullptr;
     };
 
     // Built over an ExportSet's entries by ExportSetBuilder::finish (plan 12 B1) and
@@ -34,7 +36,8 @@ class PseudoFs {
     // its ExportSet, but engines walk it through mutable Node pointers.
     Node* root() const { return const_cast<Node*>(&root_); }
     Node* find(uint64_t id) const;
-    Node* for_export(uint32_t fsid) const;  // pseudo node crossing into fsid (or null)
+    // pseudo node crossing into fsid (or null)
+    Node* for_export(uint32_t fsid) const;
 
     backend::Attr attr_of(const Node& node) const;
     static backend::ObjId oid_of(const Node& node);

@@ -98,7 +98,8 @@ class XdrDec {
         out.clear();
         uint32_t need = len;
         while (need > 0) {
-            if (!chain_) {  // flat mode: one span
+            // flat mode: one span
+            if (!chain_) {
                 out.push_back(std::span<const std::byte>(flat_.data() + off_, need));
                 off_ += need;
                 remaining_ -= need;
@@ -130,7 +131,8 @@ class XdrDec {
     Result<const std::byte*> take(size_t n) {
         if (n > remaining_) return Err(Errno::kGarbage);
         if (n == 0) return static_cast<const std::byte*>(nullptr);
-        if (!chain_) {  // flat mode
+        // flat mode
+        if (!chain_) {
             const std::byte* p = flat_.data() + off_;
             off_ += n;
             remaining_ -= n;

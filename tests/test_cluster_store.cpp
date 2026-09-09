@@ -80,7 +80,8 @@ TEST(ClusterStore, AtomicWriteFileReplacesAndReadsBack) {
     ASSERT_TRUE(core::atomic_write_file(path, "second\n", 0644).has_value());
     EXPECT_STREQ(slurp(path), "second\n");
     ASSERT_TRUE(::stat(path.c_str(), &st) == 0);
-    EXPECT_EQ(st.st_mode & 0777, 0644u);  // mode applies to the fresh temp file
+    // mode applies to the fresh temp file
+    EXPECT_EQ(st.st_mode & 0777, 0644u);
     EXPECT_FALSE(has_tmp_leftovers(dir.path));
 
     auto back = core::read_file_if_exists(path);
@@ -101,7 +102,8 @@ TEST(ClusterStore, AtomicWriteFileReplacesAndReadsBack) {
 
 TEST(ClusterStore, KeyCreatedOnceThenShared) {
     TmpDir dir;
-    auto a = server::make_posix_cluster_store(dir.path + "/shared/");  // trailing slash ok
+    // trailing slash ok
+    auto a = server::make_posix_cluster_store(dir.path + "/shared/");
     auto b = server::make_posix_cluster_store(dir.path + "/shared");
     auto ka = a->load_or_create_key();
     ASSERT_TRUE(ka.has_value());
@@ -137,7 +139,8 @@ TEST(ClusterStore, EpochMonotonicAcrossStores) {
     ASSERT_TRUE(ra.has_value() && rb.has_value());
     EXPECT_EQ(*ra, 6u);
     EXPECT_EQ(*rb, 6u);
-    EXPECT_FALSE(std::filesystem::exists(dir.path + "/epoch.lock"));  // released
+    // released
+    EXPECT_FALSE(std::filesystem::exists(dir.path + "/epoch.lock"));
     EXPECT_FALSE(has_tmp_leftovers(dir.path));
 }
 
@@ -151,7 +154,8 @@ TEST(ClusterStore, FenceAcquireRenewReleaseAndExpiry) {
     EXPECT_FALSE(empty->has_value());
 
     int64_t before = now_ms();
-    auto held = a->acquire_fence("gw a", 7, 1000ms, false);  // node names may hold spaces
+    // node names may hold spaces
+    auto held = a->acquire_fence("gw a", 7, 1000ms, false);
     ASSERT_TRUE(held.has_value());
     EXPECT_STREQ(held->node, "gw a");
     EXPECT_EQ(held->epoch, 7u);
@@ -236,7 +240,8 @@ TEST(ClusterStore, StaleLockFileIsReclaimedLiveLockIsBusy) {
     auto busy = store->acquire_fence("gw", 1, 1000ms, false);
     ASSERT_TRUE(!busy.has_value());
     EXPECT_EQ(static_cast<int>(busy.error()), EBUSY);
-    EXPECT_TRUE(std::filesystem::exists(dir.path + "/fence.lock"));  // not ours to remove
+    // not ours to remove
+    EXPECT_TRUE(std::filesystem::exists(dir.path + "/fence.lock"));
     std::this_thread::sleep_for(700ms);
     auto reclaimed = store->acquire_fence("gw", 1, 1000ms, false);
     ASSERT_TRUE(reclaimed.has_value());
@@ -260,7 +265,8 @@ TEST(ClusterStore, ClientListRoundTrip) {
     ASSERT_TRUE(store->put_client("owner-a").has_value());
     ASSERT_TRUE(store->put_client("owner-b").has_value());
     ASSERT_TRUE(store->put_client(binary_owner).has_value());
-    ASSERT_TRUE(store->put_client("owner-a").has_value());  // idempotent
+    // idempotent
+    ASSERT_TRUE(store->put_client("owner-a").has_value());
     auto listed = store->list_clients();
     ASSERT_TRUE(listed.has_value());
     std::sort(listed->begin(), listed->end());
@@ -279,7 +285,8 @@ TEST(ClusterStore, ClientListRoundTrip) {
     EXPECT_EQ(named, 3);
 
     ASSERT_TRUE(store->erase_client("owner-b").has_value());
-    ASSERT_TRUE(store->erase_client("owner-b").has_value());  // missing is fine
+    // missing is fine
+    ASSERT_TRUE(store->erase_client("owner-b").has_value());
     auto left = store->list_clients();
     ASSERT_TRUE(left.has_value());
     EXPECT_EQ(left->size(), 2u);
@@ -302,7 +309,8 @@ TEST(ClusterStore, ExportDigestsPerNode) {
 
     ASSERT_TRUE(a->put_exports_digest("gw1", "sha256:aaaa").has_value());
     ASSERT_TRUE(b->put_exports_digest("gw2", "sha256:bbbb").has_value());
-    ASSERT_TRUE(a->put_exports_digest("gw1", "sha256:cccc").has_value());  // overwrite
+    // overwrite
+    ASSERT_TRUE(a->put_exports_digest("gw1", "sha256:cccc").has_value());
     auto listed = b->list_exports_digests();
     ASSERT_TRUE(listed.has_value());
     std::sort(listed->begin(), listed->end());
@@ -382,7 +390,8 @@ TEST(ClusterStore, ExportDigestIgnoresPerNodeKeys) {
         "fd_cache = 1024\nmon_host = \"mon1\"\nconf = \"/etc/ceph/gw1.conf\"\n"
         "[[export]]\npath = \"/scratch\"\nbackend = \"gluster\"\nfsid = 2\n"
         "[export.gluster]\nvolume = \"scratch\"\n";
-    const std::string b =  // other node: different credentials/logs/cache, exports swapped
+    // other node: different credentials/logs/cache, exports swapped
+    const std::string b =
         "[[export]]\npath = \"/scratch\"\nbackend = \"gluster\"\nfsid = 2\n"
         "[export.gluster]\nvolume = \"scratch\"\n"
         "[[export]]\npath = \"/vol\"\nbackend = \"cephfs\"\nfsid = 1\n"
@@ -398,7 +407,8 @@ TEST(ClusterStore, ExportDigestIgnoresPerNodeKeys) {
     auto text = core::canonical_exports_text(parse(a));
     EXPECT_TRUE(text.find("keyring") == std::string::npos);
     EXPECT_TRUE(text.find("subdir=/exports/a") != std::string::npos);
-    EXPECT_TRUE(text.find("fsid=1") < text.find("fsid=2"));  // sorted by fsid
+    // sorted by fsid
+    EXPECT_TRUE(text.find("fsid=1") < text.find("fsid=2"));
 
     // Each identity-bearing difference changes the digest.
     auto differs = [&](const std::string& from, const std::string& to) {
@@ -443,7 +453,8 @@ TEST(ClusterStore, FsFenceBatchedPerNode) {
     EXPECT_TRUE(f1->expires_at_ms >= before + 1000);
     ASSERT_TRUE(a->acquire_fs_fence(2, "gw1", 3, 1000ms, false).has_value());
     EXPECT_TRUE(std::filesystem::exists(dir.path + "/fence.gw1"));
-    EXPECT_FALSE(std::filesystem::exists(dir.path + "/fence"));  // the failover file: untouched
+    // the failover file: untouched
+    EXPECT_FALSE(std::filesystem::exists(dir.path + "/fence"));
     auto records = a->list_fences();
     ASSERT_TRUE(records.has_value());
     ASSERT_TRUE(records->size() == 1u);
@@ -482,13 +493,15 @@ TEST(ClusterStore, FsFenceBatchedPerNode) {
     // A's lease lapses: F1 goes to B, and A's record no longer names it (so a late
     // heartbeat from A cannot revive the hold); F2 stays listed until someone takes it.
     write_raw(dir.path + "/fence.gw1", std::to_string(now_ms() - 1000) + " 1:7,2:3\n");
-    auto lapsed = b->read_fs_fence(1);  // the expired record is still reported
+    // the expired record is still reported
+    auto lapsed = b->read_fs_fence(1);
     ASSERT_TRUE(lapsed.has_value() && lapsed->has_value());
     EXPECT_STREQ((*lapsed)->node, "gw1");
     auto taken = b->acquire_fs_fence(1, "gw2", 8, 1000ms, false);
     ASSERT_TRUE(taken.has_value());
     EXPECT_STREQ(taken->node, "gw2");
-    ASSERT_TRUE(a->renew_fences("gw1", 1000ms).has_value());  // A comes back: F2 only
+    // A comes back: F2 only
+    ASSERT_TRUE(a->renew_fences("gw1", 1000ms).has_value());
     auto f1_now = a->read_fs_fence(1);
     ASSERT_TRUE(f1_now.has_value() && f1_now->has_value());
     EXPECT_STREQ((*f1_now)->node, "gw2");
@@ -517,7 +530,8 @@ TEST(ClusterStore, FsFenceBatchedPerNode) {
     ASSERT_TRUE(f2_gone.has_value());
     EXPECT_FALSE(f2_gone->has_value());
     EXPECT_TRUE(a->release_fs_fence(2, "gw1").has_value());
-    ASSERT_TRUE(a->renew_fences("gw1", 1000ms).has_value());  // an empty record still renews
+    // an empty record still renews
+    ASSERT_TRUE(a->renew_fences("gw1", 1000ms).has_value());
     EXPECT_TRUE(slurp(dir.path + "/fence.gw1").find(' ') == std::string::npos);
 
     // force: the operator's manual takeover ignores a live lease, and the previous
@@ -526,7 +540,8 @@ TEST(ClusterStore, FsFenceBatchedPerNode) {
     ASSERT_TRUE(forced.has_value());
     auto stripped = a->list_fences();
     ASSERT_TRUE(stripped.has_value() && stripped->size() == 2u);
-    ASSERT_TRUE((*stripped)[1].holds.size() == 1u);  // gw2: only F1 left
+    // gw2: only F1 left
+    ASSERT_TRUE((*stripped)[1].holds.size() == 1u);
     EXPECT_EQ((*stripped)[1].holds[0].fsid, 1u);
     EXPECT_FALSE(std::filesystem::exists(dir.path + "/fence.lock"));
     EXPECT_FALSE(has_tmp_leftovers(dir.path));
@@ -559,7 +574,8 @@ TEST(ClusterStore, PerFsidEpochOwnerClientsAndNodes) {
     ASSERT_TRUE(other.has_value());
     EXPECT_EQ(*other, 1u);
     EXPECT_EQ(*a->read_node_epoch("gw1"), 2u);
-    EXPECT_EQ(*a->read_epoch(), 0u);  // the failover epoch is a different counter
+    // the failover epoch is a different counter
+    EXPECT_EQ(*a->read_epoch(), 0u);
     EXPECT_FALSE(std::filesystem::exists(dir.path + "/epoch.gw1.lock"));
     // The per-node epoch files — and the catalog's files (plan 12 A3) — are not mistaken
     // for export digests or fence records.
@@ -579,7 +595,8 @@ TEST(ClusterStore, PerFsidEpochOwnerClientsAndNodes) {
     EXPECT_EQ(no_nodes->size(), 0u);
     ASSERT_TRUE(a->put_node_address("gw2", "10.0.0.12:2049").has_value());
     ASSERT_TRUE(b->put_node_address("gw1", "10.0.0.11:2049").has_value());
-    ASSERT_TRUE(a->put_node_address("gw1", "[fd00::11]:2049").has_value());  // overwrite
+    // overwrite
+    ASSERT_TRUE(a->put_node_address("gw1", "[fd00::11]:2049").has_value());
     auto nodes = b->list_nodes();
     ASSERT_TRUE(nodes.has_value() && nodes->size() == 2u);
     EXPECT_STREQ((*nodes)[0].first, "gw1");
@@ -629,7 +646,8 @@ TEST(ClusterStore, PerFsidEpochOwnerClientsAndNodes) {
     auto global = b->list_clients();
     ASSERT_TRUE(global.has_value() && global->size() == 1u);
     EXPECT_STREQ((*global)[0], "global-owner");
-    auto nine = b->list_clients(9);  // never touched: empty, not an error
+    // never touched: empty, not an error
+    auto nine = b->list_clients(9);
     ASSERT_TRUE(nine.has_value());
     EXPECT_EQ(nine->size(), 0u);
     ASSERT_TRUE(a->erase_client(7, "owner-b").has_value());
@@ -684,7 +702,8 @@ TEST(ClusterStore, CatalogCasAndHistory) {
     EXPECT_STREQ((*doc)->text, catalog_text(1, "first"));
     EXPECT_STREQ(slurp(dir.path + "/catalog.toml"), catalog_text(1, "first"));
     EXPECT_FALSE(std::filesystem::exists(dir.path + "/catalog.lock"));
-    EXPECT_TRUE(a->list_catalog_history()->empty());  // nothing was replaced yet
+    // nothing was replaced yet
+    EXPECT_TRUE(a->list_catalog_history()->empty());
 
     // Second commit from the other store object: history holds the replaced content.
     auto v2 = b->write_catalog(1, catalog_text(2, "second"));
@@ -697,7 +716,8 @@ TEST(ClusterStore, CatalogCasAndHistory) {
     ASSERT_TRUE(old.has_value());
     EXPECT_EQ(old->version, 1u);
     EXPECT_STREQ(old->text, catalog_text(1, "first"));
-    auto missing = a->read_catalog_history(2);  // the current version is not history
+    // the current version is not history
+    auto missing = a->read_catalog_history(2);
     ASSERT_TRUE(!missing.has_value());
     EXPECT_TRUE(missing.error() == errno_from(ENOENT));
     // The loser of a race sees EAGAIN and the file is untouched.

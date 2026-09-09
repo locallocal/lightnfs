@@ -68,7 +68,8 @@ TEST(SmallVec, InlineAndSpill) {
     SmallVec<std::string, 2> v;
     v.push_back("a");
     v.push_back("b");
-    v.push_back("c");  // spills to heap
+    // spills to heap
+    v.push_back("c");
     v.push_back("d");
     EXPECT_EQ(v.size(), 4u);
     EXPECT_STREQ(v[0], "a");
@@ -104,9 +105,12 @@ TEST(ErrLog, RecordAndDump) {
 TEST(ErrLog, RingKeepsMostRecent) {
     for (uint32_t i = 0; i < 100; ++i) obs::record_error_reply("peer", "COMPOUND", 0x9000 + i, 1);
     auto out = obs::dump_error_replies();
-    EXPECT_TRUE(out.find("xid=0x9063") != std::string::npos);  // newest (i=99)
-    EXPECT_TRUE(out.find("xid=0x9024") != std::string::npos);  // oldest kept (i=36)
-    EXPECT_TRUE(out.find("xid=0x9023") == std::string::npos);  // evicted
+    // newest (i=99)
+    EXPECT_TRUE(out.find("xid=0x9063") != std::string::npos);
+    // oldest kept (i=36)
+    EXPECT_TRUE(out.find("xid=0x9024") != std::string::npos);
+    // evicted
+    EXPECT_TRUE(out.find("xid=0x9023") == std::string::npos);
 }
 
 // Ring capacity is configurable (plan doc 10 §3.7) and the `what` field holds the
@@ -117,11 +121,13 @@ TEST(ErrLog, CapacityAndLongOpNames) {
     for (uint32_t i = 1; i < 4; ++i) obs::record_error_reply("peer", "SEQUENCE", 0xa000 + i, 1);
     auto out = obs::dump_error_replies();
     EXPECT_TRUE(out.find("proc=BIND_CONN_TO_SESSION") != std::string::npos);
-    obs::record_error_reply("peer", "SEQUENCE", 0xa004, 1);  // evicts the oldest of 4
+    // evicts the oldest of 4
+    obs::record_error_reply("peer", "SEQUENCE", 0xa004, 1);
     out = obs::dump_error_replies();
     EXPECT_TRUE(out.find("xid=0xa000 ") == std::string::npos);
     EXPECT_TRUE(out.find("xid=0xa004") != std::string::npos);
-    obs::set_error_ring_capacity(64);  // restore the default for later tests
+    // restore the default for later tests
+    obs::set_error_ring_capacity(64);
 }
 
 // Sharded metric counters (plan doc 10 §2.6): concurrent bumps land in per-thread
@@ -146,10 +152,14 @@ TEST(Metrics, ShardedCounterSumsAcrossThreads) {
 // Prometheus rendering is cumulative with _sum/_count, so p99 is computable.
 TEST(Metrics, HistogramBucketsAndExposition) {
     obs::LatencyHistogram h;
-    h.observe_us(50);         // <= 100µs -> bucket 0
-    h.observe_us(100);        // boundary is inclusive -> bucket 0
-    h.observe_us(300);        // -> le=0.0005
-    h.observe_us(9'000'000);  // beyond the last bound -> +Inf only
+    // <= 100µs -> bucket 0
+    h.observe_us(50);
+    // boundary is inclusive -> bucket 0
+    h.observe_us(100);
+    // -> le=0.0005
+    h.observe_us(300);
+    // beyond the last bound -> +Inf only
+    h.observe_us(9'000'000);
     auto snap = h.snapshot();
     EXPECT_EQ(snap.count, 4u);
     EXPECT_EQ(snap.sum_us, 50u + 100 + 300 + 9'000'000);
@@ -169,7 +179,8 @@ TEST(Metrics, HistogramBucketsAndExposition) {
 // label text is stored at bump time so obs stays independent of the nfsv4 op table.
 TEST(Metrics, V4OpSeriesInPrometheusText) {
     auto& m = obs::Metrics::instance();
-    size_t idx = obs::v4_op_index(9);  // GETATTR
+    // GETATTR
+    size_t idx = obs::v4_op_index(9);
     m.v4_op_names[idx].store("GETATTR", std::memory_order_relaxed);
     m.v4_op_calls[idx].fetch_add(3, std::memory_order_relaxed);
     m.v4_op_errors[idx].fetch_add(1, std::memory_order_relaxed);
@@ -185,7 +196,8 @@ TEST(Metrics, V4OpSeriesInPrometheusText) {
 }
 
 TEST(Metrics, SlowRequestThreshold) {
-    EXPECT_EQ(obs::slow_request_threshold_us(), 0u);  // default off until configured
+    // default off until configured
+    EXPECT_EQ(obs::slow_request_threshold_us(), 0u);
     obs::set_slow_request_threshold_us(250000);
     EXPECT_EQ(obs::slow_request_threshold_us(), 250000u);
     obs::set_slow_request_threshold_us(0);

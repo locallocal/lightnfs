@@ -92,7 +92,8 @@ PseudoFs::Node* PseudoFs::for_export(uint32_t fsid) const {
 backend::Attr PseudoFs::attr_of(const Node& node) const {
     backend::Attr a;
     a.type = backend::FType::kDir;
-    a.mode = 0555;  // pseudo directories are read-only by construction
+    // pseudo directories are read-only by construction
+    a.mode = 0555;
     a.nlink = 2 + static_cast<uint32_t>(node.children.size());
     a.uid = 0;
     a.gid = 0;

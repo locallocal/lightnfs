@@ -27,7 +27,8 @@ namespace {
 
 std::vector<std::byte> build_record(BufferPool& pool, uint32_t proc, const std::vector<std::byte>& fh) {
     xdr::XdrEnc enc(pool);
-    enc.u32(7);  // xid (idempotent procs: constant is fine)
+    // xid (idempotent procs: constant is fine)
+    enc.u32(7);
     enc.u32(0);
     enc.u32(2);
     enc.u32(nfsv3::kProgram);
@@ -38,7 +39,8 @@ std::vector<std::byte> build_record(BufferPool& pool, uint32_t proc, const std::
     enc.u32(0);
     enc.u32(0);
     enc.opaque(fh);
-    if (proc == 6) {  // READ: offset 0, count 4096
+    // READ: offset 0, count 4096
+    if (proc == 6) {
         enc.u64(0);
         enc.u32(4096);
     }

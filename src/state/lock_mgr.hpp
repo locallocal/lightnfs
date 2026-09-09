@@ -33,7 +33,8 @@ bool same_owner(const backend::LockOwnerId& a, const backend::LockOwnerId& b);
 struct LockSeg {
     backend::LockOwnerId owner;
     uint64_t start = 0;
-    uint64_t end = 0;  // exclusive; UINT64_MAX = "to EOF" (length ~0 on the wire)
+    // exclusive; UINT64_MAX = "to EOF" (length ~0 on the wire)
+    uint64_t end = 0;
     bool exclusive = false;
 };
 

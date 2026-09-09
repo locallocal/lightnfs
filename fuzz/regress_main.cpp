@@ -63,12 +63,18 @@ int main(int argc, char** argv) {
         call[off + 2] = v >> 8;
         call[off + 3] = v;
     };
-    put32(0, 0x1234);   // xid
-    put32(4, 0);        // CALL
-    put32(8, 2);        // rpcvers
-    put32(12, 300000);  // prog
-    put32(16, 1);       // vers
-    put32(20, 0);       // proc
+    // xid
+    put32(0, 0x1234);
+    // CALL
+    put32(4, 0);
+    // rpcvers
+    put32(8, 2);
+    // prog
+    put32(12, 300000);
+    // vers
+    put32(16, 1);
+    // proc
+    put32(20, 0);
     // cred/verf AUTH_NONE with zero-length bodies
     put32(24, 0);
     put32(28, 0);

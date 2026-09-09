@@ -41,7 +41,8 @@ struct FakeGfapi {
     static bool plant_stale_lock(const std::string& rel_path, uint64_t start, uint64_t len);
     static size_t stale_locks();
     static void release_stale_locks_after(int ms);
-    static void join_stale_timer();  // join the pending release (before process exit)
+    // join the pending release (before process exit)
+    static void join_stale_timer();
 };
 
 }  // namespace lnfs::testing

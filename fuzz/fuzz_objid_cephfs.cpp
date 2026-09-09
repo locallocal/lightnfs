@@ -18,7 +18,8 @@ extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
     if (!oid) return;
     auto vino = backend::CephBackend::vino_from_oid(*oid);
     if (!vino) return;
-    if (vino->ino == 0) std::abort();  // inode 0 never parses
+    // inode 0 never parses
+    if (vino->ino == 0) std::abort();
     auto back = backend::CephBackend::oid_from_vino(*vino);
     if (!(back == *oid)) std::abort();
 }

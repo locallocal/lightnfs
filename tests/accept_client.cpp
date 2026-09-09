@@ -139,21 +139,27 @@ std::vector<std::byte> build_call(BufferPool& pool, uint32_t xid, uint32_t prog,
                                   const std::vector<std::byte>& body, uint32_t vers = kVers) {
     XdrEnc enc(pool);
     enc.u32(xid);
-    enc.u32(0);  // CALL
-    enc.u32(2);  // RPC v2
+    // CALL
+    enc.u32(0);
+    // RPC v2
+    enc.u32(2);
     enc.u32(prog);
     enc.u32(vers);
     enc.u32(proc);
-    enc.u32(1);  // AUTH_SYS
+    // AUTH_SYS
+    enc.u32(1);
     XdrEnc cred(pool);
-    cred.u32(0);  // stamp
+    // stamp
+    cred.u32(0);
     cred.string("accept");
     cred.u32(static_cast<uint32_t>(getuid()));
     cred.u32(static_cast<uint32_t>(getgid()));
-    cred.u32(0);  // no aux gids
+    // no aux gids
+    cred.u32(0);
     auto cred_bytes = cred.take().to_bytes();
     enc.opaque(cred_bytes);
-    enc.u32(0);  // verf AUTH_NONE
+    // verf AUTH_NONE
+    enc.u32(0);
     enc.u32(0);
     if (!body.empty()) enc.opaque_fixed(body);
     return enc.take().to_bytes();
@@ -163,7 +169,8 @@ std::vector<std::byte> build_call(BufferPool& pool, uint32_t xid, uint32_t prog,
 uint32_t parse_reply_header(XdrDec& dec, uint32_t expect_xid) {
     auto xid = dec.u32();
     if (!xid || *xid != expect_xid) fatal("reply xid mismatch: got %#x want %#x", xid ? *xid : 0u, expect_xid);
-    if (!dec.u32() || !dec.u32()) fatal("truncated reply header");  // mtype, reply_stat
+    // mtype, reply_stat
+    if (!dec.u32() || !dec.u32()) fatal("truncated reply header");
     auto flavor = dec.u32();
     auto vlen = dec.u32();
     if (!flavor || !vlen || !dec.skip((*vlen + 3) & ~3u)) fatal("bad reply verifier");
@@ -220,7 +227,8 @@ bool rbool(XdrDec& d) {
 }
 
 struct Fattr {
-    uint32_t type = 0;  // 1=REG 2=DIR 5=LNK
+    // 1=REG 2=DIR 5=LNK
+    uint32_t type = 0;
     uint32_t mode = 0;
     uint64_t size = 0;
     uint64_t fileid = 0;
@@ -230,16 +238,24 @@ Fattr decode_fattr(XdrDec& d) {
     Fattr a;
     a.type = ru32(d);
     a.mode = ru32(d);
-    ru32(d);  // nlink
-    ru32(d);  // uid
-    ru32(d);  // gid
+    // nlink
+    ru32(d);
+    // uid
+    ru32(d);
+    // gid
+    ru32(d);
     a.size = ru64(d);
-    ru64(d);  // used
-    ru32(d);  // rdev major
-    ru32(d);  // rdev minor
-    ru64(d);  // fsid
+    // used
+    ru64(d);
+    // rdev major
+    ru32(d);
+    // rdev minor
+    ru32(d);
+    // fsid
+    ru64(d);
     a.fileid = ru64(d);
-    for (int i = 0; i < 6; ++i) ru32(d);  // atime/mtime/ctime
+    // atime/mtime/ctime
+    for (int i = 0; i < 6; ++i) ru32(d);
     return a;
 }
 
@@ -380,8 +396,10 @@ std::vector<DirEntry> readdirplus_all(Client& c, const Fh& dir) {
         enc_fh(args, dir);
         args.u64(cookie);
         args.opaque_fixed(verf);
-        args.u32(65536);    // dircount
-        args.u32(1 << 20);  // maxcount
+        // dircount
+        args.u32(65536);
+        // maxcount
+        args.u32(1 << 20);
         auto reply = c.call(kNfsProg, 17, args.take().to_bytes());
         auto dec = make_dec(reply);
         uint32_t status = ru32(dec);
@@ -431,7 +449,8 @@ std::vector<std::string> readdir_all(Client& c, const Fh& dir) {
         if (!dec.opaque_fixed(8)) fatal("READDIR: bad cookieverf");
         size_t page = 0;
         while (rbool(dec)) {
-            ru64(dec);  // fileid
+            // fileid
+            ru64(dec);
             auto name = dec.string(255);
             if (!name) fatal("READDIR: bad name");
             cookie = ru64(dec);
@@ -480,7 +499,8 @@ void fsstat_pathconf_smoke(Client& c, const Fh& fh) {
     auto d2 = make_dec(r2);
     if (ru32(d2) != kNfs3Ok) fatal("PATHCONF failed");
     decode_post_attr(d2);
-    ru32(d2);  // linkmax
+    // linkmax
+    ru32(d2);
     if (ru32(d2) == 0) fatal("PATHCONF: zero name_max");
 }
 
@@ -520,7 +540,8 @@ void walk_dir(Client& c, const Fh& dir_fh, const fs::path& local, uint32_t chunk
         fs::path child = local / ent.name;
         Fh fh;
         Fattr attr;
-        if (ent.fh && ent.attr) {  // READDIRPLUS enrichment
+        // READDIRPLUS enrichment
+        if (ent.fh && ent.attr) {
             fh = *ent.fh;
             attr = *ent.attr;
         } else {
@@ -530,12 +551,14 @@ void walk_dir(Client& c, const Fh& dir_fh, const fs::path& local, uint32_t chunk
         }
         auto lst = fs::symlink_status(child);
         switch (attr.type) {
-            case 2: {  // DIR
+            // DIR
+            case 2: {
                 if (!fs::is_directory(lst)) fatal("%s: type mismatch (server=dir)", child.c_str());
                 walk_dir(c, fh, child, chunk, st);
                 break;
             }
-            case 1: {  // REG
+            // REG
+            case 1: {
                 if (!fs::is_regular_file(lst)) fatal("%s: type mismatch (server=file)", child.c_str());
                 uint64_t local_size = fs::file_size(child);
                 if (attr.size != local_size)
@@ -554,7 +577,8 @@ void walk_dir(Client& c, const Fh& dir_fh, const fs::path& local, uint32_t chunk
                 ++st.files;
                 break;
             }
-            case 5: {  // LNK
+            // LNK
+            case 5: {
                 if (!fs::is_symlink(lst)) fatal("%s: type mismatch (server=symlink)", child.c_str());
                 auto target = read_link(c, fh);
                 if (target != fs::read_symlink(child).string())
@@ -562,10 +586,14 @@ void walk_dir(Client& c, const Fh& dir_fh, const fs::path& local, uint32_t chunk
                 ++st.symlinks;
                 break;
             }
-            case 3:    // BLK
-            case 4:    // CHR
-            case 6:    // SOCK
-            case 7: {  // FIFO
+            // BLK
+            case 3:
+            // CHR
+            case 4:
+            // SOCK
+            case 6:
+            // FIFO
+            case 7: {
                 auto ftype = fs::symlink_status(child).type();
                 bool ok = (attr.type == 3 && ftype == fs::file_type::block) ||
                           (attr.type == 4 && ftype == fs::file_type::character) ||
@@ -620,7 +648,8 @@ void negative_checks(Client& c, const Fh& root, bool readonly_export) {
         XdrEnc cr(c.pool);
         enc_fh(cr, root);
         cr.string("rofs_probe");
-        cr.u32(0);  // UNCHECKED
+        // UNCHECKED
+        cr.u32(0);
         cr.boolean(false);
         cr.boolean(false);
         cr.boolean(false);
@@ -723,7 +752,8 @@ int cmd_stress(const char* host, uint16_t nfs_port, uint16_t mount_port, const s
             uint64_t ops = 0;
             auto issue = [&] {
                 uint32_t xid = c.next_xid++;
-                if (ops % 64 == 63) {  // sprinkle GETATTR through the read storm
+                // sprinkle GETATTR through the read storm
+                if (ops % 64 == 63) {
                     XdrEnc args(c.pool);
                     enc_fh(args, file_fh);
                     send_record(c.fd, build_call(c.pool, xid, kNfsProg, 1, args.take().to_bytes()));
@@ -760,7 +790,8 @@ int cmd_stress(const char* host, uint16_t nfs_port, uint16_t mount_port, const s
                 }
                 decode_post_attr(d2);
                 uint32_t n = ru32(d2);
-                rbool(d2);  // eof
+                // eof
+                rbool(d2);
                 auto data = d2.opaque(1u << 22);
                 if (!data || data->size() != n) fatal("stress: bad READ payload");
                 uint32_t expect = (uint32_t)std::min<uint64_t>(p.len, size - p.off);
@@ -805,12 +836,16 @@ std::pair<bool, bool> skip_wcc(XdrDec& d) {
 void enc_sattr(XdrEnc& e, std::optional<uint32_t> mode, std::optional<uint64_t> size) {
     e.boolean(mode.has_value());
     if (mode) e.u32(*mode);
-    e.boolean(false);  // uid
-    e.boolean(false);  // gid
+    // uid
+    e.boolean(false);
+    // gid
+    e.boolean(false);
     e.boolean(size.has_value());
     if (size) e.u64(*size);
-    e.u32(0);  // atime DONT_CHANGE
-    e.u32(0);  // mtime DONT_CHANGE
+    // atime DONT_CHANGE
+    e.u32(0);
+    // mtime DONT_CHANGE
+    e.u32(0);
 }
 
 // CREATE; returns NFS status; on OK fills fh_out.
@@ -888,7 +923,8 @@ uint32_t nfs_dirop(Client& c, uint32_t proc, const Fh& dir, const std::string& n
     auto reply = c.call(kNfsProg, proc, args.take().to_bytes());
     auto dec = make_dec(reply);
     uint32_t status = ru32(dec);
-    if (proc == 9) {  // MKDIR carries create-style results; args lacked sattr though
+    // MKDIR carries create-style results; args lacked sattr though
+    if (proc == 9) {
         fatal("nfs_dirop misused for MKDIR");
     }
     skip_wcc(dec);
@@ -920,7 +956,8 @@ uint32_t nfs_setattr(Client& c, const Fh& fh, std::optional<uint32_t> mode, std:
     XdrEnc args(c.pool);
     enc_fh(args, fh);
     enc_sattr(args, mode, size);
-    args.boolean(false);  // no guard
+    // no guard
+    args.boolean(false);
     auto reply = c.call(kNfsProg, 2, args.take().to_bytes());
     auto dec = make_dec(reply);
     uint32_t status = ru32(dec);
@@ -1263,10 +1300,14 @@ struct V4Client {
     uint64_t clientid = 0;
     std::array<std::byte, 16> sessionid{};
     uint32_t slot_seq = 1;
-    uint32_t minor = 1;                      // COMPOUND minorversion (2 for the v4.2 scenario)
-    std::string owner_id;                    // co_ownerid: distinct per simulated client
-    std::string server_owner, server_scope;  // RFC 8881 §2.10.4 identity from EXCHANGE_ID
-    uint32_t eir_flags = 0;                  // EXCHANGE_ID reply flags (SUPP_MOVED_*)
+    // COMPOUND minorversion (2 for the v4.2 scenario)
+    uint32_t minor = 1;
+    // co_ownerid: distinct per simulated client
+    std::string owner_id;
+    // RFC 8881 §2.10.4 identity from EXCHANGE_ID
+    std::string server_owner, server_scope;
+    // EXCHANGE_ID reply flags (SUPP_MOVED_*)
+    uint32_t eir_flags = 0;
 
     explicit V4Client(const char* host, uint16_t port, std::string owner = "lightnfs-accept-v4")
         : rpc(host, port), owner_id(std::move(owner)) {}
@@ -1292,8 +1333,10 @@ struct V4Client {
         out.bytes = compound(body);
         out.dec = XdrDec(std::span<const std::byte>(out.bytes.data(), out.bytes.size()));
         out.status = ru32(out.dec);
-        (void)out.dec.opaque(1024);  // tag
-        (void)ru32(out.dec);         // resarray count
+        // tag
+        (void)out.dec.opaque(1024);
+        // resarray count
+        (void)ru32(out.dec);
         if (check && out.status != expect) fatal("v4 compound: status %u (expected %u)", out.status, expect);
         return out;
     }
@@ -1320,15 +1363,19 @@ struct V4Client {
         ex.opaque_fixed(verf);
         ex.string(owner_id);
         ex.u32(0);
-        ex.u32(0);  // SP4_NONE
-        ex.u32(0);  // no impl id
+        // SP4_NONE
+        ex.u32(0);
+        // no impl id
+        ex.u32(0);
         auto r = run(ex.take().to_bytes());
         expect_op(r.dec, kOpExchangeId);
         clientid = ru64(r.dec);
         uint32_t seq = ru32(r.dec);
         eir_flags = ru32(r.dec);
-        (void)ru32(r.dec);  // state_protect: SP4_NONE
-        (void)ru64(r.dec);  // server_owner.minor_id
+        // state_protect: SP4_NONE
+        (void)ru32(r.dec);
+        // server_owner.minor_id
+        (void)ru64(r.dec);
         if (auto major = r.dec.opaque(1024))
             server_owner.assign(reinterpret_cast<const char*>(major->data()), major->size());
         if (auto scope = r.dec.opaque(1024))
@@ -1343,17 +1390,25 @@ struct V4Client {
         cs.u32(seq);
         cs.u32(0);
         for (int chan = 0; chan < 2; ++chan) {
-            cs.u32(0);         // headerpad
-            cs.u32(1u << 20);  // maxreq
-            cs.u32(1u << 20);  // maxresp
-            cs.u32(8u << 10);  // maxresp cached
-            cs.u32(16);        // maxops
-            cs.u32(16);        // slots
-            cs.u32(0);         // rdma_ird
+            // headerpad
+            cs.u32(0);
+            // maxreq
+            cs.u32(1u << 20);
+            // maxresp
+            cs.u32(1u << 20);
+            // maxresp cached
+            cs.u32(8u << 10);
+            // maxops
+            cs.u32(16);
+            // slots
+            cs.u32(16);
+            // rdma_ird
+            cs.u32(0);
         }
         cs.u32(0x40000000);
         cs.u32(1);
-        cs.u32(0);  // AUTH_NONE cb cred
+        // AUTH_NONE cb cred
+        cs.u32(0);
         auto c = run(cs.take().to_bytes());
         expect_op(c.dec, kOpCreateSession);
         auto sid = c.dec.opaque_fixed(16);
@@ -1372,15 +1427,18 @@ struct V4Client {
 
     void seq_header(XdrEnc& enc, uint32_t extra_ops, bool cachethis = false,
                     std::optional<uint32_t> force_seq = std::nullopt) {
-        enc.u32(0);  // tag
+        // tag
+        enc.u32(0);
         enc.u32(minor);
         enc.u32(1 + extra_ops);
         enc.u32(kOpSequence);
         enc.opaque_fixed(sessionid);
         enc.u32(force_seq.value_or(slot_seq));
         if (!force_seq) slot_seq++;
-        enc.u32(0);  // slot 0
-        enc.u32(0);  // highest
+        // slot 0
+        enc.u32(0);
+        // highest
+        enc.u32(0);
         enc.boolean(cachethis);
     }
 
@@ -1456,12 +1514,15 @@ std::vector<std::byte> v4_read_all(V4Client& c, const std::vector<std::byte>& di
     open_ops.opaque(dir_fh);
     open_ops.u32(kOpOpen);
     open_ops.u32(0);
-    open_ops.u32(1);  // READ
+    // READ
+    open_ops.u32(1);
     open_ops.u32(0);
     open_ops.u64(c.clientid);
     open_ops.string("accept-owner");
-    open_ops.u32(0);  // NOCREATE
-    open_ops.u32(0);  // CLAIM_NULL
+    // NOCREATE
+    open_ops.u32(0);
+    // CLAIM_NULL
+    open_ops.u32(0);
     open_ops.string(name);
     open_ops.u32(kOpGetfh);
     auto r = c.run(open_ops.take().to_bytes());
@@ -1476,10 +1537,12 @@ std::vector<std::byte> v4_read_all(V4Client& c, const std::vector<std::byte>& di
     rbool(r.dec);
     ru64(r.dec);
     ru64(r.dec);
-    ru32(r.dec);  // rflags
+    // rflags
+    ru32(r.dec);
     uint32_t maskw = ru32(r.dec);
     for (uint32_t i = 0; i < maskw; ++i) (void)ru32(r.dec);
-    ru32(r.dec);  // delegation none
+    // delegation none
+    ru32(r.dec);
     V4Client::expect_op(r.dec, kOpGetfh);
     auto file_fh_span = r.dec.opaque(128);
     std::vector<std::byte> file_fh(file_fh_span->begin(), file_fh_span->end());
@@ -1541,7 +1604,8 @@ void v4_walk_dir(V4Client& c, const std::vector<std::byte>& dir_fh, const fs::pa
         ops.opaque_fixed(verf);
         ops.u32(1u << 16);
         ops.u32(1u << 17);
-        ops.u32(1);  // bitmap: one word
+        // bitmap: one word
+        ops.u32(1);
         ops.u32((1u << kAttrType) | (1u << kAttrSize) | (1u << kAttrFilehandle) | (1u << kAttrFileid));
         auto r = c.run(ops.take().to_bytes());
         V4Client::skip_sequence_res(r.dec);
@@ -1568,10 +1632,12 @@ void v4_walk_dir(V4Client& c, const std::vector<std::byte>& dir_fh, const fs::pa
     for (auto& ent : entries) {
         if (!local_names.count(ent.name)) fatal("%s: v4 entry '%s' missing locally", local.c_str(), ent.name.c_str());
         fs::path child = local / ent.name;
-        if (ent.type == 2) {  // DIR
+        // DIR
+        if (ent.type == 2) {
             if (ent.fh.empty()) fatal("v4: dir entry without fh");
             v4_walk_dir(c, ent.fh, child, dirs, files, bytes);
-        } else if (ent.type == 1) {  // REG
+        } else if (ent.type == 1) {
+            // REG
             if (fs::file_size(child) != ent.size) fatal("%s: v4 size mismatch", child.c_str());
             if (ent.size > 0 && ent.size <= (4u << 20)) {
                 auto remote = v4_read_all(c, dir_fh, ent.name, ent.size);
@@ -1579,7 +1645,8 @@ void v4_walk_dir(V4Client& c, const std::vector<std::byte>& dir_fh, const fs::pa
                 bytes += remote.size();
             }
             ++files;
-        } else if (ent.type == 5) {  // LNK
+        } else if (ent.type == 5) {
+            // LNK
             XdrEnc rl(c.rpc.pool);
             c.seq_header(rl, 2);
             rl.u32(kOpPutfh);
@@ -1642,11 +1709,15 @@ OpenOut v4_open(V4Client& c, const std::vector<std::byte>& fh, const std::string
     ops.u64(c.clientid);
     ops.string(owner);
     if (create) {
-        ops.u32(1);  // OPEN4_CREATE
-        ops.u32(0);  // UNCHECKED4
-        ops.u32(2);  // bitmap: 2 words
+        // OPEN4_CREATE
+        ops.u32(1);
+        // UNCHECKED4
+        ops.u32(0);
+        // bitmap: 2 words
+        ops.u32(2);
         ops.u32(size ? (1u << kAttrSize) : 0);
-        ops.u32(1u << (33 - 32));  // mode
+        // mode
+        ops.u32(1u << (33 - 32));
         XdrEnc vals(c.rpc.pool);
         if (size) vals.u64(*size);
         vals.u32(0644);
@@ -1909,10 +1980,13 @@ int cmd_v4rw(const char* host, uint16_t nfs_port, const std::string& export_path
     // Namespace: CREATE dir, RENAME file into it, LINK, REMOVE — mirrored on backing.
     uint32_t st = v4_dir_op(a, root, [&](XdrEnc& e) {
         e.u32(kOpCreate);
-        e.u32(2);  // NF4DIR
+        // NF4DIR
+        e.u32(2);
         e.string("v4dir");
-        e.u32(0);  // empty bitmap
-        e.u32(0);  // empty attrlist
+        // empty bitmap
+        e.u32(0);
+        // empty attrlist
+        e.u32(0);
     });
     if (st != 0) fatal("v4rw: CREATE dir status %u", st);
     if (!fs::is_directory(backing / "v4dir")) fatal("v4rw: v4dir missing on backing");
@@ -2033,9 +2107,9 @@ int cmd_v4lock(const char* host, uint16_t nfs_port, const std::string& export_pa
         uint32_t opcode = ru32(r.dec);
         uint32_t code = ru32(r.dec);
         if (opcode != kOpLock) fatal("v4lock: expected LOCK resop, got op=%u status=%u", opcode, code);
-        if (code == 0 && out)
-            *out = Stateid4::decode(r.dec);
-        else if (code == 10010 && denied) {  // NFS4ERR_DENIED
+        if (code == 0 && out) *out = Stateid4::decode(r.dec);
+        // NFS4ERR_DENIED
+        else if (code == 10010 && denied) {
             denied->offset = ru64(r.dec);
             denied->length = ru64(r.dec);
             ru32(r.dec);
@@ -2082,7 +2156,8 @@ int cmd_v4lock(const char* host, uint16_t nfs_port, const std::string& export_pa
         auto r = c.run(ops.take().to_bytes(), 0, false);
         V4Client::skip_sequence_res(r.dec);
         V4Client::expect_op(r.dec, kOpPutfh);
-        ru32(r.dec);  // opcode
+        // opcode
+        ru32(r.dec);
         return ru32(r.dec);
     };
     if (do_lockt(b, "lo-b", 10, 5) != 10010) fatal("v4lock: LOCKT should be DENIED");
@@ -2109,7 +2184,8 @@ int cmd_v4lock(const char* host, uint16_t nfs_port, const std::string& export_pa
         auto r = c.run(ops.take().to_bytes(), 0, false);
         V4Client::skip_sequence_res(r.dec);
         V4Client::expect_op(r.dec, kOpPutfh);
-        ru32(r.dec);  // opcode
+        // opcode
+        ru32(r.dec);
         uint32_t code = ru32(r.dec);
         if (code == 0) return (int)v4::Stateid4::decode(r.dec).seqid;
         return -(int)code;
@@ -2165,13 +2241,15 @@ int cmd_v4reclaim(const char* host, uint16_t nfs_port, const std::string& export
     if (std::system(restart_cmd.c_str()) != 0) fatal("v4reclaim: restart command failed");
 
     V4Client c(host, nfs_port);
-    c.establish(false);  // same co_ownerid + verifier: listed; no RECLAIM_COMPLETE yet
+    // same co_ownerid + verifier: listed; no RECLAIM_COMPLETE yet
+    c.establish(false);
     auto root = lookup_path(c, split_path(export_path));
     uint32_t st = 0;
     (void)v4_read(c, fh, old_sid, before.size(), &st);
-    if (st == 70) {  // NFS4ERR_STALE (handle): unprivileged fallback handles on a
-                     // filesystem without STATX_BTIME are process-local (design 06);
-                     // re-resolve by name so the state-level scenario still runs.
+    // NFS4ERR_STALE (handle): unprivileged fallback handles on a
+    // filesystem without STATX_BTIME are process-local (design 06);
+    // re-resolve by name so the state-level scenario still runs.
+    if (st == 70) {
         std::printf(
             "v4reclaim: note: filehandle not stable across restart (fallback handle "
             "mode without btime); re-resolving by name\n");
@@ -2229,9 +2307,11 @@ uint32_t v4_lock_op(V4Client& c, const std::vector<std::byte>& fh, uint32_t type
     ops.u64(len);
     ops.boolean(new_owner);
     if (new_owner) {
-        ops.u32(0);  // open_seqid (unused in 4.1)
+        // open_seqid (unused in 4.1)
+        ops.u32(0);
         sid.encode(ops);
-        ops.u32(0);  // lock_seqid
+        // lock_seqid
+        ops.u32(0);
         ops.u64(c.clientid);
         ops.string(owner);
     } else {
@@ -2315,7 +2395,8 @@ int cmd_v4failover(const char* host, uint16_t port_a, uint16_t port_b, const std
     // A's session is unknown to B: BADSESSION, not a hang or a stale reply.
     uint32_t probe = v4_probe_session(b, session_a);
     if (probe != kBadSession) fatal("v4failover: old session on B: expected BADSESSION, got %u", probe);
-    b.establish(false);  // same co_ownerid + verifier: listed by A → no RECLAIM_COMPLETE yet
+    // same co_ownerid + verifier: listed by A → no RECLAIM_COMPLETE yet
+    b.establish(false);
     if (b.server_owner != owner_a || b.server_scope != scope_a)
         fatal("v4failover: identity changed across takeover: owner %s→%s scope %s→%s", owner_a.c_str(),
               b.server_owner.c_str(), scope_a.c_str(), b.server_scope.c_str());
@@ -2329,7 +2410,8 @@ int cmd_v4failover(const char* host, uint16_t port_a, uint16_t port_b, const std
     auto root = lookup_path(b, split_path(export_path));
     uint32_t st = 0;
     (void)v4_read(b, fh, open_sid, 16, &st);
-    if (st == 70) {  // NFS4ERR_STALE handle: fallback handles without btime (design 06)
+    // NFS4ERR_STALE handle: fallback handles without btime (design 06)
+    if (st == 70) {
         std::printf(
             "v4failover: note: filehandle not stable across gateways (fallback "
             "handle mode without btime); re-resolving by name\n");
@@ -2378,7 +2460,8 @@ int cmd_v4failover(const char* host, uint16_t port_a, uint16_t port_b, const std
 
 namespace v4 {
 constexpr uint32_t kAttrFsLocations = 24;
-constexpr uint32_t kMoved = 10019;  // NFS4ERR_MOVED (v4 status, not lnfs::Errno::kMoved)
+// NFS4ERR_MOVED (v4 status, not lnfs::Errno::kMoved)
+constexpr uint32_t kMoved = 10019;
 
 // One lone SEQUENCE; returns sr_status_flags (SEQ4_STATUS_* — LEASE_MOVED is 0x80).
 uint32_t v4_sequence_flags(V4Client& c) {
@@ -2386,12 +2469,18 @@ uint32_t v4_sequence_flags(V4Client& c) {
     c.seq_header(ops, 0);
     auto r = c.run(ops.take().to_bytes());
     V4Client::expect_op(r.dec, kOpSequence);
-    (void)r.dec.opaque_fixed(16);  // sessionid
-    (void)ru32(r.dec);             // seqid
-    (void)ru32(r.dec);             // slotid
-    (void)ru32(r.dec);             // highest_slotid
-    (void)ru32(r.dec);             // target_highest_slotid
-    return ru32(r.dec);            // status_flags
+    // sessionid
+    (void)r.dec.opaque_fixed(16);
+    // seqid
+    (void)ru32(r.dec);
+    // slotid
+    (void)ru32(r.dec);
+    // highest_slotid
+    (void)ru32(r.dec);
+    // target_highest_slotid
+    (void)ru32(r.dec);
+    // status_flags
+    return ru32(r.dec);
 }
 
 // GETATTR(fs_locations) on `fh`; returns the location server strings (empty when the
@@ -2402,8 +2491,10 @@ std::vector<std::string> v4_fs_locations(V4Client& c, const std::vector<std::byt
     ops.u32(kOpPutfh);
     ops.opaque(fh);
     ops.u32(kOpGetattr);
-    ops.u32(1);                       // bitmap: one word
-    ops.u32(1u << kAttrFsLocations);  // attr 24
+    // bitmap: one word
+    ops.u32(1);
+    // attr 24
+    ops.u32(1u << kAttrFsLocations);
     auto r = c.run(ops.take().to_bytes());
     V4Client::skip_sequence_res(r.dec);
     V4Client::expect_op(r.dec, kOpPutfh);
@@ -2411,10 +2502,12 @@ std::vector<std::string> v4_fs_locations(V4Client& c, const std::vector<std::byt
     uint32_t words = ru32(r.dec);
     uint32_t w0 = words > 0 ? ru32(r.dec) : 0;
     for (uint32_t i = 1; i < words; ++i) (void)ru32(r.dec);
-    (void)ru32(r.dec);  // attrlist4 length
+    // attrlist4 length
+    (void)ru32(r.dec);
     std::vector<std::string> servers;
     if (w0 & (1u << kAttrFsLocations)) {
-        uint32_t root_comps = ru32(r.dec);  // fs_root: pathname4
+        // fs_root: pathname4
+        uint32_t root_comps = ru32(r.dec);
         for (uint32_t i = 0; i < root_comps; ++i) (void)r.dec.string(255);
         uint32_t nloc = ru32(r.dec);
         for (uint32_t i = 0; i < nloc; ++i) {
@@ -2423,7 +2516,8 @@ std::vector<std::string> v4_fs_locations(V4Client& c, const std::vector<std::byt
                 auto srv = r.dec.string(255);
                 if (srv) servers.emplace_back(*srv);
             }
-            uint32_t path_comps = ru32(r.dec);  // rootpath
+            // rootpath
+            uint32_t path_comps = ru32(r.dec);
             for (uint32_t k = 0; k < path_comps; ++k) (void)r.dec.string(255);
         }
     }
@@ -2501,7 +2595,8 @@ int cmd_v4moved(const char* host, uint16_t port_a, uint16_t port_b, uint16_t por
         V4Client b(host, port_b, "lightnfs-moved-fs");
         b.establish();
         unsigned tries = 0;
-        while (!(v4_sequence_flags(b) & 0x80u)) {  // SEQ4_STATUS_LEASE_MOVED
+        // SEQ4_STATUS_LEASE_MOVED
+        while (!(v4_sequence_flags(b) & 0x80u)) {
             if (++tries > 100) fatal("v4moved: B never set LEASE_MOVED after the migration");
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
@@ -2519,7 +2614,8 @@ int cmd_v4moved(const char* host, uint16_t port_a, uint16_t port_b, uint16_t por
         // Same co_ownerid as B: this is the migrating client reclaiming on the new owner
         // (a different server, so no clientid clash); C must find it on the reclaim list.
         V4Client c(host, port_c, "lightnfs-moved-fs");
-        c.establish(false);  // listed by B -> grace, no RECLAIM_COMPLETE yet
+        // listed by B -> grace, no RECLAIM_COMPLETE yet
+        c.establish(false);
         auto root = lookup_path(c, split_path(export_path));
         // C takes the export over on its own next tick after the owner record named it;
         // until then it still answers MOVED.  Wait for it to own the export (GRACE — it is
@@ -2535,7 +2631,8 @@ int cmd_v4moved(const char* host, uint16_t port_a, uint16_t port_b, uint16_t por
             if (++waited > 200) fatal("v4moved: C never took the migrated export over");
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        fh = lookup_path(c, comps);  // handles may not be stable across gateways
+        // handles may not be stable across gateways
+        fh = lookup_path(c, comps);
         auto re = v4_open(c, fh, "", 3, 0, owner, false, 1);
         if (re.status != 0) fatal("v4moved: OPEN(CLAIM_PREVIOUS) on C: status %u", re.status);
         Stateid4 re_lock;
@@ -2579,7 +2676,8 @@ int cmd_v4courtesy(const char* host, uint16_t nfs_port, const std::string& expor
         V4Client holder(host, nfs_port, std::string("lightnfs-accept-") + owner);
         holder.establish();
         auto root = lookup_path(holder, split_path(export_path));
-        auto o = v4_open(holder, root, name, 1, 2, owner, true, 0, 0);  // READ, deny WRITE
+        // READ, deny WRITE
+        auto o = v4_open(holder, root, name, 1, 2, owner, true, 0, 0);
         if (o.status != 0) fatal("v4courtesy: holder OPEN status %u", o.status);
         // holder goes out of scope: TCP closed, session/state left behind
     };
@@ -2592,7 +2690,8 @@ int cmd_v4courtesy(const char* host, uint16_t nfs_port, const std::string& expor
     std::printf("v4courtesy: denied inside lease; waiting %us for expiry\n", lease_seconds + 2);
     for (unsigned i = 0; i < lease_seconds + 2; ++i) {
         sleep(1);
-        XdrEnc hb(b.rpc.pool);  // keep b's own lease alive
+        // keep b's own lease alive
+        XdrEnc hb(b.rpc.pool);
         b.seq_header(hb, 0);
         (void)b.run(hb.take().to_bytes());
     }
@@ -2622,10 +2721,12 @@ int cmd_v4walk(const char* host, uint16_t nfs_port, const std::string& export_pa
     {
         XdrEnc bad(c.rpc.pool);
         bad.u32(0);
-        bad.u32(0);  // minorversion 0
+        // minorversion 0
+        bad.u32(0);
         bad.u32(1);
         bad.u32(v4::kOpPutrootfh);
-        auto r = c.run(bad.take().to_bytes(), 10021);  // MINOR_VERS_MISMATCH
+        // MINOR_VERS_MISMATCH
+        auto r = c.run(bad.take().to_bytes(), 10021);
         (void)r;
     }
 
@@ -2662,7 +2763,8 @@ int cmd_v4walk(const char* host, uint16_t nfs_port, const std::string& export_pa
         auto record = build_call(c.rpc.pool, xid, kNfsProg, 1, body, 4);
         send_record(c.rpc.fd, record);
         auto first = read_record(c.rpc.fd);
-        send_record(c.rpc.fd, record);  // byte-identical retransmission
+        // byte-identical retransmission
+        send_record(c.rpc.fd, record);
         auto second = read_record(c.rpc.fd);
         if (first != second) fatal("v4: slot replay bytes differ");
     }
@@ -2756,8 +2858,10 @@ uint32_t v4_copy(V4Client& c, const std::vector<std::byte>& src, const Stateid4&
     if (!clone) {
         if (ru32(r.dec) != 0) fatal("v42: COPY answered with a callback stateid");
         uint64_t n = ru64(r.dec);
-        (void)ru32(r.dec);            // committed
-        (void)r.dec.opaque_fixed(8);  // verifier
+        // committed
+        (void)ru32(r.dec);
+        // verifier
+        (void)r.dec.opaque_fixed(8);
         if (!rbool(r.dec) || !rbool(r.dec)) fatal("v42: COPY not consecutive+synchronous");
         if (copied) *copied = n;
     }
@@ -2940,9 +3044,11 @@ int main(int argc, char** argv) {
     if (cmd == "v4rw" && argc == 7) return cmd_v4rw(host, nfs_port, export_path, argv[6]);
     if (cmd == "v4reclaim" && argc == 8) return cmd_v4reclaim(host, nfs_port, export_path, argv[6], argv[7]);
     if (cmd == "v4courtesy" && argc == 7) return cmd_v4courtesy(host, nfs_port, export_path, (unsigned)atoi(argv[6]));
-    if (cmd == "v4failover" && argc == 8)  // argv[4] is gateway B's port, not a mount port
+    // argv[4] is gateway B's port, not a mount port
+    if (cmd == "v4failover" && argc == 8)
         return cmd_v4failover(host, nfs_port, mount_port, export_path, argv[6], argv[7]);
-    if (cmd == "v4moved" && argc == 9)  // PORT_A PORT_B PORT_C EXPORT BACKING MIGRATE_CMD
+    // PORT_A PORT_B PORT_C EXPORT BACKING MIGRATE_CMD
+    if (cmd == "v4moved" && argc == 9)
         return cmd_v4moved(host, nfs_port, mount_port, (uint16_t)atoi(argv[5]), argv[6], argv[7], argv[8]);
     if (cmd == "v4lock" && argc == 7) return cmd_v4lock(host, nfs_port, export_path, argv[6]);
     if (cmd == "v42" && argc == 7) return cmd_v42(host, nfs_port, export_path, argv[6]);

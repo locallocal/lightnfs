@@ -76,8 +76,10 @@ TEST(Metrics, TextProviderAppendsToExposition) {
 TEST(Metrics, V3SeriesRenderAndZeroSkipRule) {
     auto& m = obs::Metrics::instance();
     // Pick two v3 procs; bump one, leave the other at whatever the process has seen.
-    const uint32_t bumped = 20;      // PATHCONF — unused by other suites in this binary
-    const uint32_t maybe_zero = 21;  // COMMIT
+    // PATHCONF — unused by other suites in this binary
+    const uint32_t bumped = 20;
+    // COMMIT
+    const uint32_t maybe_zero = 21;
     uint64_t before = m.v3_calls[bumped].load();
     m.v3_calls[bumped].fetch_add(2);
     m.v3_errors[bumped].fetch_add(1);
@@ -187,7 +189,8 @@ TEST(Metrics, ClusterFsSeries) {
         EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_fence_lost_total{fsid=\"2\"}"), 0);
         EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"2\",role=\"active\"}"), 1);
         store.age_out_node("gw2", 1000);
-        ctl.tick();  // F1 is ours again (first in line), F3 as well (gw2 gone)
+        // F1 is ours again (first in line), F3 as well (gw2 gone)
+        ctl.tick();
         text = obs::prometheus_text();
         EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_role{fsid=\"1\",role=\"active\"}"), 1);
         EXPECT_EQ(sample_value(text, "lightnfs_cluster_fs_takeovers_total{fsid=\"1\"}"), 2);
@@ -222,7 +225,8 @@ TEST(Metrics, ClusterSeriesRenderWithControllerLifetime) {
         cfg.id = "cluster-metrics-test";
         cfg.node = "gw1";
         cfg.fence_lease_ms = 1000;
-        server::ClusterController ctl(cfg, store, {});  // inline hooks, nothing to run
+        // inline hooks, nothing to run
+        server::ClusterController ctl(cfg, store, {});
         EXPECT_EQ(obs::text_provider_count(), providers_before + 1);
 
         // Standby, nothing seen yet: role one-hot, no fence age sample, zero counters.

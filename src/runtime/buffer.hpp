@@ -26,7 +26,8 @@ struct Block {
     std::byte* data;
     uint32_t cap;
     std::atomic<uint32_t> refs;
-    BufferPool* pool;  // nullptr: plain malloc'd oversize block
+    // nullptr: plain malloc'd oversize block
+    BufferPool* pool;
     Block* next_free;
 };
 void block_unref(Block* b);
@@ -36,7 +37,8 @@ void block_unref(Block* b);
 // path detach it under a global registry mutex (rare). Lock order: registry -> mag.
 struct Magazine {
     std::mutex mu;
-    BufferPool* pool;  // null once the pool died; blocks were reclaimed by the pool
+    // null once the pool died; blocks were reclaimed by the pool
+    BufferPool* pool;
     Block* head[5] = {};
     uint32_t count[5] = {};
     explicit Magazine(BufferPool* p) : pool(p) {}
@@ -73,7 +75,8 @@ class Buffer {
 class BufferPool {
  public:
     struct Config {
-        size_t max_free_bytes = 64 << 20;  // watermark of cached free memory (global freelist)
+        // watermark of cached free memory (global freelist)
+        size_t max_free_bytes = 64 << 20;
     };
     BufferPool() : BufferPool(Config{}) {}
     explicit BufferPool(Config cfg);
@@ -90,7 +93,8 @@ class BufferPool {
     // without hoarding: 16 × 1M worst case = 16MB per active thread.
     static constexpr uint32_t kMagazineCap = 16;
 
-    Buffer alloc(size_t n);  // rounds up to a class; > kLarge gets an exact unpooled block
+    // rounds up to a class; > kLarge gets an exact unpooled block
+    Buffer alloc(size_t n);
     size_t free_bytes();
 
  private:
@@ -98,15 +102,20 @@ class BufferPool {
     friend void detail::magazine_thread_exit(detail::Magazine*);
     void recycle(detail::Block* b);
     detail::Block* take_or_create(int cls, size_t cap);
-    detail::Block* global_take(int cls);         // locked freelist pop (nullptr on empty)
-    void global_put(detail::Block* b, int cls);  // locked freelist push / free over watermark
-    void drop_free_locked();                     // caller holds mu_: free the whole freelist
-    detail::Magazine* magazine();                // this thread's magazine for this pool
+    // locked freelist pop (nullptr on empty)
+    detail::Block* global_take(int cls);
+    // locked freelist push / free over watermark
+    void global_put(detail::Block* b, int cls);
+    // caller holds mu_: free the whole freelist
+    void drop_free_locked();
+    // this thread's magazine for this pool
+    detail::Magazine* magazine();
 
     std::mutex mu_;
     detail::Block* free_[kClasses] = {};
     size_t free_bytes_ = 0;
-    std::vector<detail::Magazine*> magazines_;  // guarded by the global registry mutex
+    // guarded by the global registry mutex
+    std::vector<detail::Magazine*> magazines_;
     Config cfg_;
 };
 

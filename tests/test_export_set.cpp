@@ -101,7 +101,8 @@ TEST(ExportSet, EntriesSortedByFsidAndSharedAcrossPublishes) {
     ASSERT_TRUE(table.add(export_cfg(9, "/e/nine"), mem(9)).has_value());
     auto first = table.snapshot();
     EXPECT_TRUE(fsids(*first) == (std::vector<uint32_t>{2, 5, 9}));
-    EXPECT_EQ(first->generation, 3u);  // one publish per add on top of the empty set
+    // one publish per add on top of the empty set
+    EXPECT_EQ(first->generation, 3u);
     for (uint32_t fsid : {2u, 5u, 9u}) {
         const auto* entry = first->by_fsid(fsid);
         ASSERT_TRUE(entry != nullptr);
@@ -167,7 +168,8 @@ TEST(ExportSet, ForMountPathLongestPrefixOnComponentBoundary) {
     ASSERT_TRUE(hit != nullptr);
     EXPECT_EQ(hit->fsid, 2u);
     EXPECT_STREQ(rel, "a/b");
-    hit = set->for_mount_path("/export/deeper", rel);  // not a component boundary
+    // not a component boundary
+    hit = set->for_mount_path("/export/deeper", rel);
     ASSERT_TRUE(hit != nullptr);
     EXPECT_EQ(hit->fsid, 1u);
     EXPECT_STREQ(rel, "deeper");
@@ -258,8 +260,10 @@ TEST(ExportSet, ApplyAddsRemovesAndSharesEntries) {
     backend::Backend* four_backend = started[0].get();
     auto applied = table.apply(std::move(plan), started, old->epoch);
     ASSERT_TRUE(applied.has_value());
-    EXPECT_TRUE(started.empty());     // consumed
-    auto next = std::move(*applied);  // the only reference to the new set besides the table
+    // consumed
+    EXPECT_TRUE(started.empty());
+    // the only reference to the new set besides the table
+    auto next = std::move(*applied);
     EXPECT_TRUE(table.snapshot() == next);
     EXPECT_EQ(next->generation, old->generation + 1);
     EXPECT_TRUE(fsids(*next) == (std::vector<uint32_t>{1, 3, 4}));
@@ -321,17 +325,20 @@ TEST(ExportSet, PseudoChangeMonotonic) {
         if (!seen.empty()) EXPECT_TRUE(change > seen.back());
         seen.push_back(change);
     };
-    note();  // the empty boot set
+    // the empty boot set
+    note();
     ASSERT_TRUE(table.add(export_cfg(1, "/export/one"), mem(1)).has_value());
     note();
-    table.set_epoch(5);  // what the ProtocolStack does when the gateway activates
+    // what the ProtocolStack does when the gateway activates
+    table.set_epoch(5);
     note();
     core::ExportSetPlan add;
     add.add.push_back(export_cfg(2, "/export/two"));
     auto started = backends({2});
     ASSERT_TRUE(table.apply(std::move(add), started, 5).has_value());
     note();
-    core::ExportSetPlan update;  // an in-place update publishes too: the tree moves
+    // an in-place update publishes too: the tree moves
+    core::ExportSetPlan update;
     update.update.push_back(export_cfg(2, "/export/two"));
     std::vector<std::unique_ptr<backend::Backend>> none;
     ASSERT_TRUE(table.apply(std::move(update), none, 5).has_value());
@@ -420,37 +427,45 @@ TEST(ExportSet, ApplyRejectsBadPlansWithoutPublishing) {
         auto applied = table.apply(std::move(plan), started, 1);
         EXPECT_FALSE(applied.has_value());
         if (!applied) EXPECT_EQ(static_cast<int>(applied.error()), EINVAL);
-        EXPECT_EQ(started.size(), started_count);  // handed back untouched
+        // handed back untouched
+        EXPECT_EQ(started.size(), started_count);
         EXPECT_TRUE(table.snapshot() == before);
         EXPECT_EQ(table.retired_pending(), 0u);
     };
     core::ExportSetPlan p;
     p.add.push_back(export_cfg(2, "/export/two"));
-    expect_rejected(p, 0);  // backend count mismatch
+    // backend count mismatch
+    expect_rejected(p, 0);
     expect_rejected(p, 2);
     p = {};
     p.add.push_back(export_cfg(1, "/export/dup"));
-    expect_rejected(p, 1);  // fsid already in the set
+    // fsid already in the set
+    expect_rejected(p, 1);
     p = {};
     p.add.push_back(export_cfg(0, "/export/zero"));
     expect_rejected(p, 1);
     p = {};
     p.add.push_back(export_cfg(2, "/export/two"));
     p.add.push_back(export_cfg(2, "/export/two-again"));
-    expect_rejected(p, 2);  // listed twice
+    // listed twice
+    expect_rejected(p, 2);
     p = {};
     p.update.push_back(export_cfg(7, "/export/seven"));
-    expect_rejected(p, 0);  // unknown update
+    // unknown update
+    expect_rejected(p, 0);
     p = {};
     p.update.push_back(export_cfg(1, "/export/moved"));
-    expect_rejected(p, 0);  // path change is not an update
+    // path change is not an update
+    expect_rejected(p, 0);
     p = {};
     p.remove.push_back(7);
-    expect_rejected(p, 0);  // unknown remove
+    // unknown remove
+    expect_rejected(p, 0);
     p = {};
     p.remove.push_back(1);
     p.update.push_back(export_cfg(1, "/export/one"));
-    expect_rejected(p, 0);  // update and remove of one fsid
+    // update and remove of one fsid
+    expect_rejected(p, 0);
     p = {};
     auto bad = export_cfg(2, "/export/two");
     bad.clients = {"not-a-cidr"};

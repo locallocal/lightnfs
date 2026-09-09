@@ -34,20 +34,23 @@ void Bitmap::encode(xdr::XdrEnc& enc) const {
 
 Result<Bitmap> Bitmap::decode(xdr::XdrDec& dec) {
     uint32_t count = LNFS_TRY(dec.u32());
-    if (count > 8) return Err(Errno::kGarbage);  // attrs stop well below 8 words
+    // attrs stop well below 8 words
+    if (count > 8) return Err(Errno::kGarbage);
     Bitmap out;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t word = LNFS_TRY(dec.u32());
         if (i < 3)
             out.words.push_back(word);
         else if (word != 0)
-            return Err(Errno::kGarbage);  // bits we can never serve
+            // bits we can never serve
+            return Err(Errno::kGarbage);
     }
     return out;
 }
 
 void encode_nfstime(xdr::XdrEnc& enc, const backend::Timespec& time) {
-    enc.u64(static_cast<uint64_t>(time.sec));  // int64 on the wire
+    // int64 on the wire
+    enc.u64(static_cast<uint64_t>(time.sec));
     enc.u32(std::min(time.nsec, 999999999u));
 }
 
@@ -58,7 +61,8 @@ void ChannelAttrs::encode(xdr::XdrEnc& enc) const {
     enc.u32(max_response_cached);
     enc.u32(max_ops);
     enc.u32(max_requests);
-    enc.u32(0);  // rdma_ird: empty array
+    // rdma_ird: empty array
+    enc.u32(0);
 }
 
 Result<ChannelAttrs> ChannelAttrs::decode(xdr::XdrDec& dec) {

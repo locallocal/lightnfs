@@ -24,10 +24,12 @@ struct Cred {
 
 struct Target {
     uint32_t xid = 0;
-    uint32_t program = 0;  // client's cb_program from CREATE_SESSION
+    // client's cb_program from CREATE_SESSION
+    uint32_t program = 0;
     Cred cred;
     SessionId sessionid{};
-    uint32_t slot_seq = 0;  // CB_SEQUENCE csa_sequenceid (slot 0; we advertise 1 slot)
+    // CB_SEQUENCE csa_sequenceid (slot 0; we advertise 1 slot)
+    uint32_t slot_seq = 0;
 };
 
 // Full RPC CALL records (no record marking).
@@ -39,8 +41,10 @@ std::vector<std::byte> build_cb_notify_lock(const Target& t, std::span<const std
 // status extracted.  A parse failure returns nfsv4 BADXDR; RPC-level rejection maps
 // to a nonzero status too — callers only distinguish zero from nonzero.
 struct ReplyStatus {
-    bool rpc_ok = false;        // RPC accepted with SUCCESS
-    uint32_t nfs_status = ~0u;  // CB_COMPOUND status when rpc_ok
+    // RPC accepted with SUCCESS
+    bool rpc_ok = false;
+    // CB_COMPOUND status when rpc_ok
+    uint32_t nfs_status = ~0u;
 };
 ReplyStatus parse_cb_reply(std::span<const std::byte> record);
 

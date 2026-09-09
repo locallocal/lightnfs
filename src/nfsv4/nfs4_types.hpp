@@ -15,10 +15,12 @@ namespace lnfs::nfsv4 {
 
 inline constexpr uint32_t kProgram = 100003;
 inline constexpr uint32_t kVersion = 4;
-inline constexpr uint32_t kMaxFileHandle = 128;  // NFS4_FHSIZE
+// NFS4_FHSIZE
+inline constexpr uint32_t kMaxFileHandle = 128;
 inline constexpr uint32_t kMaxName = 255;
 inline constexpr uint32_t kMaxTag = 1024;
-inline constexpr uint32_t kMaxOwnerId = 1024;  // EXCHANGE_ID co_ownerid
+// EXCHANGE_ID co_ownerid
+inline constexpr uint32_t kMaxOwnerId = 1024;
 inline constexpr uint32_t kLeaseSeconds = 90;
 inline constexpr uint32_t kMaxSymlink = 4096;
 
@@ -88,8 +90,10 @@ enum class Op : uint32_t {
     kIllegal = 10044,
 };
 inline constexpr uint32_t kFirstOp = 3;
-inline constexpr uint32_t kLastOp41 = 58;     // 4.1 ceiling; beyond -> ILLEGAL at minor 1
-inline constexpr uint32_t kLastKnownOp = 75;  // 4.2 ceiling (RFC 8276); beyond -> ILLEGAL
+// 4.1 ceiling; beyond -> ILLEGAL at minor 1
+inline constexpr uint32_t kLastOp41 = 58;
+// 4.2 ceiling (RFC 8276); beyond -> ILLEGAL
+inline constexpr uint32_t kLastKnownOp = 75;
 // Minor versions served: 1 and 2 (decision D5 keeps 0 rejected).  4.2 adds ops only;
 // sessions, state and stateids are shared verbatim (RFC 7862 §1.4).
 inline bool minor_supported(uint32_t minor) {
@@ -193,7 +197,8 @@ struct Stateid {
     std::array<std::byte, 12> other{};
 
     bool is_all_zero() const;
-    bool is_all_one() const;  // READ bypass stateid
+    // READ bypass stateid
+    bool is_all_one() const;
     bool is_special() const { return is_all_zero() || is_all_one(); }
     void encode(xdr::XdrEnc& enc) const;
     static Result<Stateid> decode(xdr::XdrDec& dec);
@@ -236,7 +241,8 @@ struct ChannelAttrs {
     uint32_t max_response = 1u << 20;
     uint32_t max_response_cached = 8u << 10;
     uint32_t max_ops = 16;
-    uint32_t max_requests = 32;  // slot count
+    // slot count
+    uint32_t max_requests = 32;
     void encode(xdr::XdrEnc& enc) const;
     static Result<ChannelAttrs> decode(xdr::XdrDec& dec);
 };

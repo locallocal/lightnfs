@@ -88,8 +88,9 @@ class SmallVec {
  private:
     void grow(size_t ncap) {
         if (ncap == 0)
-            ncap = 1;  // unreachable (cap_ >= N >= 1); keeps GCC15 -Warray-bounds
-                       // from assuming a zero-size allocation below
+            // unreachable (cap_ >= N >= 1); keeps GCC15 -Warray-bounds
+            // from assuming a zero-size allocation below
+            ncap = 1;
         T* nh = static_cast<T*>(::operator new(ncap * sizeof(T)));
         T* old = data();
         for (size_t i = 0; i < size_; ++i) {

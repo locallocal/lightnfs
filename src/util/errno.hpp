@@ -12,11 +12,16 @@ namespace lnfs {
 enum class Errno : int32_t {
     kOk = 0,
     // Sentinels outside the POSIX range:
-    kJukebox = 3000,    // backend HSM "try again later" -> v3 JUKEBOX / v4 DELAY
-    kGarbage = 3001,    // XDR decode violation -> RPC GARBAGE_ARGS
-    kEof = 3002,        // orderly connection shutdown (transport-internal)
-    kBadHandle = 3003,  // authenticated file-handle envelope is malformed/forged
-    kMoved = 3004,      // export served by another gateway -> v4 MOVED (plan 12 B3)
+    // backend HSM "try again later" -> v3 JUKEBOX / v4 DELAY
+    kJukebox = 3000,
+    // XDR decode violation -> RPC GARBAGE_ARGS
+    kGarbage = 3001,
+    // orderly connection shutdown (transport-internal)
+    kEof = 3002,
+    // authenticated file-handle envelope is malformed/forged
+    kBadHandle = 3003,
+    // export served by another gateway -> v4 MOVED (plan 12 B3)
+    kMoved = 3004,
 };
 
 constexpr Errno errno_from(int e) {

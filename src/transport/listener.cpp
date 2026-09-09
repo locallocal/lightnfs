@@ -42,7 +42,8 @@ Result<int> make_listen_socket(const std::string& bind_addr, uint16_t port, uint
         v4->sin_port = htons(port);
         slen = sizeof(*v4);
     } else {
-        return Err(errno_from(EINVAL));  // config validation catches this earlier
+        // config validation catches this earlier
+        return Err(errno_from(EINVAL));
     }
     int fd = socket(ss.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return Err(errno_from(errno));
@@ -136,7 +137,8 @@ rt::Task<void> Listener::run_one(size_t idx) {
         Peer peer;
         peer.len = sizeof(peer.addr);
         if (getpeername(cfd, reinterpret_cast<sockaddr*>(&peer.addr), &peer.len) < 0) {
-            peer = Peer{};  // already disconnected: track under the zero address
+            // already disconnected: track under the zero address
+            peer = Peer{};
         }
         obs::Metrics::instance().conns_accepted.fetch_add(1, std::memory_order_relaxed);
         if (!tracker_.try_add(peer)) {

@@ -20,10 +20,12 @@ struct WaitNode {
     std::coroutine_handle<> h;
     Reactor* r = nullptr;
     WaitNode* next = nullptr;
-    bool exclusive = true;  // used by AsyncSharedMutex
+    // used by AsyncSharedMutex
+    bool exclusive = true;
 };
 
-struct WaitList {  // intrusive FIFO
+// intrusive FIFO
+struct WaitList {
     WaitNode* head = nullptr;
     WaitNode* tail = nullptr;
     bool empty() const { return head == nullptr; }
@@ -82,7 +84,8 @@ class AsyncMutex {
         bool await_ready() { return m.try_lock(); }
         bool await_suspend(std::coroutine_handle<> h) {
             std::lock_guard g(m.mu_);
-            if (!m.locked_) {  // raced free between ready and suspend
+            // raced free between ready and suspend
+            if (!m.locked_) {
                 m.locked_ = true;
                 return false;
             }
@@ -110,7 +113,8 @@ class AsyncMutex {
             std::lock_guard g(mu_);
             assert(locked_);
             n = waiters_.pop();
-            if (!n) locked_ = false;  // else: ownership transfers to n, stays locked
+            // else: ownership transfers to n, stays locked
+            if (!n) locked_ = false;
         }
         if (n) detail::resume_via_post(n);
     }
@@ -248,7 +252,8 @@ class AsyncCondVar {
                     std::lock_guard g(cv.mu_);
                     cv.waiters_.push(&node);
                 }
-                lk.reset();  // release only after we are queued: no lost wakeups
+                // release only after we are queued: no lost wakeups
+                lk.reset();
             }
             void await_resume() const noexcept {}
         };
@@ -315,7 +320,8 @@ class Semaphore {
         {
             std::lock_guard g(mu_);
             n = waiters_.pop();
-            if (!n) ++count_;  // else: the permit transfers to n
+            // else: the permit transfers to n
+            if (!n) ++count_;
         }
         if (n) detail::resume_via_post(n);
     }

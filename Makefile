@@ -2,9 +2,11 @@
 #
 #   make            configure + build the default tree (build/, Debug)
 #   make test       run the unit tests and regress binaries in build/
-#   make format     clang-format every tracked C++ source in place (.clang-format)
+#   make format     move trailing comments above their code, then clang-format every
+#                   tracked C++ source in place (.clang-format)
 #   make format-check
-#                   report formatting drift without touching files (the CI gate)
+#                   report formatting drift and trailing comments without touching
+#                   files (the CI gate: scripts/format_check.sh)
 #   make tidy       clang-tidy over the sources (scripts/tidy.sh)
 #
 # Variables: BUILD_DIR (build), BUILD_TYPE (Debug), JOBS (half the cores, the
@@ -33,6 +35,7 @@ test: build
 
 format:
 	@command -v $(CLANG_FORMAT) >/dev/null || { echo "make format: $(CLANG_FORMAT) not found (pip install clang-format, or set CLANG_FORMAT=)"; exit 1; }
+	python3 scripts/trailing_comments.py --fix $(FORMAT_FILES)
 	$(CLANG_FORMAT) -i $(FORMAT_FILES)
 	@echo "format: reformatted $(words $(FORMAT_FILES)) files"
 
@@ -46,4 +49,4 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 help:
-	@sed -n '1,11p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '1,14p' Makefile | sed 's/^# \{0,1\}//'

@@ -32,10 +32,13 @@ TEST(Offload, RoundTripAffinity) {
         rt.reactor(0));
 
     rt.start();
-    rt.stop_and_join();  // reactors stop once tasks drain (stop() already requested inside)
+    // reactors stop once tasks drain (stop() already requested inside)
+    rt.stop_and_join();
 
-    EXPECT_TRUE(reactor_tid == resume_tid);   // resumed back on the originating reactor
-    EXPECT_TRUE(reactor_tid != offload_tid);  // work ran elsewhere
+    // resumed back on the originating reactor
+    EXPECT_TRUE(reactor_tid == resume_tid);
+    // work ran elsewhere
+    EXPECT_TRUE(reactor_tid != offload_tid);
 }
 
 TEST(Offload, ExceptionPropagates) {
@@ -121,14 +124,17 @@ TEST(Offload, AdmissionCapDefersButCompletesAll) {
     });
     for (int i = 0; i < 32; ++i) pool.submit([&] { done.fetch_add(1); });
     auto mid = pool.stats();
-    EXPECT_TRUE(mid.deferred[0] > 0);                 // cap engaged
-    EXPECT_TRUE(mid.depth[0] + mid.depth[1] >= 32u);  // queued + overflow all accounted
+    // cap engaged
+    EXPECT_TRUE(mid.deferred[0] > 0);
+    // queued + overflow all accounted
+    EXPECT_TRUE(mid.depth[0] + mid.depth[1] >= 32u);
     {
         std::lock_guard lk(mu);
         release = true;
     }
     cv.notify_all();
-    pool.stop_and_join();  // drain: every deferred job still runs
+    // drain: every deferred job still runs
+    pool.stop_and_join();
     EXPECT_EQ(done.load(), 32);
     auto s = pool.stats();
     EXPECT_EQ(s.completed[0], 33u);

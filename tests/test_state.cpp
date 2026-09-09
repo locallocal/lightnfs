@@ -90,7 +90,8 @@ TEST(StateMgr, ConcurrentLifecycleMatrixIsDeadlockFree) {
                 if (!replay.replay) errors->fetch_add(1);
 
                 if (co_await mgr->destroy_clientid(ex.clientid) != static_cast<uint32_t>(nfsv4::Status::kClientidBusy))
-                    errors->fetch_add(1);  // sessions still exist: must refuse
+                    // sessions still exist: must refuse
+                    errors->fetch_add(1);
                 if (co_await mgr->destroy_session(cs.sessionid, 1) != 0) errors->fetch_add(1);
                 if (co_await mgr->destroy_clientid(ex.clientid) != 0) errors->fetch_add(1);
 
@@ -105,7 +106,8 @@ TEST(StateMgr, ConcurrentLifecycleMatrixIsDeadlockFree) {
     {
         std::unique_lock lock(mu);
         bool finished = cv.wait_for(lock, std::chrono::seconds(30), [&] { return done.load() == kClients; });
-        ASSERT_TRUE(finished);  // a deadlock would hang here
+        // a deadlock would hang here
+        ASSERT_TRUE(finished);
     }
     EXPECT_EQ(errors.load(), 0);
     auto stats = mgr.stats();
@@ -257,7 +259,8 @@ TEST(StateMgr, StableStoreHooks) {
             return {.load =
                         [this](uint32_t fsid) {
                             std::lock_guard lock(mu);
-                            EXPECT_EQ(fsid, 0u);  // the global list (plan 12 A3)
+                            // the global list (plan 12 A3)
+                            EXPECT_EQ(fsid, 0u);
                             ++loads;
                             return std::vector<std::string>(owners.begin(), owners.end());
                         },
@@ -283,7 +286,8 @@ TEST(StateMgr, StableStoreHooks) {
         state::StateMgr first({.boot_epoch = 1, .state_dir = dir.path, .stable = store.hooks()});
         first.load_grace_list();
         EXPECT_EQ(store.loads, 1);
-        EXPECT_FALSE(first.in_grace());  // nothing listed yet
+        // nothing listed yet
+        EXPECT_FALSE(first.in_grace());
         run_on(runtime, [&]() -> rt::Task<void> {
             // EXCHANGE_ID alone does not persist; the confirmed CREATE_SESSION does.
             auto ex = co_await first.exchange_id("hooked", {}, "sys/t/0", false);
@@ -322,7 +326,8 @@ TEST(StateMgr, StableStoreHooks) {
         uint32_t st = co_await second.reclaim_complete(a.clientid);
         EXPECT_EQ(st, 0u);
     });
-    EXPECT_FALSE(second.in_grace());  // the only listed client reclaimed: early exit
+    // the only listed client reclaimed: early exit
+    EXPECT_FALSE(second.in_grace());
     (void)listed_id;
 
     // Without hooks the same manager keeps writing state_dir/clients/ (A3 contract).
@@ -388,7 +393,8 @@ TEST(StateMgr, ShareReservationMergeDowngradeClose) {
         auto c6 = co_await mgr.check_io(anon, b.clientid, 1, oid_of(1), state::kShareRead);
         EXPECT_EQ(c6.status, kOk);
         nfsv4::Stateid zero_seq = o4.stateid;
-        zero_seq.seqid = 0;  // "don't check version"
+        // "don't check version"
+        zero_seq.seqid = 0;
         auto c7 = co_await mgr.check_io(zero_seq, a.clientid, 1, oid_of(1), state::kShareWrite);
         EXPECT_EQ(c7.status, kOk);
 
@@ -448,7 +454,8 @@ TEST(StateMgr, CourtesyConflictAndTimeoutReclaim) {
         auto s1 = mgr.stats();
         EXPECT_EQ(s1.courtesy, 1u);
         EXPECT_EQ(s1.lease_expirations, 1u);
-        EXPECT_EQ(s1.opens, 1u);  // courtesy keeps the state
+        // courtesy keeps the state
+        EXPECT_EQ(s1.opens, 1u);
 
         // Conflict path: B's WRITE open reclaims A and proceeds.
         auto ob2 = co_await mgr.open(open_args(b.clientid, 1, "ob", state::kShareWrite, 0), nullptr);
@@ -457,7 +464,8 @@ TEST(StateMgr, CourtesyConflictAndTimeoutReclaim) {
         EXPECT_EQ(s2.reclaim_conflict, 1u);
         EXPECT_EQ(s2.courtesy, 0u);
         EXPECT_EQ(s2.opens, 1u);
-        EXPECT_EQ(s2.sessions, 1u);  // A's session is gone
+        // A's session is gone
+        EXPECT_EQ(s2.sessions, 1u);
         auto dead = co_await mgr.sequence_begin(a.sessionid, 0, 1, 0, false, 1);
         EXPECT_EQ(dead.status, st4(nfsv4::Status::kBadsession));
         auto stale = co_await mgr.check_io(oa.stateid, a.clientid, 1, oid_of(1), state::kShareRead);
@@ -476,7 +484,8 @@ TEST(StateMgr, CourtesyConflictAndTimeoutReclaim) {
         EXPECT_EQ(s3.files, 0u);
         EXPECT_EQ(s3.sessions, 0u);
         EXPECT_EQ(s3.clients, 0u);
-        EXPECT_FALSE(mgr.in_stable_list("client-b"));  // removed from the stable list too
+        // removed from the stable list too
+        EXPECT_FALSE(mgr.in_stable_list("client-b"));
 
         // Forced reclaim via the ctl path.
         auto c = co_await connect(mgr, "client-c", 3);
@@ -500,7 +509,8 @@ TEST(StateMgr, CourtesyConflictAndTimeoutReclaim) {
         EXPECT_EQ(mgr.stats().courtesy, 0u);
         EXPECT_EQ(mgr.stats().opens, 1u);
         auto dump = co_await mgr.dump();
-        EXPECT_TRUE(dump.find("client-d") == std::string::npos);  // owner shown as hex
+        // owner shown as hex
+        EXPECT_TRUE(dump.find("client-d") == std::string::npos);
         EXPECT_TRUE(dump.find("open ") != std::string::npos);
     });
     runtime.stop_and_join();
@@ -522,7 +532,8 @@ TEST(StateMgr, GraceReclaimGate) {
     second.load_grace_list();
     EXPECT_TRUE(second.in_grace());
     run_on(runtime, [&]() -> rt::Task<void> {
-        auto a = co_await connect(second, "listed", 1, false);  // reclaims first
+        // reclaims first
+        auto a = co_await connect(second, "listed", 1, false);
         auto n = co_await connect(second, "newcomer", 2);
         // Pre-restart stateid: STALE_STATEID without a table walk.
         nfsv4::Stateid old{};
@@ -585,7 +596,8 @@ TEST(StateMgr, ByteRangeLocksLifecycle) {
         auto l1 = co_await mgr.lock(la);
         EXPECT_EQ(l1.status, kOk);
         EXPECT_EQ(l1.stateid.seqid, 1u);
-        EXPECT_EQ(l1.stateid.other[4], std::byte{2});  // type byte = kLock
+        // type byte = kLock
+        EXPECT_EQ(l1.stateid.other[4], std::byte{2});
         // b (read-only open) asking for a write lock -> OPENMODE; a read lock over a's
         // exclusive range -> DENIED naming a's owner; outside the range -> OK.
         state::StateMgr::LockArgs lb = la;
@@ -600,7 +612,8 @@ TEST(StateMgr, ByteRangeLocksLifecycle) {
         EXPECT_STREQ(denied.denied.owner, "proc-a");
         EXPECT_EQ(denied.denied.length, 100u);
         EXPECT_TRUE(denied.denied.exclusive);
-        EXPECT_EQ(mgr.stats().lock_states, 1u);  // no stateid minted for a denied new owner
+        // no stateid minted for a denied new owner
+        EXPECT_EQ(mgr.stats().lock_states, 1u);
         lb.offset = 100;
         auto l2 = co_await mgr.lock(lb);
         EXPECT_EQ(l2.status, kOk);
@@ -871,7 +884,8 @@ TEST(StateMgr, GraceDecoupledFromLeaseAndOperatorEnd) {
     EXPECT_TRUE(mgr.grace_remaining_seconds() <= 5);
     EXPECT_TRUE(mgr.end_grace());
     EXPECT_FALSE(mgr.in_grace());
-    EXPECT_FALSE(mgr.end_grace());  // second call: nothing left to end
+    // second call: nothing left to end
+    EXPECT_FALSE(mgr.end_grace());
 }
 
 namespace {
@@ -881,9 +895,12 @@ namespace {
 // configurable conflict — what a gateway sees when another gateway holds the range.
 struct FakeNativeLocks final : backend::LockMgr {
     std::vector<std::string> calls;
-    Errno fail = Errno::kOk;                          // lock() outcome when != kOk
-    int fail_times = -1;                              // >= 0: only the next N lock() calls fail (a lingering lock)
-    std::optional<backend::LockConflict> conflict{};  // test() answer
+    // lock() outcome when != kOk
+    Errno fail = Errno::kOk;
+    // >= 0: only the next N lock() calls fail (a lingering lock)
+    int fail_times = -1;
+    // test() answer
+    std::optional<backend::LockConflict> conflict{};
 
     rt::Task<Result<void>> lock(backend::Object&, const backend::LockOwnerId&, backend::LockRange r, bool exclusive,
                                 bool) override {
@@ -932,7 +949,8 @@ TEST(StateMgr, ReclaimLockPushDelayInGrace) {
         };
         return cfg;
     };
-    {  // Gateway A: the client holds an open + lock when A dies (no CLOSE, no LOCKU).
+    // Gateway A: the client holds an open + lock when A dies (no CLOSE, no LOCKU).
+    {
         state::StateMgr first(make_cfg(1));
         run_on(runtime, [&]() -> rt::Task<void> {
             auto a = co_await connect(first, "listed", 1);
@@ -981,13 +999,16 @@ TEST(StateMgr, ReclaimLockPushDelayInGrace) {
         for (int attempt = 0; attempt < 3; ++attempt) {
             auto r = co_await second.lock(la);
             EXPECT_EQ(r.status, st4(nfsv4::Status::kDelay));
-            EXPECT_EQ(r.denied.length, 0u);  // no conflict info on a DELAY
+            // no conflict info on a DELAY
+            EXPECT_EQ(r.denied.length, 0u);
             EXPECT_EQ(second.stats().native_lock_reclaim_delays, static_cast<uint64_t>(attempt + 1));
-            EXPECT_EQ(second.stats().lock_states, 0u);  // nothing minted, nothing granted
+            // nothing minted, nothing granted
+            EXPECT_EQ(second.stats().lock_states, 0u);
             EXPECT_EQ(second.lock_table().segments({1, oid_of(1)}).size(), 0u);
             EXPECT_TRUE(second.in_grace());
         }
-        EXPECT_EQ(second.stats().native_lock_denied, 3u);  // the refusals are still counted
+        // the refusals are still counted
+        EXPECT_EQ(second.stats().native_lock_denied, 3u);
         // The storage let go (A's session timed out / takeover hook ran): the retry wins.
         auto ok = co_await second.lock(la);
         EXPECT_EQ(ok.status, kOk);
@@ -1192,7 +1213,8 @@ TEST(StateMgr, PerFsidGraceIndependent) {
     EXPECT_FALSE(std::filesystem::is_empty(dir.path + "/fs/1/clients"));
     EXPECT_FALSE(std::filesystem::is_empty(dir.path + "/fs/2/clients"));
     EXPECT_TRUE(!std::filesystem::exists(dir.path + "/clients") ||
-                std::filesystem::is_empty(dir.path + "/clients"));  // no global record
+                // no global record
+                std::filesystem::is_empty(dir.path + "/clients"));
 
     // "Takeover of export 1 only": its window is armed, export 2 keeps serving.
     state::StateMgr second({.boot_epoch = 2, .state_dir = dir.path, .per_fsid_reclaim = true});
@@ -1203,7 +1225,8 @@ TEST(StateMgr, PerFsidGraceIndependent) {
     EXPECT_FALSE(second.in_grace(2));
     EXPECT_TRUE(second.in_stable_list(1, "listed"));
     EXPECT_FALSE(second.in_stable_list(2, "listed"));
-    EXPECT_FALSE(second.in_stable_list("listed"));  // not on the global list
+    // not on the global list
+    EXPECT_FALSE(second.in_stable_list("listed"));
     EXPECT_TRUE(second.grace_remaining_seconds(1) > 0);
     EXPECT_EQ(second.grace_remaining_seconds(2), 0);
     EXPECT_TRUE(second.grace_remaining_seconds() == second.grace_remaining_seconds(1));
@@ -1213,7 +1236,8 @@ TEST(StateMgr, PerFsidGraceIndependent) {
     EXPECT_EQ(st.fs_grace[0].first, 1u);
 
     run_on(runtime, [&]() -> rt::Task<void> {
-        auto a = co_await connect(second, "listed", 1, false);  // reclaims first
+        // reclaims first
+        auto a = co_await connect(second, "listed", 1, false);
         auto n = co_await connect(second, "newcomer", 2);
         // Export 2 is not in grace: new state flows, anonymous writes pass.
         EXPECT_EQ((co_await second.open(open_in(2, n.clientid, 2, "on"), nullptr)).status, kOk);
@@ -1266,13 +1290,15 @@ TEST(StateMgr, PerFsidGraceIndependent) {
     }
     third.load_grace_list();
     third.load_grace_list(2);
-    EXPECT_TRUE(third.in_grace(1));  // window 0 covers every export
+    // window 0 covers every export
+    EXPECT_TRUE(third.in_grace(1));
     EXPECT_TRUE(third.in_grace(2));
     EXPECT_TRUE(third.in_stable_list(1, "global-client"));
     EXPECT_TRUE(third.in_stable_list(2, "listed"));
     EXPECT_TRUE(third.end_grace(2));
     EXPECT_FALSE(third.end_grace(2));
-    EXPECT_TRUE(third.in_grace(2));  // still covered by window 0
+    // still covered by window 0
+    EXPECT_TRUE(third.in_grace(2));
     EXPECT_EQ(third.stats().fs_grace.size(), 0u);
     EXPECT_TRUE(third.end_grace());
     EXPECT_FALSE(third.in_grace());
@@ -1414,11 +1440,13 @@ TEST(StateMgr, ReleaseFsidDropsStateKeepsClient) {
         la.open_stateid = o1.stateid;
         la.owner = "proc-a";
         EXPECT_EQ((co_await mgr.lock(la)).status, kOk);
-        mgr.load_grace_list(1);  // pretend export 1 is mid-grace: the handover ends it
+        // pretend export 1 is mid-grace: the handover ends it
+        mgr.load_grace_list(1);
         EXPECT_TRUE(mgr.in_grace(1));
 
         size_t dropped = co_await mgr.release_fsid(1);
-        EXPECT_EQ(dropped, 2u);  // the open and its lock
+        // the open and its lock
+        EXPECT_EQ(dropped, 2u);
         EXPECT_FALSE(mgr.in_grace(1));
         // Export 1 state is gone, export 2 state and the sessions are untouched.
         auto gone = co_await mgr.check_io(o1.stateid, a.clientid, 1, oid_of(1), state::kShareRead);

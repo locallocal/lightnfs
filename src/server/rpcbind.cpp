@@ -42,14 +42,20 @@ Result<void> call_portmapper(uint32_t procedure, uint32_t program, uint32_t vers
     std::array<std::byte, 128> request{};
     size_t n = 0;
     put32(request, n, xid);
-    put32(request, n, 0);       // CALL
-    put32(request, n, 2);       // RPC version
-    put32(request, n, 100000);  // portmapper
-    put32(request, n, 2);       // PMAP v2
-    put32(request, n, procedure);
-    put32(request, n, 0);  // AUTH_NONE credential
+    // CALL
     put32(request, n, 0);
-    put32(request, n, 0);  // AUTH_NONE verifier
+    // RPC version
+    put32(request, n, 2);
+    // portmapper
+    put32(request, n, 100000);
+    // PMAP v2
+    put32(request, n, 2);
+    put32(request, n, procedure);
+    // AUTH_NONE credential
+    put32(request, n, 0);
+    put32(request, n, 0);
+    // AUTH_NONE verifier
+    put32(request, n, 0);
     put32(request, n, 0);
     put32(request, n, program);
     put32(request, n, version);

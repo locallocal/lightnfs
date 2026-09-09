@@ -72,11 +72,15 @@ class CbChannel {
     };
 
     std::mutex mu_;
-    ConnCtx* conn_;                   // null after detach
-    rt::Reactor* home_;               // the connection's reactor: all fd work happens there
-    uint32_t next_xid_ = 0x6c6e0001;  // "ln.."; distinct from client xids by role anyway
+    // null after detach
+    ConnCtx* conn_;
+    // the connection's reactor: all fd work happens there
+    rt::Reactor* home_;
+    // "ln.."; distinct from client xids by role anyway
+    uint32_t next_xid_ = 0x6c6e0001;
     std::unordered_map<uint32_t, Pending*> pending_;
-    std::weak_ptr<CbChannel> self_;  // pins the channel across the posted send task
+    // pins the channel across the posted send task
+    std::weak_ptr<CbChannel> self_;
 };
 
 }  // namespace lnfs::transport

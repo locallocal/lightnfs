@@ -16,7 +16,8 @@ namespace lnfs::rt::detail {
 inline constexpr size_t kFrameGranule = 64;
 inline constexpr size_t kFrameMaxPooled = 4096;
 inline constexpr size_t kFrameBins = kFrameMaxPooled / kFrameGranule;
-inline constexpr size_t kFrameBinCap = 64;  // slots cached per bin per thread
+// slots cached per bin per thread
+inline constexpr size_t kFrameBinCap = 64;
 
 struct FrameBins {
     void* head[kFrameBins] = {};

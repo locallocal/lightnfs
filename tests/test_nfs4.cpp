@@ -100,7 +100,8 @@ struct V4Fixture {
         enc.u32(2);
         enc.u32(nfsv4::kProgram);
         enc.u32(nfsv4::kVersion);
-        enc.u32(1);  // COMPOUND
+        // COMPOUND
+        enc.u32(1);
         enc.u32(0);
         enc.u32(0);
         enc.u32(0);
@@ -162,15 +163,23 @@ struct V4Fixture {
         uint32_t xid_be;
         std::memcpy(&xid_be, cb_record.data(), 4);
         xdr::XdrEnc r(pool);
-        r.u32(xdr::to_be32(xid_be));  // wire order in -> host for the encoder -> wire out
-        r.u32(1);                     // REPLY
-        r.u32(0);                     // MSG_ACCEPTED
-        r.u32(0);                     // verf AUTH_NONE
+        // wire order in -> host for the encoder -> wire out
+        r.u32(xdr::to_be32(xid_be));
+        // REPLY
+        r.u32(1);
+        // MSG_ACCEPTED
         r.u32(0);
-        r.u32(0);           // SUCCESS
-        r.u32(nfs_status);  // CB_COMPOUND status
-        r.u32(0);           // tag
-        r.u32(0);           // no results (status is all the sender reads)
+        // verf AUTH_NONE
+        r.u32(0);
+        r.u32(0);
+        // SUCCESS
+        r.u32(0);
+        // CB_COMPOUND status
+        r.u32(nfs_status);
+        // tag
+        r.u32(0);
+        // no results (status is all the sender reads)
+        r.u32(0);
         ctx.route_cb_reply(r.take());
         while (reactor.poll_once()) {
         }
@@ -190,14 +199,21 @@ struct V4Fixture {
         out.bytes = std::move(payload);
         out.dec = xdr::XdrDec(std::span<const std::byte>(out.bytes.data(), out.bytes.size()));
         auto& d = out.dec;
-        (void)d.u32();  // xid
-        (void)d.u32();  // reply
-        (void)d.u32();  // accepted
-        (void)d.u32();  // verf flavor
-        (void)d.u32();  // verf len
-        (void)d.u32();  // accept success
+        // xid
+        (void)d.u32();
+        // reply
+        (void)d.u32();
+        // accepted
+        (void)d.u32();
+        // verf flavor
+        (void)d.u32();
+        // verf len
+        (void)d.u32();
+        // accept success
+        (void)d.u32();
         out.status = *d.u32();
-        (void)d.opaque(nfsv4::kMaxTag);  // tag
+        // tag
+        (void)d.opaque(nfsv4::kMaxTag);
         out.ops = *d.u32();
         return out;
     }
@@ -211,24 +227,31 @@ struct V4Fixture {
     }
 
     // ---- session bootstrap ----
-    uint32_t minor = 1;  // COMPOUND minorversion used by every helper (2 for v4.2 tests)
+    // COMPOUND minorversion used by every helper (2 for v4.2 tests)
+    uint32_t minor = 1;
     uint64_t clientid = 0;
     state::SessionId sessionid{};
-    std::array<uint32_t, 64> slot_seq{};  // next seq per slot
+    // next seq per slot
+    std::array<uint32_t, 64> slot_seq{};
 
     void establish_session(bool reclaim_complete = true, std::string_view owner = "lnfs-test-client",
                            bool back_chan = false) {
         xdr::XdrEnc body(pool);
-        body.u32(0);  // tag len
+        // tag len
+        body.u32(0);
         body.u32(minor);
-        body.u32(1);  // numops
+        // numops
+        body.u32(1);
         body.u32(static_cast<uint32_t>(Op::kExchangeId));
         std::array<std::byte, 8> verf{std::byte{9}};
         body.opaque_fixed(verf);
         body.string(owner);
-        body.u32(0);  // flags
-        body.u32(0);  // SP4_NONE
-        body.u32(0);  // impl_id: none
+        // flags
+        body.u32(0);
+        // SP4_NONE
+        body.u32(0);
+        // impl_id: none
+        body.u32(0);
         auto reply = parse(compound_raw(body.take()));
         ASSERT_TRUE(reply.status == 0);
         expect_op(reply.dec, Op::kExchangeId, 0);
@@ -242,14 +265,19 @@ struct V4Fixture {
         cs.u32(static_cast<uint32_t>(Op::kCreateSession));
         cs.u64(clientid);
         cs.u32(eir_seq);
-        cs.u32(back_chan ? 0x2u : 0u);  // CREATE_SESSION4_FLAG_CONN_BACK_CHAN
+        // CREATE_SESSION4_FLAG_CONN_BACK_CHAN
+        cs.u32(back_chan ? 0x2u : 0u);
         nfsv4::ChannelAttrs fore;
         fore.max_requests = 8;
         fore.encode(cs);
-        fore.encode(cs);     // back chan
-        cs.u32(0x40000000);  // cb_program
-        cs.u32(1);           // one sec_parms entry
-        cs.u32(0);           // AUTH_NONE
+        // back chan
+        fore.encode(cs);
+        // cb_program
+        cs.u32(0x40000000);
+        // one sec_parms entry
+        cs.u32(1);
+        // AUTH_NONE
+        cs.u32(0);
         auto csr = parse(compound_raw(cs.take()));
         ASSERT_TRUE(csr.status == 0);
         expect_op(csr.dec, Op::kCreateSession, 0);
@@ -269,7 +297,8 @@ struct V4Fixture {
     rt::BufferChain session_body(uint32_t extra_ops, rt::BufferChain ops, uint32_t slot = 0, bool cachethis = false,
                                  std::optional<uint32_t> force_seq = std::nullopt) {
         xdr::XdrEnc body(pool);
-        body.u32(0);  // tag
+        // tag
+        body.u32(0);
         body.u32(minor);
         body.u32(1 + extra_ops);
         body.u32(static_cast<uint32_t>(Op::kSequence));
@@ -277,7 +306,8 @@ struct V4Fixture {
         uint32_t seq = force_seq.value_or(slot_seq[slot]);
         body.u32(seq);
         body.u32(slot);
-        body.u32(7);  // highest in use
+        // highest in use
+        body.u32(7);
         body.boolean(cachethis);
         if (!force_seq) slot_seq[slot]++;
         if (!ops.empty()) body.opaque_fixed(ops.to_bytes());
@@ -314,7 +344,8 @@ TEST(Nfs4, MinorversionZeroRejected) {
     V4Fixture f;
     xdr::XdrEnc body(f.pool);
     body.u32(0);
-    body.u32(0);  // minorversion 0
+    // minorversion 0
+    body.u32(0);
     body.u32(1);
     body.u32(static_cast<uint32_t>(Op::kPutrootfh));
     auto reply = f.parse(f.compound_raw(body.take()));
@@ -354,7 +385,8 @@ TEST(Nfs4, FirstOpDiscipline) {
 TEST(Nfs4, SessionEstablishAndHeartbeat) {
     V4Fixture f;
     f.establish_session();
-    EXPECT_TRUE(f.clientid >> 32 == 7u);  // boot epoch in clientid
+    // boot epoch in clientid
+    EXPECT_TRUE(f.clientid >> 32 == 7u);
 
     // Empty heartbeat {SEQUENCE}
     auto reply = f.parse(f.compound_raw(f.session_body(0, {})));
@@ -379,10 +411,12 @@ TEST(Nfs4, CreateSessionReplayAndClamp) {
     cs.u32(1);
     cs.u32(static_cast<uint32_t>(Op::kCreateSession));
     cs.u64(f.clientid);
-    cs.u32(1);  // the confirmed sequence again
+    // the confirmed sequence again
+    cs.u32(1);
     cs.u32(0);
     nfsv4::ChannelAttrs fore;
-    fore.max_requests = 999;  // would clamp; replay must ignore and return cached
+    // would clamp; replay must ignore and return cached
+    fore.max_requests = 999;
     fore.encode(cs);
     fore.encode(cs);
     cs.u32(0x40000000);
@@ -409,11 +443,14 @@ TEST(Nfs4, SlotReplayIsExactlyOnce) {
         return f.session_body(2, o.take(), 0, true, seq);
     };
     uint32_t seq = f.slot_seq[0];
-    auto first = f.compound_raw(make(std::nullopt));  // cachethis
-    auto replay = f.compound_raw(make(seq));          // retransmit the same seq
+    // cachethis
+    auto first = f.compound_raw(make(std::nullopt));
+    // retransmit the same seq
+    auto replay = f.compound_raw(make(seq));
     EXPECT_TRUE(first == replay);
 
-    auto mis = f.parse(f.compound_raw(make(9)));  // far-future seq
+    // far-future seq
+    auto mis = f.parse(f.compound_raw(make(9)));
     EXPECT_EQ(mis.status, stv(Status::kSeqMisordered));
 }
 
@@ -443,8 +480,10 @@ TEST(Nfs4, PseudoFsCrossingAndAttrs) {
         V4Fixture::expect_op(reply.dec, Op::kGetattr, 0);
         auto mask = nfsv4::Bitmap::decode(reply.dec);
         (void)mask;
-        (void)reply.dec.u32();    // attrlist length
-        return *reply.dec.u64();  // fsid.major
+        // attrlist length
+        (void)reply.dec.u32();
+        // fsid.major
+        return *reply.dec.u64();
     };
     EXPECT_EQ(getattr_fsid(root_fh), 0u);
     EXPECT_EQ(getattr_fsid(data_fh), 23u);
@@ -509,7 +548,8 @@ TEST(Nfs4, ExportSetSwapUnderRunningEngine) {
     ASSERT_TRUE(!more_fh.empty());
     EXPECT_EQ(getattr_status(more_fh, &fsid), 0u);
     EXPECT_EQ(fsid, 24u);
-    EXPECT_EQ(getattr_status(data_fh, &fsid), 0u);  // the old export still serves
+    // the old export still serves
+    EXPECT_EQ(getattr_status(data_fh, &fsid), 0u);
 
     // Remove /export/data: its handles are STALE, its pseudo name is gone, and the
     // entry retires once the snapshot we hold here is released.
@@ -521,7 +561,8 @@ TEST(Nfs4, ExportSetSwapUnderRunningEngine) {
     EXPECT_TRUE(f.path_fh({"export", "data"}).empty());
     EXPECT_EQ(getattr_status(more_fh, &fsid), 0u);
     EXPECT_EQ(fsid, 24u);
-    EXPECT_TRUE(f.exports.take_retired().empty());  // `old` still lists fsid 23
+    // `old` still lists fsid 23
+    EXPECT_TRUE(f.exports.take_retired().empty());
     old.reset();
     auto retired = f.exports.take_retired();
     ASSERT_TRUE(retired.size() == 1u);
@@ -562,8 +603,10 @@ TEST(Nfs4, EmptyExportSetHasABarePseudoRoot) {
     V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(reply.dec, Op::kReaddir, 0);
     (void)reply.dec.opaque_fixed(8);
-    EXPECT_FALSE(*reply.dec.boolean());  // no entries
-    EXPECT_TRUE(*reply.dec.boolean());   // eof
+    // no entries
+    EXPECT_FALSE(*reply.dec.boolean());
+    // eof
+    EXPECT_TRUE(*reply.dec.boolean());
 
     xdr::XdrEnc lookup(f.pool);
     lookup.u32(static_cast<uint32_t>(Op::kPutrootfh));
@@ -583,13 +626,18 @@ TEST(Nfs4, OpenReadCloseAndSpecialStateids) {
     ops.u32(static_cast<uint32_t>(Op::kPutfh));
     ops.opaque(dir_fh);
     ops.u32(static_cast<uint32_t>(Op::kOpen));
-    ops.u32(0);  // seqid
-    ops.u32(1);  // share_access READ
-    ops.u32(0);  // deny NONE
+    // seqid
+    ops.u32(0);
+    // share_access READ
+    ops.u32(1);
+    // deny NONE
+    ops.u32(0);
     ops.u64(f.clientid);
     ops.string("owner-1");
-    ops.u32(0);  // OPEN4_NOCREATE
-    ops.u32(0);  // CLAIM_NULL
+    // OPEN4_NOCREATE
+    ops.u32(0);
+    // CLAIM_NULL
+    ops.u32(0);
     ops.string("hello");
     ops.u32(static_cast<uint32_t>(Op::kGetfh));
     auto reply = f.parse(f.compound_raw(f.session_body(3, ops.take())));
@@ -599,12 +647,15 @@ TEST(Nfs4, OpenReadCloseAndSpecialStateids) {
     V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(reply.dec, Op::kOpen, 0);
     auto stateid = *nfsv4::Stateid::decode(reply.dec);
-    (void)reply.dec.boolean();  // change_info atomic
+    // change_info atomic
+    (void)reply.dec.boolean();
     (void)reply.dec.u64();
     (void)reply.dec.u64();
-    (void)reply.dec.u32();  // rflags
+    // rflags
+    (void)reply.dec.u32();
     (void)nfsv4::Bitmap::decode(reply.dec);
-    (void)reply.dec.u32();  // delegation none
+    // delegation none
+    (void)reply.dec.u32();
     V4Fixture::expect_op(reply.dec, Op::kGetfh, 0);
     auto fhspan = *reply.dec.opaque(128);
     std::vector<std::byte> file_fh(fhspan.begin(), fhspan.end());
@@ -626,11 +677,13 @@ TEST(Nfs4, OpenReadCloseAndSpecialStateids) {
     (void)ok.dec.skip(16 + 5 * 4);
     V4Fixture::expect_op(ok.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(ok.dec, Op::kRead, 0);
-    EXPECT_TRUE(*ok.dec.boolean());  // eof
+    // eof
+    EXPECT_TRUE(*ok.dec.boolean());
     auto data = *ok.dec.opaque(1 << 20);
     EXPECT_STREQ(std::string(reinterpret_cast<const char*>(data.data()), data.size()), "hello v4 world");
 
-    nfsv4::Stateid anon{};  // all-zero
+    // all-zero
+    nfsv4::Stateid anon{};
     EXPECT_EQ(read_with(anon).status, 0u);
 
     nfsv4::Stateid bogus{};
@@ -640,7 +693,8 @@ TEST(Nfs4, OpenReadCloseAndSpecialStateids) {
     EXPECT_EQ(read_with(bogus).status, stv(Status::kBadStateid));
 
     nfsv4::Stateid stale{};
-    epoch = 3;  // pre-restart epoch
+    // pre-restart epoch
+    epoch = 3;
     std::memcpy(stale.other.data(), &epoch, 4);
     stale.other[6] = std::byte{1};
     EXPECT_EQ(read_with(stale).status, stv(Status::kStaleStateid));
@@ -679,8 +733,10 @@ TEST(Nfs4, ReaddirPaginatesWithinBudget) {
         ops.u32(static_cast<uint32_t>(Op::kReaddir));
         ops.u64(cookie);
         ops.opaque_fixed(verf);
-        ops.u32(1u << 20);  // dircount
-        ops.u32(600);       // small maxcount forces pagination
+        // dircount
+        ops.u32(1u << 20);
+        // small maxcount forces pagination
+        ops.u32(600);
         nfsv4::Bitmap want;
         want.set(nfsv4::attr::kFileid);
         want.encode(ops);
@@ -695,7 +751,8 @@ TEST(Nfs4, ReaddirPaginatesWithinBudget) {
         while (*reply.dec.boolean()) {
             cookie = *reply.dec.u64();
             auto name = *reply.dec.string(255);
-            ASSERT_TRUE(names.insert(std::string(name)).second);  // no duplicates
+            // no duplicates
+            ASSERT_TRUE(names.insert(std::string(name)).second);
             (void)nfsv4::Bitmap::decode(reply.dec);
             auto vals = *reply.dec.u32();
             (void)reply.dec.skip((vals + 3) & ~3u);
@@ -704,8 +761,10 @@ TEST(Nfs4, ReaddirPaginatesWithinBudget) {
         ++pages;
     }
     EXPECT_TRUE(eof);
-    EXPECT_TRUE(pages > 1);        // budget actually paginated
-    EXPECT_EQ(names.size(), 43u);  // many0..39 + hello + d + link (inner nested)
+    // budget actually paginated
+    EXPECT_TRUE(pages > 1);
+    // many0..39 + hello + d + link (inner nested)
+    EXPECT_EQ(names.size(), 43u);
 }
 
 TEST(Nfs4, ErrmapV4Whitelist) {
@@ -751,7 +810,8 @@ struct OpenRes {
     nfsv4::Stateid stateid{};
     std::vector<std::byte> fh;
     nfsv4::Bitmap attrset;
-    uint32_t deleg_type = 0;  // 0 NONE / 1 READ / 3 NONE_EXT
+    // 0 NONE / 1 READ / 3 NONE_EXT
+    uint32_t deleg_type = 0;
     nfsv4::Stateid deleg_stateid{};
 };
 
@@ -770,19 +830,23 @@ OpenRes do_open(V4Fixture& f, const std::vector<std::byte>& dir_fh, std::string_
     ops.u64(f.clientid);
     ops.string(owner);
     if (create_mode) {
-        ops.u32(1);  // OPEN4_CREATE
+        // OPEN4_CREATE
+        ops.u32(1);
         ops.u32(*create_mode);
         if (create_args) create_args(ops);
     } else {
-        ops.u32(0);  // OPEN4_NOCREATE
+        // OPEN4_NOCREATE
+        ops.u32(0);
     }
     ops.u32(claim);
     if (claim == 0)
         ops.string(name);
     else if (claim == 1)
-        ops.u32(0);  // delegate_type NONE
+        // delegate_type NONE
+        ops.u32(0);
     else if (claim == 5 && claim_sid)
-        claim_sid->encode(ops);  // CLAIM_DELEG_CUR_FH
+        // CLAIM_DELEG_CUR_FH
+        claim_sid->encode(ops);
     ops.u32(static_cast<uint32_t>(Op::kGetfh));
     auto reply = f.parse(f.compound_raw(f.session_body(3, ops.take())));
     OpenRes out;
@@ -799,14 +863,21 @@ OpenRes do_open(V4Fixture& f, const std::vector<std::byte>& dir_fh, std::string_
     (void)reply.dec.u32();
     out.attrset = *nfsv4::Bitmap::decode(reply.dec);
     out.deleg_type = *reply.dec.u32();
-    if (out.deleg_type == 1) {  // OPEN_DELEGATE_READ (plan doc 10 §5.2)
+    // OPEN_DELEGATE_READ (plan doc 10 §5.2)
+    if (out.deleg_type == 1) {
         out.deleg_stateid = *nfsv4::Stateid::decode(reply.dec);
-        (void)reply.dec.boolean();     // recall
-        (void)reply.dec.u32();         // ace type
-        (void)reply.dec.u32();         // ace flag
-        (void)reply.dec.u32();         // ace mask
-        (void)reply.dec.string(64);    // who
-    } else if (out.deleg_type == 3) {  // NONE_EXT
+        // recall
+        (void)reply.dec.boolean();
+        // ace type
+        (void)reply.dec.u32();
+        // ace flag
+        (void)reply.dec.u32();
+        // ace mask
+        (void)reply.dec.u32();
+        // who
+        (void)reply.dec.string(64);
+    } else if (out.deleg_type == 3) {
+        // NONE_EXT
         if (*reply.dec.u32() == 2) (void)reply.dec.boolean();
     }
     V4Fixture::expect_op(reply.dec, Op::kGetfh, 0);
@@ -946,9 +1017,11 @@ TEST(Nfs4, OpenCreateWriteCommitReadback) {
     EXPECT_EQ(o.stateid.seqid, 1u);
 
     uint32_t n = 0;
-    EXPECT_EQ(do_write(f, o.fh, o.stateid, 0, "hello ", 0, &n), 0u);  // UNSTABLE
+    // UNSTABLE
+    EXPECT_EQ(do_write(f, o.fh, o.stateid, 0, "hello ", 0, &n), 0u);
     EXPECT_EQ(n, 6u);
-    EXPECT_EQ(do_write(f, o.fh, o.stateid, 6, "world", 2, &n), 0u);  // FILE_SYNC
+    // FILE_SYNC
+    EXPECT_EQ(do_write(f, o.fh, o.stateid, 6, "world", 2, &n), 0u);
     EXPECT_EQ(n, 5u);
 
     // COMMIT returns the boot-epoch verifier.
@@ -1005,10 +1078,12 @@ TEST(Nfs4, ExclusiveCreateReplayAndOpenmode) {
             if (mode == 3) fattr_mode(e, f.pool, 0600);
         });
     };
-    auto first = excl(verf, 2);  // EXCLUSIVE4
+    // EXCLUSIVE4
+    auto first = excl(verf, 2);
     ASSERT_TRUE(first.status == 0);
     EXPECT_TRUE(first.attrset.test(nfsv4::attr::kTimeAccess));
-    auto replay = excl(verf, 2);  // same verifier: idempotent success (merged state)
+    // same verifier: idempotent success (merged state)
+    auto replay = excl(verf, 2);
     EXPECT_EQ(replay.status, 0u);
     EXPECT_EQ(replay.stateid.seqid, 2u);
     std::array<std::byte, 8> other{std::byte{0x01}};
@@ -1043,7 +1118,8 @@ TEST(Nfs4, ShareDenyDowngradeAndLocked) {
     V4Fixture f;
     f.establish_session();
     auto dir_fh = f.path_fh({"export", "data"});
-    auto a = do_open(f, dir_fh, "hello", 1, 2, "owner-a");  // READ, deny WRITE
+    // READ, deny WRITE
+    auto a = do_open(f, dir_fh, "hello", 1, 2, "owner-a");
     ASSERT_TRUE(a.status == 0);
     EXPECT_EQ(do_open(f, dir_fh, "hello", 2, 0, "owner-b").status, stv(Status::kShareDenied));
     EXPECT_EQ(f.state->stats().share_denied, 1u);
@@ -1144,7 +1220,8 @@ TEST(Nfs4, SetattrSizeModeOwner) {
         mask.set(nfsv4::attr::kTimeModifySet);
         mask.encode(e);
         xdr::XdrEnc vals(f.pool);
-        vals.u32(1);  // SET_TO_CLIENT_TIME4
+        // SET_TO_CLIENT_TIME4
+        vals.u32(1);
         vals.u64(1234567);
         vals.u32(89);
         auto bytes = vals.take().to_bytes();
@@ -1160,7 +1237,8 @@ TEST(Nfs4, NamespaceOpsCreateRemoveRenameLink) {
     auto dir_fh = f.path_fh({"export", "data"});
     // CREATE dir "sub"
     auto mk = dir_op(f, dir_fh, Op::kCreate, [&](xdr::XdrEnc& e) {
-        e.u32(2);  // NF4DIR
+        // NF4DIR
+        e.u32(2);
         e.string("sub");
         fattr_mode(e, f.pool, 0750);
     });
@@ -1169,7 +1247,8 @@ TEST(Nfs4, NamespaceOpsCreateRemoveRenameLink) {
     ASSERT_TRUE(!sub_fh.empty());
     // CREATE symlink
     auto ln = dir_op(f, dir_fh, Op::kCreate, [&](xdr::XdrEnc& e) {
-        e.u32(5);  // NF4LNK
+        // NF4LNK
+        e.u32(5);
         e.string("hello");
         e.string("sym");
         encode_empty_fattr(e);
@@ -1250,7 +1329,8 @@ TEST(Nfs4, RestartReclaimWithinGrace) {
     f.state->load_grace_list();
     EXPECT_TRUE(f.state->in_grace());
     f.engine.emplace(f.exports, f.handles, f.locks, *f.state);
-    f.establish_session(false);  // same co_ownerid: listed; reclaim first
+    // same co_ownerid: listed; reclaim first
+    f.establish_session(false);
     EXPECT_TRUE(f.clientid >> 32 == 8u);
 
     // Old stateid is STALE; plain OPEN waits in GRACE; CLAIM_PREVIOUS reclaims.
@@ -1435,7 +1515,8 @@ TEST(Nfs4, CurrentStateidAndReclaimCompleteGate) {
     ops.opaque(dir_fh);
     ops.u32(static_cast<uint32_t>(Op::kOpen));
     ops.u32(0);
-    ops.u32(3 | 0x0400);  // READ|WRITE, WANT_NO_DELEG -> OPEN_DELEGATE_NONE_EXT
+    // READ|WRITE, WANT_NO_DELEG -> OPEN_DELEGATE_NONE_EXT
+    ops.u32(3 | 0x0400);
     ops.u32(0);
     ops.u64(f.clientid);
     ops.string("owner-cur");
@@ -1457,7 +1538,8 @@ TEST(Nfs4, CurrentStateidAndReclaimCompleteGate) {
     ops.u32(static_cast<uint32_t>(Op::kClose));
     ops.u32(0);
     nfsv4::Stateid zero_seq = current;
-    zero_seq.seqid = 1;  // still the placeholder: CLOSE consumes the current stateid
+    // still the placeholder: CLOSE consumes the current stateid
+    zero_seq.seqid = 1;
     zero_seq.encode(ops);
     auto reply = f.parse(f.compound_raw(f.session_body(7, ops.take())));
     ASSERT_TRUE(reply.status == 0);
@@ -1471,8 +1553,10 @@ TEST(Nfs4, CurrentStateidAndReclaimCompleteGate) {
     (void)reply.dec.u64();
     (void)reply.dec.u32();
     (void)nfsv4::Bitmap::decode(reply.dec);
-    EXPECT_EQ(*reply.dec.u32(), 3u);  // OPEN_DELEGATE_NONE_EXT
-    EXPECT_EQ(*reply.dec.u32(), 0u);  // WND4_NOT_WANTED
+    // OPEN_DELEGATE_NONE_EXT
+    EXPECT_EQ(*reply.dec.u32(), 3u);
+    // WND4_NOT_WANTED
+    EXPECT_EQ(*reply.dec.u32(), 0u);
     EXPECT_EQ(f.state->stats().opens, 0u);
 
     // After PUTFH the current stateid is cleared: using the placeholder -> BAD_STATEID.
@@ -1499,7 +1583,8 @@ TEST(Nfs4, CurrentStateidAndReclaimCompleteGate) {
     EXPECT_STREQ(do_read(f, late.fh, late.stateid, 0, 16), "current");
     nfsv4::Stateid zero = late.stateid;
     zero.seqid = 0;
-    EXPECT_EQ(do_close(f, late.fh, zero), 0u);  // seqid 0 accepted by CLOSE
+    // seqid 0 accepted by CLOSE
+    EXPECT_EQ(do_close(f, late.fh, zero), 0u);
     // Non-UTF-8 name -> INVAL.
     EXPECT_EQ(do_open(f, dir_fh, "\xC0\xC1", 1, 0, "owner-late").status, stv(Status::kInval));
 }
@@ -1533,7 +1618,8 @@ TEST(Nfs4, LockOpsAndSecinfo) {
         }
         return f.parse(f.compound_raw(f.session_body(2, ops.take())));
     };
-    auto r1 = lock_op(2, 0, 100, true, o.stateid, "lo-1");  // WRITE_LT
+    // WRITE_LT
+    auto r1 = lock_op(2, 0, 100, true, o.stateid, "lo-1");
     ASSERT_TRUE(r1.status == 0);
     V4Fixture::expect_op(r1.dec, Op::kSequence, 0);
     (void)r1.dec.skip(16 + 5 * 4);
@@ -1550,7 +1636,8 @@ TEST(Nfs4, LockOpsAndSecinfo) {
     V4Fixture::expect_op(r2.dec, Op::kLock, stv(Status::kDenied));
     EXPECT_EQ(*r2.dec.u64(), 0u);
     EXPECT_EQ(*r2.dec.u64(), 100u);
-    EXPECT_EQ(*r2.dec.u32(), 2u);  // WRITE_LT
+    // WRITE_LT
+    EXPECT_EQ(*r2.dec.u32(), 2u);
     EXPECT_EQ(*r2.dec.u64(), f.clientid);
     auto who = *r2.dec.opaque(1024);
     EXPECT_STREQ(std::string(reinterpret_cast<const char*>(who.data()), who.size()), "lo-1");
@@ -1643,7 +1730,8 @@ TEST(Nfs4, LockOpsAndSecinfo) {
     V4Fixture::expect_op(s1.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(s1.dec, Op::kSecinfo, 0);
     EXPECT_EQ(*s1.dec.u32(), 1u);
-    EXPECT_EQ(*s1.dec.u32(), 1u);  // AUTH_SYS
+    // AUTH_SYS
+    EXPECT_EQ(*s1.dec.u32(), 1u);
     EXPECT_EQ(secinfo("nosuch", false).status, stv(Status::kNoent));
     EXPECT_EQ(secinfo("hello", true).status, stv(Status::kNofilehandle));
 }
@@ -1714,9 +1802,12 @@ CopyRes do_copy(V4Fixture& f, const std::vector<std::byte>& src, const nfsv4::St
     ops.u64(doff);
     ops.u64(count);
     if (!clone) {
-        ops.boolean(true);   // ca_consecutive
-        ops.boolean(false);  // ca_synchronous: ask async, server answers sync
-        ops.u32(nservers);   // ca_source_server<> (intra-server: empty)
+        // ca_consecutive
+        ops.boolean(true);
+        // ca_synchronous: ask async, server answers sync
+        ops.boolean(false);
+        // ca_source_server<> (intra-server: empty)
+        ops.u32(nservers);
     }
     auto reply = f.parse(f.compound_raw(f.session_body(4, ops.take())));
     CopyRes out;
@@ -1729,7 +1820,8 @@ CopyRes do_copy(V4Fixture& f, const std::vector<std::byte>& src, const nfsv4::St
     V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(reply.dec, clone ? Op::kClone : Op::kCopy, 0);
     if (clone) return out;
-    EXPECT_EQ(*reply.dec.u32(), 0u);  // no callback stateid: synchronous
+    // no callback stateid: synchronous
+    EXPECT_EQ(*reply.dec.u32(), 0u);
     out.count = *reply.dec.u64();
     out.committed = *reply.dec.u32();
     (void)reply.dec.opaque_fixed(8);
@@ -1788,7 +1880,8 @@ TEST(Nfs4, MinorversionTwoOpcodeTable) {
         auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
         EXPECT_EQ(reply.status, stv(Status::kNotsupp));
     }
-    for (uint32_t op : {72u, 73u, 74u, 75u}) {  // GETXATTR..REMOVEXATTR
+    // GETXATTR..REMOVEXATTR
+    for (uint32_t op : {72u, 73u, 74u, 75u}) {
         xdr::XdrEnc ops(f.pool);
         ops.u32(static_cast<uint32_t>(Op::kPutfh));
         ops.opaque(fh);
@@ -1838,7 +1931,8 @@ TEST(Nfs4, V42SeekAllocateDeallocate) {
         ops.u32(1);
         ops.u32(0);
         ops.u64(f.clientid);
-        ops.string("owner-s-cur");  // distinct owner: o.stateid stays current
+        // distinct owner: o.stateid stays current
+        ops.string("owner-s-cur");
         ops.u32(0);
         ops.u32(0);
         ops.string("sparse.bin");
@@ -1907,7 +2001,8 @@ TEST(Nfs4, V42CopyAndClone) {
         xdr::XdrEnc ops(f.pool);
         ops.u32(static_cast<uint32_t>(Op::kPutfh));
         ops.opaque(dir_fh);
-        ops.u32(static_cast<uint32_t>(Op::kOpen));  // src via OPEN -> current stateid
+        // src via OPEN -> current stateid
+        ops.u32(static_cast<uint32_t>(Op::kOpen));
         ops.u32(0);
         ops.u32(1);
         ops.u32(0);
@@ -1919,7 +2014,8 @@ TEST(Nfs4, V42CopyAndClone) {
         ops.u32(static_cast<uint32_t>(Op::kSavefh));
         ops.u32(static_cast<uint32_t>(Op::kPutfh));
         ops.opaque(dir_fh);
-        ops.u32(static_cast<uint32_t>(Op::kOpen));  // dst via OPEN -> current stateid
+        // dst via OPEN -> current stateid
+        ops.u32(static_cast<uint32_t>(Op::kOpen));
         ops.u32(0);
         ops.u32(2);
         ops.u32(0);
@@ -1975,7 +2071,8 @@ TEST(Nfs4, V42CopyAndClone) {
     EXPECT_EQ(do_copy(f, src.fh, src.stateid, cl.fh, cl.stateid, 0, 10, 3, true).status, 0u);
     EXPECT_STREQ(do_read(f, cl.fh, cl.stateid, 0, 64), "abcdefghijabc");
     EXPECT_EQ(do_copy(f, src.fh, src.stateid, cl.fh, ro.stateid, 0, 0, 1, true).status,
-              stv(Status::kBadStateid));  // ro stateid belongs to dst.bin, not clone.bin
+              // ro stateid belongs to dst.bin, not clone.bin
+              stv(Status::kBadStateid));
     EXPECT_EQ(do_close(f, dst.fh, ro.stateid), 0u);
     EXPECT_EQ(do_close(f, cl.fh, cl.stateid), 0u);
     EXPECT_EQ(do_close(f, dst.fh, dst.stateid), 0u);
@@ -2000,7 +2097,8 @@ TEST(Nfs4, PseudoIdsStableAcrossReconfig) {
     }
     core::PseudoFs a(ta.snapshot()->entries, 7);
 
-    core::ExportTable tb;  // reconfig: /other dropped, a new export inserted first
+    // reconfig: /other dropped, a new export inserted first
+    core::ExportTable tb;
     {
         core::ExportConfig e;
         e.path = "/exports/new";
@@ -2016,7 +2114,8 @@ TEST(Nfs4, PseudoIdsStableAcrossReconfig) {
     auto* na = a.for_export(1);
     auto* nb = b.for_export(1);
     ASSERT_TRUE(na != nullptr && nb != nullptr);
-    EXPECT_EQ(na->id, nb->id);  // same pseudo path, same id despite different order
+    // same pseudo path, same id despite different order
+    EXPECT_EQ(na->id, nb->id);
     EXPECT_EQ(a.root()->id, b.root()->id);
     EXPECT_TRUE(b.resolve(core::PseudoFs::oid_of(*na)) == nb);
     // The dropped export's node is stale in the new tree, not silently another node.
@@ -2038,18 +2137,22 @@ TEST(Nfs4, BindConnGrantsForeOnlyAndConfiguredIdentity) {
 
     // BIND_CONN_TO_SESSION asking for CDFC4_BACK: granted, connection now carries CB.
     xdr::XdrEnc body(fx.pool);
-    body.u32(0);  // tag
+    // tag
+    body.u32(0);
     body.u32(fx.minor);
     body.u32(1);
     body.u32(static_cast<uint32_t>(Op::kBindConnToSession));
     body.opaque_fixed(fx.sessionid);
-    body.u32(2);          // CDFC4_BACK
-    body.boolean(false);  // no RDMA
+    // CDFC4_BACK
+    body.u32(2);
+    // no RDMA
+    body.boolean(false);
     auto reply = fx.parse(fx.compound_raw(body.take()));
     ASSERT_TRUE(reply.status == 0);
     V4Fixture::expect_op(reply.dec, Op::kBindConnToSession, 0);
     (void)reply.dec.opaque_fixed(16);
-    EXPECT_EQ(*reply.dec.u32(), 2u);  // CDFS4_BACK (plan doc 10 §5.2)
+    // CDFS4_BACK (plan doc 10 §5.2)
+    EXPECT_EQ(*reply.dec.u32(), 2u);
 
     // EXCHANGE_ID reply carries the configured owner/scope.
     xdr::XdrEnc ex(fx.pool);
@@ -2061,16 +2164,23 @@ TEST(Nfs4, BindConnGrantsForeOnlyAndConfiguredIdentity) {
     ex.opaque_fixed(verf);
     ex.string("lnfs-test-client");
     ex.u32(0);
-    ex.u32(0);  // SP4_NONE
-    ex.u32(0);  // impl_id: none
+    // SP4_NONE
+    ex.u32(0);
+    // impl_id: none
+    ex.u32(0);
     auto exr = fx.parse(fx.compound_raw(ex.take()));
     ASSERT_TRUE(exr.status == 0);
     V4Fixture::expect_op(exr.dec, Op::kExchangeId, 0);
-    (void)exr.dec.u64();  // clientid
-    (void)exr.dec.u32();  // sequenceid
-    (void)exr.dec.u32();  // flags
-    (void)exr.dec.u32();  // SP4_NONE
-    (void)exr.dec.u64();  // server_owner.minor_id
+    // clientid
+    (void)exr.dec.u64();
+    // sequenceid
+    (void)exr.dec.u32();
+    // flags
+    (void)exr.dec.u32();
+    // SP4_NONE
+    (void)exr.dec.u32();
+    // server_owner.minor_id
+    (void)exr.dec.u64();
     auto owner = exr.dec.opaque(1024);
     auto scope = exr.dec.opaque(1024);
     ASSERT_TRUE(owner && scope);
@@ -2163,7 +2273,8 @@ TEST(Nfs4, ReadPlusSegmentsAndEof) {
     V4Fixture f;
     f.minor = 2;
     f.establish_session();
-    auto fh = f.path_fh({"export", "data", "hello"});  // "hello v4 world" (14 bytes)
+    // "hello v4 world" (14 bytes)
+    auto fh = f.path_fh({"export", "data", "hello"});
     nfsv4::Stateid anon{};
 
     auto whole = do_read_plus(f, fh, anon, 0, 64);
@@ -2286,9 +2397,11 @@ TEST(Nfs4, ReadDelegationGrantAndReturn) {
     V4Fixture f;
     f.establish_session(true, "lnfs-test-client", /*back_chan=*/true);
     auto dir_fh = f.path_fh({"export", "data"});
-    auto o = do_open(f, dir_fh, "hello", 1, 0, "owner-d");  // read-only
+    // read-only
+    auto o = do_open(f, dir_fh, "hello", 1, 0, "owner-d");
     ASSERT_TRUE(o.status == 0);
-    EXPECT_EQ(o.deleg_type, 1u);  // OPEN_DELEGATE_READ
+    // OPEN_DELEGATE_READ
+    EXPECT_EQ(o.deleg_type, 1u);
     EXPECT_EQ(f.state->stats().delegs, 1u);
     EXPECT_EQ(f.state->stats().deleg_grants, 1u);
 
@@ -2323,14 +2436,21 @@ TEST(Nfs4, DelegationRecallOnWriteOpenConflict) {
 
     // The CB_COMPOUND that went out: CB program, CB_SEQUENCE on our session, CB_RECALL.
     auto rec = f.take_cb_record();
-    EXPECT_EQ(rd_be32(rec, 4), 0u);            // CALL
-    EXPECT_EQ(rd_be32(rec, 12), 0x40000000u);  // cb_program from CREATE_SESSION
-    EXPECT_EQ(rd_be32(rec, 20), 1u);           // CB_COMPOUND
-    EXPECT_EQ(rd_be32(rec, 52), 2u);           // numops
-    EXPECT_EQ(rd_be32(rec, 56), 11u);          // CB_SEQUENCE
+    // CALL
+    EXPECT_EQ(rd_be32(rec, 4), 0u);
+    // cb_program from CREATE_SESSION
+    EXPECT_EQ(rd_be32(rec, 12), 0x40000000u);
+    // CB_COMPOUND
+    EXPECT_EQ(rd_be32(rec, 20), 1u);
+    // numops
+    EXPECT_EQ(rd_be32(rec, 52), 2u);
+    // CB_SEQUENCE
+    EXPECT_EQ(rd_be32(rec, 56), 11u);
     EXPECT_TRUE(std::equal(f.sessionid.begin(), f.sessionid.end(), rec.begin() + 60));
-    EXPECT_EQ(rd_be32(rec, 96), 4u);  // CB_RECALL
-    f.answer_cb(rec);                 // the client acknowledged the recall
+    // CB_RECALL
+    EXPECT_EQ(rd_be32(rec, 96), 4u);
+    // the client acknowledged the recall
+    f.answer_cb(rec);
 
     // Repeated conflicting opens keep getting DELAY but do not re-recall.
     auto again = do_open(f, dir_fh, "hello", 3, 0, "owner-w");
@@ -2340,7 +2460,8 @@ TEST(Nfs4, DelegationRecallOnWriteOpenConflict) {
     // Recall response: reclaim the open under the delegation, then return it.
     auto claimed = do_open(f, o.fh, "", 1, 0, "owner-r2", std::nullopt, {}, 5, &o.deleg_stateid);
     ASSERT_TRUE(claimed.status == 0);
-    EXPECT_TRUE(claimed.deleg_type != 1u);  // no fresh delegation mid-recall
+    // no fresh delegation mid-recall
+    EXPECT_TRUE(claimed.deleg_type != 1u);
     EXPECT_EQ(do_delegreturn(f, o.fh, o.deleg_stateid), 0u);
 
     auto retry = do_open(f, dir_fh, "hello", 3, 0, "owner-w");
@@ -2403,8 +2524,10 @@ TEST(Nfs4, CbNotifyLockOnRelease) {
     auto lur = f.parse(f.compound_raw(f.session_body(2, lu.take())));
     EXPECT_EQ(lur.status, 0u);
     auto rec = f.take_cb_record();
-    EXPECT_EQ(rd_be32(rec, 56), 11u);  // CB_SEQUENCE
-    EXPECT_EQ(rd_be32(rec, 96), 14u);  // CB_NOTIFY_LOCK
+    // CB_SEQUENCE
+    EXPECT_EQ(rd_be32(rec, 56), 11u);
+    // CB_NOTIFY_LOCK
+    EXPECT_EQ(rd_be32(rec, 96), 14u);
     f.answer_cb(rec);
     EXPECT_EQ(f.state->stats().cb_lock_notifies, 1u);
 }
@@ -2434,7 +2557,8 @@ TEST(Nfs4, CopyChunksLargeFiles) {
     anon.encode(ops);
     ops.u64(0);
     ops.u64(0);
-    ops.u64(0);  // ca_count 0: to source EOF -> 3 chunks
+    // ca_count 0: to source EOF -> 3 chunks
+    ops.u64(0);
     ops.boolean(true);
     ops.boolean(true);
     ops.u32(0);
@@ -2446,7 +2570,8 @@ TEST(Nfs4, CopyChunksLargeFiles) {
     V4Fixture::expect_op(reply.dec, Op::kSavefh, 0);
     V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
     V4Fixture::expect_op(reply.dec, Op::kCopy, 0);
-    (void)reply.dec.u32();  // no callback stateid
+    // no callback stateid
+    (void)reply.dec.u32();
     EXPECT_EQ(*reply.dec.u64(), big.size());
     EXPECT_EQ(file_size(f, dst_fh), big.size());
     // Spot-check bytes on both sides of a chunk boundary.
@@ -2558,7 +2683,8 @@ TEST(Nfs4, JukeboxIsDelayAndRetrySucceeds) {
     backend::fault::arm(backend::fault::Kind::kJukebox, 1);
     auto delayed = read_anon();
     EXPECT_EQ(delayed.status, stv(Status::kDelay));
-    auto ok = read_anon();  // next slot sequence: a retry, not a replay
+    // next slot sequence: a retry, not a replay
+    auto ok = read_anon();
     ASSERT_TRUE(ok.status == 0);
     V4Fixture::expect_op(ok.dec, Op::kSequence, 0);
     (void)ok.dec.skip(16 + 5 * 4);
@@ -2643,7 +2769,8 @@ TEST(Nfs4, ClusterIdentityDerivation) {
 TEST(Nfs4, FsLocationsEncoding) {
     struct Locations {
         std::vector<std::string> fs_root;
-        std::vector<std::vector<std::string>> servers;  // per location
+        // per location
+        std::vector<std::vector<std::string>> servers;
         std::vector<std::vector<std::string>> rootpaths;
     };
     auto pathname = [](xdr::XdrDec& dec) {
@@ -2674,7 +2801,8 @@ TEST(Nfs4, FsLocationsEncoding) {
         V4Fixture::expect_op(out.parsed.dec, Op::kPutfh, 0);
         V4Fixture::expect_op(out.parsed.dec, Op::kGetattr, 0);
         out.mask = *nfsv4::Bitmap::decode(out.parsed.dec);
-        (void)out.parsed.dec.u32();  // attrlist length
+        // attrlist length
+        (void)out.parsed.dec.u32();
         return out;
     };
     auto decode_locations = [&](xdr::XdrDec& dec) {
@@ -2732,27 +2860,36 @@ TEST(Nfs4, FsLocationsEncoding) {
 
     auto r = getattr(f, data_fh, {nfsv4::attr::kFsid, nfsv4::attr::kFsLocations});
     EXPECT_TRUE(r.mask.test(nfsv4::attr::kFsLocations));
-    EXPECT_EQ(*r.parsed.dec.u64(), 23u);  // fsid.major
-    (void)r.parsed.dec.u64();             // fsid.minor
+    // fsid.major
+    EXPECT_EQ(*r.parsed.dec.u64(), 23u);
+    // fsid.minor
+    (void)r.parsed.dec.u64();
     auto loc = decode_locations(r.parsed.dec);
     ASSERT_TRUE(loc.fs_root.size() == 2u);
     EXPECT_STREQ(loc.fs_root[0], "export");
     EXPECT_STREQ(loc.fs_root[1], "data");
     ASSERT_TRUE(loc.servers.size() == 1u && loc.servers[0].size() == 1u);
-    EXPECT_STREQ(loc.servers[0][0], "10.0.0.12");  // the host: clients use the NFS port
+    // the host: clients use the NFS port
+    EXPECT_STREQ(loc.servers[0][0], "10.0.0.12");
     ASSERT_TRUE(loc.rootpaths.size() == 1u && loc.rootpaths[0].size() == 2u);
     EXPECT_STREQ(loc.rootpaths[0][1], "data");
 
     auto info = getattr(f, data_fh, {nfsv4::attr::kFsLocationsInfo});
     EXPECT_TRUE(info.mask.test(nfsv4::attr::kFsLocationsInfo));
-    EXPECT_EQ(*info.parsed.dec.u32(), 0u);                               // fli_flags
-    EXPECT_EQ(*info.parsed.dec.u32(), f.state->config().lease_seconds);  // fli_valid_for
+    // fli_flags
+    EXPECT_EQ(*info.parsed.dec.u32(), 0u);
+    // fli_valid_for
+    EXPECT_EQ(*info.parsed.dec.u32(), f.state->config().lease_seconds);
     auto info_root = pathname(info.parsed.dec);
     ASSERT_TRUE(info_root.size() == 2u);
-    EXPECT_EQ(*info.parsed.dec.u32(), 1u);              // fli_items
-    EXPECT_EQ(*info.parsed.dec.u32(), 1u);              // fli_entries
-    EXPECT_EQ(*info.parsed.dec.u32(), 0xffffffffu);     // fls_currency = -1
-    EXPECT_EQ(info.parsed.dec.opaque(64)->size(), 0u);  // fls_info
+    // fli_items
+    EXPECT_EQ(*info.parsed.dec.u32(), 1u);
+    // fli_entries
+    EXPECT_EQ(*info.parsed.dec.u32(), 1u);
+    // fls_currency = -1
+    EXPECT_EQ(*info.parsed.dec.u32(), 0xffffffffu);
+    // fls_info
+    EXPECT_EQ(info.parsed.dec.opaque(64)->size(), 0u);
     EXPECT_STREQ(std::string(*info.parsed.dec.string(1024)), "10.0.0.12");
     auto item_root = pathname(info.parsed.dec);
     EXPECT_TRUE(item_root == info_root);
@@ -2789,9 +2926,11 @@ TEST(Nfs4, FsLocationsEncoding) {
         want.set(nfsv4::attr::kFsLocations);
         want.encode(ops);
         auto nobody = f.parse(f.compound_raw(f.session_body(2, ops.take())));
-        EXPECT_EQ(nobody.status, 10008u);  // NFS4ERR_DELAY
+        // NFS4ERR_DELAY
+        EXPECT_EQ(nobody.status, 10008u);
     }
-    view.publish({});  // unknown export: served here, no address to name
+    // unknown export: served here, no address to name
+    view.publish({});
     auto unknown_reply = getattr(f, data_fh, {nfsv4::attr::kFsLocations});
     auto unknown = decode_locations(unknown_reply.parsed.dec);
     EXPECT_EQ(unknown.servers.size(), 0u);
@@ -2868,7 +3007,8 @@ TEST(Nfs4, MovedAtExportBoundary) {
     auto decode_fattr = [&](xdr::XdrDec& dec) {
         Fattr out;
         out.mask = *nfsv4::Bitmap::decode(dec);
-        (void)dec.u32();  // attrlist length
+        // attrlist length
+        (void)dec.u32();
         // Ascending attribute order: size(4) fsid(8) rdattr_error(11) fs_locations(24)
         // mounted_on_fileid(55).
         if (out.mask.test(nfsv4::attr::kSize)) (void)dec.u64();
@@ -2957,13 +3097,20 @@ TEST(Nfs4, MovedAtExportBoundary) {
     EXPECT_EQ(op_status(b_fh, Op::kSecinfo, [](xdr::XdrEnc& e) { e.string("file"); }), kMoved);
     EXPECT_EQ(op_status(b_fh, Op::kOpen,
                         [](xdr::XdrEnc& e) {
-                            e.u32(0);           // seqid
-                            e.u32(1);           // OPEN4_SHARE_ACCESS_READ
-                            e.u32(0);           // deny none
-                            e.u64(0);           // open_owner4.clientid
-                            e.string("owner");  // open_owner4.owner
-                            e.u32(0);           // OPEN4_NOCREATE
-                            e.u32(0);           // CLAIM_NULL
+                            // seqid
+                            e.u32(0);
+                            // OPEN4_SHARE_ACCESS_READ
+                            e.u32(1);
+                            // deny none
+                            e.u32(0);
+                            // open_owner4.clientid
+                            e.u64(0);
+                            // open_owner4.owner
+                            e.string("owner");
+                            // OPEN4_NOCREATE
+                            e.u32(0);
+                            // CLAIM_NULL
+                            e.u32(0);
                             e.string("file");
                         }),
               kMoved);
@@ -3040,7 +3187,8 @@ TEST(Nfs4, MovedAtExportBoundary) {
             std::string name(*reply.dec.string(255));
             entries[name] = decode_fattr(reply.dec);
         }
-        EXPECT_TRUE(*reply.dec.boolean());  // eof
+        // eof
+        EXPECT_TRUE(*reply.dec.boolean());
         ASSERT_TRUE(entries.size() == 3u);
         EXPECT_TRUE(entries["data"].mask.test(kSize));
         EXPECT_EQ(entries["data"].fsid, 23u);
@@ -3119,10 +3267,13 @@ TEST(Nfs4, MovedAtExportedRoot) {
     V4Fixture::expect_op(reply.dec, Op::kGetattr, 0);
     auto mask = *nfsv4::Bitmap::decode(reply.dec);
     EXPECT_TRUE(mask.test(nfsv4::attr::kFsid) && mask.test(nfsv4::attr::kFsLocations));
-    (void)reply.dec.u32();            // attrlist length
-    EXPECT_EQ(*reply.dec.u64(), 5u);  // fsid.major
+    // attrlist length
+    (void)reply.dec.u32();
+    // fsid.major
+    EXPECT_EQ(*reply.dec.u64(), 5u);
     (void)reply.dec.u64();
-    EXPECT_EQ(*reply.dec.u32(), 0u);  // fs_root: empty — the export is the root
+    // fs_root: empty — the export is the root
+    EXPECT_EQ(*reply.dec.u32(), 0u);
     ASSERT_TRUE(*reply.dec.u32() == 1u);
     ASSERT_TRUE(*reply.dec.u32() == 1u);
     EXPECT_STREQ(std::string(*reply.dec.string(64)), "10.0.0.12");
@@ -3158,24 +3309,30 @@ TEST(Nfs4, ActiveActiveIdentityAndFlags) {
         std::array<std::byte, 8> verf{std::byte{9}};
         body.opaque_fixed(verf);
         body.string(co_owner);
-        body.u32(kSuppMovedRefer | kSuppMovedMigr);  // a referral-capable client's request
+        // a referral-capable client's request
+        body.u32(kSuppMovedRefer | kSuppMovedMigr);
         body.u32(0);
         body.u32(0);
         auto reply = f.parse(f.compound_raw(body.take()));
         EidReply out;
         if (reply.status != 0) return out;
         f.expect_op(reply.dec, Op::kExchangeId, 0);
-        (void)reply.dec.u64();  // clientid
-        (void)reply.dec.u32();  // sequenceid
+        // clientid
+        (void)reply.dec.u64();
+        // sequenceid
+        (void)reply.dec.u32();
         out.flags = *reply.dec.u32();
-        (void)reply.dec.u32();  // SP4_NONE
-        (void)reply.dec.u64();  // minor_id
+        // SP4_NONE
+        (void)reply.dec.u32();
+        // minor_id
+        (void)reply.dec.u64();
         out.owner = *reply.dec.string(1024);
         out.scope = *reply.dec.string(1024);
         return out;
     };
 
-    V4Fixture single;  // the fixture's default engine: a single gateway
+    // the fixture's default engine: a single gateway
+    V4Fixture single;
     auto s = exchange(single, "client-s");
     EXPECT_EQ(s.flags & (kSuppMovedRefer | kSuppMovedMigr), 0u);
     EXPECT_EQ(s.flags & kUseNonPnfs, kUseNonPnfs);
@@ -3198,7 +3355,8 @@ TEST(Nfs4, ActiveActiveIdentityAndFlags) {
     EXPECT_EQ(r1.flags & (kSuppMovedRefer | kSuppMovedMigr), kSuppMovedRefer | kSuppMovedMigr);
     EXPECT_EQ(r2.flags & (kSuppMovedRefer | kSuppMovedMigr), kSuppMovedRefer | kSuppMovedMigr);
     EXPECT_EQ(r1.flags & kUseNonPnfs, kUseNonPnfs);
-    EXPECT_EQ(r1.flags & 0x80000000u, 0u);  // not CONFIRMED_R on a first EXCHANGE_ID
+    // not CONFIRMED_R on a first EXCHANGE_ID
+    EXPECT_EQ(r1.flags & 0x80000000u, 0u);
     EXPECT_STREQ(r1.scope, r2.scope);
     EXPECT_STREQ(r1.owner, "lightnfs-cluster:c:gw1");
     EXPECT_STREQ(r2.owner, "lightnfs-cluster:c:gw2");

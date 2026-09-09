@@ -33,18 +33,23 @@ class RecordStream {
     bool tls_active() const { return tls_ != nullptr; }
 
  private:
-    rt::Task<Result<void>> fill();           // recv more bytes into rbuf_
-    rt::Task<Result<uint32_t>> read_be32();  // may straddle recv buffers
+    // recv more bytes into rbuf_
+    rt::Task<Result<void>> fill();
+    // may straddle recv buffers
+    rt::Task<Result<uint32_t>> read_be32();
 
     int fd_;
     rt::BufferPool& pool_;
     rt::Buffer rbuf_;
-    uint32_t roff_ = 0;  // consumed
-    uint32_t rend_ = 0;  // filled
+    // consumed
+    uint32_t roff_ = 0;
+    // filled
+    uint32_t rend_ = 0;
     uint32_t max_fragment_;
     uint32_t max_record_;
 
-    std::unique_ptr<TlsConn> tls_;  // null until STARTTLS upgrades the connection
+    // null until STARTTLS upgrades the connection
+    std::unique_ptr<TlsConn> tls_;
     rt::AsyncMutex wmu_;
     size_t send_queued_ = 0;
 };

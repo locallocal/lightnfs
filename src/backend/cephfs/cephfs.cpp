@@ -20,8 +20,10 @@
 namespace lnfs::backend {
 namespace {
 
-constexpr std::byte kCephHandle{5};      // ObjId tag (1/2 local, 3 gluster, 4 lustre)
-constexpr size_t kObjIdLen = 1 + 8 + 8;  // tag + ino + snapid
+// ObjId tag (1/2 local, 3 gluster, 4 lustre)
+constexpr std::byte kCephHandle{5};
+// tag + ino + snapid
+constexpr size_t kObjIdLen = 1 + 8 + 8;
 
 // Attributes every statx asks for: the basic set plus the change attribute.
 constexpr unsigned kWant = cephapi::kStatxBasicStats | cephapi::kStatxVersion;
@@ -29,7 +31,8 @@ constexpr unsigned kWant = cephapi::kStatxBasicStats | cephapi::kStatxVersion;
 #ifndef ESHUTDOWN
 #define ESHUTDOWN 108
 #endif
-constexpr int kBlocklisted = ESHUTDOWN;  // libcephfs EBLOCKLISTED
+// libcephfs EBLOCKLISTED
+constexpr int kBlocklisted = ESHUTDOWN;
 
 FType mode_type(mode_t mode) {
     if (S_ISREG(mode)) return FType::kReg;
@@ -258,7 +261,8 @@ class CephBackend::FdCache {
             (write && it != shard.entries.end() ? upgrades_ : misses_).fetch_add(1, std::memory_order_relaxed);
         }
         int flags = write ? O_RDWR : O_RDONLY;
-        auto ref = obj.ref_;  // keeps the Inode alive across the hop
+        // keeps the Inode alive across the hop
+        auto ref = obj.ref_;
         auto opened = co_await rt::offload([this, ref, flags]() -> Result<Fh*> {
             const auto& api = *backend_.api_;
             Fh* fh = nullptr;
@@ -279,7 +283,8 @@ class CephBackend::FdCache {
                 push_back(shard, value.get());
             } else {
                 touch(shard, it->second.get());
-                value = it->second;  // lost the race: adopt the winner, ours closes
+                // lost the race: adopt the winner, ours closes
+                value = it->second;
             }
             evict(shard);
         }
@@ -411,8 +416,10 @@ CephBackend::InodeRef::~InodeRef() {
 CephBackend::CephBackend(Config cfg, std::shared_ptr<const cephapi::Api> api)
     : cfg_(std::move(cfg)), api_(std::move(api)) {
     caps_.set(Cap::kSymlink).set(Cap::kHardlink).set(Cap::kMknod);
-    caps_.set(Cap::kStableHandles);  // inode numbers are never reused (06 §6.8)
-    caps_.set(Cap::kNativeChange);   // stx_version: the MDS change attribute
+    // inode numbers are never reused (06 §6.8)
+    caps_.set(Cap::kStableHandles);
+    // stx_version: the MDS change attribute
+    caps_.set(Cap::kNativeChange);
     caps_.set(Cap::kSparseOps).set(Cap::kCopyRange);
     if (cfg_.jukebox) caps_.set(Cap::kJukebox);
     if (cfg_.native_locks) caps_.set(Cap::kByteLocks);
@@ -476,7 +483,8 @@ Errno CephBackend::map_rc(int64_t rc) const {
             return errno_from(EIO);
         }
         case 0:
-            return errno_from(EIO);  // "failed" without a code
+            // "failed" without a code
+            return errno_from(EIO);
         default:
             return errno_from(e);
     }
@@ -488,7 +496,8 @@ Result<vinodeno_t> CephBackend::vino_from_oid(const ObjId& oid) {
     vinodeno_t out{};
     std::memcpy(&out.ino, bytes.data() + 1, 8);
     std::memcpy(&out.snapid, bytes.data() + 9, 8);
-    if (out.ino == 0) return Err(errno_from(ESTALE));  // no such inode number in Ceph
+    // no such inode number in Ceph
+    if (out.ino == 0) return Err(errno_from(ESTALE));
     return out;
 }
 
@@ -544,7 +553,8 @@ ObjPtr CephBackend::wrap(ObjRef ref, const ObjId& oid, FType type) {
 }
 
 Result<ObjPtr> CephBackend::wrap_new(Inode* in, const struct ceph_statx& st) {
-    auto ref = std::make_shared<InodeRef>(api_.get(), mount_, in);  // adopts the reference
+    // adopts the reference
+    auto ref = std::make_shared<InodeRef>(api_.get(), mount_, in);
     ObjId oid = oid_of(st);
     auto entry = obj_cache_->insert(oid, std::make_shared<ObjCache::Entry>(oid, ref, mode_type(st.stx_mode)));
     return wrap(entry->ref, oid, entry->type);
@@ -620,7 +630,8 @@ rt::Task<Result<void>> CephBackend::start() {
             int rc = api->ceph_create(&m, cfg.id.empty() ? nullptr : cfg.id.c_str());
             if (rc < 0 || !m) return Err(errno_from(rc < 0 ? -rc : ENOMEM));
             auto fail = [&](int e) {
-                api->ceph_release(m);  // never mounted on any failure path below
+                // never mounted on any failure path below
+                api->ceph_release(m);
                 return Err(errno_from(e ? e : EIO));
             };
             rc = api->ceph_conf_read_file(m, cfg.conf.empty() ? nullptr : cfg.conf.c_str());
@@ -666,7 +677,8 @@ rt::Task<Result<void>> CephBackend::start() {
     root_oid_ = oid_of(started->st);
     cluster_fsid_ = started->cluster_fsid;
     fscid_ = started->fscid;
-    session_uuid_.clear();  // a fresh session: no uuid until a takeover sets one
+    // a fresh session: no uuid until a takeover sets one
+    session_uuid_.clear();
     obj_cache_->insert(root_oid_, std::make_shared<ObjCache::Entry>(root_oid_, root_, FType::kDir));
     LNFS_INFO(
         "cephfs export {} up: cluster {} fs '{}' (fscid {}) libcephfs {} "
@@ -714,7 +726,8 @@ rt::Task<Result<void>> CephBackend::takeover(const ClusterIdentity& who) {
     obj_cache_->clear();
     root_.reset();
     ceph_mount_info* m = mount_;
-    mount_ = nullptr;  // anything arriving meanwhile answers ENOTCONN
+    // anything arriving meanwhile answers ENOTCONN
+    mount_ = nullptr;
     const bool already_ours = session_uuid_ == uuid;
     auto api = api_;
     auto cfg = cfg_;
@@ -877,7 +890,8 @@ rt::Task<Result<Attr>> CephObject::getattr() {
 
 rt::Task<Result<void>> CephObject::require_dir(const Cred&) {
     if (type() != FType::kDir) co_return Err(errno_from(ENOTDIR));
-    co_return Result<void>{};  // libcephfs enforces write permission on the directory
+    // libcephfs enforces write permission on the directory
+    co_return Result<void>{};
 }
 
 rt::Task<Result<ObjPtr>> CephObject::lookup(const Cred& cred, std::string_view name) {
@@ -963,7 +977,8 @@ Result<Created> CephObject::created_sync(Inode* child, struct ceph_statx st, con
     struct ceph_statx cur{};
     if (api.ceph_ll_getattr(backend_.mount_, child, &cur, kWant, 0, perms) == 0) st = cur;
     auto attr = backend_.attr_from_statx(st);
-    auto obj = backend_.wrap_new(child, st);  // adopts child
+    // adopts child
+    auto obj = backend_.wrap_new(child, st);
     if (!obj) return Err(obj.error());
     return Created{std::move(*obj), *attr};
 }
@@ -1001,7 +1016,8 @@ rt::Task<Result<Created>> CephObject::create(const Cred& cred, std::string_view 
             return Err(errno_from(EEXIST));
         }
         if (rc < 0 || !child) return Err(backend_.map_rc(rc < 0 ? rc : -EIO));
-        if (fh) api.ceph_ll_close(backend_.mount_, fh);  // IO goes through the caches
+        // IO goes through the caches
+        if (fh) api.ceph_ll_close(backend_.mount_, fh);
         auto undo = [&](int64_t err) {
             api.ceph_ll_put(backend_.mount_, child);
             (void)api.ceph_ll_unlink(backend_.mount_, ref->in, owned.c_str(), perms.get());
@@ -1151,7 +1167,8 @@ rt::Task<Result<void>> CephObject::rmdir(const Cred& cred, std::string_view name
         const auto& api = *backend_.api_;
         Perms perms(api, oc);
         int rc = api.ceph_ll_rmdir(backend_.mount_, ref->in, owned.c_str(), perms.get());
-        if (rc < 0) return Err(backend_.map_rc(rc));  // ENOTDIR / ENOTEMPTY from the MDS
+        // ENOTDIR / ENOTEMPTY from the MDS
+        if (rc < 0) return Err(backend_.map_rc(rc));
         return {};
     });
 }
@@ -1385,7 +1402,8 @@ rt::Task<Result<uint32_t>> CephObject::write(OpenCtx ctx, uint64_t off, std::spa
             size_t done = 0, idx = 0;
             while (done < total) {
                 int64_t n;
-                if (short_write) {  // fault: 1 byte, exercising the iovec advance below
+                // fault: 1 byte, exercising the iovec advance below
+                if (short_write) {
                     short_write = false;
                     n = api.ceph_ll_write(backend_.mount_, fh, static_cast<int64_t>(off + done), 1,
                                           static_cast<const char*>(vec[idx].iov_base));
@@ -1422,7 +1440,8 @@ rt::Task<Result<uint32_t>> CephObject::write(OpenCtx ctx, uint64_t off, std::spa
 
 rt::Task<Result<void>> CephObject::commit(OpenCtx ctx, uint64_t, uint64_t) {
     if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
-    if (backend_.is_poisoned(id())) co_return Err(errno_from(EIO));  // sticky (06 §6.2)
+    // sticky (06 §6.2)
+    if (backend_.is_poisoned(id())) co_return Err(errno_from(EIO));
     Fh* fh = nullptr;
     CephBackend::FdCache::Ref ref;
     if (auto* os = open_state(ctx); os && os->writable()) {
@@ -1526,7 +1545,8 @@ rt::Task<Result<uint64_t>> CephObject::copy_range(OpenCtx sctx, Object& dst, Ope
             // (still server-side from the client's point of view — no NFS traffic).
             const auto& api = *backend_.api_;
             uint64_t want = len;
-            if (want == 0) {  // to EOF
+            // to EOF
+            if (want == 0) {
                 auto attr = backend_.stat_sync(src_in->in, nullptr);
                 if (!attr) return Err(attr.error());
                 if (attr->size <= src_off) return 0;
@@ -1624,7 +1644,8 @@ Result<Fh*> CephLockMgr::fh_for(CephObject& obj, const LockOwnerId& owner, bool 
     if (rc < 0 || !fh) return Err(backend_.map_rc(rc < 0 ? rc : -EIO));
     std::lock_guard lock(mu_);
     auto [it, inserted] = fhs_.emplace(key, fh);
-    if (!inserted) {  // lost a race: keep the winner
+    // lost a race: keep the winner
+    if (!inserted) {
         api.ceph_ll_close(backend_.mount_, fh);
         return it->second;
     }
@@ -1659,7 +1680,8 @@ rt::Task<Result<void>> CephLockMgr::unlock(Object& object, const LockOwnerId& ow
     auto keep = obj->ref_;
     co_return co_await rt::offload([this, obj, owner, range]() -> Result<void> {
         auto fh = fh_for(*obj, owner, false);
-        if (!fh) return {};  // nothing held by this owner on this file: unlocking is idempotent
+        // nothing held by this owner on this file: unlocking is idempotent
+        if (!fh) return {};
         struct flock fl = make_flock(range, F_UNLCK);
         int rc = backend_.api_->ceph_ll_setlk(backend_.mount_, *fh, &fl, owner_key(owner), 0);
         if (rc < 0) return Err(backend_.map_rc(rc));

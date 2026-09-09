@@ -24,7 +24,8 @@ TEST(Timer, SleepOrdering) {
     opts.clock = [&clk] { return clk.now; };
     Reactor r(ring, opts);
     ring.on_wait = [&clk](std::optional<std::chrono::nanoseconds> t) {
-        if (t && t->count() > 0) clk.now += *t;  // reactor blocks -> time passes
+        // reactor blocks -> time passes
+        if (t && t->count() > 0) clk.now += *t;
     };
 
     std::vector<int> order;
@@ -46,7 +47,8 @@ TEST(Timer, SleepOrdering) {
             o->push_back(200);
         }(&order),
         r);
-    r.stop();  // run() exits once all tasks are done
+    // run() exits once all tasks are done
+    r.stop();
     r.run();
     ASSERT_TRUE(order.size() == 3);
     EXPECT_EQ(order[0], 100);
@@ -100,7 +102,8 @@ TEST(Timer, WithTimeoutTimerWins) {
             auto v = co_await with_timeout(
                 [](bool* sdd) -> Task<int> {
                     co_await sleep_for(5s);
-                    *sdd = true;  // keeps running after the timeout (cooperative model)
+                    // keeps running after the timeout (cooperative model)
+                    *sdd = true;
                     co_return 7;
                 }(sd),
                 50ms);
@@ -109,9 +112,11 @@ TEST(Timer, WithTimeoutTimerWins) {
         }(&got, &slow_done),
         r);
     r.stop();
-    r.run();  // run drains the still-sleeping detached task too
+    // run drains the still-sleeping detached task too
+    r.run();
     EXPECT_TRUE(got);
-    EXPECT_TRUE(slow_done);  // discarded, but it did finish
+    // discarded, but it did finish
+    EXPECT_TRUE(slow_done);
 }
 
 // Token bucket (plan doc 10 §4.3) on the fake clock: unconfigured acquires are free,
@@ -132,11 +137,15 @@ TEST(TokenBucket, ShapesToConfiguredRate) {
     TimePoint after_free{}, after_shaped{};
     spawn(
         [](TokenBucket* tb, FakeClock* clk, TimePoint* free_t, TimePoint* shaped_t) -> Task<void> {
-            co_await tb->acquire(1u << 20);  // unconfigured: immediate
+            // unconfigured: immediate
+            co_await tb->acquire(1u << 20);
             *free_t = clk->now;
-            tb->configure(1000);         // 1000 tokens/s, burst = 1000, starts full
-            co_await tb->acquire(1000);  // drains the bucket, still immediate
-            co_await tb->acquire(500);   // must wait ~0.5s of (fake) refill
+            // 1000 tokens/s, burst = 1000, starts full
+            tb->configure(1000);
+            // drains the bucket, still immediate
+            co_await tb->acquire(1000);
+            // must wait ~0.5s of (fake) refill
+            co_await tb->acquire(500);
             *shaped_t = clk->now;
         }(&tb, &clk, &after_free, &after_shaped),
         r);
@@ -159,16 +168,20 @@ TEST(TokenBucket, DebtModePassesOverBurstRequests) {
     };
 
     TokenBucket tb;
-    tb.configure(1000);  // burst 1000
+    // burst 1000
+    tb.configure(1000);
     const TimePoint start = clk.now;
     TimePoint after_big{}, after_small{};
     spawn(
         [](TokenBucket* tb, FakeClock* clk, TimePoint* big_t, TimePoint* small_t) -> Task<void> {
-            co_await tb->acquire(5000);  // > burst: passes at once, leaves a 4000 debt
+            // > burst: passes at once, leaves a 4000 debt
+            co_await tb->acquire(5000);
             *big_t = clk->now;
-            co_await tb->acquire(1);  // repays the debt: ~4s of refill
+            // repays the debt: ~4s of refill
+            co_await tb->acquire(1);
             *small_t = clk->now;
-            tb->configure(0);  // disabling releases everything instantly
+            // disabling releases everything instantly
+            tb->configure(0);
             co_await tb->acquire(1u << 30);
         }(&tb, &clk, &after_big, &after_small),
         r);

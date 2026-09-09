@@ -80,7 +80,8 @@ struct WriteFixture {
         enc.u32(nfsv3::kProgram);
         enc.u32(nfsv3::kVersion);
         enc.u32(proc);
-        enc.u32(0);  // AUTH_NONE
+        // AUTH_NONE
+        enc.u32(0);
         enc.u32(0);
         enc.u32(0);
         enc.u32(0);
@@ -92,7 +93,8 @@ struct WriteFixture {
         auto record = call(xid, static_cast<uint32_t>(proc), std::move(args));
         auto parsed = rpc::parse_call(record);
         if (!parsed.has_value()) return {};
-        rpc::Cred root_cred;  // squash=none in the fixture: acts as root
+        // squash=none in the fixture: acts as root
+        rpc::Cred root_cred;
         root_cred.uid = 0;
         root_cred.gid = 0;
         rt::spawn(engine.dispatch(ctx, *parsed, root_cred), reactor);
@@ -106,17 +108,24 @@ struct WriteFixture {
         ring.complete(op, static_cast<int32_t>(wire.size()));
         while (reactor.poll_once()) {
         }
-        return wire;  // includes the 4-byte record mark
+        // includes the 4-byte record mark
+        return wire;
     }
 
     static xdr::XdrDec result(std::vector<std::byte>& bytes) {
         xdr::XdrDec dec(std::span<const std::byte>(bytes.data() + 4, bytes.size() - 4));
-        (void)dec.u32();  // xid
-        (void)dec.u32();  // reply
-        (void)dec.u32();  // accepted
-        (void)dec.u32();  // verf flavor
-        (void)dec.u32();  // verf len
-        (void)dec.u32();  // accept_stat
+        // xid
+        (void)dec.u32();
+        // reply
+        (void)dec.u32();
+        // accepted
+        (void)dec.u32();
+        // verf flavor
+        (void)dec.u32();
+        // verf len
+        (void)dec.u32();
+        // accept_stat
+        (void)dec.u32();
         return dec;
     }
 
@@ -197,11 +206,14 @@ TEST(WritePath, CreateWriteCommitReadBack) {
     create.encode(enc);
     auto reply = f.request(nfsv3::Proc::kCreate, enc.take());
     auto dec = WriteFixture::result(reply);
-    EXPECT_EQ(*dec.u32(), 0u);    // NFS3_OK
-    ASSERT_TRUE(*dec.boolean());  // post_op_fh present
+    // NFS3_OK
+    EXPECT_EQ(*dec.u32(), 0u);
+    // post_op_fh present
+    ASSERT_TRUE(*dec.boolean());
     auto fh_bytes = *dec.opaque(64);
     nfsv3::FileHandle file{{fh_bytes.begin(), fh_bytes.end()}};
-    ASSERT_TRUE(*dec.boolean());  // post_op_attr present
+    // post_op_attr present
+    ASSERT_TRUE(*dec.boolean());
     WriteFixture::skip_fattr(dec);
     auto [pre, post] = WriteFixture::skip_wcc(dec);
     EXPECT_TRUE(pre);
@@ -222,10 +234,13 @@ TEST(WritePath, CreateWriteCommitReadBack) {
     auto wcc = WriteFixture::skip_wcc(dec);
     EXPECT_TRUE(wcc.first);
     EXPECT_TRUE(wcc.second);
-    EXPECT_EQ(*dec.u32(), 5u);                // count
-    EXPECT_EQ(*dec.u32(), nfsv3::kUnstable);  // committed
+    // count
+    EXPECT_EQ(*dec.u32(), 5u);
+    // committed
+    EXPECT_EQ(*dec.u32(), nfsv3::kUnstable);
     auto verf = *dec.opaque_fixed(8);
-    EXPECT_EQ(static_cast<int>(verf[0]), 0xAB);  // engine write verifier
+    // engine write verifier
+    EXPECT_EQ(static_cast<int>(verf[0]), 0xAB);
 
     // COMMIT
     xdr::XdrEnc cenc(f.pool);
@@ -246,7 +261,8 @@ TEST(WritePath, CreateWriteCommitReadBack) {
     ASSERT_TRUE(*dec.boolean());
     WriteFixture::skip_fattr(dec);
     EXPECT_EQ(*dec.u32(), 5u);
-    EXPECT_TRUE(*dec.boolean());  // eof
+    // eof
+    EXPECT_TRUE(*dec.boolean());
     auto got = *dec.opaque(64);
     EXPECT_STREQ(std::string(reinterpret_cast<const char*>(got.data()), got.size()), "hello");
 }
@@ -275,7 +291,8 @@ TEST(WritePath, CreateExclusiveVerifierReplay) {
     create.verf[0] = std::byte{0x22};
     reply = f.request(nfsv3::Proc::kCreate, encode(), 0x9998);
     dec = WriteFixture::result(reply);
-    EXPECT_EQ(*dec.u32(), 17u);  // NFS3ERR_EXIST
+    // NFS3ERR_EXIST
+    EXPECT_EQ(*dec.u32(), 17u);
 }
 
 TEST(WritePath, SetattrGuardCtime) {
@@ -287,7 +304,8 @@ TEST(WritePath, SetattrGuardCtime) {
     auto reply = f.request(nfsv3::Proc::kGetattr, genc.take());
     auto dec = WriteFixture::result(reply);
     ASSERT_TRUE(*dec.u32() == 0u);
-    for (int i = 0; i < 17; ++i) (void)dec.u32();  // to ctime (fattr words 18/19 = ctime)
+    // to ctime (fattr words 18/19 = ctime)
+    for (int i = 0; i < 17; ++i) (void)dec.u32();
     uint32_t csec = *dec.u32();
     uint32_t cnsec = *dec.u32();
 
@@ -295,12 +313,14 @@ TEST(WritePath, SetattrGuardCtime) {
     args.object = file;
     args.attrs.mode = 0600;
     args.guard = true;
-    args.guard_ctime = {static_cast<int64_t>(csec) + 100, cnsec};  // stale guard
+    // stale guard
+    args.guard_ctime = {static_cast<int64_t>(csec) + 100, cnsec};
     xdr::XdrEnc enc(f.pool);
     args.encode(enc);
     reply = f.request(nfsv3::Proc::kSetattr, enc.take());
     dec = WriteFixture::result(reply);
-    EXPECT_EQ(*dec.u32(), 10002u);  // NFS3ERR_NOT_SYNC
+    // NFS3ERR_NOT_SYNC
+    EXPECT_EQ(*dec.u32(), 10002u);
     WriteFixture::skip_wcc(dec);
 
     args.guard_ctime = {static_cast<int64_t>(csec), cnsec};
@@ -353,14 +373,16 @@ TEST(WritePath, RemoveRenameLinkAndFailureWcc) {
     reply = f.request(nfsv3::Proc::kLink, lenc.take());
     dec = WriteFixture::result(reply);
     EXPECT_EQ(*dec.u32(), 0u);
-    ASSERT_TRUE(*dec.boolean());  // file post-op attr
+    // file post-op attr
+    ASSERT_TRUE(*dec.boolean());
     WriteFixture::skip_fattr(dec);
     WriteFixture::skip_wcc(dec);
 
     // REMOVE of a missing name: failure branch still carries dir WCC post attr.
     reply = f.request(nfsv3::Proc::kRemove, f.enc_diropargs(f.root_fh, "missing"));
     dec = WriteFixture::result(reply);
-    EXPECT_EQ(*dec.u32(), 2u);  // NOENT
+    // NOENT
+    EXPECT_EQ(*dec.u32(), 2u);
     auto wcc = WriteFixture::skip_wcc(dec);
     EXPECT_TRUE(wcc.second);
 
@@ -384,7 +406,8 @@ TEST(WritePath, ReadonlyExportRejectsWithRofs) {
     create.encode(enc);
     auto reply = f.request(nfsv3::Proc::kCreate, enc.take());
     auto dec = WriteFixture::result(reply);
-    EXPECT_EQ(*dec.u32(), 30u);  // NFS3ERR_ROFS
+    // NFS3ERR_ROFS
+    EXPECT_EQ(*dec.u32(), 30u);
     auto wcc = WriteFixture::skip_wcc(dec);
     EXPECT_TRUE(wcc.second);
 
@@ -405,10 +428,12 @@ TEST(WritePath, MknodRejectsBadType) {
     WriteFixture f;
     xdr::XdrEnc enc(f.pool);
     nfsv3::Diropargs{f.root_fh, "dev"}.encode(enc);
-    enc.u32(1);  // NF3REG: not creatable via MKNOD
+    // NF3REG: not creatable via MKNOD
+    enc.u32(1);
     auto reply = f.request(nfsv3::Proc::kMknod, enc.take());
     auto dec = WriteFixture::result(reply);
-    EXPECT_EQ(*dec.u32(), 10007u);  // NFS3ERR_BADTYPE
+    // NFS3ERR_BADTYPE
+    EXPECT_EQ(*dec.u32(), 10007u);
 }
 
 TEST(WritePath, DrcReplaysIdenticalReply) {
@@ -451,7 +476,8 @@ TEST(WritePath, DrcReplaysIdenticalReply) {
     EXPECT_EQ(drc.stats().entries, 0u);
     auto fourth = f.request(nfsv3::Proc::kMkdir, encode(), 0x777);
     auto dec4 = WriteFixture::result(fourth);
-    EXPECT_EQ(*dec4.u32(), 17u);  // re-executed -> EEXIST, not a cached success replay
+    // re-executed -> EEXIST, not a cached success replay
+    EXPECT_EQ(*dec4.u32(), 17u);
 }
 
 TEST(WritePath, ErrmapWhitelistForWriteProcs) {
@@ -514,9 +540,11 @@ TEST(WritePath, WritePayloadSpanningSegments) {
     while (f.reactor.poll_once()) {
     }
     auto dec = WriteFixture::result(wire);
-    EXPECT_EQ(*dec.u32(), 0u);  // NFS3_OK
+    // NFS3_OK
+    EXPECT_EQ(*dec.u32(), 0u);
     WriteFixture::skip_wcc(dec);
-    EXPECT_EQ(*dec.u32(), payload.size());  // full count written
+    // full count written
+    EXPECT_EQ(*dec.u32(), payload.size());
 
     // READ back and compare.
     xdr::XdrEnc renc(f.pool);
@@ -527,7 +555,8 @@ TEST(WritePath, WritePayloadSpanningSegments) {
     ASSERT_TRUE(*rdec.boolean());
     WriteFixture::skip_fattr(rdec);
     EXPECT_EQ(*rdec.u32(), payload.size());
-    (void)rdec.boolean();  // eof
+    // eof
+    (void)rdec.boolean();
     auto got = *rdec.opaque(256);
     EXPECT_STREQ(std::string(reinterpret_cast<const char*>(got.data()), got.size()), payload);
 }

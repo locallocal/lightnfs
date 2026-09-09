@@ -51,7 +51,8 @@ class LocalBackend : public Backend {
 
     struct FdCacheStats {
         uint64_t hits = 0, misses = 0, upgrades = 0, evictions = 0;
-        uint64_t overflows = 0;  // eviction passes that found every entry in use
+        // eviction passes that found every entry in use
+        uint64_t overflows = 0;
         size_t entries = 0;
         // Parallel O_PATH resolve cache (plan doc 10 §2.1).
         uint64_t path_hits = 0, path_misses = 0;
@@ -71,7 +72,8 @@ class LocalBackend : public Backend {
     // can succeed again without a restart; returns how many were cleared.
     size_t clear_poison();
 
-    size_t fallback_path_count() const;  // observability for the §1.5 cap
+    // observability for the §1.5 cap
+    size_t fallback_path_count() const;
 
     // Handle-content parser + open. Public because handle bytes are client-controlled and
     // this is the parse boundary fuzz targets exercise directly (plan doc 10 §7.2).
@@ -202,9 +204,11 @@ class LocalObject final : public Object {
     rt::Task<Result<void>> io_gate(const Cred& cred, bool write);
 
     LocalBackend& backend_;
-    int path_fd_ = -1;  // O_PATH|O_NOFOLLOW, safe for statx/lookup.
+    // O_PATH|O_NOFOLLOW, safe for statx/lookup.
+    int path_fd_ = -1;
     std::string relative_;
-    std::shared_ptr<void> keeper_;  // set: path_fd_ belongs to the resolve cache
+    // set: path_fd_ belongs to the resolve cache
+    std::shared_ptr<void> keeper_;
 };
 
 }  // namespace lnfs::backend

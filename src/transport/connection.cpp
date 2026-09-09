@@ -37,7 +37,8 @@ IpKey Peer::ip_key() const {
     IpKey k;
     if (addr.ss_family == AF_INET) {
         auto* a = reinterpret_cast<const sockaddr_in*>(&addr);
-        k.b[10] = k.b[11] = 0xff;  // ::ffff:a.b.c.d
+        // ::ffff:a.b.c.d
+        k.b[10] = k.b[11] = 0xff;
         std::memcpy(k.b.data() + 12, &a->sin_addr, 4);
     } else if (addr.ss_family == AF_INET6) {
         auto* a = reinterpret_cast<const sockaddr_in6*>(&addr);
@@ -165,10 +166,12 @@ std::shared_ptr<CbChannel> ConnCtx::cb_channel() {
 
 void ConnCtx::route_cb_reply(rt::BufferChain rec) {
     auto bytes = rec.to_bytes();
-    if (bytes.size() < 8 || !cb) return;  // no channel: nothing ever called out
+    // no channel: nothing ever called out
+    if (bytes.size() < 8 || !cb) return;
     uint32_t xid = 0;
     std::memcpy(&xid, bytes.data(), 4);
-    xid = xdr::to_be32(xid);  // symmetric byte swap
+    // symmetric byte swap
+    xid = xdr::to_be32(xid);
     if (!cb->route_reply(xid, std::move(bytes)))
         LNFS_DEBUG("conn {}: unmatched callback reply xid={:#x}, dropped", peer.to_string(), xid);
 }
@@ -182,8 +185,10 @@ std::optional<uint32_t> starttls_probe_xid(const BufferChain& rec) {
     auto xid = d.u32();
     auto mtype = d.u32();
     auto rpcvers = d.u32();
-    (void)d.u32();  // prog
-    (void)d.u32();  // vers
+    // prog
+    (void)d.u32();
+    // vers
+    (void)d.u32();
     auto proc = d.u32();
     auto cred_flavor = d.u32();
     if (!xid || !mtype || !rpcvers || !proc || !cred_flavor) return std::nullopt;
@@ -203,15 +208,19 @@ Task<void> negotiate_starttls(ConnCtx* c, uint32_t xid) {
     enc.u32(rpc::kReply);
     enc.u32(rpc::kMsgAccepted);
     if (offer) {
-        enc.u32(rpc::kAuthTls);  // verifier flavor
+        // verifier flavor
+        enc.u32(rpc::kAuthTls);
         static const char kStartTls[] = {'S', 'T', 'A', 'R', 'T', 'T', 'L', 'S'};
         enc.opaque(std::span<const std::byte>(reinterpret_cast<const std::byte*>(kStartTls), sizeof kStartTls));
     } else {
-        enc.u32(0);  // AUTH_NONE verifier
+        // AUTH_NONE verifier
+        enc.u32(0);
         enc.u32(0);
     }
-    enc.u32(rpc::kSuccess);        // NULL has void results
-    co_await c->send(enc.take());  // cleartext: rs is not yet upgraded
+    // NULL has void results
+    enc.u32(rpc::kSuccess);
+    // cleartext: rs is not yet upgraded
+    co_await c->send(enc.take());
     if (!offer) co_return;
 
     auto made = TlsConn::create(*c->tls_ctx);
@@ -252,7 +261,8 @@ Task<void> handle_one(ConnCtx* c, rpc::Dispatcher* d, BufferChain rec) {
 Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp, ConnTracker* tracker) {
     ConnCtx* c = ctx.get();
     uint64_t conn_id = ConnRegistry::instance().add(c->fd, c->peer);
-    bool tls_probe_seen = false;  // RFC 9289: the AUTH_TLS probe is the first RPC or never
+    // RFC 9289: the AUTH_TLS probe is the first RPC or never
+    bool tls_probe_seen = false;
     for (;;) {
         auto rec = co_await c->rs.read_record();
         if (!rec) {
@@ -261,7 +271,8 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp, 
             }
             break;
         }
-        if (rec->empty()) continue;  // empty record: ignore
+        // empty record: ignore
+        if (rec->empty()) continue;
         if (c->cancel.cancel_requested()) break;
         if (!tls_probe_seen) {
             // STARTTLS negotiation runs inline in the read loop (before any handler spawns):
@@ -278,7 +289,8 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp, 
             // RPC REPLY records answer our backchannel calls (plan doc 10 §5.2): routed by
             // xid to the pending callback, never dispatched as requests.
             xdr::XdrDec peek(*rec);
-            (void)peek.u32();  // xid
+            // xid
+            (void)peek.u32();
             auto mtype = peek.u32();
             if (mtype && *mtype == rpc::kReply) {
                 c->route_cb_reply(std::move(*rec));
@@ -287,7 +299,8 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp, 
         }
         if (c->inflight.available() <= 0)
             obs::Metrics::instance().backpressure_waits.fetch_add(1, std::memory_order_relaxed);
-        co_await c->inflight.acquire();  // backpressure (design 01 §1.5)
+        // backpressure (design 01 §1.5)
+        co_await c->inflight.acquire();
         ++c->live;
         spawn(handle_one(c, &disp, std::move(*rec)), current_reactor());
     }
@@ -303,7 +316,8 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp, 
         c->drained.reset();
         if (c->live > 0) co_await c->drained.wait();
     }
-    ConnRegistry::instance().remove(conn_id);  // before close: kill() must not hit a reused fd
+    // before close: kill() must not hit a reused fd
+    ConnRegistry::instance().remove(conn_id);
     co_await uring_close(c->fd);
     if (tracker) tracker->remove(c->peer);
 }

@@ -35,7 +35,8 @@ bool deactivate(DataPlaneInstance& instance, const core::ServerConfig& cfg, Mana
     }
     if (instance.stack) instance.stack->stop_lease_scanner();
     instance.metrics.reset();
-    instance.frontend.reset();  // listeners go before the dispatcher they serve
+    // listeners go before the dispatcher they serve
+    instance.frontend.reset();
     instance.stack.reset();
     return converged;
 }

@@ -7,7 +7,8 @@ namespace {
 class AuthNone final : public Authenticator {
  public:
     Result<Cred> authenticate(const OpaqueAuth&, const OpaqueAuth&) override {
-        return Cred{};  // anonymous/nobody
+        // anonymous/nobody
+        return Cred{};
     }
 };
 
@@ -15,11 +16,13 @@ class AuthNone final : public Authenticator {
 class AuthSys final : public Authenticator {
  public:
     Result<Cred> authenticate(const OpaqueAuth& cred, const OpaqueAuth&) override {
-        xdr::XdrDec dec(cred.body);  // flat mode; body references the request record
+        // flat mode; body references the request record
+        xdr::XdrDec dec(cred.body);
 
         Cred out;
         out.flavor = AuthFlavor::kSys;
-        if (!dec.u32()) return Err(errno_from(EACCES));  // stamp
+        // stamp
+        if (!dec.u32()) return Err(errno_from(EACCES));
         auto name = dec.string(255);
         if (!name) return Err(errno_from(EACCES));
         out.machine = std::string(*name);

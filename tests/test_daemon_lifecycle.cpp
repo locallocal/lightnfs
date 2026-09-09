@@ -93,7 +93,8 @@ TEST(DaemonLifecycle, ActivateDeactivateTwiceOverOneRuntime) {
     core::ServerConfig cfg;
     cfg.state_dir = dir;
     cfg.ctl_socket = dir + "/ctl.sock";
-    cfg.port = 0;  // ephemeral loopback ports
+    // ephemeral loopback ports
+    cfg.port = 0;
     cfg.mount_port = 0;
     cfg.bind = "127.0.0.1";
     cfg.rpcbind = false;
@@ -107,7 +108,8 @@ TEST(DaemonLifecycle, ActivateDeactivateTwiceOverOneRuntime) {
     {
         server::Management mgmt = server::Management::start(cfg, runtime, {});
         ASSERT_TRUE(mgmt.ctl != nullptr);
-        std::this_thread::sleep_for(50ms);  // ctl accept loop up
+        // ctl accept loop up
+        std::this_thread::sleep_for(50ms);
         EXPECT_TRUE(ctl(cfg.ctl_socket, "status").find("role=standby") != std::string::npos);
         EXPECT_STREQ(ctl(cfg.ctl_socket, "drc"), "not active\n");
 
@@ -118,7 +120,8 @@ TEST(DaemonLifecycle, ActivateDeactivateTwiceOverOneRuntime) {
             ASSERT_TRUE(plane->frontend.has_value());
             EXPECT_TRUE(plane->stack->nfs4.has_value());
             EXPECT_EQ(plane->stack->state.config().boot_epoch, 100u + static_cast<uint64_t>(round));
-            EXPECT_EQ(obs::text_provider_count(), providers_before + 6);  // 4 groups + v4 moved + pool
+            // 4 groups + v4 moved + pool
+            EXPECT_EQ(obs::text_provider_count(), providers_before + 6);
             // ctl now addresses this plane; the epoch shows in the state dump.
             EXPECT_TRUE(ctl(cfg.ctl_socket, "status").find("role=active") != std::string::npos);
             EXPECT_TRUE(ctl(cfg.ctl_socket, "state").find("boot_epoch=" + std::to_string(100 + round)) !=
@@ -139,11 +142,13 @@ TEST(DaemonLifecycle, ActivateDeactivateTwiceOverOneRuntime) {
             bool converged = server::deactivate(*plane, cfg, mgmt, 100ms, 2s);
             auto took = std::chrono::steady_clock::now() - t0;
             EXPECT_TRUE(converged);
-            EXPECT_TRUE(took < 2s);  // 100 ms grace + close; not the lease scanner's 1 s
+            // 100 ms grace + close; not the lease scanner's 1 s
+            EXPECT_TRUE(took < 2s);
             EXPECT_TRUE(plane->stack == nullptr);
             EXPECT_FALSE(plane->frontend.has_value());
             EXPECT_EQ(transport::ConnRegistry::instance().count(), conns_before);
-            EXPECT_EQ(obs::text_provider_count(), providers_before);  // nothing leaked
+            // nothing leaked
+            EXPECT_EQ(obs::text_provider_count(), providers_before);
             // The silent client was kicked: its read sees EOF/reset, not a hang.
             char b;
             EXPECT_TRUE(read(cfd, &b, 1) <= 0);
@@ -172,9 +177,11 @@ TEST(DaemonLifecycle, DetachWaitsForPinnedCommands) {
         auto pin = slot.acquire();
         ASSERT_TRUE(static_cast<bool>(pin));
         EXPECT_EQ(slot.pins(), 1);
-        EXPECT_FALSE(slot.detach(20ms));  // held: times out, plane pointer already cleared
+        // held: times out, plane pointer already cleared
+        EXPECT_FALSE(slot.detach(20ms));
         EXPECT_TRUE(slot.load() == nullptr);
-        EXPECT_FALSE(static_cast<bool>(slot.acquire()));  // late comers see nothing
+        // late comers see nothing
+        EXPECT_FALSE(static_cast<bool>(slot.acquire()));
         EXPECT_EQ(slot.pins(), 1);
     }
     EXPECT_EQ(slot.pins(), 0);
@@ -237,7 +244,8 @@ TEST(DaemonLifecycle, CatalogBootFromStore) {
     EXPECT_EQ(boot->version, 3u);
     EXPECT_TRUE(boot->digest.starts_with("sha256:"));
     EXPECT_TRUE(local.exports_from_catalog);
-    ASSERT_TRUE(local.exports.size() == 1u);  // the disabled cephfs export is not served
+    // the disabled cephfs export is not served
+    ASSERT_TRUE(local.exports.size() == 1u);
     EXPECT_EQ(local.exports[0].fsid, 7u);
     EXPECT_TRUE(local.exports[0].readonly);
     EXPECT_STREQ(local.exports[0].nodes[1], "gw2");
@@ -284,7 +292,8 @@ TEST(DaemonLifecycle, CatalogBootEmpty) {
     EXPECT_EQ(boot->version, 0u);
     EXPECT_TRUE(local.exports.empty());
     EXPECT_FALSE(local.exports_from_catalog);
-    auto table = core::ExportTable::build(local);  // empty is allowed in catalog mode
+    // empty is allowed in catalog mode
+    auto table = core::ExportTable::build(local);
     ASSERT_TRUE(table.has_value());
     EXPECT_EQ((*table)->size(), 0u);
     EXPECT_TRUE((*table)->snapshot()->pseudo->root()->children.empty());

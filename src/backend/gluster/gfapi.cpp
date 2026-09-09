@@ -11,8 +11,10 @@ namespace {
 
 struct Sym {
     const char* name;
-    const char* version;  // GFAPI_x.y.z default version in GlusterFS 11's map file
-    size_t offset;        // of the member in Api
+    // GFAPI_x.y.z default version in GlusterFS 11's map file
+    const char* version;
+    // of the member in Api
+    size_t offset;
 };
 
 #define LNFS_GFAPI_SYM(fn, ver)              \

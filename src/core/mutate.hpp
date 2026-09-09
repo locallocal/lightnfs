@@ -42,14 +42,17 @@ class MutateGuard {
     struct Target {
         backend::ObjPtr obj;
         backend::ObjId oid;
-        bool sample = true;  // false: lock only (ops whose reply carries no change data)
+        // false: lock only (ops whose reply carries no change data)
+        bool sample = true;
     };
 
     // Outcome of steps 1-2, in evaluation order.
     struct Verdict {
         enum Kind : uint8_t { kOk, kReadonly, kBadName } kind = kOk;
-        NameCheck name = NameCheck::kOk;  // set for kBadName
-        size_t name_index = 0;            // which of the checked names failed
+        // set for kBadName
+        NameCheck name = NameCheck::kOk;
+        // which of the checked names failed
+        size_t name_index = 0;
         explicit operator bool() const { return kind == kOk; }
     };
 

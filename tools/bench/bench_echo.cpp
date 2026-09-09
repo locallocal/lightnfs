@@ -23,7 +23,8 @@ Task<void> echo_conn(int fd, BufferPool* pool) {
     for (;;) {
         auto rec = co_await rs.read_record();
         if (!rec) break;
-        auto wr = co_await rs.write_record(std::move(*rec));  // BufferChain == SendBuf: zero-copy
+        // BufferChain == SendBuf: zero-copy
+        auto wr = co_await rs.write_record(std::move(*rec));
         if (!wr) break;
     }
     co_await uring_close(fd);
@@ -84,5 +85,6 @@ int lnfs::bench::echo_main(int argc, char** argv) {
 
     close(lfd);
     fflush(stdout);
-    _exit(0);  // reactors may still be blocked in accept; process exit tears them down
+    // reactors may still be blocked in accept; process exit tears them down
+    _exit(0);
 }

@@ -32,7 +32,8 @@ TEST(FakeRing, ShortReadThenRetryLoop) {
     ring.complete_with_data(ring.take(FakeRing::Kind::kRecv, 5), std::string_view("abc"));
     while (r.poll_once()) {
     }
-    ring.complete(ring.take(FakeRing::Kind::kRecv, 5), -EINTR);  // injected EINTR
+    // injected EINTR
+    ring.complete(ring.take(FakeRing::Kind::kRecv, 5), -EINTR);
     while (r.poll_once()) {
     }
     ring.complete_with_data(ring.take(FakeRing::Kind::kRecv, 5), std::string_view("de"));
@@ -79,7 +80,8 @@ TEST(FakeRing, CompletionReordering) {
     }
     while (r.poll_once()) {
     }
-    ring.complete(ring.take(FakeRing::Kind::kFsync, 2), 0);  // 2 first
+    // 2 first
+    ring.complete(ring.take(FakeRing::Kind::kFsync, 2), 0);
     ring.complete(ring.take(FakeRing::Kind::kFsync, 1), 0);
     while (r.poll_once()) {
     }

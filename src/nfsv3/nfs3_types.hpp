@@ -172,8 +172,10 @@ inline constexpr uint32_t kCreateExclusive = 2;
 struct CreateArgs {
     Diropargs where;
     uint32_t mode = kCreateUnchecked;
-    backend::SetAttr attrs;    // UNCHECKED/GUARDED
-    backend::ExclVerf verf{};  // EXCLUSIVE
+    // UNCHECKED/GUARDED
+    backend::SetAttr attrs;
+    // EXCLUSIVE
+    backend::ExclVerf verf{};
     void encode(xdr::XdrEnc& enc) const;
     static Result<CreateArgs> decode(xdr::XdrDec& dec);
 };
@@ -225,7 +227,8 @@ struct CommitArgs {
 
 // ---- weak cache consistency -----------------------------------------------
 
-struct WccPre {  // wcc_attr: the pre-op sample of the three CTO-relevant fields
+// wcc_attr: the pre-op sample of the three CTO-relevant fields
+struct WccPre {
     uint64_t size = 0;
     backend::Timespec mtime{}, ctime{};
 };

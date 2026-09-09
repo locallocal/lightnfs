@@ -1,6 +1,12 @@
 # Google C++ style (https://google.github.io/styleguide/cppguide.html) with the
 # project's deviations below.  `make format` rewrites the tracked C++ sources,
 # `make format-check` (scripts/format_check.sh, the CI gate) reports drift.
+#
+# One rule clang-format cannot express is enforced by the same gate
+# (scripts/trailing_comments.py): a `//` comment goes on its own line above the code
+# it describes, never after it on the same line.  Exceptions: `}  // namespace x` and
+# other closing-brace-only lines, `#if/#else/#endif  // …`, `// NOLINT…` and the
+# clang-format on/off markers.
 BasedOnStyle: Google
 Language: Cpp
 Standard: c++20

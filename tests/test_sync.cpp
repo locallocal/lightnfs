@@ -67,7 +67,8 @@ TEST(AsyncSharedMutex, ReadersSharedWriterExclusive) {
         [](Ctx* cc) -> Task<void> {
             auto lk = co_await cc->smu.lock_shared();
             cc->trace.push_back("r1");
-            co_await cc->ev.wait();  // hold until released
+            // hold until released
+            co_await cc->ev.wait();
         }(&c),
         r);
     spawn(
@@ -91,8 +92,10 @@ TEST(AsyncSharedMutex, ReadersSharedWriterExclusive) {
         r);
     while (r.poll_once()) {
     }
-    ASSERT_TRUE(c.trace.size() == 2);  // both readers in; writer + r3 queued
-    c.ev.set();                        // release both readers
+    // both readers in; writer + r3 queued
+    ASSERT_TRUE(c.trace.size() == 2);
+    // release both readers
+    c.ev.set();
     while (r.poll_once()) {
     }
     ASSERT_TRUE(c.trace.size() == 4);
@@ -132,7 +135,8 @@ TEST(AsyncCondVar, WaitNotify) {
 TEST(Semaphore, PermitTransfer) {
     FakeRing ring;
     Reactor r(ring);
-    Ctx c;  // sem = 2
+    // sem = 2
+    Ctx c;
     for (int i = 0; i < 4; ++i) {
         spawn(
             [](Ctx* cc, int idx) -> Task<void> {
@@ -145,7 +149,8 @@ TEST(Semaphore, PermitTransfer) {
     }
     while (r.poll_once()) {
     }
-    EXPECT_EQ(c.trace.size(), 2u);  // only 2 permits
+    // only 2 permits
+    EXPECT_EQ(c.trace.size(), 2u);
     c.ev.set();
     while (r.poll_once()) {
     }
@@ -175,5 +180,6 @@ TEST(Sharded, IndependentShards) {
     EXPECT_TRUE(done);
     EXPECT_EQ(tab.shard(1).v, 10);
     EXPECT_EQ(tab.shard(2).v, 20);
-    EXPECT_EQ(tab.shard(5).v, 10);  // same shard as 1 (mod 4)
+    // same shard as 1 (mod 4)
+    EXPECT_EQ(tab.shard(5).v, 10);
 }

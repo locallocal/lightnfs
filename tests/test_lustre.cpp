@@ -66,8 +66,10 @@ T run(rt::Runtime& runtime, rt::Task<T> task) {
 struct Options {
     bool hsm = true;
     bool locks = true;
-    std::string mount;  // explicit mount root
-    std::string reuse;  // serve this directory instead of a fresh one (no fake reset)
+    // explicit mount root
+    std::string mount;
+    // serve this directory instead of a fresh one (no fake reset)
+    std::string reuse;
     uint32_t stripe = 0;
     Options& no_hsm() {
         hsm = false;
@@ -167,13 +169,15 @@ TEST(Lustre, CapsHandlesAndResolve) {
     EXPECT_TRUE(caps.has(backend::Cap::kSymlink));
     EXPECT_TRUE(caps.has(backend::Cap::kHardlink));
     EXPECT_FALSE(caps.has(backend::Cap::kNativeAccess));
-    EXPECT_FALSE(caps.has(backend::Cap::kNativeChange));  // change is ctime-synthesized
+    // change is ctime-synthesized
+    EXPECT_FALSE(caps.has(backend::Cap::kNativeChange));
     EXPECT_TRUE(m.be->native_locks().has_value());
     EXPECT_EQ(m.be->fsid(), 11u);
     EXPECT_TRUE(m.be->stable_handles());
 
     auto root = m.root();
-    EXPECT_EQ(root->id().len, 17);  // tag + lu_fid
+    // tag + lu_fid
+    EXPECT_EQ(root->id().len, 17);
     EXPECT_EQ(static_cast<int>(root->id().bytes[0]), 4);
     EXPECT_EQ(root->type(), backend::FType::kDir);
     auto fid = backend::LustreBackend::fid_from_oid(root->id());
@@ -187,7 +191,8 @@ TEST(Lustre, CapsHandlesAndResolve) {
     EXPECT_TRUE((*again)->id() == root->id());
     auto third = run(m.runtime, m.be->resolve(root->id()));
     ASSERT_TRUE(third.has_value());
-    EXPECT_TRUE(m.be->fd_cache_stats().path_hits >= 1);  // O_PATH resolve cache hit
+    // O_PATH resolve cache hit
+    EXPECT_TRUE(m.be->fd_cache_stats().path_hits >= 1);
 
     // Malformed / foreign handle bytes → ESTALE, never a crash.
     std::array<std::byte, 17> gluster_like{};
@@ -208,14 +213,16 @@ TEST(Lustre, CapsHandlesAndResolve) {
     std::array<std::byte, 16> short_one{};
     short_one[0] = std::byte{4};
     EXPECT_FALSE(backend::LustreBackend::fid_from_oid(*backend::ObjId::from(short_one)).has_value());
-    backend::llapi::Fid unknown{0x200000401ull, 0xfffffff0u, 7};  // never pinned
+    // never pinned
+    backend::llapi::Fid unknown{0x200000401ull, 0xfffffff0u, 7};
     auto u = run(m.runtime, m.be->resolve(backend::LustreBackend::oid_from_fid(unknown)));
     EXPECT_FALSE(u.has_value());
     EXPECT_EQ(raw(u.error()), ESTALE);
 }
 
 TEST(Lustre, FidHandlesSurviveRenameAndRestart) {
-    TmpDir dir;  // outlives both backend instances
+    // outlives both backend instances
+    TmpDir dir;
     testing::FakeLlapi::reset();
     backend::ObjId file_oid, dir_oid, link_oid;
     uint64_t fileid = 0;
@@ -320,7 +327,8 @@ TEST(Lustre, AnonymousAndOpenStateIo) {
     // the data fd cache is the local one, keyed by the FID handle
     auto stats = m.be->fd_cache_stats();
     EXPECT_TRUE(stats.entries >= 1);
-    EXPECT_TRUE(m.be->stats().hsm_checks >= 1);  // every regular-file data open is gated
+    // every regular-file data open is gated
+    EXPECT_TRUE(m.be->stats().hsm_checks >= 1);
 }
 
 TEST(Lustre, HsmReleasedFileIsJukeboxUntilRestored) {
@@ -328,7 +336,8 @@ TEST(Lustre, HsmReleasedFileIsJukeboxUntilRestored) {
     auto f = m.create_file("cold", "archived bytes");
     ASSERT_TRUE(f != nullptr);
     auto fid = *backend::LustreBackend::fid_from_oid(f->id());
-    ASSERT_TRUE(m.be->flush_fd_cache() >= 1);  // forget the descriptor the write cached
+    // forget the descriptor the write cached
+    ASSERT_TRUE(m.be->flush_fd_cache() >= 1);
     testing::FakeLlapi::set_hsm_states(
         fid, backend::llapi::kHsExists | backend::llapi::kHsArchived | backend::llapi::kHsReleased);
 
@@ -396,7 +405,8 @@ TEST(Lustre, HsmDisabledServesReleasedFilesInline) {
     auto fid = *backend::LustreBackend::fid_from_oid(f->id());
     (void)m.be->flush_fd_cache();
     testing::FakeLlapi::set_hsm_states(fid, backend::llapi::kHsReleased);
-    EXPECT_STREQ(m.read_all(*f), "inline restore");  // the kernel would restore inline
+    // the kernel would restore inline
+    EXPECT_STREQ(m.read_all(*f), "inline restore");
     EXPECT_EQ(m.be->stats().jukebox, 0u);
     EXPECT_EQ(m.be->stats().hsm_checks, 0u);
     EXPECT_TRUE(testing::FakeLlapi::restore_requests().empty());
@@ -426,7 +436,8 @@ TEST(Lustre, NativeByteRangeLocks) {
     EXPECT_TRUE((*probe)->exclusive);
     EXPECT_EQ((*probe)->range.offset, 0u);
     EXPECT_EQ((*probe)->range.length, 10u);
-    EXPECT_EQ((*probe)->owner.len, 0);  // holder identity unknown (OFD)
+    // holder identity unknown (OFD)
+    EXPECT_EQ((*probe)->owner.len, 0);
     auto clear = run(m.runtime, mgr.test(obj, {10, UINT64_MAX}, true));
     ASSERT_TRUE(clear.has_value());
     EXPECT_FALSE(clear->has_value());
@@ -479,7 +490,8 @@ TEST(Lustre, NativeLocksOff) {
 
 TEST(Lustre, StripeSizeShapesTransferHints) {
     {
-        Mount m;  // no layout on the root: defaults stay
+        // no layout on the root: defaults stay
+        Mount m;
         EXPECT_EQ(m.be->limits().pref_read, 1u << 20);
         EXPECT_EQ(m.be->limits().pref_write, 1u << 20);
     }
@@ -489,7 +501,8 @@ TEST(Lustre, StripeSizeShapesTransferHints) {
         EXPECT_EQ(m.be->limits().pref_write, 64u << 10);
     }
     {
-        Mount m(Options{}.striped(4u << 20));  // wider than max_read: clamped
+        // wider than max_read: clamped
+        Mount m(Options{}.striped(4u << 20));
         EXPECT_EQ(m.be->limits().pref_read, m.be->limits().max_read);
         EXPECT_EQ(m.be->limits().pref_write, m.be->limits().max_write);
     }
@@ -567,7 +580,8 @@ TEST(Lustre, ConfigFactory) {
     backend::register_builtin_backends();
     const auto* factory = backend::find_backend("lustre");
     ASSERT_TRUE(factory != nullptr);
-    EXPECT_FALSE(factory->virtual_path);  // path is a real directory inside the mount
+    // path is a real directory inside the mount
+    EXPECT_FALSE(factory->virtual_path);
     auto names = backend::registered_backends();
     EXPECT_TRUE(std::set<std::string>(names.begin(), names.end()).contains("lustre"));
 
@@ -624,7 +638,8 @@ TEST(Lustre, ConfigFactory) {
 // nodes — the validator reads the section's real `mount` key.
 TEST(Lustre, SameMountExportsShareOwnerList) {
     backend::register_builtin_backends();
-    TmpDir dir;  // exports are real directories inside the (stand-in) client mount
+    // exports are real directories inside the (stand-in) client mount
+    TmpDir dir;
     const std::string a = dir.path + "/a", b = dir.path + "/b";
     ASSERT_TRUE(std::filesystem::create_directory(a) && std::filesystem::create_directory(b));
     auto text = [&](const std::string& nodes_b) {
@@ -690,7 +705,8 @@ TEST(Lustre, ReclaimLockDelayUntilClientEviction) {
     // The MDS evicts the dead client after ~150 ms: its OFD lock is dropped (fd closed).
     std::thread evict([stale_fd] {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        ::close(stale_fd);  // closing the descriptor releases its OFD locks
+        // closing the descriptor releases its OFD locks
+        ::close(stale_fd);
     });
     auto out = probe.lock_until_settled(/*attempts=*/100, std::chrono::milliseconds(20));
     evict.join();

@@ -63,14 +63,17 @@ class OffloadPool {
         // 0 = max(1, threads / 4). Heavy jobs are confined to these threads; when idle
         // they park rather than steal light work (predictability over utilization).
         int heavy_threads = 0;
-        size_t queue_cap = 4096;  // per class: queued-jobs bound before admission holds
+        // per class: queued-jobs bound before admission holds
+        size_t queue_cap = 4096;
     };
 
     struct Stats {
         uint64_t submitted[kOffloadClasses]{};
         uint64_t completed[kOffloadClasses]{};
-        uint64_t deferred[kOffloadClasses]{};  // held in admission overflow at least once
-        size_t depth[kOffloadClasses]{};       // queued: admitted + overflow (design 08 §8.3)
+        // held in admission overflow at least once
+        uint64_t deferred[kOffloadClasses]{};
+        // queued: admitted + overflow (design 08 §8.3)
+        size_t depth[kOffloadClasses]{};
     };
 
     explicit OffloadPool(int threads) : OffloadPool(Config{.threads = threads}) {}

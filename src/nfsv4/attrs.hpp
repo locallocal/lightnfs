@@ -36,12 +36,18 @@ const Bitmap& supported_attrs(bool referrals = false);
 // Everything the encoders may need; the engine prefetches async pieces (stats) first.
 struct AttrSource {
     const backend::Attr* attr = nullptr;
-    uint64_t fsid = 0;                        // fsid4.major; 0 = pseudo-fs
-    uint64_t mounted_on_fileid = 0;           // defaults to attr->fileid when 0
-    std::span<const std::byte> fh{};          // attr 19 (filehandle)
-    const core::FsProps* fs = nullptr;        // caps/limits derivation; null = pseudo
-    const backend::FsStats* stats = nullptr;  // null -> zeros (pseudo)
-    uint32_t lease_seconds = kLeaseSeconds;   // attr 10 (lease_time)
+    // fsid4.major; 0 = pseudo-fs
+    uint64_t fsid = 0;
+    // defaults to attr->fileid when 0
+    uint64_t mounted_on_fileid = 0;
+    // attr 19 (filehandle)
+    std::span<const std::byte> fh{};
+    // caps/limits derivation; null = pseudo
+    const core::FsProps* fs = nullptr;
+    // null -> zeros (pseudo)
+    const backend::FsStats* stats = nullptr;
+    // attr 10 (lease_time)
+    uint32_t lease_seconds = kLeaseSeconds;
     // Referrals (plan 12 B2): `referrals` selects the supported set; for an export-side
     // object `fs_root` is the export's pseudo path and `owner` its owner as this gateway
     // sees it (null: no location to name — the pseudo fs, or an unknown owner).

@@ -17,18 +17,24 @@
 namespace lnfs::core {
 
 enum class FsRole : uint8_t {
-    kActive,    // this gateway owns the export and serves it
-    kDraining,  // this gateway is handing the export over: refer, do not serve
-    kRemote,    // another gateway owns it: refer there
-    kUnowned,   // nobody holds its fence right now: the client should retry
+    // this gateway owns the export and serves it
+    kActive,
+    // this gateway is handing the export over: refer, do not serve
+    kDraining,
+    // another gateway owns it: refer there
+    kRemote,
+    // nobody holds its fence right now: the client should retry
+    kUnowned,
 };
 
 const char* fs_role_name(FsRole role);
 
 struct FsOwner {
     FsRole role = FsRole::kActive;
-    std::string node;     // the owner (this node when kActive / kDraining)
-    std::string address;  // the owner's `[cluster] node_address`; empty when unknown
+    // the owner (this node when kActive / kDraining)
+    std::string node;
+    // the owner's `[cluster] node_address`; empty when unknown
+    std::string address;
     uint64_t fs_epoch = 0;
 };
 

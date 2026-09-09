@@ -28,7 +28,8 @@ void add_test_program(Dispatcher& disp) {
     disp.add({kProg, 1, 1, nullptr, [](void*, ConnCtx& c, RpcCall& call, const Cred&) -> Task<void> {
                   xdr::XdrEnc enc(c.pool);
                   encode_reply_success(enc, call.xid);
-                  if (call.proc == 1) {  // echo
+                  // echo
+                  if (call.proc == 1) {
                       auto arg = call.args.opaque(1 << 16);
                       if (!arg) {
                           co_await Dispatcher::reply_garbage_args(c, call.xid);
@@ -57,15 +58,18 @@ std::vector<std::byte> build_call(uint32_t xid, uint32_t proc, std::string_view 
     BufferPool pool;
     xdr::XdrEnc enc(pool);
     enc.u32(xid);
-    enc.u32(0);  // CALL
+    // CALL
+    enc.u32(0);
     enc.u32(2);
     enc.u32(kProg);
     enc.u32(1);
     enc.u32(proc);
     enc.u32(0);
-    enc.u32(0);  // cred AUTH_NONE
+    // cred AUTH_NONE
     enc.u32(0);
-    enc.u32(0);  // verf
+    enc.u32(0);
+    // verf
+    enc.u32(0);
     if (proc == 1) enc.opaque(std::span<const std::byte>((const std::byte*)payload.data(), payload.size()));
     auto body = enc.take().to_bytes();
     std::vector<std::byte> rec(4 + body.size());
@@ -131,20 +135,28 @@ TEST(Loopback, NullAndEcho) {
     std::vector<std::byte> rep;
     ASSERT_TRUE(read_record(fd, rep));
     xdr::XdrDec dec{std::span<const std::byte>(rep.data(), rep.size())};
-    EXPECT_EQ(*dec.u32(), 1u);  // xid
-    EXPECT_EQ(*dec.u32(), 1u);  // REPLY
-    EXPECT_EQ(*dec.u32(), 0u);  // MSG_ACCEPTED
+    // xid
+    EXPECT_EQ(*dec.u32(), 1u);
+    // REPLY
+    EXPECT_EQ(*dec.u32(), 1u);
+    // MSG_ACCEPTED
+    EXPECT_EQ(*dec.u32(), 0u);
 
     auto call1 = build_call(2, 1, "the quick brown fox");
     ASSERT_TRUE(write(fd, call1.data(), call1.size()) == (ssize_t)call1.size());
     ASSERT_TRUE(read_record(fd, rep));
     xdr::XdrDec dec2{std::span<const std::byte>(rep.data(), rep.size())};
     EXPECT_EQ(*dec2.u32(), 2u);
-    (void)dec2.u32();            // REPLY
-    (void)dec2.u32();            // MSG_ACCEPTED
-    (void)dec2.u32();            // verf flavor
-    (void)dec2.u32();            // verf len
-    EXPECT_EQ(*dec2.u32(), 0u);  // accept stat SUCCESS
+    // REPLY
+    (void)dec2.u32();
+    // MSG_ACCEPTED
+    (void)dec2.u32();
+    // verf flavor
+    (void)dec2.u32();
+    // verf len
+    (void)dec2.u32();
+    // accept stat SUCCESS
+    EXPECT_EQ(*dec2.u32(), 0u);
     auto echoed = *dec2.opaque(1 << 16);
     EXPECT_STREQ(std::string((const char*)echoed.data(), echoed.size()), "the quick brown fox");
 
@@ -252,7 +264,8 @@ TEST(Loopback, CloseAllAndWaitIdle) {
     EXPECT_EQ(registry.count(), before);
     for (int fd : fds) {
         char b;
-        EXPECT_TRUE(read(fd, &b, 1) <= 0);  // EOF or reset, never data
+        // EOF or reset, never data
+        EXPECT_TRUE(read(fd, &b, 1) <= 0);
         close(fd);
     }
     // The listener still accepts afterwards (close_all is not a stop).
@@ -267,7 +280,8 @@ TEST(Loopback, CloseAllAndWaitIdle) {
     // The accept loops can be joined while the runtime keeps running.
     srv.listener->request_stop();
     srv.listener->wait_stopped();
-    EXPECT_TRUE(connect_loopback(srv.port()) < 0 || true);  // sockets closed on destroy
+    // sockets closed on destroy
+    EXPECT_TRUE(connect_loopback(srv.port()) < 0 || true);
 }
 
 TEST(Loopback, HalfCloseDrainsPipelinedRepliesThenTearsDown) {
@@ -301,7 +315,8 @@ TEST(Loopback, HalfCloseDrainsPipelinedRepliesThenTearsDown) {
     auto partial = build_call(23, 1, "never finished");
     ASSERT_TRUE(write(fd, partial.data(), 6) == 6);
     ASSERT_TRUE(shutdown(fd, SHUT_WR) == 0);
-    EXPECT_FALSE(read_record(fd, rep));  // server tears down instead of waiting forever
+    // server tears down instead of waiting forever
+    EXPECT_FALSE(read_record(fd, rep));
     close(fd);
 
     // And the listener still serves new connections.

@@ -52,7 +52,8 @@ extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
         if (!ring.has_pending(testing::FakeRing::Kind::kRecv, 5)) break;
         auto op = ring.take(testing::FakeRing::Kind::kRecv, 5);
         if (pos >= size) {
-            ring.complete(op, 0);  // EOF
+            // EOF
+            ring.complete(op, 0);
         } else {
             // Chunk size steered by the stream itself: 1..16 bytes per completion.
             size_t chunk = 1 + (data[pos] & 0x0f);
@@ -64,7 +65,8 @@ extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
         while (r.poll_once()) {
         }
         if (st.done && st.result.has_value() && st.records < 64) {
-            ++st.records;  // a complete record: keep reading the rest of the stream
+            // a complete record: keep reading the rest of the stream
+            ++st.records;
             start_read();
         }
     }

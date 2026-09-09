@@ -12,7 +12,8 @@ std::shared_ptr<rt::AsyncSharedMutex> ObjLockRegistry::get(uint32_t fsid, const 
     if (auto it = shard.locks.find(key); it != shard.locks.end()) {
         if (auto existing = it->second.lock()) return existing;
         auto made = std::make_shared<rt::AsyncSharedMutex>();
-        it->second = made;  // expired entry: reuse its slot
+        // expired entry: reuse its slot
+        it->second = made;
         return made;
     }
     auto made = std::make_shared<rt::AsyncSharedMutex>();

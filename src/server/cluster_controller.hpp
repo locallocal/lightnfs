@@ -43,7 +43,8 @@ const char* role_name(Role role);
 
 // What a takeover hands to the backends and the external hook (plan 10 D1).
 struct TakeoverContext {
-    backend::ClusterIdentity identity;  // cluster id, this node, the epoch just minted
+    // cluster id, this node, the epoch just minted
+    backend::ClusterIdentity identity;
     // Node named by the fence record we replaced — the gateway whose storage-side
     // residue the hooks should clear.  Empty when the fence was free (first start) or
     // was our own previous incarnation.
@@ -78,12 +79,18 @@ class ClusterController {
     struct Snapshot {
         Role role = Role::kStandby;
         std::string node;
-        uint64_t epoch = 0;                                  // the epoch this gateway serves (0 until activated)
-        std::optional<FenceRecord> fence;                    // last fence record seen
-        std::chrono::steady_clock::time_point fence_seen{};  // when `fence` was read/written
-        uint64_t takeovers = 0;                              // activations completed
-        uint64_t fence_lost = 0;                             // Active → Draining because the fence was taken
-        uint64_t activation_failures = 0;                    // Activating → Standby
+        // the epoch this gateway serves (0 until activated)
+        uint64_t epoch = 0;
+        // last fence record seen
+        std::optional<FenceRecord> fence;
+        // when `fence` was read/written
+        std::chrono::steady_clock::time_point fence_seen{};
+        // activations completed
+        uint64_t takeovers = 0;
+        // Active → Draining because the fence was taken
+        uint64_t fence_lost = 0;
+        // Activating → Standby
+        uint64_t activation_failures = 0;
         std::chrono::milliseconds last_activation{0};
     };
 
@@ -113,13 +120,16 @@ class ClusterController {
     Result<std::vector<std::string>> peers() const;
 
  private:
-    void tick_once();  // tick() without Hooks::after_tick
+    // tick() without Hooks::after_tick
+    void tick_once();
     bool auto_takeover_allowed() const;
     // Standby → Activating: fence + epoch, then post the data-plane work.
     Result<void> begin_activation(bool force);
-    void run_activation(uint64_t epoch, std::string prev_node);  // on the posting thread
+    // on the posting thread
+    void run_activation(uint64_t epoch, std::string prev_node);
     void begin_draining(const char* why, bool fence_lost);
-    void run_draining(bool release);  // on the posting thread
+    // on the posting thread
+    void run_draining(bool release);
     void renew();
     // Prometheus text provider: lightnfs_cluster_* (plan 10 C4).
     void append_metrics(std::string& out) const;
@@ -139,7 +149,8 @@ class ClusterController {
     uint64_t takeovers_ = 0, fence_lost_ = 0, activation_failures_ = 0;
     std::chrono::steady_clock::time_point activation_started_{};
     std::chrono::milliseconds last_activation_{0};
-    obs::LatencyHistogram activation_hist_;  // Standby → Active, per completed takeover
+    // Standby → Active, per completed takeover
+    obs::LatencyHistogram activation_hist_;
     obs::ProviderHandle metrics_ = 0;
 
     std::thread thread_;
@@ -189,16 +200,22 @@ class FsClusterController {
 
     struct FsState {
         uint32_t fsid = 0;
-        Role role = Role::kStandby;        // kStandby = Remote (served elsewhere or by nobody)
-        uint64_t fs_epoch = 0;             // the fs epoch we serve it with (0 unless ours)
-        std::optional<FenceRecord> fence;  // the record naming the export last seen
-        std::optional<OwnerRecord> owner;  // fs/<fsid>/owner last read
+        // kStandby = Remote (served elsewhere or by nobody)
+        Role role = Role::kStandby;
+        // the fs epoch we serve it with (0 unless ours)
+        uint64_t fs_epoch = 0;
+        // the record naming the export last seen
+        std::optional<FenceRecord> fence;
+        // fs/<fsid>/owner last read
+        std::optional<OwnerRecord> owner;
         uint64_t takeovers = 0, fence_lost = 0, activation_failures = 0;
         // What the v4 engine is told (plan 12 B2): active / draining / remote (+ owner
         // node, address, fs epoch) / unowned.  Activating shows as unowned there.
         core::FsOwner view;
-        std::vector<std::string> nodes;  // the export's owner order ([[export]] nodes)
-        std::string path;                // the export path, for `cluster exports`
+        // the export's owner order ([[export]] nodes)
+        std::vector<std::string> nodes;
+        // the export path, for `cluster exports`
+        std::string path;
     };
     // The role as the operator sees it (plan 12 C4): "activating" while the data-plane
     // work runs, else the view's active / draining / remote / unowned.
@@ -237,7 +254,8 @@ class FsClusterController {
     // here, EHOSTDOWN unless the target is registered with a live heartbeat, EINVAL for
     // an unknown fsid or ourselves as the target.
     Result<void> request_migrate(uint32_t fsid, std::string_view target);
-    uint64_t migrations() const;  // request_migrate calls that got as far as the owner record
+    // request_migrate calls that got as far as the owner record
+    uint64_t migrations() const;
 
     // Follows the export set across versions (design 11 §11.7, plan 12 B3); main-loop
     // thread, after ExportTable::apply.  A new fsid starts Standby (Unowned in the view)
@@ -252,7 +270,8 @@ class FsClusterController {
     void sync_exports(const std::shared_ptr<const core::ExportSet>& set);
 
     std::vector<FsState> snapshot() const;
-    Role role_of(uint32_t fsid) const;  // kStandby for an unknown fsid
+    // kStandby for an unknown fsid
+    Role role_of(uint32_t fsid) const;
     const core::ClusterConfig& config() const { return cfg_; }
     const std::string& node() const { return node_; }
     uint64_t node_epoch() const { return node_epoch_; }
@@ -306,7 +325,8 @@ class FsClusterController {
     };
     struct Holder {
         const NodeFences* rec;
-        uint64_t epoch;  // the fs epoch that record took the fence with
+        // the fs epoch that record took the fence with
+        uint64_t epoch;
         bool live;
     };
     static bool expired(const NodeFences& rec, int64_t now_ms);
@@ -323,7 +343,8 @@ class FsClusterController {
     // predecessor with no record at all is "not heard from yet" for our first ttl after
     // start (gateways starting together must not race each other's exports away) and
     // dead after that.
-    void tick_once();  // tick() without Hooks::after_tick
+    // tick() without Hooks::after_tick
+    void tick_once();
     bool our_turn(const core::ExportEntry& exp, const StoreView& sv, bool stuck) const;
     // Hands an export we serve but are no longer listed for to the first node of
     // `nodes` that request_migrate accepts (registered, heartbeat live).  False when
@@ -335,7 +356,8 @@ class FsClusterController {
     void run_activation(uint32_t fsid, uint64_t fs_epoch, std::string prev_node, std::string reason);
     void begin_draining(uint32_t fsid, const char* why, bool fence_lost, bool release);
     void run_draining(uint32_t fsid, bool release);
-    bool renew();  // false after a failed renew (three in a row drain what we hold)
+    // false after a failed renew (three in a row drain what we hold)
+    bool renew();
     // Rebuilds and publishes the engine's view from the current roles and store view.
     void publish(const StoreView* sv);
     Fs* find(uint32_t fsid);
@@ -348,11 +370,13 @@ class FsClusterController {
     std::string node_;
     uint64_t node_epoch_ = 0;
     obs::ProviderHandle metrics_ = 0;
-    int64_t started_ms_ = 0;  // wall clock at construction
+    // wall clock at construction
+    int64_t started_ms_ = 0;
 
     mutable std::mutex mu_;
     std::map<uint32_t, Fs> fs_;
-    StoreView last_;  // the last successful read, for publishes between ticks
+    // the last successful read, for publishes between ticks
+    StoreView last_;
     int renew_failures_ = 0;
     uint64_t migrations_ = 0;
 

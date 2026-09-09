@@ -34,7 +34,8 @@ struct CatalogExport {
 
 struct Catalog {
     CatalogMeta meta;
-    std::vector<CatalogExport> exports;  // fsid ascending
+    // fsid ascending
+    std::vector<CatalogExport> exports;
 
     const CatalogExport* by_fsid(uint32_t fsid) const;
 

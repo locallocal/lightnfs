@@ -68,7 +68,8 @@ class Reactor {
 
     // Runs until stop() AND all spawned tasks have finished.
     void run();
-    void stop();  // thread-safe
+    // thread-safe
+    void stop();
 
     // Thread-safe: schedule h to be resumed on this reactor's thread.  Calls from this
     // reactor's own thread take a syscall-free fast path (plan doc 10 §2.2): the handle
@@ -129,7 +130,8 @@ class Reactor {
 
     struct TimerEnt {
         TimePoint deadline;
-        uint64_t seq;  // FIFO tie-break
+        // FIFO tie-break
+        uint64_t seq;
         std::coroutine_handle<> h;
         bool operator>(const TimerEnt& o) const { return deadline != o.deadline ? deadline > o.deadline : seq > o.seq; }
     };
@@ -140,7 +142,8 @@ class Reactor {
     // Same-thread post() targets; drained by pump() with no lock or wake involved.
     // A deque so handles queued by a resumed handle land behind the current batch.
     std::deque<std::coroutine_handle<>> local_ready_;
-    std::vector<std::coroutine_handle<>> drain_buf_;  // reused across pumps (see drain())
+    // reused across pumps (see drain())
+    std::vector<std::coroutine_handle<>> drain_buf_;
     std::atomic<bool> stop_{false};
     std::atomic<int64_t> live_tasks_{0};
     int64_t pending_ops_ = 0;

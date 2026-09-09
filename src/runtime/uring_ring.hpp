@@ -26,8 +26,10 @@ class UringRing final : public RingOps {
  public:
     struct Setup {
         unsigned sq_entries = 1024;
-        unsigned cq_entries = 0;  // 0 = 8 × sq_entries (decoupled from SQ, plan §2.3)
-        bool sqpoll = false;      // kernel-thread submission (design 02 §2.63)
+        // 0 = 8 × sq_entries (decoupled from SQ, plan §2.3)
+        unsigned cq_entries = 0;
+        // kernel-thread submission (design 02 §2.63)
+        bool sqpoll = false;
         unsigned sqpoll_idle_ms = 1000;
     };
     static Result<std::unique_ptr<UringRing>> create(unsigned entries = 1024);
@@ -62,7 +64,8 @@ class UringRing final : public RingOps {
         int fd = -1;
         bool armed = false;
         OpHandle* waiter = nullptr;
-        int32_t pending_err = 0;  // terminal error to hand to the next accept
+        // terminal error to hand to the next accept
+        int32_t pending_err = 0;
         std::deque<int> queued;
     };
 
@@ -70,7 +73,8 @@ class UringRing final : public RingOps {
     io_uring_sqe* get_sqe();
     void arm_wake();
     void arm_multishot(int fd, AcceptStream& s);
-    void purge_stream(int fd);  // close queued fds, drop the stream
+    // close queued fds, drop the stream
+    void purge_stream(int fd);
     // Flushes queued SQEs; a negative return leaves them in the SQ ring for the next
     // attempt (counted + throttled-logged, plan doc 10 §1.4).
     int submit_all();
@@ -83,8 +87,10 @@ class UringRing final : public RingOps {
 
     io_uring ring_{};
     bool ring_init_ = false;
-    bool enabled_ = false;       // bind_submitter() ran (or the ring never was disabled)
-    bool needs_enable_ = false;  // created with IORING_SETUP_R_DISABLED
+    // bind_submitter() ran (or the ring never was disabled)
+    bool enabled_ = false;
+    // created with IORING_SETUP_R_DISABLED
+    bool needs_enable_ = false;
     unsigned setup_flags_ = 0;
     bool multishot_accept_ = false;
     int evfd_ = -1;
@@ -98,8 +104,10 @@ class UringRing final : public RingOps {
     size_t backlog_head_ = 0;
     uint64_t submit_failures_ = 0;
     std::unordered_map<int, AcceptStream> accept_streams_;
-    std::vector<int> rearm_pending_;  // streams to re-arm before the next blocking wait
-    std::vector<int> purge_pending_;  // streams to drop once the CQE batch is consumed
+    // streams to re-arm before the next blocking wait
+    std::vector<int> rearm_pending_;
+    // streams to drop once the CQE batch is consumed
+    std::vector<int> purge_pending_;
 };
 
 }  // namespace lnfs::rt

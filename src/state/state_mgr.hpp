@@ -44,21 +44,28 @@ struct OtherHash {
 };
 
 struct ClientRec {
-    uint64_t clientid = 0;  // {boot_epoch(32) | counter(32)}
-    std::string owner_id;   // EXCHANGE_ID co_ownerid (raw bytes)
-    std::string principal;  // RPC identity that registered the owner (CLID_INUSE checks)
+    // {boot_epoch(32) | counter(32)}
+    uint64_t clientid = 0;
+    // EXCHANGE_ID co_ownerid (raw bytes)
+    std::string owner_id;
+    // RPC identity that registered the owner (CLID_INUSE checks)
+    std::string principal;
     bool confirmed = false;
     Verifier verifier{};
-    uint32_t cs_sequence = 1;                // next expected CREATE_SESSION sequence
-    std::vector<std::byte> cs_cached_reply;  // CREATE_SESSION replay (op body bytes)
+    // next expected CREATE_SESSION sequence
+    uint32_t cs_sequence = 1;
+    // CREATE_SESSION replay (op body bytes)
+    std::vector<std::byte> cs_cached_reply;
     std::vector<SessionId> sessions;
-    std::atomic<int64_t> lease_expiry{0};  // coarse seconds; SEQUENCE fast path stores
+    // coarse seconds; SEQUENCE fast path stores
+    std::atomic<int64_t> lease_expiry{0};
     bool reclaim_complete = false;
     bool persisted = false;
     // Lease scanner (07 §7.4): a client past its lease enters courtesy; a courtesy client
     // is reclaimed on the first conflict or after courtesy_multiplier × lease.
     std::atomic<bool> courtesy{false};
-    std::atomic<bool> expired{false};  // reclaim chain started: its state is dead
+    // reclaim chain started: its state is dead
+    std::atomic<bool> expired{false};
     int64_t courtesy_since = 0;
     // Deadline of this client's live lease-heap entry, -1 = none. Guarded by the
     // StateMgr lease heap mutex (plan doc 10 §2.6: the scanner walks an expiry heap
@@ -66,7 +73,8 @@ struct ClientRec {
     int64_t lease_heap_deadline = -1;
     // Read delegations held (plan doc 10 §5.2); drives SEQ4_STATUS_CB_PATH_DOWN.
     std::atomic<uint32_t> delegs{0};
-    std::unordered_set<StateOther, OtherHash> states;  // owned stateids (client shard)
+    // owned stateids (client shard)
+    std::unordered_set<StateOther, OtherHash> states;
     // States per export (plan 12 A3), alongside `states`: the per-export reclaim list
     // gets a put when the first state in an export is minted and an erase when the
     // last one goes.  Client shard.
@@ -78,10 +86,12 @@ struct ClientRec {
 };
 
 struct Slot {
-    uint32_t seqid = 0;  // last executed sequence on this slot (0 = none yet)
+    // last executed sequence on this slot (0 = none yet)
+    uint32_t seqid = 0;
     bool in_flight = false;
     bool cached = false;
-    std::vector<std::byte> reply;  // full RPC reply payload for replay
+    // full RPC reply payload for replay
+    std::vector<std::byte> reply;
     // Retransmission-of-in-flight waiters park here (plan doc 10 §2.6): completing one
     // slot no longer wakes every waiter of the whole session shard.
     rt::AsyncCondVar cv;
@@ -94,7 +104,8 @@ struct SessionRec {
     // Fixed at creation; Slot owns a condvar and never moves.
     std::unique_ptr<Slot[]> slots;
     uint32_t slot_count = 0;
-    std::unordered_set<uint64_t> bound_conns;  // CREATE/BIND/SEQUENCE bind; DESTROY checks
+    // CREATE/BIND/SEQUENCE bind; DESTROY checks
+    std::unordered_set<uint64_t> bound_conns;
 
     // Backchannel send side (plan doc 10 §5.2): one cb slot (the back channel is
     // clamped to 1 request), bound at CREATE_SESSION (CONN_BACK_CHAN flag) or
@@ -116,26 +127,32 @@ enum class StateType : uint8_t { kOpen = 1, kLock = 2, kDeleg = 3 };
 // share_access / share_deny bit values (RFC 8881 §18.16).
 inline constexpr uint32_t kShareRead = 1, kShareWrite = 2, kShareBoth = 3;
 
-struct StateRec {  // other = {boot_epoch(4B)|type(1B)|counter(7B)}
+// other = {boot_epoch(4B)|type(1B)|counter(7B)}
+struct StateRec {
     StateOther other{};
     StateType type = StateType::kOpen;
     // seqid/access/deny are mutated under the file shard (merge / downgrade) and read
     // on the IO path without it: relaxed atomics keep those reads well-defined.
-    std::atomic<uint32_t> seqid{1};  // stateid version: bumped by OPEN merge / DOWNGRADE
+    // stateid version: bumped by OPEN merge / DOWNGRADE
+    std::atomic<uint32_t> seqid{1};
     std::shared_ptr<ClientRec> client;
     uint32_t fsid = 0;
     backend::ObjId oid{};
     // kOpen:
-    std::string owner;  // open_owner4.owner / lock_owner4.owner bytes
+    // open_owner4.owner / lock_owner4.owner bytes
+    std::string owner;
     std::atomic<uint32_t> access{0}, deny{0};
     // kLock:
-    backend::LockOwnerId lowner{};          // {clientid(8) | fnv64(owner)(8) | len(4)}
-    std::shared_ptr<StateRec> parent_open;  // the open stateid the lock derives from
+    // {clientid(8) | fnv64(owner)(8) | len(4)}
+    backend::LockOwnerId lowner{};
+    // the open stateid the lock derives from
+    std::shared_ptr<StateRec> parent_open;
     // Backend open handle: written only under the state shard lock (creation before
     // publication, taken out by unlink) and copied under it for the IO path; the
     // handle itself is released outside every lock.
     backend::OpenPtr bopen;
-    bool closed = false;  // set under the state shard when removed from the index
+    // set under the state shard when removed from the index
+    bool closed = false;
     // kDeleg (plan doc 10 §5.2): the filehandle for CB_RECALL, the recall state and
     // the revocation deadline (coarse seconds; 0 = not recalled).
     std::vector<std::byte> fh;
@@ -144,10 +161,13 @@ struct StateRec {  // other = {boot_epoch(4B)|type(1B)|counter(7B)}
 };
 using StateRef = std::shared_ptr<StateRec>;
 
-struct FileStateRec {  // conflict arbitration entry: share reservations + lock owners
+// conflict arbitration entry: share reservations + lock owners
+struct FileStateRec {
     std::vector<StateRef> opens;
-    std::vector<StateRef> locks;   // one lock stateid per (lock-owner, file)
-    std::vector<StateRef> delegs;  // read delegations (plan doc 10 §5.2)
+    // one lock stateid per (lock-owner, file)
+    std::vector<StateRef> locks;
+    // read delegations (plan doc 10 §5.2)
+    std::vector<StateRef> delegs;
 };
 
 // Compatibility view for callers that only need the identity of an open state.
@@ -168,7 +188,8 @@ class StateMgr {
         // Grace window after restart (plan doc 10 §4.4): 0 = lease_seconds. Decoupled so
         // operators can shorten recovery (grace < lease) without touching the lease.
         uint32_t grace_seconds = 0;
-        uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
+        // courtesy window = multiplier × lease
+        uint32_t courtesy_multiplier = 24;
         uint32_t max_slots = 32;
         uint32_t max_cached_reply = 8u << 10;
         uint32_t max_ops = 64;
@@ -176,8 +197,10 @@ class StateMgr {
         // Resource caps (plan doc 10 §1.5): a runaway client gets NFS4ERR_RESOURCE
         // instead of growing server state without bound.  0 = unlimited.
         uint32_t max_clients = 4096;
-        uint32_t max_states_per_client = 65536;       // open + lock stateids per client
-        uint32_t max_lock_segments_per_owner = 1024;  // per (lock-owner, file)
+        // open + lock stateids per client
+        uint32_t max_states_per_client = 65536;
+        // per (lock-owner, file)
+        uint32_t max_lock_segments_per_owner = 1024;
         // Shard count for the client/session/state/file tables (plan doc 10 §2.6: was a
         // hardcoded 16).  [server] state_shards.
         uint32_t shards = 16;
@@ -225,17 +248,24 @@ class StateMgr {
     // export over, from that export's list, and gates only that export — the others
     // keep serving.  Every window ends on its deadline or when all its listed clients
     // sent RECLAIM_COMPLETE.
-    void load_grace_list();               // arms window 0 from the global list
-    void load_grace_list(uint32_t fsid);  // arms the export's window from its list
+    // arms window 0 from the global list
+    void load_grace_list();
+    // arms the export's window from its list
+    void load_grace_list(uint32_t fsid);
     // Operator override (`lightnfs-ctl grace-end`, plan doc 10 §4.2): ends grace
     // immediately — every window for 0, one export's window otherwise.  Clients that
     // had not reclaimed yet lose their claim window.  Returns whether grace was active.
     bool end_grace(uint32_t fsid = 0);
-    bool in_grace() const;                                                // any window live
-    bool in_grace(uint32_t fsid) const;                                   // window 0 or the export's own
-    bool in_stable_list(std::string_view owner_id) const;                 // the global list
-    bool in_stable_list(uint32_t fsid, std::string_view owner_id) const;  // global or export
-    int64_t grace_remaining_seconds() const;                              // the longest live window
+    // any window live
+    bool in_grace() const;
+    // window 0 or the export's own
+    bool in_grace(uint32_t fsid) const;
+    // the global list
+    bool in_stable_list(std::string_view owner_id) const;
+    // global or export
+    bool in_stable_list(uint32_t fsid, std::string_view owner_id) const;
+    // the longest live window
+    int64_t grace_remaining_seconds() const;
     int64_t grace_remaining_seconds(uint32_t fsid) const;
     // This gateway stops owning an export (design 10 §10.7/§10.8, plan 12 A3): every
     // open / lock / delegation in it is dropped — no reclaim-list change (the new owner
@@ -247,10 +277,12 @@ class StateMgr {
 
     // ---- EXCHANGE_ID ----
     struct ExchangeResult {
-        uint32_t status = 0;  // nfsstat4
+        // nfsstat4
+        uint32_t status = 0;
         uint64_t clientid = 0;
         uint32_t sequenceid = 1;
-        bool confirmed_r = false;  // reply flag EXCHGID4_FLAG_CONFIRMED_R
+        // reply flag EXCHGID4_FLAG_CONFIRMED_R
+        bool confirmed_r = false;
     };
     // Full RFC 8881 §18.35 record semantics: confirmed/unconfirmed per owner, principal
     // collisions, client-reboot detection, and the UPD_CONFIRMED_REC_A update path.
@@ -260,7 +292,8 @@ class StateMgr {
     struct CreateSessionResult {
         uint32_t status = 0;
         bool replay = false;
-        std::vector<std::byte> cached;  // replay: previously encoded op body
+        // replay: previously encoded op body
+        std::vector<std::byte> cached;
         SessionId sessionid{};
         nfsv4::ChannelAttrs fore, back;
         uint32_t sequence = 0;
@@ -285,13 +318,16 @@ class StateMgr {
 
     // ---- SEQUENCE ----
     struct SeqResult {
-        uint32_t status = 0;  // 0: proceed (owner) or replay
+        // 0: proceed (owner) or replay
+        uint32_t status = 0;
         bool replay = false;
-        std::vector<std::byte> replay_bytes;  // full RPC reply payload
+        // full RPC reply payload
+        std::vector<std::byte> replay_bytes;
         // negotiated context for the executing compound:
         uint32_t max_ops = 0, max_request = 0, max_response = 0, max_response_cached = 0;
         uint32_t highest_slot = 0;
-        uint32_t status_flags = 0;  // sr_status_flags: SEQ4_STATUS_CB_PATH_DOWN etc.
+        // sr_status_flags: SEQ4_STATUS_CB_PATH_DOWN etc.
+        uint32_t status_flags = 0;
     };
     rt::Task<SeqResult> sequence_begin(const SessionId& id, uint32_t slotid, uint32_t seqid, uint32_t highest,
                                        bool cachethis, uint64_t conn_id);
@@ -310,15 +346,18 @@ class StateMgr {
         backend::ObjId oid{};
         std::string owner;
         uint32_t access = 0, deny = 0;
-        bool reclaim = false;  // CLAIM_PREVIOUS: stable-list gated, allowed during grace
+        // CLAIM_PREVIOUS: stable-list gated, allowed during grace
+        bool reclaim = false;
         // CLAIM_DELEG_CUR_FH (plan doc 10 §5.2): the open reclaims state under a
         // delegation being recalled — it must not itself trigger the recall gate.
         bool deleg_claim = false;
     };
     struct OpenResult {
-        uint32_t status = 0;  // OK / SHARE_DENIED / GRACE / NO_GRACE / RECLAIM_BAD / ...
+        // OK / SHARE_DENIED / GRACE / NO_GRACE / RECLAIM_BAD / ...
+        uint32_t status = 0;
         Stateid stateid{};
-        bool merged = false;  // existing same-owner state widened instead of a new record
+        // existing same-owner state widened instead of a new record
+        bool merged = false;
     };
     // Share-reservation arbitration against every other open on the file (courtesy
     // conflicts are reclaimed first, then re-arbitrated); same owner+file merges into the
@@ -356,26 +395,31 @@ class StateMgr {
     // IO-path stateid check (07 §6.1 order: special → table → OPENMODE).  `need` is the
     // share_access bit the op requires (kShareRead / kShareWrite).
     struct IoCheck {
-        uint32_t status = 0;  // OK / BAD_STATEID / STALE_STATEID / OLD_STATEID / OPENMODE /
-                              // LOCKED (anonymous stateid vs. deny) / GRACE
+        // OK / BAD_STATEID / STALE_STATEID / OLD_STATEID / OPENMODE /
+        // LOCKED (anonymous stateid vs. deny) / GRACE
+        uint32_t status = 0;
         bool special = false;
         StateRef rec;
-        backend::OpenPtr bopen;  // the open's backend handle (may be null); keeps it alive
+        // the open's backend handle (may be null); keeps it alive
+        backend::OpenPtr bopen;
     };
     rt::Task<IoCheck> check_io(const Stateid& sid, uint64_t clientid, uint32_t fsid, const backend::ObjId& oid,
                                uint32_t need);
 
     struct StateLookup {
-        uint32_t status = 0;  // OK / BAD_STATEID / STALE_STATEID
+        // OK / BAD_STATEID / STALE_STATEID
+        uint32_t status = 0;
         bool special = false;
-        OpenRec rec{};  // valid when status==0 && !special
+        // valid when status==0 && !special
+        OpenRec rec{};
     };
     rt::Task<StateLookup> lookup_stateid(const Stateid& sid);
 
     // CLOSE: seqid discipline (0 = current, older → OLD_STATEID, ahead → BAD_STATEID).
     // Returns the post-close stateid in `out`.
     rt::Task<uint32_t> close_state(const Stateid& sid, uint64_t clientid, Stateid* out);
-    rt::Task<uint32_t> close_state(const Stateid& sid);  // legacy: any owner, any seqid
+    // legacy: any owner, any seqid
+    rt::Task<uint32_t> close_state(const Stateid& sid);
     rt::Task<uint32_t> open_downgrade(const Stateid& sid, uint64_t clientid, uint32_t access, uint32_t deny,
                                       Stateid* out);
     rt::Task<uint32_t> free_stateid(const Stateid& sid);
@@ -385,7 +429,8 @@ class StateMgr {
         uint64_t offset = 0, length = 0;
         bool exclusive = false;
         uint64_t clientid = 0;
-        std::string owner;  // lock_owner4.owner of the conflicting holder
+        // lock_owner4.owner of the conflicting holder
+        std::string owner;
     };
     struct LockArgs {
         uint64_t clientid = 0;
@@ -393,16 +438,23 @@ class StateMgr {
         backend::ObjId oid{};
         bool exclusive = false;
         bool reclaim = false;
-        uint64_t offset = 0, length = 0;  // length UINT64_MAX = to EOF (validated by caller)
+        // length UINT64_MAX = to EOF (validated by caller)
+        uint64_t offset = 0, length = 0;
         bool new_owner = false;
-        Stateid open_stateid{};  // new_owner: the open the lock derives from
-        std::string owner;       // new_owner: lock_owner4.owner
-        Stateid lock_stateid{};  // !new_owner: existing lock stateid
+        // new_owner: the open the lock derives from
+        Stateid open_stateid{};
+        // new_owner: lock_owner4.owner
+        std::string owner;
+        // !new_owner: existing lock stateid
+        Stateid lock_stateid{};
     };
     struct LockResult {
-        uint32_t status = 0;  // OK / DENIED / BAD_STATEID / OLD_STATEID / OPENMODE / GRACE ...
-        Stateid stateid{};    // OK: the (new or bumped) lock stateid
-        LockDenied denied{};  // status == DENIED
+        // OK / DENIED / BAD_STATEID / OLD_STATEID / OPENMODE / GRACE ...
+        uint32_t status = 0;
+        // OK: the (new or bumped) lock stateid
+        Stateid stateid{};
+        // status == DENIED
+        LockDenied denied{};
     };
     rt::Task<LockResult> lock(LockArgs args);
     rt::Task<LockResult> lockt(uint64_t clientid, uint32_t fsid, const backend::ObjId& oid, std::string owner,
@@ -421,7 +473,8 @@ class StateMgr {
     struct Stats {
         size_t clients = 0, sessions = 0, opens = 0, files = 0, courtesy = 0;
         uint64_t seq_new = 0, seq_replay = 0, seq_misordered = 0, seq_waits = 0;
-        uint64_t lease_expirations = 0;  // clients that entered courtesy
+        // clients that entered courtesy
+        uint64_t lease_expirations = 0;
         uint64_t reclaim_conflict = 0, reclaim_timeout = 0, reclaim_forced = 0;
         uint64_t share_denied = 0, open_merges = 0;
         size_t lock_states = 0, lock_segments = 0, lock_owners = 0;
@@ -474,7 +527,8 @@ class StateMgr {
         std::unordered_map<FileKey, FileStateRec, FileKeyHash> table;
     };
 
-    ClientShard& owner_shard(std::string_view owner_id);  // clients live in the owner shard
+    // clients live in the owner shard
+    ClientShard& owner_shard(std::string_view owner_id);
     SessionShard& session_shard(const SessionId& id);
     StateShard& state_shard(const StateOther& other);
     FileShard& file_shard(const FileKey& key);
@@ -487,9 +541,11 @@ class StateMgr {
     // Per-export list entries (plan 12 A3).
     void persist_fs_client(uint32_t fsid, std::string_view owner_id);
     void unpersist_fs_client(uint32_t fsid, std::string_view owner_id);
-    std::vector<std::string> load_local_clients(uint32_t fsid) const;  // no hooks
+    // no hooks
+    std::vector<std::string> load_local_clients(uint32_t fsid) const;
     std::string local_clients_dir(uint32_t fsid) const;
-    void note_reclaimed(std::string_view owner_id);  // grace early-exit bookkeeping
+    // grace early-exit bookkeeping
+    void note_reclaimed(std::string_view owner_id);
     // Registers / drops a state in the client's tables (client shard held).  Returns
     // whether that was the client's first / last state in the export.
     static bool track_state_locked(ClientRec& client, const StateRec& rec);
@@ -531,8 +587,10 @@ class StateMgr {
     Config cfg_;
     GatewayLockMgr locks_;
     std::mutex lock_owner_mu_;
-    std::unordered_map<std::string, LockOwnerRec> lock_owners_;  // key: 24 id bytes
-    size_t shard_count_;                                         // cfg_.shards, clamped >= 1
+    // key: 24 id bytes
+    std::unordered_map<std::string, LockOwnerRec> lock_owners_;
+    // cfg_.shards, clamped >= 1
+    size_t shard_count_;
     std::unique_ptr<ClientShard[]> clients_;
     std::unique_ptr<SessionShard[]> sessions_;
     std::unique_ptr<StateShard[]> states_;
@@ -553,8 +611,10 @@ class StateMgr {
     // expired lazily by the readers; grace_any_ is the lock-free "nothing live" fast
     // path the IO gates take.
     struct GraceWindow {
-        std::unordered_set<std::string> pending;  // owner ids still expected to reclaim
-        std::unordered_set<std::string> listed;   // the stable list the window was armed from
+        // owner ids still expected to reclaim
+        std::unordered_set<std::string> pending;
+        // the stable list the window was armed from
+        std::unordered_set<std::string> listed;
         std::chrono::steady_clock::time_point deadline{};
         bool active = false;
     };
@@ -562,7 +622,8 @@ class StateMgr {
     mutable std::unordered_map<uint32_t, GraceWindow> grace_;
     mutable std::atomic<bool> grace_any_{false};
     void arm_grace(uint32_t fsid, std::vector<std::string> owners);
-    bool window_live(uint32_t fsid, GraceWindow& window) const;  // grace_mu_ held
+    // grace_mu_ held
+    bool window_live(uint32_t fsid, GraceWindow& window) const;
 
     mutable std::atomic<uint64_t> seq_new_{0}, seq_replay_{0}, seq_misordered_{0}, seq_waits_{0};
     std::atomic<int64_t> client_count_{0}, session_count_{0}, open_count_{0}, file_count_{0}, courtesy_count_{0};
@@ -586,7 +647,8 @@ class StateMgr {
     rt::Task<void> notify_task(uint64_t clientid, std::string owner, std::vector<std::byte> fh);
 
     std::mutex recall_mu_;
-    std::vector<StateRef> recall_watch_;  // recalled delegations awaiting return/revoke
+    // recalled delegations awaiting return/revoke
+    std::vector<StateRef> recall_watch_;
 
     struct LockWaiter {
         uint64_t clientid = 0;

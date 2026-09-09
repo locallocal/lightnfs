@@ -29,13 +29,15 @@ struct Fixture {
 
     Fixture() {
         disp.add({kTestProg, 2, 3, nullptr, [](void*, ConnCtx& c, RpcCall& call, const Cred& cred) -> Task<void> {
-                      if (call.proc == 0) {  // NULL
+                      // NULL
+                      if (call.proc == 0) {
                           xdr::XdrEnc enc(c.pool);
                           encode_reply_success(enc, call.xid);
                           co_await c.send(enc.take());
                           co_return;
                       }
-                      if (call.proc == 1) {  // echo an opaque + report uid
+                      // echo an opaque + report uid
+                      if (call.proc == 1) {
                           auto arg = call.args.opaque(1024);
                           if (!arg) {
                               co_await Dispatcher::reply_garbage_args(c, call.xid);
@@ -91,7 +93,8 @@ BufferChain make_call(BufferPool& pool, uint32_t xid, uint32_t prog, uint32_t ve
     enc.u32(proc);
     enc.u32(cred_flavor);
     enc.opaque(cred_body);
-    enc.u32(0);  // verf AUTH_NONE
+    // verf AUTH_NONE
+    enc.u32(0);
     enc.u32(0);
     if (!args.empty()) enc.opaque_fixed(args);
     return enc.take();
@@ -100,7 +103,8 @@ BufferChain make_call(BufferPool& pool, uint32_t xid, uint32_t prog, uint32_t ve
 std::vector<std::byte> auth_sys_body(BufferPool& pool, uint32_t uid, uint32_t gid,
                                      std::initializer_list<uint32_t> gids) {
     xdr::XdrEnc enc(pool);
-    enc.u32(1);  // stamp
+    // stamp
+    enc.u32(1);
     enc.string("testhost");
     enc.u32(uid);
     enc.u32(gid);
@@ -110,7 +114,8 @@ std::vector<std::byte> auth_sys_body(BufferPool& pool, uint32_t uid, uint32_t gi
 }
 
 struct Reply {
-    std::vector<std::byte> bytes;  // keeps the decoder's backing store alive
+    // keeps the decoder's backing store alive
+    std::vector<std::byte> bytes;
     uint32_t xid = 0, mtype = 0, stat = 0;
     xdr::XdrDec rest{std::span<const std::byte>{}};
 };
@@ -134,8 +139,10 @@ TEST(Rpc, NullProcSuccess) {
     EXPECT_EQ(rep.xid, 0x1001u);
     EXPECT_EQ(rep.mtype, (uint32_t)kReply);
     EXPECT_EQ(rep.stat, (uint32_t)kMsgAccepted);
-    (void)rep.rest.u32();  // verf flavor
-    (void)rep.rest.u32();  // verf len
+    // verf flavor
+    (void)rep.rest.u32();
+    // verf len
+    (void)rep.rest.u32();
     EXPECT_EQ(*rep.rest.u32(), (uint32_t)kSuccess);
 }
 
@@ -150,9 +157,11 @@ TEST(Rpc, EchoWithAuthSys) {
     auto rep = parse_reply(f.take_reply());
     EXPECT_EQ(rep.stat, (uint32_t)kMsgAccepted);
     (void)rep.rest.u32();
-    (void)rep.rest.u32();  // verf
+    // verf
+    (void)rep.rest.u32();
     EXPECT_EQ(*rep.rest.u32(), (uint32_t)kSuccess);
-    EXPECT_EQ(*rep.rest.u32(), 1000u);  // uid seen by handler
+    // uid seen by handler
+    EXPECT_EQ(*rep.rest.u32(), 1000u);
     auto echoed = *rep.rest.opaque(64);
     EXPECT_STREQ(std::string((const char*)echoed.data(), echoed.size()), "ping");
 }
@@ -163,8 +172,10 @@ TEST(Rpc, RpcVersionMismatch) {
     auto rep = parse_reply(f.take_reply());
     EXPECT_EQ(rep.stat, (uint32_t)kMsgDenied);
     EXPECT_EQ(*rep.rest.u32(), (uint32_t)kRpcMismatch);
-    EXPECT_EQ(*rep.rest.u32(), 2u);  // low
-    EXPECT_EQ(*rep.rest.u32(), 2u);  // high
+    // low
+    EXPECT_EQ(*rep.rest.u32(), 2u);
+    // high
+    EXPECT_EQ(*rep.rest.u32(), 2u);
 }
 
 TEST(Rpc, ProgUnavail) {
@@ -173,16 +184,19 @@ TEST(Rpc, ProgUnavail) {
     auto rep = parse_reply(f.take_reply());
     EXPECT_EQ(rep.stat, (uint32_t)kMsgAccepted);
     (void)rep.rest.u32();
-    (void)rep.rest.u32();  // verf
+    // verf
+    (void)rep.rest.u32();
     EXPECT_EQ(*rep.rest.u32(), (uint32_t)kProgUnavail);
 }
 
 TEST(Rpc, ProgMismatchReportsRange) {
     Fixture f;
-    f.dispatch(make_call(f.pool, 10, kTestProg, 7, 0));  // vers 7 not in [2,3]
+    // vers 7 not in [2,3]
+    f.dispatch(make_call(f.pool, 10, kTestProg, 7, 0));
     auto rep = parse_reply(f.take_reply());
     (void)rep.rest.u32();
-    (void)rep.rest.u32();  // verf
+    // verf
+    (void)rep.rest.u32();
     EXPECT_EQ(*rep.rest.u32(), (uint32_t)kProgMismatch);
     EXPECT_EQ(*rep.rest.u32(), 2u);
     EXPECT_EQ(*rep.rest.u32(), 3u);
@@ -213,7 +227,8 @@ TEST(Rpc, GarbageArgs) {
     f.dispatch(make_call(f.pool, 13, kTestProg, 2, 1));
     auto rep = parse_reply(f.take_reply());
     (void)rep.rest.u32();
-    (void)rep.rest.u32();  // verf
+    // verf
+    (void)rep.rest.u32();
     EXPECT_EQ(*rep.rest.u32(), (uint32_t)kGarbageArgs);
 }
 
@@ -222,7 +237,8 @@ TEST(Rpc, HandlerExceptionBecomesSystemErr) {
     f.dispatch(make_call(f.pool, 14, kTestProg, 2, 99));
     auto rep = parse_reply(f.take_reply());
     (void)rep.rest.u32();
-    (void)rep.rest.u32();  // verf
+    // verf
+    (void)rep.rest.u32();
     EXPECT_EQ(*rep.rest.u32(), (uint32_t)kSystemErr);
 }
 
@@ -233,7 +249,8 @@ TEST(Rpc, UnparseableRecordDropped) {
     std::memcpy(b.data(), "ab", 2);
     junk.append(b, 0, 2);
     f.dispatch(std::move(junk));
-    EXPECT_FALSE(f.ring.has_pending(FakeRing::Kind::kSendv));  // no reply at all
+    // no reply at all
+    EXPECT_FALSE(f.ring.has_pending(FakeRing::Kind::kSendv));
 }
 
 TEST(Rpc, ReplyRecordIsWellFormedOnWire) {
@@ -251,6 +268,8 @@ TEST(Rpc, ReplyRecordIsWellFormedOnWire) {
     uint32_t hdr;
     std::memcpy(&hdr, out.data(), 4);
     hdr = xdr::from_be32(hdr);
-    EXPECT_TRUE(hdr & 0x80000000u);                // last fragment
-    EXPECT_EQ(hdr & 0x7fffffffu, out.size() - 4);  // length matches
+    // last fragment
+    EXPECT_TRUE(hdr & 0x80000000u);
+    // length matches
+    EXPECT_EQ(hdr & 0x7fffffffu, out.size() - 4);
 }

@@ -35,7 +35,8 @@
 struct ceph_mount_info;
 struct ceph_dir_result;
 struct Inode;
-class Fh;  // libcephfs.h declares it `class Fh` under C++
+// libcephfs.h declares it `class Fh` under C++
+class Fh;
 struct UserPerm;
 
 #ifndef CEPH_CEPH_LL_CLIENT_H
@@ -56,13 +57,15 @@ struct ceph_statx {
     uint64_t stx_ino;
     uint64_t stx_size;
     uint64_t stx_blocks;
-    dev_t stx_dev;  // libcephfs fills this with the inode's snapid (Ganesha relies on it)
+    // libcephfs fills this with the inode's snapid (Ganesha relies on it)
+    dev_t stx_dev;
     dev_t stx_rdev;
     struct timespec stx_atime;
     struct timespec stx_ctime;
     struct timespec stx_mtime;
     struct timespec stx_btime;
-    uint64_t stx_version;  // the MDS change attribute → Attr::change (kNativeChange)
+    // the MDS change attribute → Attr::change (kNativeChange)
+    uint64_t stx_version;
 };
 #endif
 

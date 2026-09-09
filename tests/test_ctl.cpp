@@ -192,7 +192,8 @@ TEST(Ctl, OpsConfigKeys) {
     EXPECT_EQ(parsed->server.log_rotate_size, 10u << 20);
     EXPECT_EQ(parsed->server.log_rotate_keep, 3u);
     EXPECT_EQ(parsed->server.lease_seconds, 90u);
-    EXPECT_EQ(parsed->server.grace_seconds, 30u);  // decoupled from the lease
+    // decoupled from the lease
+    EXPECT_EQ(parsed->server.grace_seconds, 30u);
     EXPECT_EQ(parsed->server.client_read_bps, 10u << 20);
     EXPECT_EQ(parsed->server.client_write_bps, 5u << 20);
     EXPECT_EQ(parsed->server.client_iops, 500u);
@@ -234,7 +235,8 @@ TEST(Ctl, ClusterConfigKeys) {
     EXPECT_STREQ(defaults->cluster.takeover, "auto");
     EXPECT_EQ(defaults->cluster.fence_lease_ms, 3000u);
     EXPECT_FALSE(defaults->cluster.unsafe_skip_backend_checks);
-    EXPECT_FALSE(core::cluster_node_name(defaults->cluster).empty());  // hostname default
+    // hostname default
+    EXPECT_FALSE(core::cluster_node_name(defaults->cluster).empty());
     EXPECT_TRUE(core::validate_config(*defaults).has_value());
 
     const std::string cluster =
@@ -251,7 +253,8 @@ TEST(Ctl, ClusterConfigKeys) {
     ASSERT_TRUE(parsed.has_value());
     EXPECT_TRUE(parsed->cluster.enabled);
     EXPECT_STREQ(parsed->cluster.id, "3f9c1e2a-6b7d-4c5e-9f10-2a3b4c5d6e7f");
-    EXPECT_STREQ(parsed->cluster.shared_dir, "/mnt/cephfs/.lightnfs-cluster");  // normalized
+    // normalized
+    EXPECT_STREQ(parsed->cluster.shared_dir, "/mnt/cephfs/.lightnfs-cluster");
     EXPECT_STREQ(parsed->cluster.node, "gw1");
     EXPECT_STREQ(core::cluster_node_name(parsed->cluster), "gw1");
     EXPECT_STREQ(parsed->cluster.role, "standby");
@@ -312,7 +315,8 @@ TEST(Ctl, ClusterConfigKeys) {
     int fd = ::mkstemp(tmpl);
     ASSERT_TRUE(fd >= 0);
     ::close(fd);
-    EXPECT_TRUE(rejects(base + "takeover_hook = \"" + tmpl + "\"\n"));  // not executable
+    // not executable
+    EXPECT_TRUE(rejects(base + "takeover_hook = \"" + tmpl + "\"\n"));
     ::chmod(tmpl, 0700);
     EXPECT_FALSE(rejects(base + "takeover_hook = \"" + tmpl + "\"\n"));
     ::unlink(tmpl);
@@ -374,15 +378,24 @@ TEST(Ctl, ActiveActiveConfigKeys) {
     // Enabled: each active-active rule rejects on its own.
     const std::string a_nodes = exp_a + "nodes = [\"gw1\", \"gw2\"]\n";
     EXPECT_TRUE(parse_ok(aa + a_nodes));
-    EXPECT_TRUE(rejects(base + "mode = \"multi\"\n" + a_nodes));          // unknown mode
-    EXPECT_TRUE(rejects(base + "mode = \"active-active\"\n" + a_nodes));  // no node_address
-    EXPECT_TRUE(rejects(aa + exp_a));                                     // nodes missing
-    EXPECT_TRUE(rejects(aa + exp_a + "nodes = []\n"));                    // nodes empty
-    EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"gw1\", \"gw1\"]\n"));    // duplicate
-    EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"gw 1\"]\n"));            // bad name
-    EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"a/b\"]\n"));             // bad name
-    EXPECT_TRUE(rejects(aa + a_nodes + exp_b));                           // one export lacks nodes
-    EXPECT_TRUE(rejects(aa + "role = \"active\"\n" + a_nodes));           // role must be auto
+    // unknown mode
+    EXPECT_TRUE(rejects(base + "mode = \"multi\"\n" + a_nodes));
+    // no node_address
+    EXPECT_TRUE(rejects(base + "mode = \"active-active\"\n" + a_nodes));
+    // nodes missing
+    EXPECT_TRUE(rejects(aa + exp_a));
+    // nodes empty
+    EXPECT_TRUE(rejects(aa + exp_a + "nodes = []\n"));
+    // duplicate
+    EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"gw1\", \"gw1\"]\n"));
+    // bad name
+    EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"gw 1\"]\n"));
+    // bad name
+    EXPECT_TRUE(rejects(aa + exp_a + "nodes = [\"a/b\"]\n"));
+    // one export lacks nodes
+    EXPECT_TRUE(rejects(aa + a_nodes + exp_b));
+    // role must be auto
+    EXPECT_TRUE(rejects(aa + "role = \"active\"\n" + a_nodes));
     EXPECT_TRUE(rejects(aa + "role = \"standby\"\n" + a_nodes));
     EXPECT_TRUE(parse_ok(aa + "role = \"auto\"\ntakeover = \"manual\"\n" + a_nodes));
     // node_address forms.
@@ -391,13 +404,18 @@ TEST(Ctl, ActiveActiveConfigKeys) {
     };
     EXPECT_TRUE(parse_ok(with_addr("gw1.example.net:2049")));
     EXPECT_TRUE(parse_ok(with_addr("[fd00::11]:2049")));
-    EXPECT_TRUE(rejects(with_addr("10.0.0.11")));    // no port
-    EXPECT_TRUE(rejects(with_addr("10.0.0.11:")));   // empty port
-    EXPECT_TRUE(rejects(with_addr(":2049")));        // empty host
-    EXPECT_TRUE(rejects(with_addr("10.0.0.11:0")));  // port range
+    // no port
+    EXPECT_TRUE(rejects(with_addr("10.0.0.11")));
+    // empty port
+    EXPECT_TRUE(rejects(with_addr("10.0.0.11:")));
+    // empty host
+    EXPECT_TRUE(rejects(with_addr(":2049")));
+    // port range
+    EXPECT_TRUE(rejects(with_addr("10.0.0.11:0")));
     EXPECT_TRUE(rejects(with_addr("10.0.0.11:70000")));
     EXPECT_TRUE(rejects(with_addr("10.0.0.11:20a9")));
-    EXPECT_TRUE(rejects(with_addr("fd00::11:2049")));  // unbracketed v6
+    // unbracketed v6
+    EXPECT_TRUE(rejects(with_addr("fd00::11:2049")));
     EXPECT_TRUE(core::valid_node_address("[::1]:1") && !core::valid_node_address("[::1]:"));
 
     // Gluster / Lustre isolation (design 10 §10.6): exports on one volume / mount must
@@ -424,7 +442,8 @@ TEST(Ctl, ActiveActiveConfigKeys) {
     ASSERT_TRUE(lustre_bad.has_value());
     auto lustre_two = core::parse_config(aa + lustre("/mnt/l", "1", same) + lustre("/mnt/m", "2", diff));
     ASSERT_TRUE(lustre_two.has_value());
-    if (backend::find_backend("gluster")) {  // built with the Gluster backend
+    // built with the Gluster backend
+    if (backend::find_backend("gluster")) {
         EXPECT_TRUE(core::validate_config(*gluster_ok).has_value());
         EXPECT_FALSE(core::validate_config(*gluster_bad).has_value());
         EXPECT_TRUE(core::validate_config(*gluster_two).has_value());
@@ -466,7 +485,8 @@ TEST(Ctl, ActiveActiveConfigKeys) {
     fresh.exports[0].nodes = {"gw2", "gw1"};
     EXPECT_TRUE(table.reload_dynamic(fresh).find("export fsid=1: nodes changed, restart required") !=
                 std::string::npos);
-    EXPECT_STREQ(table.by_fsid(1)->node_list()[0], "gw1");  // never applied live
+    // never applied live
+    EXPECT_STREQ(table.by_fsid(1)->node_list()[0], "gw1");
 }
 
 TEST(Ctl, CatalogConfigKeys) {
@@ -490,7 +510,8 @@ TEST(Ctl, CatalogConfigKeys) {
     EXPECT_TRUE(defaults->backend_defaults.empty());
     EXPECT_FALSE(core::cluster_catalog_exports(defaults->cluster));
     EXPECT_TRUE(core::validate_config(*defaults).has_value());
-    EXPECT_TRUE(rejects("[server]\n"));  // local mode still insists on exports
+    // local mode still insists on exports
+    EXPECT_TRUE(rejects("[server]\n"));
 
     // Catalog mode: cluster on, no local exports, an empty table is fine before the
     // first publish; the per-node defaults table is parsed and kept.
@@ -575,7 +596,8 @@ TEST(Ctl, ExportReloadDynamic) {
     fresh.exports.push_back(updated);
     auto report = table.reload_dynamic(fresh);
     EXPECT_TRUE(report.find("clients (1) and qos applied") != std::string::npos);
-    EXPECT_TRUE(table.check_client(peer, *entry));  // allowlist swapped in place
+    // allowlist swapped in place
+    EXPECT_TRUE(table.check_client(peer, *entry));
     EXPECT_EQ(table.by_fsid(1)->qos.read_bytes.rate(), 1u << 20);
     EXPECT_EQ(table.by_fsid(1)->qos.ops.rate(), 100u);
 
@@ -612,7 +634,8 @@ TEST(Ctl, AnswerCommandSurface) {
     auto lv = server::CtlServer::answer(deps, "loglevel warn");
     EXPECT_TRUE(lv.find("warn") != std::string::npos);
     EXPECT_FALSE(log_enabled(LogLevel::kInfo));
-    set_log_level(LogLevel::kInfo);  // restore for later tests
+    // restore for later tests
+    set_log_level(LogLevel::kInfo);
     EXPECT_TRUE(server::CtlServer::answer(deps, "reload").find("unavailable") != std::string::npos);
     EXPECT_STREQ(server::CtlServer::answer(deps, "drain"), "not active\n");
     EXPECT_STREQ(server::CtlServer::answer(deps, "drain --json"), "{\"error\":\"not active\"}\n");
@@ -671,9 +694,11 @@ TEST(Ctl, ConnRegistryListAndKill) {
     EXPECT_TRUE(found);
     EXPECT_TRUE(transport::ConnRegistry::instance().kill(id));
     char b;
-    EXPECT_EQ(read(sv[1], &b, 1), 0);  // SHUT_RDWR: peer sees EOF
+    // SHUT_RDWR: peer sees EOF
+    EXPECT_EQ(read(sv[1], &b, 1), 0);
     transport::ConnRegistry::instance().remove(id);
-    EXPECT_FALSE(transport::ConnRegistry::instance().kill(id));  // id gone
+    // id gone
+    EXPECT_FALSE(transport::ConnRegistry::instance().kill(id));
     close(sv[0]);
     close(sv[1]);
 }
@@ -731,7 +756,8 @@ TEST(Ctl, MetricsDumpErrorsAndConnsCommands) {
     auto killed = server::CtlServer::answer(deps, std::format("kill-conn {}", id));
     EXPECT_TRUE(killed.find("shut down") != std::string::npos);
     char b;
-    EXPECT_EQ(read(sv[1], &b, 1), 0);  // the shutdown really reached the socket
+    // the shutdown really reached the socket
+    EXPECT_EQ(read(sv[1], &b, 1), 0);
     transport::ConnRegistry::instance().remove(id);
     EXPECT_TRUE(server::CtlServer::answer(deps, std::format("kill-conn {}", id)).find("not found") !=
                 std::string::npos);
@@ -752,7 +778,8 @@ TEST(Ctl, ClusterFsCommands) {
         test::MemClusterStore store;
         (void)store.put_node_address("gw2", "10.0.0.2:2049");
         (void)store.put_node_address("gw1", "10.0.0.1:2049");
-        (void)store.renew_fences("gw2", std::chrono::seconds(60));  // gw2 is alive
+        // gw2 is alive
+        (void)store.renew_fences("gw2", std::chrono::seconds(60));
         core::ExportTable exports;
         for (uint32_t fsid = 1; fsid <= 3; ++fsid) {
             core::ExportConfig ec;
@@ -915,7 +942,8 @@ TEST(Ctl, ClusterFsCommands) {
         EXPECT_STREQ(ask("cluster takeover 2 --force --json"),
                      "{\"takeover\":true,\"fsid\":2,\"forced\":true,\"fs_epoch\":6,\"role\":\"active\"}\n");
         EXPECT_STREQ(joined_calls(calls), "activate:2");
-        EXPECT_TRUE(store.fences["gw2"].holds.size() == 1u);  // F3 only
+        // F3 only
+        EXPECT_TRUE(store.fences["gw2"].holds.size() == 1u);
         // takeover 3: not in F3's node list, but ctl --force is the operator's call; without
         // force the live fence is refused just the same.
         EXPECT_STREQ(ask("cluster takeover 3"), "cluster: fsid 3 fence held by gw2 (retry with --force to take it)\n");
@@ -924,7 +952,8 @@ TEST(Ctl, ClusterFsCommands) {
         EXPECT_STREQ(ask("cluster standby 1 --json"), "{\"standby\":true,\"fsid\":1}\n");
         EXPECT_STREQ(joined_calls(calls), "activate:2 deactivate:1");
         EXPECT_TRUE(fc.role_of(1) == server::Role::kStandby);
-        EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);  // F2 only
+        // F2 only
+        EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);
         EXPECT_STREQ(ask("cluster standby 1"), "cluster: fsid 1 not active (role=unowned)\n");
         EXPECT_STREQ(ask("cluster standby 2"), "standby requested: fsid=2 draining\n");
         EXPECT_STREQ(ask("cluster standby 3 --json"), "{\"error\":\"fsid 3 not active (role=remote)\"}\n");
@@ -1010,7 +1039,8 @@ TEST(Ctl, ClusterCommands) {
         EXPECT_TRUE(cc.role() == server::Role::kStandby);
         EXPECT_FALSE(store.fence.has_value());
         EXPECT_TRUE(ask("cluster status").find("role=standby node=gw1 epoch=0 fence_owner=gw1") !=
-                    std::string::npos);  // the last record seen was ours
+                    // the last record seen was ours
+                    std::string::npos);
         // An expired fence needs no force; JSON success carries the new epoch.
         store.taken_by("gw2", 9);
         store.age_out();

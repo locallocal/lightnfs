@@ -26,7 +26,8 @@ class Listener {
 
     uint16_t port() const { return port_; }
     ConnTracker& tracker() { return tracker_; }
-    rt::BufferPool& pool() { return pool_; }  // watermark metrics (plan doc 10 §3.5)
+    // watermark metrics (plan doc 10 §3.5)
+    rt::BufferPool& pool() { return pool_; }
 
     // Spawns the accept loops (one per reactor). They exit when request_stop() is called.
     void start();
@@ -43,7 +44,8 @@ class Listener {
 
     rt::Task<void> run_one(size_t idx);
 
-    std::vector<int> fds_;  // fds_[i] is accepted on rt_.reactor(i)
+    // fds_[i] is accepted on rt_.reactor(i)
+    std::vector<int> fds_;
     uint16_t port_;
     TransportConfig cfg_;
     rpc::Dispatcher& disp_;

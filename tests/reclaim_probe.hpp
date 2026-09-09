@@ -165,11 +165,13 @@ class ReclaimProbe {
     rt::Task<uint64_t> connect_reclaimer() {
         if (clientid_) co_return clientid_;
         nfsv4::Verifier verf{};
-        verf[0] = std::byte{0x9};  // same co_ownerid + verifier as gateway A: listed
+        // same co_ownerid + verifier as gateway A: listed
+        verf[0] = std::byte{0x9};
         auto ex = co_await b_->exchange_id("dead-gw", verf, "sys/e2/0", false);
         co_await b_->create_session(ex.clientid, ex.sequenceid, "sys/e2/0", {}, {}, 1);
         co_await b_->confirm_create_session(ex.clientid, {std::byte{1}});
-        co_return ex.clientid;  // no RECLAIM_COMPLETE: still reclaiming
+        // no RECLAIM_COMPLETE: still reclaiming
+        co_return ex.clientid;
     }
 
     rt::Runtime& runtime_;

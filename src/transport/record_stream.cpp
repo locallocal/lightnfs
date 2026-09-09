@@ -13,12 +13,14 @@ Task<Result<void>> RecordStream::fill() {
         try {
             rbuf_ = pool_.alloc(BufferPool::kMedium);
         } catch (const std::bad_alloc&) {
-            co_return Err(errno_from(ENOMEM));  // OOM degrades to a connection error (§2.4)
+            // OOM degrades to a connection error (§2.4)
+            co_return Err(errno_from(ENOMEM));
         }
         roff_ = rend_ = 0;
     }
     std::span<std::byte> dst(rbuf_.data() + rend_, rbuf_.capacity() - rend_);
-    if (tls_) {  // RFC 9289: plaintext comes out of the TLS session
+    // RFC 9289: plaintext comes out of the TLS session
+    if (tls_) {
         auto r = co_await tls_->read(fd_, dst);
         if (!r) co_return Err(r.error());
         rend_ += *r;
@@ -69,7 +71,8 @@ Task<Result<rt::BufferChain>> RecordStream::read_record() {
                 if (!r) co_return Err(r.error() == Errno::kEof ? errno_from(EBADMSG) : r.error());
             }
             uint32_t k = std::min(need, rend_ - roff_);
-            rec.append(rbuf_, roff_, k);  // zero-copy slice; refcount keeps rbuf_ alive
+            // zero-copy slice; refcount keeps rbuf_ alive
+            rec.append(rbuf_, roff_, k);
             roff_ += k;
             need -= k;
         }
@@ -81,11 +84,13 @@ Task<Result<rt::BufferChain>> RecordStream::read_record() {
 Task<Result<void>> RecordStream::write_record(SendBuf buf) {
     const size_t total = buf.size();
     send_queued_ += total;
-    auto lk = co_await wmu_.lock();  // per-conn reply serialization (design 03 §3.2)
+    // per-conn reply serialization (design 03 §3.2)
+    auto lk = co_await wmu_.lock();
 
     // 4-byte record mark (single fragment; RPC replies are bounded by reply-size budgets).
     uint32_t marker = xdr::to_be32(0x80000000u | static_cast<uint32_t>(total));
-    if (tls_) {  // RFC 9289: marker + body become TLS application data (SSL_write frames it)
+    // RFC 9289: marker + body become TLS application data (SSL_write frames it)
+    if (tls_) {
         std::byte mk[4];
         std::memcpy(mk, &marker, 4);
         Result<void> w = co_await tls_->write(fd_, std::span<const std::byte>(mk, 4));
@@ -96,7 +101,8 @@ Task<Result<void>> RecordStream::write_record(SendBuf buf) {
         send_queued_ -= total;
         co_return w;
     }
-    SmallVec<iovec, 8> iov;  // typical replies: marker + a few segments — no heap (§2.4)
+    // typical replies: marker + a few segments — no heap (§2.4)
+    SmallVec<iovec, 8> iov;
     SmallVec<iovec, 8> body;
     size_t sent = 0;
     while (sent < 4 + total) {

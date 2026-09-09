@@ -64,14 +64,19 @@ struct ServerConfig {
     // Read delegations (plan doc 10 §5.2): granted only to sessions with a live
     // backchannel; this is the operator kill switch.
     bool delegations = true;
-    uint32_t lease_seconds = 90;  // v4 lease
+    // v4 lease
+    uint32_t lease_seconds = 90;
     // Grace window after restart, decoupled from the lease (plan doc 10 §4.4):
     // 0 = "auto" = lease; operators often want grace < lease for faster recovery.
     uint32_t grace_seconds = 0;
-    uint32_t courtesy_multiplier = 24;  // courtesy window = multiplier × lease
-    uint32_t state_shards = 16;         // v4 state table shards (plan doc 10 §2.6)
-    std::string ctl_socket;             // default: <state_dir>/ctl.sock; "" resolves at startup
-    uint16_t metrics_port = 0;          // 0 = disabled
+    // courtesy window = multiplier × lease
+    uint32_t courtesy_multiplier = 24;
+    // v4 state table shards (plan doc 10 §2.6)
+    uint32_t state_shards = 16;
+    // default: <state_dir>/ctl.sock; "" resolves at startup
+    std::string ctl_socket;
+    // 0 = disabled
+    uint16_t metrics_port = 0;
     // Metrics exposure (plan doc 10 §1.8): loopback by default; widening the bind and
     // the CIDR allowlist are both explicit choices.  Empty allowlist = no per-peer
     // filtering beyond the bind address.
@@ -82,7 +87,8 @@ struct ServerConfig {
     // Empty = derived from hostname + state_dir at startup.
     std::string server_owner;
     std::string server_scope;
-    std::string log_level = "info";  // debug enables the per-request summary line (08 §8.2)
+    // debug enables the per-request summary line (08 §8.2)
+    std::string log_level = "info";
     // Observability knobs (plan doc 10 §3.6/§3.7): requests slower than this warn-log a
     // per-op time breakdown (0 disables); error_ring sizes the dump-errors sampling ring.
     uint32_t slow_request_ms = 1000;
@@ -134,27 +140,36 @@ struct ExportConfig {
 // field is ignored while `enabled` is false; the section is not hot-reloadable.
 struct ClusterConfig {
     bool enabled = false;
-    std::string id;             // shared by every gateway; [A-Za-z0-9_-]{8,64} (a UUID fits)
-    std::string shared_dir;     // absolute path on the shared filesystem (design 09 §9.4)
-    std::string node;           // this gateway's name; empty = gethostname() at startup
-    std::string role = "auto";  // active | standby | auto (active-active: auto only)
+    // shared by every gateway; [A-Za-z0-9_-]{8,64} (a UUID fits)
+    std::string id;
+    // absolute path on the shared filesystem (design 09 §9.4)
+    std::string shared_dir;
+    // this gateway's name; empty = gethostname() at startup
+    std::string node;
+    // active | standby | auto (active-active: auto only)
+    std::string role = "auto";
     // failover (design 09: one active gateway behind one VIP) | active-active (design 10:
     // one owner gateway per export, clients referred with fs_locations).  Plan 12 A1.
     std::string mode = "failover";
     // active-active: this gateway's own "host:port" ("[v6]:port" for IPv6), the address
     // its fs_locations answers carry for the exports it owns.  Ignored under failover.
     std::string node_address;
-    uint32_t fence_lease_ms = 3000;  // fence renew period; lost after 3 missed renewals
-    std::string takeover = "auto";   // auto | manual (only `lightnfs-ctl cluster takeover`)
-    std::string takeover_hook;       // optional script run after the backend takeover hooks
+    // fence renew period; lost after 3 missed renewals
+    uint32_t fence_lease_ms = 3000;
+    // auto | manual (only `lightnfs-ctl cluster takeover`)
+    std::string takeover = "auto";
+    // optional script run after the backend takeover hooks
+    std::string takeover_hook;
     // Shared export catalog (design 11 §11.2, plan 12 A1): where the export table comes
     // from.  "local" = this file's [[export]] blocks (today); "catalog" = the cluster's
     // shared_dir/catalog.toml, in which case this file must carry no [[export]] and may
     // start with an empty table until one is published.  Restart-required.
-    std::string exports_source = "local";  // local | catalog
+    // local | catalog
+    std::string exports_source = "local";
     // catalog only: pick up a newer catalog on the fence tick ("auto") or only on
     // `lightnfs-ctl cluster catalog apply` / `reload` / SIGHUP ("manual").  Hot-reloadable.
-    std::string catalog_refresh = "auto";  // auto | manual
+    // auto | manual
+    std::string catalog_refresh = "auto";
     // Test-only: turn the kStableHandles/kByteLocks/native_locks requirement into a
     // warning so the two-instance local acceptance run can use the local backend.
     bool unsafe_skip_backend_checks = false;
@@ -289,20 +304,25 @@ class PseudoFs;
 // membership is frozen; the entries' own runtime state stays mutable through the
 // pointers handed out here, which is why they are not const.
 struct ExportSet {
-    uint64_t generation = 0;  // +1 on every publish
-    uint64_t epoch = 1;       // the boot epoch the set serves under
+    // +1 on every publish
+    uint64_t generation = 0;
+    // the boot epoch the set serves under
+    uint64_t epoch = 1;
     // The pseudo tree's change attribute (plan 12 B2): epoch << 32 | generation, so it
     // moves on every publish and never repeats across restarts.
     uint64_t pseudo_change() const { return (epoch << 32) | generation; }
-    std::vector<std::shared_ptr<ExportEntry>> entries;  // fsid ascending, unique
-    std::unique_ptr<const PseudoFs> pseudo;             // built over `entries`
+    // fsid ascending, unique
+    std::vector<std::shared_ptr<ExportEntry>> entries;
+    // built over `entries`
+    std::unique_ptr<const PseudoFs> pseudo;
 
     ExportSet();
     ~ExportSet();
     ExportSet(const ExportSet&) = delete;
     ExportSet& operator=(const ExportSet&) = delete;
 
-    ExportEntry* by_fsid(uint32_t fsid) const;  // binary search
+    // binary search
+    ExportEntry* by_fsid(uint32_t fsid) const;
     // Longest export path prefix, component-boundary checked.
     ExportEntry* for_mount_path(std::string_view path, std::string& relative) const;
 };
@@ -328,10 +348,13 @@ class ExportSetBuilder {
 // One export-set change (plan 12 B2), produced by diff_catalog + merge_with_local
 // (C2) or by the ctl export commands (D2).
 struct ExportSetPlan {
-    std::vector<ExportConfig> add;     // new fsids (an export coming back enabled too)
-    std::vector<ExportConfig> update;  // same fsid: clients / qos / readonly / squash /
-                                       // anon / nodes applied in place
-    std::vector<uint32_t> remove;      // deleted or disabled
+    // new fsids (an export coming back enabled too)
+    std::vector<ExportConfig> add;
+    // same fsid: clients / qos / readonly / squash /
+    // anon / nodes applied in place
+    std::vector<ExportConfig> update;
+    // deleted or disabled
+    std::vector<uint32_t> remove;
 };
 
 // The published export set (RCU, plan 12 B1): one atomic pointer to the current
@@ -341,7 +364,8 @@ struct ExportSetPlan {
 // writers, all on the main-loop thread.
 class ExportTable {
  public:
-    ExportTable();  // an empty set
+    // an empty set
+    ExportTable();
     explicit ExportTable(std::shared_ptr<const ExportSet> initial);
 
     static Result<std::unique_ptr<ExportTable>> build(Config config);

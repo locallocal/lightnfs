@@ -22,8 +22,10 @@ class FakeRing final : public RingOps {
         Kind kind;
         int fd = -1;
         uint64_t off = 0;
-        std::span<std::byte> wbuf{};        // read/recv destination
-        std::span<const std::byte> rbuf{};  // write source
+        // read/recv destination
+        std::span<std::byte> wbuf{};
+        // write source
+        std::span<const std::byte> rbuf{};
         const iovec* iov = nullptr;
         int iovcnt = 0;
         const char* path = nullptr;

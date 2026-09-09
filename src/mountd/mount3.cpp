@@ -69,11 +69,13 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
     if (call.proc == 0 || call.proc == 2 || call.proc == 4) {
         xdr::XdrEnc enc(ctx.pool);
         rpc::encode_reply_success(enc, call.xid);
-        if (call.proc == 2) enc.boolean(false);  // empty mountlist
+        // empty mountlist
+        if (call.proc == 2) enc.boolean(false);
         co_await send(ctx, enc);
         co_return;
     }
-    if (call.proc == 3) {  // UMNT: consume path but keep no authoritative rmtab.
+    // UMNT: consume path but keep no authoritative rmtab.
+    if (call.proc == 3) {
         auto path = call.args.string(1024);
         if (!path || !call.args.at_end()) {
             co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
@@ -84,7 +86,8 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
         co_await send(ctx, enc);
         co_return;
     }
-    if (call.proc == 5) {  // EXPORT
+    // EXPORT
+    if (call.proc == 5) {
         if (!call.args.at_end()) {
             co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
             co_return;
@@ -99,9 +102,11 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
                 enc.boolean(true);
                 enc.string(client.text());
             }
-            enc.boolean(false);  // end groups
+            // end groups
+            enc.boolean(false);
         }
-        enc.boolean(false);  // end exports
+        // end exports
+        enc.boolean(false);
         co_await send(ctx, enc);
         co_return;
     }
@@ -112,7 +117,8 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
         co_return;
     }
     std::string relative;
-    auto set = exports_.snapshot();  // held for the rest of the MNT
+    // held for the rest of the MNT
+    auto set = exports_.snapshot();
     core::ExportEntry* exp = set->for_mount_path(*path_arg, relative);
     xdr::XdrEnc enc(ctx.pool);
     rpc::encode_reply_success(enc, call.xid);
@@ -151,7 +157,8 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
     auto fh = handles_.encode(*exp, (*obj)->id());
     enc.u32(static_cast<uint32_t>(MountStatus::kOk));
     enc.opaque(fh);
-    enc.u32(1);  // auth_flavors length
+    // auth_flavors length
+    enc.u32(1);
     enc.u32(static_cast<uint32_t>(rpc::AuthFlavor::kSys));
     co_await send(ctx, enc);
 }

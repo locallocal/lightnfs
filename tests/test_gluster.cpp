@@ -125,7 +125,8 @@ TEST(Gluster, CapsHandlesAndResolve) {
     EXPECT_EQ(v.be->volume_id().size(), 32u);
 
     auto root = v.root();
-    EXPECT_EQ(root->id().len, 17);  // tag + GFID
+    // tag + GFID
+    EXPECT_EQ(root->id().len, 17);
     EXPECT_EQ(root->type(), backend::FType::kDir);
     auto gfid = backend::GlusterBackend::gfid_from_oid(root->id());
     ASSERT_TRUE(gfid.has_value());
@@ -134,7 +135,8 @@ TEST(Gluster, CapsHandlesAndResolve) {
     auto again = run(v.runtime, v.be->resolve(root->id()));
     ASSERT_TRUE(again.has_value());
     EXPECT_TRUE((*again)->id() == root->id());
-    EXPECT_TRUE(v.be->stats().obj_hits >= 1);  // second resolve hit the handle cache
+    // second resolve hit the handle cache
+    EXPECT_TRUE(v.be->stats().obj_hits >= 1);
 
     // Malformed / foreign handle bytes → ESTALE, never a crash.
     std::array<std::byte, 21> local_like{};
@@ -161,7 +163,8 @@ TEST(Gluster, NamespaceOpsAndReaddirCookies) {
     sa.mode = 0750;
     auto dir = run(v.runtime, root->mkdir(v.root_cred, "d", sa));
     ASSERT_TRUE(dir.has_value());
-    EXPECT_EQ(dir->attr.mode, 0750u);  // exact mode regardless of umask
+    // exact mode regardless of umask
+    EXPECT_EQ(dir->attr.mode, 0750u);
     EXPECT_EQ(dir->obj->type(), backend::FType::kDir);
 
     backend::SetAttr fa;
@@ -218,7 +221,8 @@ TEST(Gluster, NamespaceOpsAndReaddirCookies) {
     ASSERT_TRUE(run(v.runtime, dir->obj->rename(v.root_cred, "a2", *root, "a3")).has_value());
     auto a3 = run(v.runtime, root->lookup(v.root_cred, "a3"));
     ASSERT_TRUE(a3.has_value());
-    EXPECT_TRUE((*a3)->id() == (*a)->id());  // same inode → same handle (P1)
+    // same inode → same handle (P1)
+    EXPECT_TRUE((*a3)->id() == (*a)->id());
 
     // hard link + nlink, symlink + readlink, mknod fifo
     ASSERT_TRUE(run(v.runtime, dir->obj->link(v.root_cred, **a3, "alink")).has_value());
@@ -277,7 +281,8 @@ TEST(Gluster, RecreatedObjectGetsNewHandle) {
     ASSERT_TRUE(run(v.runtime, root->unlink(v.root_cred, "f")).has_value());
     auto f2 = run(v.runtime, root->create(v.root_cred, "f", backend::SetAttr{}, nullptr));
     ASSERT_TRUE(f2.has_value());
-    EXPECT_FALSE(f2->obj->id() == oid1);  // P2
+    // P2
+    EXPECT_FALSE(f2->obj->id() == oid1);
     auto stale = run(v.runtime, v.be->resolve(oid1));
     EXPECT_FALSE(stale.has_value());
     EXPECT_EQ(raw(stale.error()), ESTALE);
@@ -290,7 +295,8 @@ TEST(Gluster, ExclusiveCreateReplay) {
                            std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}};
     auto first = run(v.runtime, root->create(v.root_cred, "x", backend::SetAttr{}, &verf));
     ASSERT_TRUE(first.has_value());
-    EXPECT_EQ(first->attr.mode, 0u);  // EXCLUSIVE leaves mode for the follow-up SETATTR
+    // EXCLUSIVE leaves mode for the follow-up SETATTR
+    EXPECT_EQ(first->attr.mode, 0u);
     auto replay = run(v.runtime, root->create(v.root_cred, "x", backend::SetAttr{}, &verf));
     ASSERT_TRUE(replay.has_value());
     EXPECT_TRUE(replay->obj->id() == first->obj->id());
@@ -453,9 +459,12 @@ TEST(Gluster, NativeAccessRunsUnderCallerIdentity) {
     EXPECT_TRUE(mine->has(backend::Access::kRead));
     EXPECT_TRUE(mine->has(backend::Access::kModify));
     EXPECT_FALSE(mine->has(backend::Access::kExecute));
-    EXPECT_FALSE(mine->has(backend::Access::kLookup));           // not a directory
-    EXPECT_FALSE(mine->has(backend::Access::kDelete));           // not a directory
-    EXPECT_EQ(testing::FakeGfapi::access_calls() - before, 3u);  // R, W, X: one each
+    // not a directory
+    EXPECT_FALSE(mine->has(backend::Access::kLookup));
+    // not a directory
+    EXPECT_FALSE(mine->has(backend::Access::kDelete));
+    // R, W, X: one each
+    EXPECT_EQ(testing::FakeGfapi::access_calls() - before, 3u);
     EXPECT_EQ(testing::FakeGfapi::last_fsuid(), me);
     EXPECT_EQ(testing::FakeGfapi::last_fsgid(), gid);
 
@@ -612,7 +621,8 @@ TEST(Gluster, StopRestartAndLeakFree) {
         EXPECT_FALSE(down.has_value());
         EXPECT_EQ(raw(down.error()), ENOTCONN);
         ASSERT_TRUE(run(v.runtime, v.be->start()).has_value());
-        auto back = run(v.runtime, v.be->resolve(oid));  // GFIDs survive a reconnect (P1)
+        // GFIDs survive a reconnect (P1)
+        auto back = run(v.runtime, v.be->resolve(oid));
         ASSERT_TRUE(back.has_value());
         EXPECT_STREQ(v.read_all(**back), "abc");
         back->reset();
@@ -669,7 +679,8 @@ TEST(Gluster, ConfigFactory) {
     backend::BackendConfig missing;
     missing.path = "/data";
     missing.fsid = 5;
-    EXPECT_TRUE(factory->make(missing) == nullptr);  // volume is required
+    // volume is required
+    EXPECT_TRUE(factory->make(missing) == nullptr);
     backend::BackendConfig bad = cfg;
     bad.values["servers"] = "gs1:notaport";
     EXPECT_TRUE(factory->make(bad) == nullptr);
@@ -722,7 +733,8 @@ TEST(Gluster, SameVolumeExportsShareOwnerList) {
     ASSERT_TRUE(same->exports.size() == 2u);
     EXPECT_STREQ(same->exports[1].backend_config.values.at("volume"), "vol0");
     EXPECT_TRUE(core::validate_config(*same).has_value());
-    {  // the key the validator grouped on is the one the factory consumes
+    // the key the validator grouped on is the one the factory consumes
+    {
         backend::BackendConfig bc = same->exports[1].backend_config;
         bc.path = same->exports[1].path;
         bc.fsid = same->exports[1].fsid;
@@ -778,5 +790,6 @@ TEST(Gluster, ReclaimLockDelayUntilBrickTimeout) {
     EXPECT_EQ(testing::FakeGfapi::stale_locks(), 0u);
     EXPECT_EQ(probe.lock_states(), 1u);
     EXPECT_TRUE(probe.in_grace());
-    testing::FakeGfapi::join_stale_timer();  // never leave a joinable std::thread
+    // never leave a joinable std::thread
+    testing::FakeGfapi::join_stale_timer();
 }

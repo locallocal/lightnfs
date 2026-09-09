@@ -27,9 +27,11 @@ struct MemClusterStore final : server::ClusterStore {
     std::optional<server::FenceRecord> fence;
     std::map<std::string, std::string> clients, digests;
     std::vector<std::string> log;
-    Errno fail_renew = Errno::kOk;  // IO trouble injected into renew_fence
+    // IO trouble injected into renew_fence
+    Errno fail_renew = Errno::kOk;
     Errno fail_read = Errno::kOk;
-    Errno fail_list = Errno::kOk;  // injected into list_exports_digests
+    // injected into list_exports_digests
+    Errno fail_list = Errno::kOk;
 
     Result<std::array<std::byte, 16>> load_or_create_key() override { return std::array<std::byte, 16>{std::byte{1}}; }
     Result<uint64_t> read_epoch() override { return epoch; }
@@ -86,7 +88,8 @@ struct MemClusterStore final : server::ClusterStore {
     }
 
     // ---- active-active (plan 12 A2): per-node batched fences, per-fsid records ----
-    std::map<std::string, server::NodeFences> fences;  // node → record (expired ones too)
+    // node → record (expired ones too)
+    std::map<std::string, server::NodeFences> fences;
     std::map<std::string, uint64_t> node_epochs;
     std::map<std::string, std::string> node_addresses;
     std::map<uint32_t, uint64_t> fs_epochs;

@@ -111,7 +111,8 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
     }
 
     const backend::Attr& a = *src.attr;
-    static const core::FsProps kPseudoProps;  // defaults double as the pseudo-fs answer
+    // defaults double as the pseudo-fs answer
+    static const core::FsProps kPseudoProps;
     const core::FsProps& fs = src.fs ? *src.fs : kPseudoProps;
     const backend::FsLimits& lim = fs.limits;
     backend::FsStats zero_stats;
@@ -128,7 +129,8 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
 
     if (ok(kSupportedAttrs)) supported_attrs(src.referrals).encode(vals);
     if (ok(kType)) vals.u32(static_cast<uint32_t>(a.type));
-    if (ok(kFhExpireType)) vals.u32(0);  // FH4_PERSISTENT
+    // FH4_PERSISTENT
+    if (ok(kFhExpireType)) vals.u32(0);
     if (ok(kChange)) vals.u64(a.change);
     if (ok(kSize)) vals.u64(a.size);
     if (ok(kLinkSupport)) vals.boolean(fs.link_support);
@@ -159,7 +161,8 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
         std::string server = location_server(src);
         vals.u32(server.empty() ? 0 : 1);
         if (!server.empty()) {
-            vals.u32(1);  // server<>
+            // server<>
+            vals.u32(1);
             vals.string(server);
             encode_pathname(vals, src.fs_root);
         }
@@ -173,7 +176,8 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
     if (ok(kMode)) vals.u32(a.mode & 07777);
     if (ok(kNoTrunc)) vals.boolean(core::FsProps::kNoTrunc);
     if (ok(kNumlinks)) vals.u32(a.nlink);
-    if (ok(kOwner)) vals.string(std::to_string(a.uid));  // AUTH_SYS numeric string
+    // AUTH_SYS numeric string
+    if (ok(kOwner)) vals.string(std::to_string(a.uid));
     if (ok(kOwnerGroup)) vals.string(std::to_string(a.gid));
     if (ok(kRawdev)) {
         vals.u32(a.rdev.major);
@@ -190,15 +194,21 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
     // fs_locations_info (RFC 8881 §11.10.1): the same single location — currency
     // unknown (-1), no fls_info, valid for one lease — under fli_flags 0.
     if (ok(kFsLocationsInfo)) {
-        vals.u32(0);                  // fli_flags
-        vals.u32(src.lease_seconds);  // fli_valid_for
+        // fli_flags
+        vals.u32(0);
+        // fli_valid_for
+        vals.u32(src.lease_seconds);
         encode_pathname(vals, src.fs_root);
         std::string server = location_server(src);
-        vals.u32(server.empty() ? 0 : 1);  // fli_items<>
+        // fli_items<>
+        vals.u32(server.empty() ? 0 : 1);
         if (!server.empty()) {
-            vals.u32(1);            // fli_entries<>
-            vals.u32(0xffffffffu);  // fls_currency = -1
-            vals.u32(0);            // fls_info: empty
+            // fli_entries<>
+            vals.u32(1);
+            // fls_currency = -1
+            vals.u32(0xffffffffu);
+            // fls_info: empty
+            vals.u32(0);
             vals.string(server);
             encode_pathname(vals, src.fs_root);
         }
@@ -285,7 +295,8 @@ Status decode_settable_fattr(xdr::XdrDec& dec, backend::SetAttr& out, Bitmap& se
                 auto how = v.u32();
                 if (!how || *how > 1) return Status::kBadxdr;
                 backend::Timespec t{};
-                if (*how == 1) {  // SET_TO_CLIENT_TIME4
+                // SET_TO_CLIENT_TIME4
+                if (*how == 1) {
                     auto sec = v.u64();
                     auto nsec = v.u32();
                     if (!sec || !nsec) return Status::kBadxdr;
@@ -308,7 +319,8 @@ Status decode_settable_fattr(xdr::XdrDec& dec, backend::SetAttr& out, Bitmap& se
         }
         set.set(bit);
     }
-    if (!v.at_end()) return Status::kBadxdr;  // trailing bytes: malformed attrlist
+    // trailing bytes: malformed attrlist
+    if (!v.at_end()) return Status::kBadxdr;
     return Status::kOk;
 }
 

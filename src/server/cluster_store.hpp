@@ -52,13 +52,15 @@ namespace lnfs::server {
 struct FenceRecord {
     std::string node;
     uint64_t epoch = 0;
-    int64_t expires_at_ms = 0;  // wall clock (CLOCK_REALTIME); gateways must run NTP
+    // wall clock (CLOCK_REALTIME); gateways must run NTP
+    int64_t expires_at_ms = 0;
 };
 
 // The current owner of one export, as fs/<fsid>/owner records it (plan 12 A2).
 struct OwnerRecord {
     std::string node;
-    std::string address;  // that node's `[cluster] node_address`
+    // that node's `[cluster] node_address`
+    std::string address;
     uint64_t fs_epoch = 0;
 };
 
@@ -83,11 +85,13 @@ struct CatalogApplied {
 struct NodeFences {
     struct Hold {
         uint32_t fsid = 0;
-        uint64_t epoch = 0;  // the fs epoch the holder took the fence with
+        // the fs epoch the holder took the fence with
+        uint64_t epoch = 0;
     };
     std::string node;
     int64_t expires_at_ms = 0;
-    std::vector<Hold> holds;  // sorted by fsid
+    // sorted by fsid
+    std::vector<Hold> holds;
 };
 
 class ClusterStore {

@@ -39,43 +39,59 @@ std::span<const std::byte> bytes_of(std::string_view s) {
 // credential the client asked for and a NULL verifier.
 void rpc_call_header(Writer& w, const Target& t) {
     w.u32(t.xid);
-    w.u32(0);  // CALL
-    w.u32(2);  // rpcvers
+    // CALL
+    w.u32(0);
+    // rpcvers
+    w.u32(2);
     w.u32(t.program);
-    w.u32(1);  // CB version (4.1 backchannel program version)
-    w.u32(1);  // CB_COMPOUND
+    // CB version (4.1 backchannel program version)
+    w.u32(1);
+    // CB_COMPOUND
+    w.u32(1);
     if (t.cred.auth_sys) {
         Writer body;
-        body.u32(0);  // stamp
+        // stamp
+        body.u32(0);
         body.opaque(bytes_of(t.cred.machine));
         body.u32(t.cred.uid);
         body.u32(t.cred.gid);
-        body.u32(0);  // no aux gids
+        // no aux gids
+        body.u32(0);
         auto b = body.take();
-        w.u32(1);  // AUTH_SYS
+        // AUTH_SYS
+        w.u32(1);
         w.opaque(b);
     } else {
-        w.u32(0);  // AUTH_NONE
+        // AUTH_NONE
+        w.u32(0);
         w.u32(0);
     }
-    w.u32(0);  // verf AUTH_NONE
+    // verf AUTH_NONE
+    w.u32(0);
     w.u32(0);
 }
 
 // CB_COMPOUND prefix: tag "", minorversion 1, callback_ident 0 (unused in 4.1),
 // then CB_SEQUENCE on slot 0 with no referring call lists.
 void compound_prefix(Writer& w, const Target& t, uint32_t numops) {
-    w.u32(0);  // empty tag
-    w.u32(1);  // minorversion
-    w.u32(0);  // callback_ident
+    // empty tag
+    w.u32(0);
+    // minorversion
+    w.u32(1);
+    // callback_ident
+    w.u32(0);
     w.u32(numops);
     w.u32(kCbSequence);
     w.raw(std::span<const std::byte>(t.sessionid.data(), t.sessionid.size()));
     w.u32(t.slot_seq);
-    w.u32(0);  // slotid
-    w.u32(0);  // highest_slotid
-    w.u32(0);  // cachethis = false
-    w.u32(0);  // no referring call lists
+    // slotid
+    w.u32(0);
+    // highest_slotid
+    w.u32(0);
+    // cachethis = false
+    w.u32(0);
+    // no referring call lists
+    w.u32(0);
 }
 
 }  // namespace
@@ -87,7 +103,8 @@ std::vector<std::byte> build_cb_recall(const Target& t, const Stateid& sid, std:
     w.u32(kCbRecall);
     w.u32(sid.seqid);
     w.raw(std::span<const std::byte>(sid.other.data(), sid.other.size()));
-    w.u32(0);  // truncate = false
+    // truncate = false
+    w.u32(0);
     w.opaque(fh);
     return w.take();
 }
@@ -112,19 +129,22 @@ ReplyStatus parse_cb_reply(std::span<const std::byte> record) {
         uint32_t be;
         std::memcpy(&be, record.data() + off, 4);
         off += 4;
-        v = xdr::to_be32(be);  // symmetric swap
+        // symmetric swap
+        v = xdr::to_be32(be);
         return true;
     };
     uint32_t xid, mtype, reply_stat;
     if (!u32(xid) || !u32(mtype) || !u32(reply_stat)) return out;
-    if (mtype != 1 || reply_stat != 0) return out;  // denied / not a reply
+    // denied / not a reply
+    if (mtype != 1 || reply_stat != 0) return out;
     uint32_t verf_flavor, verf_len;
     if (!u32(verf_flavor) || !u32(verf_len)) return out;
     off += (verf_len + 3) & ~3u;
     uint32_t accept_stat;
     if (!u32(accept_stat) || accept_stat != 0) return out;
     uint32_t status;
-    if (!u32(status)) return out;  // CB_COMPOUND status
+    // CB_COMPOUND status
+    if (!u32(status)) return out;
     out.rpc_ok = true;
     out.nfs_status = status;
     return out;

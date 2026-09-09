@@ -29,7 +29,8 @@ rt::Task<void> MutateGuard::enter(Target a) {
     a_ = std::move(a);
     b_ = Target{};
     b_.sample = false;
-    same_ = true;  // second() aliases first()
+    // second() aliases first()
+    same_ = true;
     lock_a_ = locks_.get(exp_.fsid, a_.oid);
     held_a_ = co_await lock_a_->lock();
     if (a_.sample) sample_a_.before = co_await sample_attr(a_.obj);
