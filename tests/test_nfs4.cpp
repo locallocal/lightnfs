@@ -456,6 +456,77 @@ TEST(Nfs4, PseudoFsCrossingAndAttrs) {
   EXPECT_EQ(reply.status, stv(Status::kNoent));
 }
 
+// Plan 12 B2: the export set changes under a running engine.  A new export shows up
+// in the pseudo tree for the next COMPOUND; a removed export's filehandles go STALE
+// and its entry is retired only once no snapshot references it.
+TEST(Nfs4, ExportSetSwapUnderRunningEngine) {
+  V4Fixture f;
+  f.establish_session();
+  auto data_fh = f.path_fh({"export", "data"});
+  ASSERT_TRUE(!data_fh.empty());
+  EXPECT_TRUE(f.path_fh({"export", "more"}).empty());
+
+  auto getattr_status = [&](const std::vector<std::byte>& fh, uint64_t* fsid) -> uint32_t {
+    xdr::XdrEnc ops(f.pool);
+    ops.u32(static_cast<uint32_t>(Op::kPutfh));
+    ops.opaque(fh);
+    ops.u32(static_cast<uint32_t>(Op::kGetattr));
+    nfsv4::Bitmap want;
+    want.set(nfsv4::attr::kFsid);
+    want.encode(ops);
+    auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+    if (reply.status != 0) return reply.status;
+    V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+    (void)reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(reply.dec, Op::kGetattr, 0);
+    (void)nfsv4::Bitmap::decode(reply.dec);
+    (void)reply.dec.u32();
+    if (fsid) *fsid = *reply.dec.u64();
+    return 0;
+  };
+  uint64_t fsid = 0;
+  EXPECT_EQ(getattr_status(data_fh, &fsid), 0u);
+  EXPECT_EQ(fsid, 23u);
+
+  // Add /export/more (fsid 24) with a started backend: visible to the next compound.
+  auto more = std::make_unique<backend::MemoryBackend>(24);
+  (void)more->add_file("/inside", "more data");
+  core::ExportConfig cfg;
+  cfg.path = "/export/more";
+  cfg.fsid = 24;
+  cfg.clients = {"127.0.0.0/8"};
+  cfg.squash = core::Squash::kNone;
+  core::ExportSetPlan plan;
+  plan.add.push_back(cfg);
+  std::vector<std::unique_ptr<backend::Backend>> started;
+  started.push_back(std::move(more));
+  auto old = f.exports.snapshot();
+  ASSERT_TRUE(f.exports.apply(std::move(plan), started, 1).has_value());
+  auto more_fh = f.path_fh({"export", "more"});
+  ASSERT_TRUE(!more_fh.empty());
+  EXPECT_EQ(getattr_status(more_fh, &fsid), 0u);
+  EXPECT_EQ(fsid, 24u);
+  EXPECT_EQ(getattr_status(data_fh, &fsid), 0u);  // the old export still serves
+
+  // Remove /export/data: its handles are STALE, its pseudo name is gone, and the
+  // entry retires once the snapshot we hold here is released.
+  core::ExportSetPlan remove;
+  remove.remove.push_back(23);
+  std::vector<std::unique_ptr<backend::Backend>> none;
+  ASSERT_TRUE(f.exports.apply(std::move(remove), none, 1).has_value());
+  EXPECT_EQ(getattr_status(data_fh, nullptr), stv(Status::kStale));
+  EXPECT_TRUE(f.path_fh({"export", "data"}).empty());
+  EXPECT_EQ(getattr_status(more_fh, &fsid), 0u);
+  EXPECT_EQ(fsid, 24u);
+  EXPECT_TRUE(f.exports.take_retired().empty());  // `old` still lists fsid 23
+  old.reset();
+  auto retired = f.exports.take_retired();
+  ASSERT_TRUE(retired.size() == 1u);
+  EXPECT_EQ(retired[0]->fsid, 23u);
+  EXPECT_TRUE(retired[0]->backend.get() == f.memory);
+}
+
 TEST(Nfs4, OpenReadCloseAndSpecialStateids) {
   V4Fixture f;
   f.establish_session();

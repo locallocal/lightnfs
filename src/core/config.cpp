@@ -856,7 +856,7 @@ Result<void> ExportSetBuilder::add(ExportConfig cfg, std::unique_ptr<backend::Ba
   entry->anon_uid = cfg.anon_uid;
   entry->anon_gid = cfg.anon_gid;
   entry->readonly = cfg.readonly;
-  entry->nodes = std::move(cfg.nodes);
+  entry->set_nodes(std::move(cfg.nodes));
   entry->backend = std::move(backend);
   std::vector<Cidr> clients;
   for (const auto& client : cfg.clients) clients.push_back(LNFS_TRY(Cidr::parse(client)));
@@ -876,7 +876,7 @@ std::shared_ptr<const ExportSet> ExportSetBuilder::finish(uint64_t epoch, uint64
   entries_.clear();
   std::stable_sort(set->entries.begin(), set->entries.end(),
                    [](const auto& a, const auto& b) { return a->fsid < b->fsid; });
-  set->pseudo = std::make_unique<PseudoFs>(set->entries, epoch);
+  set->pseudo = std::make_unique<PseudoFs>(set->entries, set->pseudo_change());
   return set;
 }
 
@@ -922,6 +922,109 @@ void ExportTable::publish(std::shared_ptr<const ExportSet> set) {
   set_.store(std::move(set), std::memory_order_release);
 }
 
+namespace {
+
+// The per-export settings apply() may change on a live entry (plan 12 B2).  `clients`
+// was parsed up front so this cannot fail half-way.
+void update_entry(ExportEntry& entry, const ExportConfig& cfg, std::vector<Cidr> clients) {
+  entry.set_clients(std::move(clients));
+  entry.qos.read_bytes.configure(cfg.read_bps);
+  entry.qos.write_bytes.configure(cfg.write_bps);
+  entry.qos.ops.configure(cfg.iops);
+  entry.readonly.store(cfg.readonly, std::memory_order_relaxed);
+  entry.squash.store(cfg.squash, std::memory_order_relaxed);
+  entry.anon_uid.store(cfg.anon_uid, std::memory_order_relaxed);
+  entry.anon_gid.store(cfg.anon_gid, std::memory_order_relaxed);
+  entry.set_nodes(cfg.nodes);
+}
+
+Result<std::vector<Cidr>> parse_clients(const ExportConfig& cfg) {
+  std::vector<Cidr> clients;
+  for (const auto& client : cfg.clients) clients.push_back(LNFS_TRY(Cidr::parse(client)));
+  return clients;
+}
+
+}  // namespace
+
+Result<std::shared_ptr<const ExportSet>> ExportTable::apply(
+    ExportSetPlan plan, std::vector<std::unique_ptr<backend::Backend>>& started, uint64_t epoch) {
+  auto current = snapshot();
+  // Validate everything first: nothing is touched until the whole plan is known good.
+  if (started.size() != plan.add.size()) return Err(errno_from(EINVAL));
+  for (const auto& backend : started)
+    if (!backend) return Err(errno_from(EINVAL));
+  // An fsid may appear once per list; remove + add of the same fsid is a replacement,
+  // any other combination is a contradiction.
+  std::set<uint32_t> removed, updated, added;
+  for (uint32_t fsid : plan.remove)
+    if (!current->by_fsid(fsid) || !removed.insert(fsid).second) return Err(errno_from(EINVAL));
+  std::vector<std::vector<Cidr>> update_clients;
+  for (const auto& cfg : plan.update) {
+    const ExportEntry* entry = current->by_fsid(cfg.fsid);
+    if (!entry || removed.contains(cfg.fsid) || !updated.insert(cfg.fsid).second)
+      return Err(errno_from(EINVAL));
+    if (normalize_path(cfg.path) != entry->path) return Err(errno_from(EINVAL));
+    update_clients.push_back(LNFS_TRY(parse_clients(cfg)));
+  }
+  for (const auto& cfg : plan.add) {
+    if (cfg.fsid == 0 || updated.contains(cfg.fsid) || !added.insert(cfg.fsid).second)
+      return Err(errno_from(EINVAL));
+    if (current->by_fsid(cfg.fsid) && !removed.contains(cfg.fsid)) return Err(errno_from(EINVAL));
+    LNFS_TRY(parse_clients(cfg));
+  }
+
+  // Build the next set: the kept entries shared, the added ones fresh.
+  ExportSetBuilder builder;
+  std::vector<std::shared_ptr<ExportEntry>> retired;
+  for (const auto& entry : current->entries) {
+    if (removed.contains(entry->fsid))
+      retired.push_back(entry);
+    else
+      builder.keep(entry);
+  }
+  for (size_t i = 0; i < plan.add.size(); ++i) {
+    auto made = builder.add(std::move(plan.add[i]), std::move(started[i]));
+    if (!made) return Err(made.error());  // unreachable after the checks above
+  }
+  started.clear();
+  // In-place updates on the shared entries, then the publish.
+  for (size_t i = 0; i < plan.update.size(); ++i)
+    update_entry(*current->by_fsid(plan.update[i].fsid), plan.update[i],
+                 std::move(update_clients[i]));
+  auto next = builder.finish(epoch, current->generation + 1);
+  publish(next);
+  if (!retired.empty()) {
+    std::lock_guard lock(retired_mu_);
+    auto now = std::chrono::steady_clock::now();
+    for (auto& entry : retired) retired_.push_back({std::move(entry), now});
+  }
+  return next;
+}
+
+std::vector<std::shared_ptr<ExportEntry>> ExportTable::take_retired() {
+  std::vector<std::shared_ptr<ExportEntry>> out;
+  std::lock_guard lock(retired_mu_);
+  std::erase_if(retired_, [&](Retired& item) {
+    if (item.entry.use_count() != 1) return false;
+    out.push_back(std::move(item.entry));
+    return true;
+  });
+  return out;
+}
+
+size_t ExportTable::retired_pending() const {
+  std::lock_guard lock(retired_mu_);
+  return retired_.size();
+}
+
+std::optional<std::chrono::steady_clock::time_point> ExportTable::oldest_retired() const {
+  std::lock_guard lock(retired_mu_);
+  std::optional<std::chrono::steady_clock::time_point> oldest;
+  for (const auto& item : retired_)
+    if (!oldest || item.since < *oldest) oldest = item.since;
+  return oldest;
+}
+
 bool ExportTable::check_client(const sockaddr_storage& peer, const ExportEntry& entry) {
   const auto& clients = entry.client_list();
   return std::any_of(clients.begin(), clients.end(),
@@ -948,7 +1051,7 @@ std::string ExportTable::reload_dynamic(const Config& fresh) {
           "(clients/qos still applied)\n",
           cfg.fsid);
     }
-    if (cfg.nodes != entry->nodes)
+    if (cfg.nodes != entry->node_list())
       report += std::format("export fsid={}: nodes changed, restart required\n", cfg.fsid);
     std::vector<Cidr> clients;
     for (const auto& client : cfg.clients)

@@ -461,15 +461,15 @@ TEST(Ctl, ActiveActiveConfigKeys) {
   cfg.clients = {"127.0.0.0/8"};
   cfg.nodes = {"gw1", "gw2"};
   ASSERT_TRUE(table.add(cfg, std::make_unique<backend::MemoryBackend>(1)).has_value());
-  ASSERT_TRUE(table.by_fsid(1)->nodes.size() == 2u);
-  EXPECT_STREQ(table.by_fsid(1)->nodes[1], "gw2");
+  ASSERT_TRUE(table.by_fsid(1)->node_list().size() == 2u);
+  EXPECT_STREQ(table.by_fsid(1)->node_list()[1], "gw2");
   core::Config fresh;
   fresh.exports.push_back(cfg);
   EXPECT_TRUE(table.reload_dynamic(fresh).find("nodes changed") == std::string::npos);
   fresh.exports[0].nodes = {"gw2", "gw1"};
   EXPECT_TRUE(table.reload_dynamic(fresh).find("export fsid=1: nodes changed, restart required") !=
               std::string::npos);
-  EXPECT_STREQ(table.by_fsid(1)->nodes[0], "gw1");  // never applied live
+  EXPECT_STREQ(table.by_fsid(1)->node_list()[0], "gw1");  // never applied live
 }
 
 TEST(Ctl, CatalogConfigKeys) {
