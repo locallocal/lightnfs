@@ -27,44 +27,41 @@ namespace lnfs::rt {
 
 // One in-flight operation; lives in the awaiting coroutine's frame.
 struct OpHandle {
-  std::coroutine_handle<> waiter;
-  int32_t res = 0;
+    std::coroutine_handle<> waiter;
+    int32_t res = 0;
 };
 
 struct Completion {
-  OpHandle* op;
-  int32_t res;
+    OpHandle* op;
+    int32_t res;
 };
 
 class RingOps {
  public:
-  virtual ~RingOps() = default;
+    virtual ~RingOps() = default;
 
-  // Optional hook: the first call made from the thread that will drive wait() from now
-  // on. io_uring uses it for SINGLE_ISSUER/DEFER_TASKRUN (the ring is created disabled
-  // on the setup thread, then enabled here); other backends need nothing.
-  virtual void bind_submitter() {}
+    // Optional hook: the first call made from the thread that will drive wait() from now
+    // on. io_uring uses it for SINGLE_ISSUER/DEFER_TASKRUN (the ring is created disabled
+    // on the setup thread, then enabled here); other backends need nothing.
+    virtual void bind_submitter() {}
 
-  virtual void prep_read(OpHandle* op, int fd, std::span<std::byte> buf, uint64_t off) = 0;
-  virtual void prep_write(OpHandle* op, int fd, std::span<const std::byte> buf, uint64_t off) = 0;
-  // Positioned scatter write (file WRITE path, plan doc 10 §2.4); iov must stay alive
-  // until completion.
-  virtual void prep_writev(OpHandle* op, int fd, const iovec* iov, int iovcnt,
-                           uint64_t off) = 0;
-  virtual void prep_fsync(OpHandle* op, int fd, bool datasync) = 0;
-  virtual void prep_recv(OpHandle* op, int fd, std::span<std::byte> buf) = 0;
-  virtual void prep_sendv(OpHandle* op, int fd, const iovec* iov, int iovcnt) = 0;
-  virtual void prep_accept(OpHandle* op, int fd, sockaddr* addr, socklen_t* alen) = 0;
-  virtual void prep_statx(OpHandle* op, int dirfd, const char* path, int flags, unsigned mask,
-                          struct statx* out) = 0;
-  virtual void prep_openat(OpHandle* op, int dirfd, const char* path, int flags, mode_t mode) = 0;
-  virtual void prep_close(OpHandle* op, int fd) = 0;
-  // Best-effort cancel of all in-flight ops on fd; each cancelled op completes with -ECANCELED.
-  virtual void prep_cancel_fd(OpHandle* op, int fd) = 0;
+    virtual void prep_read(OpHandle* op, int fd, std::span<std::byte> buf, uint64_t off) = 0;
+    virtual void prep_write(OpHandle* op, int fd, std::span<const std::byte> buf, uint64_t off) = 0;
+    // Positioned scatter write (file WRITE path, plan doc 10 §2.4); iov must stay alive
+    // until completion.
+    virtual void prep_writev(OpHandle* op, int fd, const iovec* iov, int iovcnt, uint64_t off) = 0;
+    virtual void prep_fsync(OpHandle* op, int fd, bool datasync) = 0;
+    virtual void prep_recv(OpHandle* op, int fd, std::span<std::byte> buf) = 0;
+    virtual void prep_sendv(OpHandle* op, int fd, const iovec* iov, int iovcnt) = 0;
+    virtual void prep_accept(OpHandle* op, int fd, sockaddr* addr, socklen_t* alen) = 0;
+    virtual void prep_statx(OpHandle* op, int dirfd, const char* path, int flags, unsigned mask, struct statx* out) = 0;
+    virtual void prep_openat(OpHandle* op, int dirfd, const char* path, int flags, mode_t mode) = 0;
+    virtual void prep_close(OpHandle* op, int fd) = 0;
+    // Best-effort cancel of all in-flight ops on fd; each cancelled op completes with -ECANCELED.
+    virtual void prep_cancel_fd(OpHandle* op, int fd) = 0;
 
-  virtual size_t wait(std::span<Completion> out,
-                      std::optional<std::chrono::nanoseconds> timeout) = 0;
-  virtual void wake() = 0;
+    virtual size_t wait(std::span<Completion> out, std::optional<std::chrono::nanoseconds> timeout) = 0;
+    virtual void wake() = 0;
 };
 
 }  // namespace lnfs::rt

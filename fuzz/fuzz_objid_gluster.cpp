@@ -14,18 +14,17 @@
 using namespace lnfs;
 
 extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
-  auto oid = backend::ObjId::from(
-      std::span<const std::byte>(reinterpret_cast<const std::byte*>(data), size));
-  if (!oid) return;
-  auto gfid = backend::GlusterBackend::gfid_from_oid(*oid);
-  if (!gfid) return;
-  auto back = backend::GlusterBackend::oid_from_gfid(*gfid);
-  if (!(back == *oid)) std::abort();
+    auto oid = backend::ObjId::from(std::span<const std::byte>(reinterpret_cast<const std::byte*>(data), size));
+    if (!oid) return;
+    auto gfid = backend::GlusterBackend::gfid_from_oid(*oid);
+    if (!gfid) return;
+    auto back = backend::GlusterBackend::oid_from_gfid(*gfid);
+    if (!(back == *oid)) std::abort();
 }
 
 #ifndef LNFS_FUZZ_REGRESS
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  lnfs_fuzz_entry(data, size);
-  return 0;
+    lnfs_fuzz_entry(data, size);
+    return 0;
 }
 #endif

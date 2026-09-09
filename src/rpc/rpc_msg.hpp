@@ -21,36 +21,36 @@ inline constexpr uint32_t kAuthTls = 7;        // RFC 9289 AUTH_TLS (STARTTLS pr
 enum MsgType : uint32_t { kCall = 0, kReply = 1 };
 enum ReplyStat : uint32_t { kMsgAccepted = 0, kMsgDenied = 1 };
 enum AcceptStat : uint32_t {
-  kSuccess = 0,
-  kProgUnavail = 1,
-  kProgMismatch = 2,
-  kProcUnavail = 3,
-  kGarbageArgs = 4,
-  kSystemErr = 5,
+    kSuccess = 0,
+    kProgUnavail = 1,
+    kProgMismatch = 2,
+    kProcUnavail = 3,
+    kGarbageArgs = 4,
+    kSystemErr = 5,
 };
 enum RejectStat : uint32_t { kRpcMismatch = 0, kAuthError = 1 };
 enum AuthStat : uint32_t {
-  kAuthOk = 0,
-  kAuthBadcred = 1,
-  kAuthRejectedcred = 2,
-  kAuthBadverf = 3,
-  kAuthTooweak = 5,
+    kAuthOk = 0,
+    kAuthBadcred = 1,
+    kAuthRejectedcred = 2,
+    kAuthBadverf = 3,
+    kAuthTooweak = 5,
 };
 
 struct OpaqueAuth {
-  uint32_t flavor = 0;
-  std::span<const std::byte> body{};
+    uint32_t flavor = 0;
+    std::span<const std::byte> body{};
 };
 
 struct RpcCall {
-  uint32_t xid = 0;
-  uint32_t rpcvers = 0;
-  uint32_t prog = 0;
-  uint32_t vers = 0;
-  uint32_t proc = 0;
-  OpaqueAuth cred{}, verf{};
-  uint64_t args_hash = 0;  // FNV over the first 256 bytes of args (DRC key component)
-  xdr::XdrDec args;        // positioned at the start of procedure arguments
+    uint32_t xid = 0;
+    uint32_t rpcvers = 0;
+    uint32_t prog = 0;
+    uint32_t vers = 0;
+    uint32_t proc = 0;
+    OpaqueAuth cred{}, verf{};
+    uint64_t args_hash = 0;  // FNV over the first 256 bytes of args (DRC key component)
+    xdr::XdrDec args;        // positioned at the start of procedure arguments
 };
 
 // Parses through the auth fields; `rec` must outlive the returned RpcCall (spans reference

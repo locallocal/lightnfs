@@ -8,8 +8,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
-#include <deque>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -43,36 +43,35 @@ namespace {
 
 // Parse + validate the TOML. nullopt after logging the reason.
 std::optional<core::Config> load_validated_config(const std::string& path) {
-  auto config = core::load_config(path);
-  if (!config) {
-    LNFS_ERROR("cannot load config {}: {}", path, errno_name(config.error()));
-    return std::nullopt;
-  }
-  if (auto ok = core::validate_config(*config); !ok) {
-    LNFS_ERROR("invalid config {}: {}", path, errno_name(ok.error()));
-    return std::nullopt;
-  }
-  return std::move(*config);
+    auto config = core::load_config(path);
+    if (!config) {
+        LNFS_ERROR("cannot load config {}: {}", path, errno_name(config.error()));
+        return std::nullopt;
+    }
+    if (auto ok = core::validate_config(*config); !ok) {
+        LNFS_ERROR("invalid config {}: {}", path, errno_name(ok.error()));
+        return std::nullopt;
+    }
+    return std::move(*config);
 }
 
 void apply_log_level(const core::ServerConfig& cfg) {
-  set_log_level(cfg.log_level == "debug"   ? LogLevel::kDebug
-                : cfg.log_level == "warn"  ? LogLevel::kWarn
-                : cfg.log_level == "error" ? LogLevel::kError
-                                           : LogLevel::kInfo);
+    set_log_level(cfg.log_level == "debug"   ? LogLevel::kDebug
+                  : cfg.log_level == "warn"  ? LogLevel::kWarn
+                  : cfg.log_level == "error" ? LogLevel::kError
+                                             : LogLevel::kInfo);
 }
 
 // Slow-request log threshold + error-sampling ring size (plan doc 10 §3.6/§3.7); both
 // hot-reloadable, so this runs at startup and on every reload.
 void apply_observability(const core::ServerConfig& cfg) {
-  obs::set_slow_request_threshold_us(static_cast<uint64_t>(cfg.slow_request_ms) * 1000);
-  obs::set_error_ring_capacity(cfg.error_ring);
+    obs::set_slow_request_threshold_us(static_cast<uint64_t>(cfg.slow_request_ms) * 1000);
+    obs::set_error_ring_capacity(cfg.error_ring);
 }
 
 // Per-client (v4 clientid) token buckets; hot-reloadable.
 void apply_client_qos(ProtocolStack& stack, const core::ServerConfig& cfg) {
-  if (stack.nfs4)
-    stack.nfs4->configure_client_qos(cfg.client_read_bps, cfg.client_write_bps, cfg.client_iops);
+    if (stack.nfs4) stack.nfs4->configure_client_qos(cfg.client_read_bps, cfg.client_write_bps, cfg.client_iops);
 }
 
 // ---- phase 2: durable identity ------------------------------------------------------
@@ -82,28 +81,28 @@ void apply_client_qos(ProtocolStack& stack, const core::ServerConfig& cfg) {
 // the export table is built so a bad shared_dir fails fast, and both stay outside
 // build_core_state so the caller decides when the epoch advances.
 struct Identity {
-  std::array<std::byte, 16> key{};
-  uint64_t epoch = 0;
+    std::array<std::byte, 16> key{};
+    uint64_t epoch = 0;
 };
 
 std::optional<Identity> local_identity(const std::string& state_dir) {
-  std::error_code ec;
-  std::filesystem::create_directories(state_dir, ec);
-  if (ec) {
-    LNFS_ERROR("cannot create state_dir {}: {}", state_dir, errno_name(errno_from(ec.value())));
-    return std::nullopt;
-  }
-  auto key = core::load_or_create_hmac_key(state_dir + "/hmac.key");
-  if (!key) {
-    LNFS_ERROR("cannot load file-handle key: {}", errno_name(key.error()));
-    return std::nullopt;
-  }
-  auto epoch = core::bump_boot_epoch(state_dir);
-  if (!epoch) {
-    LNFS_ERROR("cannot persist boot epoch: {}", errno_name(epoch.error()));
-    return std::nullopt;
-  }
-  return Identity{*key, *epoch};
+    std::error_code ec;
+    std::filesystem::create_directories(state_dir, ec);
+    if (ec) {
+        LNFS_ERROR("cannot create state_dir {}: {}", state_dir, errno_name(errno_from(ec.value())));
+        return std::nullopt;
+    }
+    auto key = core::load_or_create_hmac_key(state_dir + "/hmac.key");
+    if (!key) {
+        LNFS_ERROR("cannot load file-handle key: {}", errno_name(key.error()));
+        return std::nullopt;
+    }
+    auto epoch = core::bump_boot_epoch(state_dir);
+    if (!epoch) {
+        LNFS_ERROR("cannot persist boot epoch: {}", errno_name(epoch.error()));
+        return std::nullopt;
+    }
+    return Identity{*key, *epoch};
 }
 
 // Cluster mode (design 09 §9.3/§9.5): the key is shared.  Failover: the epoch is the
@@ -113,46 +112,42 @@ std::optional<Identity> local_identity(const std::string& state_dir) {
 // plan 12 B1): every gateway is its own server, so the epoch is the node's own
 // (epoch.<node>), advanced once per process start like a single gateway's boot epoch
 // — the stack is built once and stays up while exports come and go.
-std::optional<Identity> cluster_identity(ClusterStore& store,
-                                         const core::ClusterConfig& cluster) {
-  auto key = store.load_or_create_key();
-  if (!key) {
-    LNFS_ERROR("cannot load the cluster file-handle key: {}", errno_name(key.error()));
-    return std::nullopt;
-  }
-  auto epoch = core::cluster_active_active(cluster)
-                   ? store.bump_node_epoch(core::cluster_node_name(cluster))
-                   : store.read_epoch();
-  if (!epoch) {
-    LNFS_ERROR("cannot {} the cluster epoch: {}",
-               core::cluster_active_active(cluster) ? "advance" : "read",
-               errno_name(epoch.error()));
-    return std::nullopt;
-  }
-  return Identity{*key, *epoch};
+std::optional<Identity> cluster_identity(ClusterStore& store, const core::ClusterConfig& cluster) {
+    auto key = store.load_or_create_key();
+    if (!key) {
+        LNFS_ERROR("cannot load the cluster file-handle key: {}", errno_name(key.error()));
+        return std::nullopt;
+    }
+    auto epoch = core::cluster_active_active(cluster) ? store.bump_node_epoch(core::cluster_node_name(cluster))
+                                                      : store.read_epoch();
+    if (!epoch) {
+        LNFS_ERROR("cannot {} the cluster epoch: {}", core::cluster_active_active(cluster) ? "advance" : "read",
+                   errno_name(epoch.error()));
+        return std::nullopt;
+    }
+    return Identity{*key, *epoch};
 }
 
-std::optional<CoreState> build_core_state(core::Config&& config, const Identity& identity,
-                                          ClusterStore* cluster) {
-  // This host's side stays behind for later catalog versions (plan 12 C1/C2); the
-  // exports go into the table.
-  core::Config local = config;
-  local.exports.clear();
-  local.exports_from_catalog = false;
-  auto exports = core::ExportTable::build(std::move(config));
-  if (!exports) {
-    LNFS_ERROR("cannot initialize exports: {}", errno_name(exports.error()));
-    return std::nullopt;
-  }
-  CoreState core{.exports = std::move(*exports),
-                 .key = core::FileHandleCodec::from_key_only(identity.key),
-                 .epoch = identity.epoch,
-                 .cluster = cluster,
-                 .owners = nullptr,       // set under active-active in run_server
-                 .active_active = false,  // "
-                 .node = {},              // "
-                 .local_config = std::move(local)};
-  return core;
+std::optional<CoreState> build_core_state(core::Config&& config, const Identity& identity, ClusterStore* cluster) {
+    // This host's side stays behind for later catalog versions (plan 12 C1/C2); the
+    // exports go into the table.
+    core::Config local = config;
+    local.exports.clear();
+    local.exports_from_catalog = false;
+    auto exports = core::ExportTable::build(std::move(config));
+    if (!exports) {
+        LNFS_ERROR("cannot initialize exports: {}", errno_name(exports.error()));
+        return std::nullopt;
+    }
+    CoreState core{.exports = std::move(*exports),
+                   .key = core::FileHandleCodec::from_key_only(identity.key),
+                   .epoch = identity.epoch,
+                   .cluster = cluster,
+                   .owners = nullptr,       // set under active-active in run_server
+                   .active_active = false,  // "
+                   .node = {},              // "
+                   .local_config = std::move(local)};
+    return core;
 }
 
 // Multi-gateway failover prerequisites (design 09 §9.2, plan 10 A1): every export's
@@ -161,27 +156,25 @@ std::optional<CoreState> build_core_state(core::Config&& config, const Identity&
 // capability bits only exist once the backends are constructed, so this runs after
 // ExportTable::build rather than inside validate_config.  Returns false (reasons
 // logged) unless the test-only escape hatch downgrades the failures to warnings.
-bool check_cluster_backends(const core::ClusterConfig& cluster,
-                            const core::ExportTable& exports) {
-  if (!cluster.enabled) return true;
-  bool ok = true;
-  auto set = exports.snapshot();
-  for (const auto& entry : set->entries) {
-    auto caps = entry->backend->caps();
-    std::string missing;
-    if (!caps.has(backend::Cap::kStableHandles)) missing += " stable-handles";
-    if (!caps.has(backend::Cap::kByteLocks)) missing += " byte-locks";
-    if (!entry->backend->native_locks().has_value()) missing += " native_locks";
-    if (missing.empty()) continue;
-    if (cluster.unsafe_skip_backend_checks) {
-      LNFS_WARN("export {}: cluster mode requires{} (skipped: unsafe_skip_backend_checks)",
-                entry->path, missing);
-    } else {
-      LNFS_ERROR("export {}: cluster mode requires{}", entry->path, missing);
-      ok = false;
+bool check_cluster_backends(const core::ClusterConfig& cluster, const core::ExportTable& exports) {
+    if (!cluster.enabled) return true;
+    bool ok = true;
+    auto set = exports.snapshot();
+    for (const auto& entry : set->entries) {
+        auto caps = entry->backend->caps();
+        std::string missing;
+        if (!caps.has(backend::Cap::kStableHandles)) missing += " stable-handles";
+        if (!caps.has(backend::Cap::kByteLocks)) missing += " byte-locks";
+        if (!entry->backend->native_locks().has_value()) missing += " native_locks";
+        if (missing.empty()) continue;
+        if (cluster.unsafe_skip_backend_checks) {
+            LNFS_WARN("export {}: cluster mode requires{} (skipped: unsafe_skip_backend_checks)", entry->path, missing);
+        } else {
+            LNFS_ERROR("export {}: cluster mode requires{}", entry->path, missing);
+            ok = false;
+        }
     }
-  }
-  return ok;
+    return ok;
 }
 
 // Export-table consistency across the cluster (design 09 §9.3, plan 10 B4): refuse to
@@ -190,135 +183,130 @@ bool check_cluster_backends(const core::ClusterConfig& cluster,
 // this node's digest only once it agrees, so a misconfigured node never leaves a
 // record that would keep the healthy ones from restarting.  A removed node's stale
 // exports.<node> record must be deleted by the operator (no automatic GC).
-bool check_exports_consistency(ClusterStore& store, const std::string& node,
-                               const std::string& digest) {
-  auto listed = store.list_exports_digests();
-  if (!listed) {
-    LNFS_ERROR("cannot read the cluster export digests: {}", errno_name(listed.error()));
-    return false;
-  }
-  bool ok = true;
-  for (const auto& [peer, theirs] : *listed) {
-    if (peer == node || theirs == digest) continue;
-    LNFS_ERROR("export table differs from cluster node {}: ours {} theirs {} "
-               "(fix the config, or delete shared_dir/exports.{} if that node is gone)",
-               peer, digest, theirs, peer);
-    ok = false;
-  }
-  if (!ok) return false;
-  if (auto put = store.put_exports_digest(node, digest); !put) {
-    LNFS_ERROR("cannot publish the export digest to the cluster store: {}",
-               errno_name(put.error()));
-    return false;
-  }
-  return true;
+bool check_exports_consistency(ClusterStore& store, const std::string& node, const std::string& digest) {
+    auto listed = store.list_exports_digests();
+    if (!listed) {
+        LNFS_ERROR("cannot read the cluster export digests: {}", errno_name(listed.error()));
+        return false;
+    }
+    bool ok = true;
+    for (const auto& [peer, theirs] : *listed) {
+        if (peer == node || theirs == digest) continue;
+        LNFS_ERROR(
+            "export table differs from cluster node {}: ours {} theirs {} "
+            "(fix the config, or delete shared_dir/exports.{} if that node is gone)",
+            peer, digest, theirs, peer);
+        ok = false;
+    }
+    if (!ok) return false;
+    if (auto put = store.put_exports_digest(node, digest); !put) {
+        LNFS_ERROR("cannot publish the export digest to the cluster store: {}", errno_name(put.error()));
+        return false;
+    }
+    return true;
 }
 
 // `--check-config` must not write into shared_dir (another gateway may be active);
 // it only reports whether this gateway could.
 void warn_shared_dir_access(const core::ClusterConfig& cluster) {
-  if (!cluster.enabled) return;
-  if (::access(cluster.shared_dir.c_str(), W_OK | X_OK) < 0)
-    LNFS_WARN("cluster shared_dir {} is not writable from this host: {}",
-              cluster.shared_dir, errno_name(errno_from(errno)));
+    if (!cluster.enabled) return;
+    if (::access(cluster.shared_dir.c_str(), W_OK | X_OK) < 0)
+        LNFS_WARN("cluster shared_dir {} is not writable from this host: {}", cluster.shared_dir,
+                  errno_name(errno_from(errno)));
 }
 
 // ---- phase 3: runtime + backends ----------------------------------------------------
 
 rt::Runtime::Config runtime_config(const core::ServerConfig& cfg) {
-  return {.reactors = cfg.reactors,
-          .offload_threads = cfg.offload_threads,
-          .offload_heavy_threads = cfg.offload_heavy_threads,
-          .offload_queue_cap = cfg.offload_queue_cap,
-          .ring = cfg.ring,
-          .ring_sqpoll = cfg.ring_sqpoll};
+    return {.reactors = cfg.reactors,
+            .offload_threads = cfg.offload_threads,
+            .offload_heavy_threads = cfg.offload_heavy_threads,
+            .offload_queue_cap = cfg.offload_queue_cap,
+            .ring = cfg.ring,
+            .ring_sqpoll = cfg.ring_sqpoll};
 }
 
 // Runs a backend lifecycle coroutine on `reactor` and blocks the calling (main) thread
 // until it completes — start()/stop() are the only backend calls made off-reactor.
 Result<void> run_on_reactor(rt::Reactor& reactor, rt::Task<Result<void>> task) {
-  std::mutex mu;
-  std::condition_variable cv;
-  bool done = false;
-  Result<void> result;
-  rt::spawn(
-      [](rt::Task<Result<void>> work, std::mutex* mu, std::condition_variable* cv,
-         bool* done, Result<void>* result) -> rt::Task<void> {
-        *result = co_await std::move(work);
-        {
-          std::lock_guard lock(*mu);
-          *done = true;
-          cv->notify_one();  // under the lock: the waiter cannot destroy cv first
-        }
-      }(std::move(task), &mu, &cv, &done, &result),
-      reactor);
-  std::unique_lock lock(mu);
-  cv.wait(lock, [&] { return done; });
-  return result;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    Result<void> result;
+    rt::spawn(
+        [](rt::Task<Result<void>> work, std::mutex* mu, std::condition_variable* cv, bool* done,
+           Result<void>* result) -> rt::Task<void> {
+            *result = co_await std::move(work);
+            {
+                std::lock_guard lock(*mu);
+                *done = true;
+                cv->notify_one();  // under the lock: the waiter cannot destroy cv first
+            }
+        }(std::move(task), &mu, &cv, &done, &result),
+        reactor);
+    std::unique_lock lock(mu);
+    cv.wait(lock, [&] { return done; });
+    return result;
 }
 
 // One line per export for the v4.2 probe and the capability bits the engines consume
 // (plan doc 10 §5.3): native change counter, storage-side access, native locks, jukebox.
 void log_backend_traits(const core::ExportEntry& entry) {
-  auto caps = entry.backend->caps();
-  LNFS_INFO("export {} v4.2 capabilities: seek/allocate={} copy={} clone={}", entry.path,
-            caps.has(backend::Cap::kSparseOps), caps.has(backend::Cap::kCopyRange),
-            caps.has(backend::Cap::kCloneRange));
-  LNFS_INFO("export {} backend traits: stable-handles={} native-change={} "
-            "native-access={} native-locks={} jukebox={}",
-            entry.path, caps.has(backend::Cap::kStableHandles),
-            caps.has(backend::Cap::kNativeChange), caps.has(backend::Cap::kNativeAccess),
-            entry.backend->native_locks().has_value(), caps.has(backend::Cap::kJukebox));
+    auto caps = entry.backend->caps();
+    LNFS_INFO("export {} v4.2 capabilities: seek/allocate={} copy={} clone={}", entry.path,
+              caps.has(backend::Cap::kSparseOps), caps.has(backend::Cap::kCopyRange),
+              caps.has(backend::Cap::kCloneRange));
+    LNFS_INFO(
+        "export {} backend traits: stable-handles={} native-change={} "
+        "native-access={} native-locks={} jukebox={}",
+        entry.path, caps.has(backend::Cap::kStableHandles), caps.has(backend::Cap::kNativeChange),
+        caps.has(backend::Cap::kNativeAccess), entry.backend->native_locks().has_value(),
+        caps.has(backend::Cap::kJukebox));
 }
 
 // Start every backend on reactor 0 (cluster backends connect here).
 bool start_backends(rt::Runtime& runtime, core::ExportTable& exports) {
-  auto set = exports.snapshot();
-  for (const auto& entry : set->entries) {
-    auto started = run_on_reactor(runtime.reactor(0), entry->backend->start());
-    if (!started) {
-      LNFS_ERROR("backend {} failed to start: {}", entry->path, errno_name(started.error()));
-      return false;
+    auto set = exports.snapshot();
+    for (const auto& entry : set->entries) {
+        auto started = run_on_reactor(runtime.reactor(0), entry->backend->start());
+        if (!started) {
+            LNFS_ERROR("backend {} failed to start: {}", entry->path, errno_name(started.error()));
+            return false;
+        }
+        log_backend_traits(*entry);
     }
-    log_backend_traits(*entry);
-  }
-  return true;
+    return true;
 }
 
 void stop_backends(rt::Runtime& runtime, core::ExportTable& exports) {
-  auto set = exports.snapshot();
-  for (const auto& entry : set->entries)
-    (void)run_on_reactor(runtime.reactor(0), entry->backend->stop());
+    auto set = exports.snapshot();
+    for (const auto& entry : set->entries) (void)run_on_reactor(runtime.reactor(0), entry->backend->stop());
 }
 
 // ---- hot reload (plan doc 10 §4.1, step 1) -----------------------------------------
 
 // Topology/runtime keys stay fixed until restart; name what a reload ignored.
-std::string restart_required_report(const core::ServerConfig& fresh,
-                                    const core::ServerConfig& running) {
-  std::string report;
-  if (fresh.port != running.port || fresh.mount_port != running.mount_port ||
-      fresh.bind != running.bind)
-    report += "listen address/ports changed: restart required\n";
-  if (fresh.reactors != running.reactors || fresh.offload_threads != running.offload_threads)
-    report += "thread topology changed: restart required\n";
-  if (fresh.state_dir != running.state_dir || fresh.enable_v4 != running.enable_v4 ||
-      fresh.lease_seconds != running.lease_seconds ||
-      fresh.state_shards != running.state_shards)
-    report += "state_dir/v4/lease/shards changed: restart required\n";
-  if (fresh.metrics_port != running.metrics_port || fresh.metrics_bind != running.metrics_bind)
-    report += "metrics endpoint changed: restart required\n";
-  return report;
+std::string restart_required_report(const core::ServerConfig& fresh, const core::ServerConfig& running) {
+    std::string report;
+    if (fresh.port != running.port || fresh.mount_port != running.mount_port || fresh.bind != running.bind)
+        report += "listen address/ports changed: restart required\n";
+    if (fresh.reactors != running.reactors || fresh.offload_threads != running.offload_threads)
+        report += "thread topology changed: restart required\n";
+    if (fresh.state_dir != running.state_dir || fresh.enable_v4 != running.enable_v4 ||
+        fresh.lease_seconds != running.lease_seconds || fresh.state_shards != running.state_shards)
+        report += "state_dir/v4/lease/shards changed: restart required\n";
+    if (fresh.metrics_port != running.metrics_port || fresh.metrics_bind != running.metrics_bind)
+        report += "metrics endpoint changed: restart required\n";
+    return report;
 }
 
 // The [cluster] section fixes the gateway's identity, epoch source and fence: none of it
 // can change under a live role (plan 10 A1).
-std::string cluster_restart_required_report(const core::ClusterConfig& fresh,
-                                            const core::ClusterConfig& running) {
-  // `catalog_refresh` is the one hot key: the catalog poll reads it live (plan 12 C2).
-  core::ClusterConfig comparable = fresh;
-  comparable.catalog_refresh = running.catalog_refresh;
-  return comparable == running ? "" : "cluster settings changed: restart required\n";
+std::string cluster_restart_required_report(const core::ClusterConfig& fresh, const core::ClusterConfig& running) {
+    // `catalog_refresh` is the one hot key: the catalog poll reads it live (plan 12 C2).
+    core::ClusterConfig comparable = fresh;
+    comparable.catalog_refresh = running.catalog_refresh;
+    return comparable == running ? "" : "cluster settings changed: restart required\n";
 }
 
 // Re-parses the config file and applies the non-topology subset — log level,
@@ -329,32 +317,31 @@ std::string cluster_restart_required_report(const core::ClusterConfig& fresh,
 // `stack` may be null while no protocol stack exists (the management plane is up
 // before the engines, plan 10 A4): the per-client QoS knobs are then skipped.
 std::string reload_config(const std::string& config_path, const core::ServerConfig& running,
-                          const core::ClusterConfig& running_cluster, CoreState& core,
-                          ProtocolStack* stack) {
-  auto fresh = load_validated_config(config_path);
-  if (!fresh) return "reload failed: config invalid (details in the log)\n";
-  std::string report;
-  const auto& sc = fresh->server;
-  if (sc.log_level != running.log_level) {
-    apply_log_level(sc);
-    report += std::format("log_level -> {}\n", sc.log_level);
-  }
-  apply_observability(sc);
-  if (stack) apply_client_qos(*stack, sc);
-  if (core::cluster_catalog_exports(running_cluster)) {
-    // The exports come from the catalog; the caller applies its latest version next.
-    // catalog_refresh is the one [cluster] key that is hot (plan 12 A1/C2).
-    if (fresh->cluster.catalog_refresh != core.local_config.cluster.catalog_refresh) {
-      report += std::format("catalog_refresh -> {}\n", fresh->cluster.catalog_refresh);
-      core.local_config.cluster.catalog_refresh = fresh->cluster.catalog_refresh;
+                          const core::ClusterConfig& running_cluster, CoreState& core, ProtocolStack* stack) {
+    auto fresh = load_validated_config(config_path);
+    if (!fresh) return "reload failed: config invalid (details in the log)\n";
+    std::string report;
+    const auto& sc = fresh->server;
+    if (sc.log_level != running.log_level) {
+        apply_log_level(sc);
+        report += std::format("log_level -> {}\n", sc.log_level);
     }
-  } else {
-    report += core.exports->reload_dynamic(*fresh);
-  }
-  report += restart_required_report(sc, running);
-  report += cluster_restart_required_report(fresh->cluster, running_cluster);
-  LNFS_INFO("configuration reloaded from {}", config_path);
-  return report.empty() ? "nothing to apply\n" : report;
+    apply_observability(sc);
+    if (stack) apply_client_qos(*stack, sc);
+    if (core::cluster_catalog_exports(running_cluster)) {
+        // The exports come from the catalog; the caller applies its latest version next.
+        // catalog_refresh is the one [cluster] key that is hot (plan 12 A1/C2).
+        if (fresh->cluster.catalog_refresh != core.local_config.cluster.catalog_refresh) {
+            report += std::format("catalog_refresh -> {}\n", fresh->cluster.catalog_refresh);
+            core.local_config.cluster.catalog_refresh = fresh->cluster.catalog_refresh;
+        }
+    } else {
+        report += core.exports->reload_dynamic(*fresh);
+    }
+    report += restart_required_report(sc, running);
+    report += cluster_restart_required_report(fresh->cluster, running_cluster);
+    LNFS_INFO("configuration reloaded from {}", config_path);
+    return report.empty() ? "nothing to apply\n" : report;
 }
 
 // How long a stopping gateway lets established connections finish before closing them.
@@ -364,362 +351,355 @@ constexpr std::chrono::milliseconds kShutdownDrainGrace{2000};
 
 volatile std::sig_atomic_t g_stopping = 0;
 volatile std::sig_atomic_t g_reload_requested = 0;
-void on_stop_signal(int) { g_stopping = 1; }
-void on_sighup(int) { g_reload_requested = 1; }
+void on_stop_signal(int) {
+    g_stopping = 1;
+}
+void on_sighup(int) {
+    g_reload_requested = 1;
+}
 
 // The main thread's event loop (plan 10 C2): runs until SIGINT/SIGTERM, applying
 // SIGHUP reloads and whatever other threads post — the cluster controller's activate /
 // deactivate work runs here because the data plane (Frontend::start, backend
 // lifecycle calls) belongs to the main thread.
 void log_reload_report(std::string report) {
-  while (!report.empty() && report.back() == '\n') report.pop_back();
-  std::replace(report.begin(), report.end(), '\n', ';');
-  LNFS_INFO("reload (SIGHUP): {}", report);
+    while (!report.empty() && report.back() == '\n') report.pop_back();
+    std::replace(report.begin(), report.end(), '\n', ';');
+    LNFS_INFO("reload (SIGHUP): {}", report);
 }
 
 }  // namespace
 
 int check_config(const std::string& config_path) {
-  auto config = load_validated_config(config_path);
-  if (!config) return 1;
-  // Also constructs the backends so per-backend keys ([export.local] identity, ...)
-  // are validated exactly as a real startup would.
-  const core::ClusterConfig cluster_cfg = config->cluster;
-  if (core::cluster_catalog_exports(cluster_cfg)) {
-    // Catalog mode (plan 12 C1): the exports are read from shared_dir (never written
-    // to) and merged exactly as the startup would.
-    auto store = make_posix_cluster_store(
-        cluster_cfg.shared_dir, std::chrono::milliseconds(2 * cluster_cfg.fence_lease_ms));
-    std::string why;
-    auto boot = load_catalog_exports(*store, *config, &why);
-    if (!boot) {
-      LNFS_ERROR("invalid config {}: {}", config_path, why);
-      return 1;
+    auto config = load_validated_config(config_path);
+    if (!config) return 1;
+    // Also constructs the backends so per-backend keys ([export.local] identity, ...)
+    // are validated exactly as a real startup would.
+    const core::ClusterConfig cluster_cfg = config->cluster;
+    if (core::cluster_catalog_exports(cluster_cfg)) {
+        // Catalog mode (plan 12 C1): the exports are read from shared_dir (never written
+        // to) and merged exactly as the startup would.
+        auto store =
+            make_posix_cluster_store(cluster_cfg.shared_dir, std::chrono::milliseconds(2 * cluster_cfg.fence_lease_ms));
+        std::string why;
+        auto boot = load_catalog_exports(*store, *config, &why);
+        if (!boot) {
+            LNFS_ERROR("invalid config {}: {}", config_path, why);
+            return 1;
+        }
+        std::printf("catalog: %s\n",
+                    boot->present ? ("v" + std::to_string(boot->version)).c_str() : "none yet (empty export table)");
     }
-    std::printf("catalog: %s\n", boot->present ? ("v" + std::to_string(boot->version)).c_str()
-                                               : "none yet (empty export table)");
-  }
-  auto exports = core::ExportTable::build(std::move(*config));
-  if (!exports) {
-    LNFS_ERROR("invalid config {}: {}", config_path, errno_name(exports.error()));
-    return 1;
-  }
-  if (!check_cluster_backends(cluster_cfg, **exports)) {
-    LNFS_ERROR("invalid config {}: backends do not meet the cluster requirements",
-               config_path);
-    return 1;
-  }
-  warn_shared_dir_access(cluster_cfg);
-  std::printf("configuration is valid\n");
-  return 0;
+    auto exports = core::ExportTable::build(std::move(*config));
+    if (!exports) {
+        LNFS_ERROR("invalid config {}: {}", config_path, errno_name(exports.error()));
+        return 1;
+    }
+    if (!check_cluster_backends(cluster_cfg, **exports)) {
+        LNFS_ERROR("invalid config {}: backends do not meet the cluster requirements", config_path);
+        return 1;
+    }
+    warn_shared_dir_access(cluster_cfg);
+    std::printf("configuration is valid\n");
+    return 0;
 }
 
 int run_server(const std::string& config_path) {
-  // 1. configuration
-  auto config = load_validated_config(config_path);
-  if (!config) return 1;
-  const core::ServerConfig server_cfg = config->server;
-  const core::ClusterConfig cluster_cfg = config->cluster;
-  const bool active_active = core::cluster_active_active(cluster_cfg);
-  const bool catalog_mode = core::cluster_catalog_exports(cluster_cfg);
-  apply_log_level(server_cfg);
+    // 1. configuration
+    auto config = load_validated_config(config_path);
+    if (!config) return 1;
+    const core::ServerConfig server_cfg = config->server;
+    const core::ClusterConfig cluster_cfg = config->cluster;
+    const bool active_active = core::cluster_active_active(cluster_cfg);
+    const bool catalog_mode = core::cluster_catalog_exports(cluster_cfg);
+    apply_log_level(server_cfg);
 
-  // 2. durable identity: handle HMAC key + epoch (state_dir, or the shared cluster
-  //    store), the exports (the local file, or the shared catalog — plan 12 C1: the
-  //    catalog's exports merged with this host's [backend_defaults]; no catalog yet
-  //    means an empty table until one is published), then the export table
-  std::unique_ptr<ClusterStore> cluster_store;
-  if (cluster_cfg.enabled)
-    cluster_store = make_posix_cluster_store(
-        cluster_cfg.shared_dir, std::chrono::milliseconds(2 * cluster_cfg.fence_lease_ms));
-  CatalogBoot catalog;
-  if (catalog_mode) {
-    auto boot = load_catalog_exports(*cluster_store, *config);
-    if (!boot) return 1;
-    catalog = *boot;
-  }
-  const std::string exports_digest = core::canonical_exports_digest(*config);
-  auto identity = cluster_store ? cluster_identity(*cluster_store, cluster_cfg)
-                                : local_identity(server_cfg.state_dir);
-  if (!identity) return 1;
-  auto core = build_core_state(std::move(*config), *identity, cluster_store.get());
-  if (!core) return 1;
-  core->catalog_exports = catalog_mode;
-  core->applied_catalog_version = catalog.version;
-  if (!check_cluster_backends(cluster_cfg, *core->exports)) return 1;
-  // Per-export ownership as the v4 engine sees it (plan 12 B2): published by the
-  // FsClusterController under active-active, left null (everything served here)
-  // otherwise.  Outlives the stack that reads it.
-  core::FsOwnerView owner_view;
-  if (cluster_store) {
-    const std::string node = core::cluster_node_name(cluster_cfg);
+    // 2. durable identity: handle HMAC key + epoch (state_dir, or the shared cluster
+    //    store), the exports (the local file, or the shared catalog — plan 12 C1: the
+    //    catalog's exports merged with this host's [backend_defaults]; no catalog yet
+    //    means an empty table until one is published), then the export table
+    std::unique_ptr<ClusterStore> cluster_store;
+    if (cluster_cfg.enabled)
+        cluster_store =
+            make_posix_cluster_store(cluster_cfg.shared_dir, std::chrono::milliseconds(2 * cluster_cfg.fence_lease_ms));
+    CatalogBoot catalog;
     if (catalog_mode) {
-      if (!check_catalog_consistency(*cluster_store, node, catalog.version, exports_digest))
-        return 1;
-    } else if (!check_exports_consistency(*cluster_store, node, exports_digest)) {
-      return 1;
+        auto boot = load_catalog_exports(*cluster_store, *config);
+        if (!boot) return 1;
+        catalog = *boot;
     }
-    if (active_active) {
-      // Where our fs_locations point (design 10 §10.3): peers copy it into the view
-      // for the exports we own.
-      if (auto put = cluster_store->put_node_address(node, cluster_cfg.node_address); !put) {
-        LNFS_ERROR("cannot publish the node address to the cluster store: {}",
-                   errno_name(put.error()));
-        return 1;
-      }
-      core->owners = &owner_view;
-      core->active_active = true;
-      core->node = node;
-    }
-    LNFS_INFO("cluster mode: id={} node={} mode={} shared_dir={} epoch={} exports={}{}",
-              cluster_cfg.id, node, cluster_cfg.mode, cluster_cfg.shared_dir, core->epoch,
-              exports_digest,
-              !catalog_mode     ? ""
-              : catalog.present ? std::format(" catalog=v{}", catalog.version)
-                                : " catalog=none");
-  }
-  init_async_logging({.file = server_cfg.log_file,
-                      .rotate_size = server_cfg.log_rotate_size,
-                      .rotate_keep = server_cfg.log_rotate_keep});
-
-  // 3. runtime + backends
-  rt::Runtime runtime(runtime_config(server_cfg));
-  runtime.start();
-  if (!start_backends(runtime, *core->exports)) {
-    runtime.stop_and_join();
-    return 1;
-  }
-  // The catalog version this host now serves (design 11 §11.4): catalog.<node>, for
-  // `cluster catalog status` and the peers' consistency warnings.
-  if (catalog_mode)
-    record_catalog_applied(*cluster_store, core::cluster_node_name(cluster_cfg), catalog.version,
-                           exports_digest, "ok");
-
-  // 3b. management plane (ctl socket + metrics endpoint): up before the engines and
-  //     down after them, so it answers while no data plane exists (plan 10 A4).
-  std::atomic<ProtocolStack*> active_stack{nullptr};
-  MainLoop loop;
-  std::unique_ptr<CatalogApplier> applier;  // catalog mode (plan 12 C2), built below
-  // A reload runs on the main loop (plan 12 C2): the file IO and, in catalog mode,
-  // the apply pipeline belong there, not on the ctl reactor.  SIGHUP is already on
-  // that thread; the ctl command posts and waits.
-  auto reload_inline = [config_path, server_cfg, cluster_cfg, &core, &active_stack,
-                        &applier]() -> std::string {
-    std::string report = reload_config(config_path, server_cfg, cluster_cfg, *core,
-                                       active_stack.load(std::memory_order_acquire));
-    if (!applier) return report;
-    const uint64_t before = applier->applied();
-    auto applied = applier->apply_latest();
-    if (!applied)
-      report +=
-          std::format("catalog: apply failed, still v{}: {}\n", before, applier->last_error());
-    else if (*applied != before)
-      report += std::format("catalog: v{} applied (was v{})\n", *applied, before);
-    else
-      report += std::format("catalog: v{} is current\n", *applied);
-    return report;
-  };
-  auto do_reload = [&loop, reload_inline]() -> std::string {
-    auto report = loop.call(reload_inline, std::chrono::seconds(60));
-    return report ? *report : "reload timed out: the main loop did not run it\n";
-  };
-  std::optional<DataPlaneInstance> plane;
-  std::unique_ptr<ClusterController> controller;       // failover (plan 10 C2)
-  std::unique_ptr<FsClusterController> fs_controller;  // active-active (plan 12 C1)
-  std::optional<Management> mgmt;  // started below, once the controller exists
-  // The data-plane hooks the single gateway and the controller share (main thread).
-  auto bring_up = [&](uint64_t epoch) -> Result<void> {
-    core->epoch = epoch;
-    plane = activate(server_cfg, cluster_cfg, *core, runtime, *mgmt);
-    if (!plane) return Err(errno_from(EIO));
-    active_stack.store(plane->stack.get(), std::memory_order_release);
-    LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={} epoch={}", LIGHTNFS_VERSION,
-              plane->frontend->nfs->port(), plane->frontend->mount->port(), core->exports->size(),
-              epoch);
-    return {};
-  };
-  auto take_down = [&](std::chrono::milliseconds grace) {
-    if (!plane) return;
-    active_stack.store(nullptr);
-    (void)deactivate(*plane, server_cfg, *mgmt, grace);
-    plane.reset();
-  };
-  const std::chrono::milliseconds drain_grace(2 * cluster_cfg.fence_lease_ms);
-  if (cluster_store && active_active) {
-    // Active-active (design 10, plan 12 C1): the stack is built once (below) and stays
-    // up; the controller moves single exports in and out of service through the
-    // state manager and the owner view.  Its ctl surface arrives with plan 12 C4.
-    FsClusterController::Hooks hooks;
-    hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
-    hooks.after_tick = [&applier] {
-      if (applier) applier->poll();
-    };
-    hooks.activate_fs = [&](uint32_t fsid, uint64_t fs_epoch) -> Result<void> {
-      if (!plane) return Err(errno_from(EIO));
-      plane->stack->state.load_grace_list(fsid);
-      LNFS_INFO("cluster: fsid {} in service (fs epoch {})", fsid, fs_epoch);
-      return {};
-    };
-    hooks.deactivate_fs = [&](uint32_t fsid) {
-      if (!plane) return;
-      // Drop the export's open/lock/delegation state (plan 12 A3): a coroutine, run to
-      // completion on reactor 0 like the backend lifecycle calls.
-      auto release = [](state::StateMgr* state, uint32_t id) -> rt::Task<Result<void>> {
-        size_t dropped = co_await state->release_fsid(id);
-        LNFS_INFO("cluster: fsid {} out of service: {} state(s) dropped", id, dropped);
-        co_return Result<void>{};
-      };
-      (void)run_on_reactor(runtime.reactor(0), release(&plane->stack->state, fsid));
-    };
-    // Storage-side eviction scoped to the export (plan 12 C2): that backend's
-    // takeover() — CephFS reclaims only `<cluster id>-<fsid>` — then the operator's
-    // script with LNFS_FSID set.
-    hooks.backend_takeover = [&](uint32_t fsid, const TakeoverContext& ctx) -> Result<void> {
-      const auto* entry = core->exports->by_fsid(fsid);
-      if (!entry) return Err(errno_from(ENOENT));
-      Result<void> outcome{};
-      auto took = run_on_reactor(runtime.reactor(0), entry->backend->takeover(ctx.identity));
-      if (!took) {
-        LNFS_WARN("cluster: backend {} takeover failed: {}", entry->path, errno_name(took.error()));
-        outcome = Err(took.error());
-      }
-      if (!cluster_cfg.takeover_hook.empty()) {
-        auto ran = run_takeover_hook(cluster_cfg.takeover_hook, ctx.identity, ctx.prev_node,
-                                     std::chrono::milliseconds(cluster_cfg.fence_lease_ms), fsid,
-                                     ctx.reason);
-        if (!ran) outcome = Err(ran.error());
-      }
-      return outcome;
-    };
-    fs_controller = std::make_unique<FsClusterController>(
-        cluster_cfg, *core->exports, *cluster_store, owner_view, std::move(hooks), core->epoch);
-  } else if (cluster_store) {
-    // The controller (plan 10 C2) is built before the management plane so the ctl
-    // socket can address it (`cluster *`, plan 10 C3); its timer starts after.
-    ClusterController::Hooks hooks;
-    hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
-    hooks.after_tick = [&applier] {
-      if (applier) applier->poll();
-    };
-    hooks.activate = bring_up;
-    hooks.deactivate = [&, drain_grace] { take_down(drain_grace); };
-    // Storage-side eviction of the failed gateway (plan 10 D1): every backend's
-    // takeover() on reactor 0 (as start()/stop()), then the operator's script.  Each
-    // failure is logged; the activation goes on regardless (B2's DELAY path covers
-    // whatever is still held).
-    hooks.backend_takeover = [&](const TakeoverContext& ctx) -> Result<void> {
-      Result<void> outcome{};
-      auto set = core->exports->snapshot();
-      for (const auto& entry : set->entries) {
-        auto took = run_on_reactor(runtime.reactor(0), entry->backend->takeover(ctx.identity));
-        if (!took) {
-          LNFS_WARN("cluster: backend {} takeover failed: {}", entry->path,
-                    errno_name(took.error()));
-          outcome = Err(took.error());
+    const std::string exports_digest = core::canonical_exports_digest(*config);
+    auto identity =
+        cluster_store ? cluster_identity(*cluster_store, cluster_cfg) : local_identity(server_cfg.state_dir);
+    if (!identity) return 1;
+    auto core = build_core_state(std::move(*config), *identity, cluster_store.get());
+    if (!core) return 1;
+    core->catalog_exports = catalog_mode;
+    core->applied_catalog_version = catalog.version;
+    if (!check_cluster_backends(cluster_cfg, *core->exports)) return 1;
+    // Per-export ownership as the v4 engine sees it (plan 12 B2): published by the
+    // FsClusterController under active-active, left null (everything served here)
+    // otherwise.  Outlives the stack that reads it.
+    core::FsOwnerView owner_view;
+    if (cluster_store) {
+        const std::string node = core::cluster_node_name(cluster_cfg);
+        if (catalog_mode) {
+            if (!check_catalog_consistency(*cluster_store, node, catalog.version, exports_digest)) return 1;
+        } else if (!check_exports_consistency(*cluster_store, node, exports_digest)) {
+            return 1;
         }
-      }
-      if (!cluster_cfg.takeover_hook.empty()) {
-        auto ran = run_takeover_hook(cluster_cfg.takeover_hook, ctx.identity, ctx.prev_node,
-                                     std::chrono::milliseconds(cluster_cfg.fence_lease_ms));
-        if (!ran) outcome = Err(ran.error());
-      }
-      return outcome;
-    };
-    hooks.backend_reset = [&] {
-      stop_backends(runtime, *core->exports);
-      if (!start_backends(runtime, *core->exports))
-        LNFS_ERROR("cluster: backends failed to restart after draining; the next takeover "
-                   "will not serve");
-    };
-    controller = std::make_unique<ClusterController>(cluster_cfg, *cluster_store,
-                                                     std::move(hooks));
-  }
-  if (catalog_mode) {
-    // The catalog follower (plan 12 C2): polled from the controller's tick, applied on
-    // the main loop, backends started / stopped on reactor 0 as at boot.
-    applier = std::make_unique<CatalogApplier>(
-        CatalogApplier::Deps{
-            .store = *cluster_store,
-            .exports = *core->exports,
-            .local = core->local_config,
-            .node = core::cluster_node_name(cluster_cfg),
-            .fs_cluster = fs_controller.get(),
-            .post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); },
-            .start_backend =
-                [&runtime](backend::Backend& backend) {
-                  return run_on_reactor(runtime.reactor(0), backend.start());
-                },
-            .stop_backend =
-                [&runtime](backend::Backend& backend) {
-                  (void)run_on_reactor(runtime.reactor(0), backend.stop());
-                },
-            .retire_overdue = std::chrono::seconds(10 * server_cfg.lease_seconds)},
-        catalog.version, std::move(catalog.catalog), exports_digest);
-  }
-  mgmt.emplace(Management::start(server_cfg, runtime, do_reload, {}, controller.get(),
-                                 fs_controller.get(), applier.get()));
-  apply_observability(server_cfg);
-
-  if (!cluster_store || active_active) {
-    // 4+5. single gateway (plan 10 C1) and active-active (plan 12 C1): the data plane
-    //      once, for the whole process.  Under active-active every export starts
-    //      Unowned in the view (clients wait) until the controller's first ticks have
-    //      taken over what is ours.
-    if (!bring_up(core->epoch)) {
-      mgmt->stop();
-      runtime.stop_and_join();
-      return 1;
+        if (active_active) {
+            // Where our fs_locations point (design 10 §10.3): peers copy it into the view
+            // for the exports we own.
+            if (auto put = cluster_store->put_node_address(node, cluster_cfg.node_address); !put) {
+                LNFS_ERROR("cannot publish the node address to the cluster store: {}", errno_name(put.error()));
+                return 1;
+            }
+            core->owners = &owner_view;
+            core->active_active = true;
+            core->node = node;
+        }
+        LNFS_INFO("cluster mode: id={} node={} mode={} shared_dir={} epoch={} exports={}{}", cluster_cfg.id, node,
+                  cluster_cfg.mode, cluster_cfg.shared_dir, core->epoch, exports_digest,
+                  !catalog_mode     ? ""
+                  : catalog.present ? std::format(" catalog=v{}", catalog.version)
+                                    : " catalog=none");
     }
-    if (fs_controller) {
-      fs_controller->start();
-      LNFS_INFO("lightnfs {} active-active: node={} address={} takeover={} fence_lease={}ms",
-                LIGHTNFS_VERSION, core::cluster_node_name(cluster_cfg), cluster_cfg.node_address,
-                cluster_cfg.takeover, cluster_cfg.fence_lease_ms);
+    init_async_logging({.file = server_cfg.log_file,
+                        .rotate_size = server_cfg.log_rotate_size,
+                        .rotate_keep = server_cfg.log_rotate_keep});
+
+    // 3. runtime + backends
+    rt::Runtime runtime(runtime_config(server_cfg));
+    runtime.start();
+    if (!start_backends(runtime, *core->exports)) {
+        runtime.stop_and_join();
+        return 1;
     }
-  } else {
-    // 4+5. cluster (plan 10 C2): standby until the controller takes the fence; the
-    //      data plane is built with the epoch the takeover mints and torn down again
-    //      when the fence is lost or the operator asks.
-    controller->start();
-    LNFS_INFO("lightnfs {} standby: node={} role={} takeover={} fence_lease={}ms",
-              LIGHTNFS_VERSION, core::cluster_node_name(cluster_cfg), cluster_cfg.role,
-              cluster_cfg.takeover, cluster_cfg.fence_lease_ms);
-  }
+    // The catalog version this host now serves (design 11 §11.4): catalog.<node>, for
+    // `cluster catalog status` and the peers' consistency warnings.
+    if (catalog_mode)
+        record_catalog_applied(*cluster_store, core::cluster_node_name(cluster_cfg), catalog.version, exports_digest,
+                               "ok");
 
-  std::signal(SIGINT, on_stop_signal);
-  std::signal(SIGTERM, on_stop_signal);
-  std::signal(SIGHUP, on_sighup);
-  loop.run([] { return g_stopping != 0; },
-           [] {
-             if (!g_reload_requested) return false;
-             g_reload_requested = 0;
-             return true;
-           },
-           [&] { log_reload_report(reload_inline()); });
+    // 3b. management plane (ctl socket + metrics endpoint): up before the engines and
+    //     down after them, so it answers while no data plane exists (plan 10 A4).
+    std::atomic<ProtocolStack*> active_stack{nullptr};
+    MainLoop loop;
+    std::unique_ptr<CatalogApplier> applier;  // catalog mode (plan 12 C2), built below
+    // A reload runs on the main loop (plan 12 C2): the file IO and, in catalog mode,
+    // the apply pipeline belong there, not on the ctl reactor.  SIGHUP is already on
+    // that thread; the ctl command posts and waits.
+    auto reload_inline = [config_path, server_cfg, cluster_cfg, &core, &active_stack, &applier]() -> std::string {
+        std::string report =
+            reload_config(config_path, server_cfg, cluster_cfg, *core, active_stack.load(std::memory_order_acquire));
+        if (!applier) return report;
+        const uint64_t before = applier->applied();
+        auto applied = applier->apply_latest();
+        if (!applied)
+            report += std::format("catalog: apply failed, still v{}: {}\n", before, applier->last_error());
+        else if (*applied != before)
+            report += std::format("catalog: v{} applied (was v{})\n", *applied, before);
+        else
+            report += std::format("catalog: v{} is current\n", *applied);
+        return report;
+    };
+    auto do_reload = [&loop, reload_inline]() -> std::string {
+        auto report = loop.call(reload_inline, std::chrono::seconds(60));
+        return report ? *report : "reload timed out: the main loop did not run it\n";
+    };
+    std::optional<DataPlaneInstance> plane;
+    std::unique_ptr<ClusterController> controller;       // failover (plan 10 C2)
+    std::unique_ptr<FsClusterController> fs_controller;  // active-active (plan 12 C1)
+    std::optional<Management> mgmt;                      // started below, once the controller exists
+    // The data-plane hooks the single gateway and the controller share (main thread).
+    auto bring_up = [&](uint64_t epoch) -> Result<void> {
+        core->epoch = epoch;
+        plane = activate(server_cfg, cluster_cfg, *core, runtime, *mgmt);
+        if (!plane) return Err(errno_from(EIO));
+        active_stack.store(plane->stack.get(), std::memory_order_release);
+        LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={} epoch={}", LIGHTNFS_VERSION,
+                  plane->frontend->nfs->port(), plane->frontend->mount->port(), core->exports->size(), epoch);
+        return {};
+    };
+    auto take_down = [&](std::chrono::milliseconds grace) {
+        if (!plane) return;
+        active_stack.store(nullptr);
+        (void)deactivate(*plane, server_cfg, *mgmt, grace);
+        plane.reset();
+    };
+    const std::chrono::milliseconds drain_grace(2 * cluster_cfg.fence_lease_ms);
+    if (cluster_store && active_active) {
+        // Active-active (design 10, plan 12 C1): the stack is built once (below) and stays
+        // up; the controller moves single exports in and out of service through the
+        // state manager and the owner view.  Its ctl surface arrives with plan 12 C4.
+        FsClusterController::Hooks hooks;
+        hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
+        hooks.after_tick = [&applier] {
+            if (applier) applier->poll();
+        };
+        hooks.activate_fs = [&](uint32_t fsid, uint64_t fs_epoch) -> Result<void> {
+            if (!plane) return Err(errno_from(EIO));
+            plane->stack->state.load_grace_list(fsid);
+            LNFS_INFO("cluster: fsid {} in service (fs epoch {})", fsid, fs_epoch);
+            return {};
+        };
+        hooks.deactivate_fs = [&](uint32_t fsid) {
+            if (!plane) return;
+            // Drop the export's open/lock/delegation state (plan 12 A3): a coroutine, run to
+            // completion on reactor 0 like the backend lifecycle calls.
+            auto release = [](state::StateMgr* state, uint32_t id) -> rt::Task<Result<void>> {
+                size_t dropped = co_await state->release_fsid(id);
+                LNFS_INFO("cluster: fsid {} out of service: {} state(s) dropped", id, dropped);
+                co_return Result<void>{};
+            };
+            (void)run_on_reactor(runtime.reactor(0), release(&plane->stack->state, fsid));
+        };
+        // Storage-side eviction scoped to the export (plan 12 C2): that backend's
+        // takeover() — CephFS reclaims only `<cluster id>-<fsid>` — then the operator's
+        // script with LNFS_FSID set.
+        hooks.backend_takeover = [&](uint32_t fsid, const TakeoverContext& ctx) -> Result<void> {
+            const auto* entry = core->exports->by_fsid(fsid);
+            if (!entry) return Err(errno_from(ENOENT));
+            Result<void> outcome{};
+            auto took = run_on_reactor(runtime.reactor(0), entry->backend->takeover(ctx.identity));
+            if (!took) {
+                LNFS_WARN("cluster: backend {} takeover failed: {}", entry->path, errno_name(took.error()));
+                outcome = Err(took.error());
+            }
+            if (!cluster_cfg.takeover_hook.empty()) {
+                auto ran = run_takeover_hook(cluster_cfg.takeover_hook, ctx.identity, ctx.prev_node,
+                                             std::chrono::milliseconds(cluster_cfg.fence_lease_ms), fsid, ctx.reason);
+                if (!ran) outcome = Err(ran.error());
+            }
+            return outcome;
+        };
+        fs_controller = std::make_unique<FsClusterController>(cluster_cfg, *core->exports, *cluster_store, owner_view,
+                                                              std::move(hooks), core->epoch);
+    } else if (cluster_store) {
+        // The controller (plan 10 C2) is built before the management plane so the ctl
+        // socket can address it (`cluster *`, plan 10 C3); its timer starts after.
+        ClusterController::Hooks hooks;
+        hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
+        hooks.after_tick = [&applier] {
+            if (applier) applier->poll();
+        };
+        hooks.activate = bring_up;
+        hooks.deactivate = [&, drain_grace] { take_down(drain_grace); };
+        // Storage-side eviction of the failed gateway (plan 10 D1): every backend's
+        // takeover() on reactor 0 (as start()/stop()), then the operator's script.  Each
+        // failure is logged; the activation goes on regardless (B2's DELAY path covers
+        // whatever is still held).
+        hooks.backend_takeover = [&](const TakeoverContext& ctx) -> Result<void> {
+            Result<void> outcome{};
+            auto set = core->exports->snapshot();
+            for (const auto& entry : set->entries) {
+                auto took = run_on_reactor(runtime.reactor(0), entry->backend->takeover(ctx.identity));
+                if (!took) {
+                    LNFS_WARN("cluster: backend {} takeover failed: {}", entry->path, errno_name(took.error()));
+                    outcome = Err(took.error());
+                }
+            }
+            if (!cluster_cfg.takeover_hook.empty()) {
+                auto ran = run_takeover_hook(cluster_cfg.takeover_hook, ctx.identity, ctx.prev_node,
+                                             std::chrono::milliseconds(cluster_cfg.fence_lease_ms));
+                if (!ran) outcome = Err(ran.error());
+            }
+            return outcome;
+        };
+        hooks.backend_reset = [&] {
+            stop_backends(runtime, *core->exports);
+            if (!start_backends(runtime, *core->exports))
+                LNFS_ERROR(
+                    "cluster: backends failed to restart after draining; the next takeover "
+                    "will not serve");
+        };
+        controller = std::make_unique<ClusterController>(cluster_cfg, *cluster_store, std::move(hooks));
+    }
+    if (catalog_mode) {
+        // The catalog follower (plan 12 C2): polled from the controller's tick, applied on
+        // the main loop, backends started / stopped on reactor 0 as at boot.
+        applier = std::make_unique<CatalogApplier>(
+            CatalogApplier::Deps{
+                .store = *cluster_store,
+                .exports = *core->exports,
+                .local = core->local_config,
+                .node = core::cluster_node_name(cluster_cfg),
+                .fs_cluster = fs_controller.get(),
+                .post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); },
+                .start_backend =
+                    [&runtime](backend::Backend& backend) {
+                        return run_on_reactor(runtime.reactor(0), backend.start());
+                    },
+                .stop_backend =
+                    [&runtime](backend::Backend& backend) { (void)run_on_reactor(runtime.reactor(0), backend.stop()); },
+                .retire_overdue = std::chrono::seconds(10 * server_cfg.lease_seconds)},
+            catalog.version, std::move(catalog.catalog), exports_digest);
+    }
+    mgmt.emplace(
+        Management::start(server_cfg, runtime, do_reload, {}, controller.get(), fs_controller.get(), applier.get()));
+    apply_observability(server_cfg);
 
-  // mirror-image shutdown: controller timer → pending posted work → data plane
-  // (detach from ctl → stop accepting → connections → lease scanner → stack) → fence
-  // → backends → management → runtime → logging
-  if (controller) controller->stop();
-  if (fs_controller) fs_controller->stop();
-  loop.drain();
-  // Active-active: hand every export we hold back (view → Draining, state dropped,
-  // fence released) before the connections close, so clients are referred on.
-  if (fs_controller) fs_controller->shutdown();
-  take_down(kShutdownDrainGrace);
-  // Exports removed by a catalog version and not yet retired (their last snapshot
-  // went with the data plane): stop their backends with the rest.
-  if (applier) (void)applier->retire_exports();
-  if (controller && controller->role() != Role::kStandby) {
-    (void)cluster_store->release_fence(core::cluster_node_name(cluster_cfg));
-    LNFS_INFO("cluster: fence released on exit");
-  }
-  stop_backends(runtime, *core->exports);
-  mgmt->stop();
-  runtime.stop_and_join();
-  LNFS_INFO("lightnfs stopped");
-  shutdown_async_logging();
-  return 0;
+    if (!cluster_store || active_active) {
+        // 4+5. single gateway (plan 10 C1) and active-active (plan 12 C1): the data plane
+        //      once, for the whole process.  Under active-active every export starts
+        //      Unowned in the view (clients wait) until the controller's first ticks have
+        //      taken over what is ours.
+        if (!bring_up(core->epoch)) {
+            mgmt->stop();
+            runtime.stop_and_join();
+            return 1;
+        }
+        if (fs_controller) {
+            fs_controller->start();
+            LNFS_INFO("lightnfs {} active-active: node={} address={} takeover={} fence_lease={}ms", LIGHTNFS_VERSION,
+                      core::cluster_node_name(cluster_cfg), cluster_cfg.node_address, cluster_cfg.takeover,
+                      cluster_cfg.fence_lease_ms);
+        }
+    } else {
+        // 4+5. cluster (plan 10 C2): standby until the controller takes the fence; the
+        //      data plane is built with the epoch the takeover mints and torn down again
+        //      when the fence is lost or the operator asks.
+        controller->start();
+        LNFS_INFO("lightnfs {} standby: node={} role={} takeover={} fence_lease={}ms", LIGHTNFS_VERSION,
+                  core::cluster_node_name(cluster_cfg), cluster_cfg.role, cluster_cfg.takeover,
+                  cluster_cfg.fence_lease_ms);
+    }
+
+    std::signal(SIGINT, on_stop_signal);
+    std::signal(SIGTERM, on_stop_signal);
+    std::signal(SIGHUP, on_sighup);
+    loop.run([] { return g_stopping != 0; },
+             [] {
+                 if (!g_reload_requested) return false;
+                 g_reload_requested = 0;
+                 return true;
+             },
+             [&] { log_reload_report(reload_inline()); });
+
+    // mirror-image shutdown: controller timer → pending posted work → data plane
+    // (detach from ctl → stop accepting → connections → lease scanner → stack) → fence
+    // → backends → management → runtime → logging
+    if (controller) controller->stop();
+    if (fs_controller) fs_controller->stop();
+    loop.drain();
+    // Active-active: hand every export we hold back (view → Draining, state dropped,
+    // fence released) before the connections close, so clients are referred on.
+    if (fs_controller) fs_controller->shutdown();
+    take_down(kShutdownDrainGrace);
+    // Exports removed by a catalog version and not yet retired (their last snapshot
+    // went with the data plane): stop their backends with the rest.
+    if (applier) (void)applier->retire_exports();
+    if (controller && controller->role() != Role::kStandby) {
+        (void)cluster_store->release_fence(core::cluster_node_name(cluster_cfg));
+        LNFS_INFO("cluster: fence released on exit");
+    }
+    stop_backends(runtime, *core->exports);
+    mgmt->stop();
+    runtime.stop_and_join();
+    LNFS_INFO("lightnfs stopped");
+    shutdown_async_logging();
+    return 0;
 }
 
 }  // namespace lnfs::server

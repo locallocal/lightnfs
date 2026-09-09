@@ -42,17 +42,16 @@ std::string backend_value_text(std::string_view value);
 // are EINVAL; `disabled` (a catalog-only key) is accepted only when a slot is given.
 class ExportBlockParser {
  public:
-  explicit ExportBlockParser(ExportConfig& exp, bool* disabled = nullptr)
-      : exp_(exp), disabled_(disabled) {}
-  // Feeds one trimmed, comment-stripped, non-empty line.  True: the block consumed it (a
-  // `key = value` or the `[export.<backend>]` header).  False: the line is some other
-  // section header — the block has ended and the caller owns the line.
-  Result<bool> line(std::string_view line);
+    explicit ExportBlockParser(ExportConfig& exp, bool* disabled = nullptr) : exp_(exp), disabled_(disabled) {}
+    // Feeds one trimmed, comment-stripped, non-empty line.  True: the block consumed it (a
+    // `key = value` or the `[export.<backend>]` header).  False: the line is some other
+    // section header — the block has ended and the caller owns the line.
+    Result<bool> line(std::string_view line);
 
  private:
-  ExportConfig& exp_;
-  bool* disabled_;
-  bool backend_table_ = false;
+    ExportConfig& exp_;
+    bool* disabled_;
+    bool backend_table_ = false;
 };
 
 }  // namespace lnfs::core::detail

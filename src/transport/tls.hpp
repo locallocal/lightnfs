@@ -37,11 +37,11 @@ namespace lnfs::transport {
 enum class TlsPolicy { kOff, kOptional, kRequired };
 
 struct TlsConfig {
-  TlsPolicy policy = TlsPolicy::kOff;
-  std::string cert;  // server certificate chain, PEM
-  std::string key;   // server private key, PEM
-  std::string ca;    // optional CA bundle: when set, client certs are requested+verified
-  bool require_client_cert = false;  // mutual TLS (needs `ca`)
+    TlsPolicy policy = TlsPolicy::kOff;
+    std::string cert;                  // server certificate chain, PEM
+    std::string key;                   // server private key, PEM
+    std::string ca;                    // optional CA bundle: when set, client certs are requested+verified
+    bool require_client_cert = false;  // mutual TLS (needs `ca`)
 };
 
 // True when this build was compiled with OpenSSL support.
@@ -51,47 +51,47 @@ bool tls_available();
 // connection; thread-safe for creating per-connection sessions.
 class TlsContext {
  public:
-  static Result<std::unique_ptr<TlsContext>> create(const TlsConfig& cfg);
-  ~TlsContext();
-  TlsContext(const TlsContext&) = delete;
-  TlsContext& operator=(const TlsContext&) = delete;
+    static Result<std::unique_ptr<TlsContext>> create(const TlsConfig& cfg);
+    ~TlsContext();
+    TlsContext(const TlsContext&) = delete;
+    TlsContext& operator=(const TlsContext&) = delete;
 
-  void* native() const { return ctx_; }  // SSL_CTX* (opaque to non-TLS TUs)
+    void* native() const { return ctx_; }  // SSL_CTX* (opaque to non-TLS TUs)
 
  private:
-  explicit TlsContext(void* ctx) : ctx_(ctx) {}
-  void* ctx_ = nullptr;
+    explicit TlsContext(void* ctx) : ctx_(ctx) {}
+    void* ctx_ = nullptr;
 };
 
 // One TLS session over one connection's fd.  Owns the SSL object and its memory BIOs.
 class TlsConn {
  public:
-  static Result<std::unique_ptr<TlsConn>> create(const TlsContext& ctx);
-  ~TlsConn();
-  TlsConn(const TlsConn&) = delete;
-  TlsConn& operator=(const TlsConn&) = delete;
+    static Result<std::unique_ptr<TlsConn>> create(const TlsContext& ctx);
+    ~TlsConn();
+    TlsConn(const TlsConn&) = delete;
+    TlsConn& operator=(const TlsConn&) = delete;
 
-  // Server-side handshake on `fd` (must run on the fd's home reactor).
-  rt::Task<Result<void>> accept(int fd);
-  // Reads up to out.size() plaintext bytes; 0 return maps to Err(kEof) at a clean close.
-  rt::Task<Result<uint32_t>> read(int fd, std::span<std::byte> out);
-  // Writes all of `in` as TLS application data.
-  rt::Task<Result<void>> write(int fd, std::span<const std::byte> in);
+    // Server-side handshake on `fd` (must run on the fd's home reactor).
+    rt::Task<Result<void>> accept(int fd);
+    // Reads up to out.size() plaintext bytes; 0 return maps to Err(kEof) at a clean close.
+    rt::Task<Result<uint32_t>> read(int fd, std::span<std::byte> out);
+    // Writes all of `in` as TLS application data.
+    rt::Task<Result<void>> write(int fd, std::span<const std::byte> in);
 
-  explicit TlsConn(void* ssl) : ssl_(ssl) {}
+    explicit TlsConn(void* ssl) : ssl_(ssl) {}
 
  private:
-  // Drains OpenSSL's outgoing BIO to the socket; feeds one socket read into the
-  // incoming BIO.  Both return Err on socket error / EOF.
-  rt::Task<Result<void>> flush_out(int fd);
-  rt::Task<Result<void>> feed_in(int fd);
+    // Drains OpenSSL's outgoing BIO to the socket; feeds one socket read into the
+    // incoming BIO.  Both return Err on socket error / EOF.
+    rt::Task<Result<void>> flush_out(int fd);
+    rt::Task<Result<void>> feed_in(int fd);
 
-  void* ssl_ = nullptr;  // SSL*
-  std::vector<std::byte> netbuf_ = std::vector<std::byte>(16384);  // ciphertext scratch
-  // Serializes ciphertext egress: SSL_write on a reply handler and an incidental write
-  // from the read loop's SSL_read (TLS 1.3 KeyUpdate/ticket) both drain the outgoing
-  // BIO, so their socket sends must not interleave and reorder the byte stream.
-  rt::AsyncMutex send_mu_;
+    void* ssl_ = nullptr;                                            // SSL*
+    std::vector<std::byte> netbuf_ = std::vector<std::byte>(16384);  // ciphertext scratch
+    // Serializes ciphertext egress: SSL_write on a reply handler and an incidental write
+    // from the read loop's SSL_read (TLS 1.3 KeyUpdate/ticket) both drain the outgoing
+    // BIO, so their socket sends must not interleave and reorder the byte stream.
+    rt::AsyncMutex send_mu_;
 };
 
 }  // namespace lnfs::transport

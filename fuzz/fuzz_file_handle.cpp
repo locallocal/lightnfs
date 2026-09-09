@@ -22,63 +22,63 @@ using namespace lnfs;
 namespace {
 
 struct Env {
-  std::shared_ptr<const core::ExportSet> exports;
-  std::unique_ptr<core::FileHandleCodec> codec;
-  sockaddr_storage peer{};
-  std::vector<std::byte> valid;  // a correctly tagged handle to mutate
+    std::shared_ptr<const core::ExportSet> exports;
+    std::unique_ptr<core::FileHandleCodec> codec;
+    sockaddr_storage peer{};
+    std::vector<std::byte> valid;  // a correctly tagged handle to mutate
 
-  Env() {
-    lnfs::set_log_level(lnfs::LogLevel::kError);
-    core::ExportConfig cfg;
-    cfg.path = "/fuzz";
-    cfg.fsid = 1;
-    cfg.clients = {"127.0.0.0/8"};
-    auto memory = std::make_unique<backend::MemoryBackend>(1);
-    core::ExportSetBuilder builder;
-    (void)builder.add(cfg, std::move(memory));
-    exports = builder.finish(1, 0);
-    std::array<std::byte, 16> key{};
-    key[0] = std::byte{0x5a};
-    codec = std::make_unique<core::FileHandleCodec>(core::FileHandleCodec::from_key(key));
-    auto* sin = reinterpret_cast<sockaddr_in*>(&peer);
-    sin->sin_family = AF_INET;
-    inet_pton(AF_INET, "127.0.0.1", &sin->sin_addr);
-    backend::ObjId oid{};
-    oid.len = 8;
-    for (int i = 0; i < 8; ++i) oid.bytes[i] = std::byte(i + 1);
-    valid = codec->encode(*exports->by_fsid(1), oid);
-  }
+    Env() {
+        lnfs::set_log_level(lnfs::LogLevel::kError);
+        core::ExportConfig cfg;
+        cfg.path = "/fuzz";
+        cfg.fsid = 1;
+        cfg.clients = {"127.0.0.0/8"};
+        auto memory = std::make_unique<backend::MemoryBackend>(1);
+        core::ExportSetBuilder builder;
+        (void)builder.add(cfg, std::move(memory));
+        exports = builder.finish(1, 0);
+        std::array<std::byte, 16> key{};
+        key[0] = std::byte{0x5a};
+        codec = std::make_unique<core::FileHandleCodec>(core::FileHandleCodec::from_key(key));
+        auto* sin = reinterpret_cast<sockaddr_in*>(&peer);
+        sin->sin_family = AF_INET;
+        inet_pton(AF_INET, "127.0.0.1", &sin->sin_addr);
+        backend::ObjId oid{};
+        oid.len = 8;
+        for (int i = 0; i < 8; ++i) oid.bytes[i] = std::byte(i + 1);
+        valid = codec->encode(*exports->by_fsid(1), oid);
+    }
 };
 
 Env& env() {
-  static Env e;
-  return e;
+    static Env e;
+    return e;
 }
 
 }  // namespace
 
 extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
-  auto& e = env();
-  std::span<const std::byte> fh(reinterpret_cast<const std::byte*>(data), size);
-  (void)e.codec->decode(fh, e.peer, *e.exports);
-  (void)e.codec->decode_v4(fh, e.peer, *e.exports);
-  (void)e.codec->inspect(fh);
+    auto& e = env();
+    std::span<const std::byte> fh(reinterpret_cast<const std::byte*>(data), size);
+    (void)e.codec->decode(fh, e.peer, *e.exports);
+    (void)e.codec->decode_v4(fh, e.peer, *e.exports);
+    (void)e.codec->inspect(fh);
 
-  // Near-valid input: apply the fuzzer's bytes as targeted mutations to a handle that
-  // carries a correct tag, reaching the post-HMAC parse stages more often.
-  if (size >= 2) {
-    auto mutated = e.valid;
-    mutated[data[0] % mutated.size()] ^= std::byte(data[1]);
-    std::span<const std::byte> mfh(mutated.data(), mutated.size());
-    (void)e.codec->decode(mfh, e.peer, *e.exports);
-    (void)e.codec->decode_v4(mfh, e.peer, *e.exports);
-    (void)e.codec->inspect(mfh);
-  }
+    // Near-valid input: apply the fuzzer's bytes as targeted mutations to a handle that
+    // carries a correct tag, reaching the post-HMAC parse stages more often.
+    if (size >= 2) {
+        auto mutated = e.valid;
+        mutated[data[0] % mutated.size()] ^= std::byte(data[1]);
+        std::span<const std::byte> mfh(mutated.data(), mutated.size());
+        (void)e.codec->decode(mfh, e.peer, *e.exports);
+        (void)e.codec->decode_v4(mfh, e.peer, *e.exports);
+        (void)e.codec->inspect(mfh);
+    }
 }
 
 #ifndef LNFS_FUZZ_REGRESS
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  lnfs_fuzz_entry(data, size);
-  return 0;
+    lnfs_fuzz_entry(data, size);
+    return 0;
 }
 #endif

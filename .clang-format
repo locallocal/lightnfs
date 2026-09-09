@@ -1,6 +1,18 @@
+# Google C++ style (https://google.github.io/styleguide/cppguide.html) with the
+# project's deviations below.  `make format` rewrites the tracked C++ sources,
+# `make format-check` (scripts/format_check.sh, the CI gate) reports drift.
 BasedOnStyle: Google
-IndentWidth: 2
-ColumnLimit: 100
+Language: Cpp
+Standard: c++20
+
+IndentWidth: 4
+ColumnLimit: 120
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -3
+ConstructorInitializerIndentWidth: 4
+ContinuationIndentWidth: 4
+
 DerivePointerAlignment: false
 PointerAlignment: Left
 AllowShortFunctionsOnASingleLine: Inline

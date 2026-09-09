@@ -14,36 +14,40 @@ enum class LogLevel : int { kDebug = 0, kInfo, kWarn, kError };
 
 namespace detail {
 constexpr spdlog::level::level_enum to_spdlog(LogLevel lv) {
-  switch (lv) {
-    case LogLevel::kDebug: return spdlog::level::debug;
-    case LogLevel::kWarn: return spdlog::level::warn;
-    case LogLevel::kError: return spdlog::level::err;
-    default: return spdlog::level::info;
-  }
+    switch (lv) {
+        case LogLevel::kDebug:
+            return spdlog::level::debug;
+        case LogLevel::kWarn:
+            return spdlog::level::warn;
+        case LogLevel::kError:
+            return spdlog::level::err;
+        default:
+            return spdlog::level::info;
+    }
 }
 // Returns the current logger, installing the synchronous stderr one on first touch.
 spdlog::logger* logger();
 }  // namespace detail
 
 inline void set_log_level(LogLevel lv) {
-  detail::logger()->set_level(detail::to_spdlog(lv));
+    detail::logger()->set_level(detail::to_spdlog(lv));
 }
 inline bool log_enabled(LogLevel lv) {
-  return detail::logger()->should_log(detail::to_spdlog(lv));
+    return detail::logger()->should_log(detail::to_spdlog(lv));
 }
 
 template <class... A>
 void log(LogLevel lv, spdlog::format_string_t<A...> fmt, A&&... a) {
-  detail::logger()->log(detail::to_spdlog(lv), fmt, std::forward<A>(a)...);
+    detail::logger()->log(detail::to_spdlog(lv), fmt, std::forward<A>(a)...);
 }
 
 // Switch the sink to the async logger (production main); keeps the current level.
 // An empty `file` logs to stderr as before; otherwise a size-rotated file sink
 // ([server] log_file / log_rotate_*, plan doc 10 §4.4).
 struct LogSinkConfig {
-  std::string file;
-  size_t rotate_size = 50u << 20;
-  size_t rotate_keep = 5;
+    std::string file;
+    size_t rotate_size = 50u << 20;
+    size_t rotate_keep = 5;
 };
 void init_async_logging(const LogSinkConfig& cfg = {});
 void shutdown_async_logging();

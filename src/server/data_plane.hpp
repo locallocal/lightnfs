@@ -20,24 +20,22 @@
 namespace lnfs::server {
 
 struct DataPlaneInstance {
-  std::unique_ptr<ProtocolStack> stack;
-  std::optional<Frontend> frontend;
-  MetricsRegistration metrics;
+    std::unique_ptr<ProtocolStack> stack;
+    std::optional<Frontend> frontend;
+    MetricsRegistration metrics;
 };
 
 // Builds the stack (v4 when enabled: grace list, engine, lease scanner), registers
 // the metrics providers, applies the QoS knobs and starts the frontend, which attaches
 // the data plane to `mgmt`.  nullopt (reason logged) leaves nothing behind.
-std::optional<DataPlaneInstance> activate(const core::ServerConfig& cfg,
-                                          const core::ClusterConfig& cluster, CoreState& core,
-                                          rt::Runtime& runtime, Management& mgmt);
+std::optional<DataPlaneInstance> activate(const core::ServerConfig& cfg, const core::ClusterConfig& cluster,
+                                          CoreState& core, rt::Runtime& runtime, Management& mgmt);
 
 // Mirror image: detach from ctl and stop accepting → let connections finish for
 // `grace`, then close the rest → join the lease scanner → drop the providers → destroy
 // the frontend, then the stack.  False when connections did not converge in time (the
 // instance is then still destroyed; this is the signal to log and count).
 bool deactivate(DataPlaneInstance& instance, const core::ServerConfig& cfg, Management& mgmt,
-                std::chrono::milliseconds grace,
-                std::chrono::milliseconds close_timeout = std::chrono::seconds(5));
+                std::chrono::milliseconds grace, std::chrono::milliseconds close_timeout = std::chrono::seconds(5));
 
 }  // namespace lnfs::server

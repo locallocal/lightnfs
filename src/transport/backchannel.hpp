@@ -32,52 +32,51 @@ struct ConnCtx;
 
 class CbChannel {
  public:
-  static std::shared_ptr<CbChannel> create(ConnCtx* conn, rt::Reactor* home) {
-    auto chan = std::make_shared<CbChannel>(conn, home);
-    chan->self_ = chan;
-    return chan;
-  }
-  CbChannel(ConnCtx* conn, rt::Reactor* home) : conn_(conn), home_(home) {}
+    static std::shared_ptr<CbChannel> create(ConnCtx* conn, rt::Reactor* home) {
+        auto chan = std::make_shared<CbChannel>(conn, home);
+        chan->self_ = chan;
+        return chan;
+    }
+    CbChannel(ConnCtx* conn, rt::Reactor* home) : conn_(conn), home_(home) {}
 
-  // Monotonic xid for the next call; the caller encodes it into `record`.
-  uint32_t next_xid() {
-    std::lock_guard lock(mu_);
-    return next_xid_++;
-  }
+    // Monotonic xid for the next call; the caller encodes it into `record`.
+    uint32_t next_xid() {
+        std::lock_guard lock(mu_);
+        return next_xid_++;
+    }
 
-  // Sends one full RPC CALL record (no record marking) and awaits the raw reply
-  // record.  Callable from any reactor.
-  rt::Task<Result<std::vector<std::byte>>> call(uint32_t xid,
-                                                std::vector<std::byte> record);
+    // Sends one full RPC CALL record (no record marking) and awaits the raw reply
+    // record.  Callable from any reactor.
+    rt::Task<Result<std::vector<std::byte>>> call(uint32_t xid, std::vector<std::byte> record);
 
-  // Read-loop upcall (connection's reactor): reply record for `xid` arrived.
-  // Returns false when no such call is pending (stale/unknown xid: dropped).
-  bool route_reply(uint32_t xid, std::vector<std::byte> record);
+    // Read-loop upcall (connection's reactor): reply record for `xid` arrived.
+    // Returns false when no such call is pending (stale/unknown xid: dropped).
+    bool route_reply(uint32_t xid, std::vector<std::byte> record);
 
-  // Connection teardown (connection's reactor): fail pending and future calls.
-  void detach();
+    // Connection teardown (connection's reactor): fail pending and future calls.
+    void detach();
 
-  bool alive() {
-    std::lock_guard lock(mu_);
-    return conn_ != nullptr;
-  }
+    bool alive() {
+        std::lock_guard lock(mu_);
+        return conn_ != nullptr;
+    }
 
-  // Internal (connection-reactor only): the connection to send on, or null.
-  ConnCtx* conn_for_send();
+    // Internal (connection-reactor only): the connection to send on, or null.
+    ConnCtx* conn_for_send();
 
  private:
-  struct Pending {
-    std::vector<std::byte> reply;
-    bool failed = false;
-    rt::Event done;
-  };
+    struct Pending {
+        std::vector<std::byte> reply;
+        bool failed = false;
+        rt::Event done;
+    };
 
-  std::mutex mu_;
-  ConnCtx* conn_;      // null after detach
-  rt::Reactor* home_;  // the connection's reactor: all fd work happens there
-  uint32_t next_xid_ = 0x6c6e0001;  // "ln.."; distinct from client xids by role anyway
-  std::unordered_map<uint32_t, Pending*> pending_;
-  std::weak_ptr<CbChannel> self_;  // pins the channel across the posted send task
+    std::mutex mu_;
+    ConnCtx* conn_;                   // null after detach
+    rt::Reactor* home_;               // the connection's reactor: all fd work happens there
+    uint32_t next_xid_ = 0x6c6e0001;  // "ln.."; distinct from client xids by role anyway
+    std::unordered_map<uint32_t, Pending*> pending_;
+    std::weak_ptr<CbChannel> self_;  // pins the channel across the posted send task
 };
 
 }  // namespace lnfs::transport

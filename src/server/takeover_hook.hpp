@@ -30,8 +30,8 @@ namespace lnfs::server {
 // ok on exit status 0; ETIMEDOUT when killed on timeout; EIO on a non-zero exit or a
 // signal death; the spawn errno (ENOENT, EACCES, ...) when it cannot start.  Every
 // failure is logged with the script path and what happened.
-Result<void> run_takeover_hook(const std::string& path, const backend::ClusterIdentity& id,
-                               std::string_view prev_node, std::chrono::milliseconds timeout,
+Result<void> run_takeover_hook(const std::string& path, const backend::ClusterIdentity& id, std::string_view prev_node,
+                               std::chrono::milliseconds timeout,
                                uint32_t fsid = 0,  // 0 = not scoped to one export
                                std::string_view reason = "takeover");
 

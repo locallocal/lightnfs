@@ -17,31 +17,30 @@ namespace lnfs::rpc {
 
 class Dispatcher {
  public:
-  // The handler owns arg decoding and reply sending. Throwing out of it maps to SYSTEM_ERR.
-  // A plain function pointer + self (plan doc 10 §3.8): every request went through a
-  // std::function's type-erased indirection; engines now register a captureless lambda
-  // that downcasts `self`.
-  using Handler = rt::Task<void> (*)(void* self, transport::ConnCtx&, RpcCall&,
-                                     const Cred&);
+    // The handler owns arg decoding and reply sending. Throwing out of it maps to SYSTEM_ERR.
+    // A plain function pointer + self (plan doc 10 §3.8): every request went through a
+    // std::function's type-erased indirection; engines now register a captureless lambda
+    // that downcasts `self`.
+    using Handler = rt::Task<void> (*)(void* self, transport::ConnCtx&, RpcCall&, const Cred&);
 
-  struct Program {
-    uint32_t prog;
-    uint32_t vers_lo, vers_hi;
-    void* self;
-    Handler handler;
-  };
+    struct Program {
+        uint32_t prog;
+        uint32_t vers_lo, vers_hi;
+        void* self;
+        Handler handler;
+    };
 
-  explicit Dispatcher(AuthRegistry& auth = AuthRegistry::default_registry()) : auth_(auth) {}
-  void add(Program p) { programs_.push_back(p); }
+    explicit Dispatcher(AuthRegistry& auth = AuthRegistry::default_registry()) : auth_(auth) {}
+    void add(Program p) { programs_.push_back(p); }
 
-  rt::Task<void> handle_request(transport::ConnCtx& ctx, rt::BufferChain rec);
+    rt::Task<void> handle_request(transport::ConnCtx& ctx, rt::BufferChain rec);
 
-  // Helper for engines: GARBAGE_ARGS on arg decode failure.
-  static rt::Task<void> reply_garbage_args(transport::ConnCtx& ctx, uint32_t xid);
+    // Helper for engines: GARBAGE_ARGS on arg decode failure.
+    static rt::Task<void> reply_garbage_args(transport::ConnCtx& ctx, uint32_t xid);
 
  private:
-  AuthRegistry& auth_;
-  std::vector<Program> programs_;
+    AuthRegistry& auth_;
+    std::vector<Program> programs_;
 };
 
 }  // namespace lnfs::rpc

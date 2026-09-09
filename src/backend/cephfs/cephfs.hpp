@@ -62,178 +62,169 @@ class CephLockMgr;
 
 class CephBackend final : public Backend {
  public:
-  struct Config {
-    std::string conf;      // ceph.conf; empty = library defaults ($CEPH_CONF, /etc/ceph/ceph.conf)
-    std::string id;        // client id without the "client." prefix; empty = library default
-    std::string keyring;   // ceph_conf_set("keyring", …)
-    std::string mon_host;  // ceph_conf_set("mon_host", …)
-    std::string fs_name;   // ceph_select_filesystem; empty = the cluster's default fs
-    std::string subdir = "/";  // export root inside the filesystem (the mount root)
-    std::string log_file;      // ceph_conf_set("log_file", …); empty = library default
-    // Session uuid every gateway of the cluster reclaims on takeover; empty = derived
-    // from the cluster id and fsid at takeover time (the same on every gateway).
-    std::string uuid;
-    std::vector<std::pair<std::string, std::string>> options;  // extra ceph_conf_set pairs
-    uint64_t fsid = 0;
-    size_t fd_cache = 1024;
-    bool enrich_readdir = true;
-    bool jukebox = true;       // transport-class errors → kJukebox (else EIO)
-    bool native_locks = true;  // ceph_ll_setlk → kByteLocks / native_locks()
-  };
+    struct Config {
+        std::string conf;          // ceph.conf; empty = library defaults ($CEPH_CONF, /etc/ceph/ceph.conf)
+        std::string id;            // client id without the "client." prefix; empty = library default
+        std::string keyring;       // ceph_conf_set("keyring", …)
+        std::string mon_host;      // ceph_conf_set("mon_host", …)
+        std::string fs_name;       // ceph_select_filesystem; empty = the cluster's default fs
+        std::string subdir = "/";  // export root inside the filesystem (the mount root)
+        std::string log_file;      // ceph_conf_set("log_file", …); empty = library default
+        // Session uuid every gateway of the cluster reclaims on takeover; empty = derived
+        // from the cluster id and fsid at takeover time (the same on every gateway).
+        std::string uuid;
+        std::vector<std::pair<std::string, std::string>> options;  // extra ceph_conf_set pairs
+        uint64_t fsid = 0;
+        size_t fd_cache = 1024;
+        bool enrich_readdir = true;
+        bool jukebox = true;       // transport-class errors → kJukebox (else EIO)
+        bool native_locks = true;  // ceph_ll_setlk → kByteLocks / native_locks()
+    };
 
-  // `api` null: dlopen the system libcephfs at start().  Construction never touches
-  // the cluster; start() connects (config load must not block on a cluster).
-  static Result<std::unique_ptr<CephBackend>> create(
-      Config cfg, std::shared_ptr<const cephapi::Api> api = nullptr);
-  ~CephBackend() override;
+    // `api` null: dlopen the system libcephfs at start().  Construction never touches
+    // the cluster; start() connects (config load must not block on a cluster).
+    static Result<std::unique_ptr<CephBackend>> create(Config cfg, std::shared_ptr<const cephapi::Api> api = nullptr);
+    ~CephBackend() override;
 
-  Caps caps() const override { return caps_; }
-  FsLimits limits() const override { return limits_; }
-  uint64_t fsid() const override { return cfg_.fsid; }
-  rt::Task<Result<ObjPtr>> root() override;
-  rt::Task<Result<ObjPtr>> resolve(const ObjId&) override;
-  rt::Task<Result<FsStats>> statfs() override;
-  rt::Task<Result<void>> start() override;
-  rt::Task<Result<void>> stop() override;
-  std::optional<LockMgrRef> native_locks() override;
-  // Reclaims the failed gateway's session (see the header comment).  ENOTSUP when
-  // the loaded libcephfs has no reclaim entries; ENOENT from the MDS ("no such
-  // session") counts as success; the remount happens regardless of the reclaim's
-  // outcome, and its failure (the backend is then down, as if never started) wins.
-  rt::Task<Result<void>> takeover(const ClusterIdentity&) override;
+    Caps caps() const override { return caps_; }
+    FsLimits limits() const override { return limits_; }
+    uint64_t fsid() const override { return cfg_.fsid; }
+    rt::Task<Result<ObjPtr>> root() override;
+    rt::Task<Result<ObjPtr>> resolve(const ObjId&) override;
+    rt::Task<Result<FsStats>> statfs() override;
+    rt::Task<Result<void>> start() override;
+    rt::Task<Result<void>> stop() override;
+    std::optional<LockMgrRef> native_locks() override;
+    // Reclaims the failed gateway's session (see the header comment).  ENOTSUP when
+    // the loaded libcephfs has no reclaim entries; ENOENT from the MDS ("no such
+    // session") counts as success; the remount happens regardless of the reclaim's
+    // outcome, and its failure (the backend is then down, as if never started) wins.
+    rt::Task<Result<void>> takeover(const ClusterIdentity&) override;
 
-  const Config& config() const { return cfg_; }
-  bool started() const { return mount_ != nullptr; }
-  // The uuid the current session carries (empty until a takeover set one).
-  const std::string& session_uuid() const { return session_uuid_; }
-  const std::string& cluster_fsid() const { return cluster_fsid_; }
-  int64_t fscid() const { return fscid_; }
+    const Config& config() const { return cfg_; }
+    bool started() const { return mount_ != nullptr; }
+    // The uuid the current session carries (empty until a takeover set one).
+    const std::string& session_uuid() const { return session_uuid_; }
+    const std::string& cluster_fsid() const { return cluster_fsid_; }
+    int64_t fscid() const { return fscid_; }
 
-  struct Stats {
-    uint64_t fd_hits = 0, fd_misses = 0, fd_upgrades = 0, fd_evictions = 0;
-    size_t fd_entries = 0;
-    uint64_t obj_hits = 0, obj_misses = 0;
-    size_t obj_entries = 0;
-    uint64_t jukebox = 0;      // transport errors surfaced as kJukebox
-    uint64_t blocklisted = 0;  // EBLOCKLISTED seen (permanent until restart)
-    size_t lock_fds = 0;       // Fh pinned by native byte-range locks
-  };
-  Stats stats() const;
-  size_t flush_fd_cache();  // `lightnfs-ctl fdcache flush`: drops unpinned entries
+    struct Stats {
+        uint64_t fd_hits = 0, fd_misses = 0, fd_upgrades = 0, fd_evictions = 0;
+        size_t fd_entries = 0;
+        uint64_t obj_hits = 0, obj_misses = 0;
+        size_t obj_entries = 0;
+        uint64_t jukebox = 0;      // transport errors surfaced as kJukebox
+        uint64_t blocklisted = 0;  // EBLOCKLISTED seen (permanent until restart)
+        size_t lock_fds = 0;       // Fh pinned by native byte-range locks
+    };
+    Stats stats() const;
+    size_t flush_fd_cache();  // `lightnfs-ctl fdcache flush`: drops unpinned entries
 
-  // Sticky fsync failure per design 06 §6.2 (same contract as the local backend).
-  void poison(const ObjId& oid);
-  bool is_poisoned(const ObjId& oid) const;
-  size_t clear_poison();
+    // Sticky fsync failure per design 06 §6.2 (same contract as the local backend).
+    void poison(const ObjId& oid);
+    bool is_poisoned(const ObjId& oid) const;
+    size_t clear_poison();
 
-  // Handle codec (client-controlled bytes → vinodeno): public for the fuzz target.
-  static Result<vinodeno_t> vino_from_oid(const ObjId& oid);
-  static ObjId oid_from_vino(const vinodeno_t& vino);
+    // Handle codec (client-controlled bytes → vinodeno): public for the fuzz target.
+    static Result<vinodeno_t> vino_from_oid(const ObjId& oid);
+    static ObjId oid_from_vino(const vinodeno_t& vino);
 
  private:
-  friend class CephObject;
-  friend class CephLockMgr;
-  class FdCache;
-  class ObjCache;
+    friend class CephObject;
+    friend class CephLockMgr;
+    class FdCache;
+    class ObjCache;
 
-  // One libcephfs inode reference; put back when the last user is gone.
-  struct InodeRef {
-    InodeRef(const cephapi::Api* a, ceph_mount_info* m, Inode* i) : api(a), mount(m), in(i) {}
-    ~InodeRef();
-    InodeRef(const InodeRef&) = delete;
-    const cephapi::Api* api;
-    ceph_mount_info* mount;
-    Inode* in;
-  };
-  using ObjRef = std::shared_ptr<InodeRef>;
+    // One libcephfs inode reference; put back when the last user is gone.
+    struct InodeRef {
+        InodeRef(const cephapi::Api* a, ceph_mount_info* m, Inode* i) : api(a), mount(m), in(i) {}
+        ~InodeRef();
+        InodeRef(const InodeRef&) = delete;
+        const cephapi::Api* api;
+        ceph_mount_info* mount;
+        Inode* in;
+    };
+    using ObjRef = std::shared_ptr<InodeRef>;
 
-  explicit CephBackend(Config cfg, std::shared_ptr<const cephapi::Api> api);
+    explicit CephBackend(Config cfg, std::shared_ptr<const cephapi::Api> api);
 
-  // Offload-thread helpers (blocking libcephfs calls).  `rc` is a libcephfs return
-  // value (negative errno).
-  Errno map_rc(int64_t rc) const;
-  Result<Attr> attr_from_statx(const struct ceph_statx& st) const;
-  Result<Attr> stat_sync(Inode* in, const UserPerm* perms) const;
-  static ObjId oid_of(const struct ceph_statx& st);
-  ObjPtr wrap(ObjRef ref, const ObjId& oid, FType type);
-  Result<ObjPtr> wrap_new(Inode* in, const struct ceph_statx& st);  // adopts the reference
-  static bool valid_name(std::string_view name, bool allow_dotdot = false);
+    // Offload-thread helpers (blocking libcephfs calls).  `rc` is a libcephfs return
+    // value (negative errno).
+    Errno map_rc(int64_t rc) const;
+    Result<Attr> attr_from_statx(const struct ceph_statx& st) const;
+    Result<Attr> stat_sync(Inode* in, const UserPerm* perms) const;
+    static ObjId oid_of(const struct ceph_statx& st);
+    ObjPtr wrap(ObjRef ref, const ObjId& oid, FType type);
+    Result<ObjPtr> wrap_new(Inode* in, const struct ceph_statx& st);  // adopts the reference
+    static bool valid_name(std::string_view name, bool allow_dotdot = false);
 
-  Config cfg_;
-  std::shared_ptr<const cephapi::Api> api_;
-  ceph_mount_info* mount_ = nullptr;
-  UserPerm* root_perms_ = nullptr;  // the gateway's own identity (fd cache, locks)
-  Caps caps_;
-  FsLimits limits_;
-  ObjRef root_;
-  ObjId root_oid_{};
-  std::string cluster_fsid_;
-  int64_t fscid_ = -1;
-  std::string session_uuid_;
-  std::unique_ptr<FdCache> fd_cache_;
-  std::unique_ptr<ObjCache> obj_cache_;
-  std::unique_ptr<CephLockMgr> locks_;
-  mutable std::atomic<uint64_t> jukebox_{0};
-  mutable std::atomic<uint64_t> blocklisted_{0};
+    Config cfg_;
+    std::shared_ptr<const cephapi::Api> api_;
+    ceph_mount_info* mount_ = nullptr;
+    UserPerm* root_perms_ = nullptr;  // the gateway's own identity (fd cache, locks)
+    Caps caps_;
+    FsLimits limits_;
+    ObjRef root_;
+    ObjId root_oid_{};
+    std::string cluster_fsid_;
+    int64_t fscid_ = -1;
+    std::string session_uuid_;
+    std::unique_ptr<FdCache> fd_cache_;
+    std::unique_ptr<ObjCache> obj_cache_;
+    std::unique_ptr<CephLockMgr> locks_;
+    mutable std::atomic<uint64_t> jukebox_{0};
+    mutable std::atomic<uint64_t> blocklisted_{0};
 
-  mutable std::mutex poison_mu_;
-  std::unordered_set<ObjId, ObjIdHash> poisoned_;
+    mutable std::mutex poison_mu_;
+    std::unordered_set<ObjId, ObjIdHash> poisoned_;
 };
 
 class CephObject final : public Object {
  public:
-  rt::Task<Result<Attr>> getattr() override;
-  rt::Task<Result<Attr>> setattr(const Cred&, const SetAttr&) override;
-  // access(): the Object default (mode bits from getattr) — libcephfs has no access
-  // call; mutations and opens are still authorized by the library under the caller.
-  rt::Task<Result<ObjPtr>> lookup(const Cred&, std::string_view name) override;
-  rt::Task<Result<Created>> create(const Cred&, std::string_view, const SetAttr&,
-                                    ExclVerf*) override;
-  rt::Task<Result<Created>> mkdir(const Cred&, std::string_view, const SetAttr&) override;
-  rt::Task<Result<Created>> symlink(const Cred&, std::string_view, std::string_view,
-                                     const SetAttr&) override;
-  rt::Task<Result<Created>> mknod(const Cred&, std::string_view, FType, DevT,
-                                   const SetAttr&) override;
-  rt::Task<Result<void>> unlink(const Cred&, std::string_view) override;
-  rt::Task<Result<void>> rmdir(const Cred&, std::string_view) override;
-  rt::Task<Result<void>> rename(const Cred&, std::string_view, Object&,
-                                 std::string_view) override;
-  rt::Task<Result<void>> link(const Cred&, Object&, std::string_view) override;
-  rt::Task<Result<DirPage>> readdir(const Cred&, uint64_t cookie,
-                                     uint32_t max_entries) override;
-  rt::Task<Result<std::string>> readlink() override;
-  rt::Task<Result<OpenPtr>> open(const Cred&, OpenFlags) override;
-  rt::Task<Result<uint32_t>> read(OpenCtx, uint64_t off, std::span<std::byte> out,
-                                  bool& eof) override;
-  rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const std::byte> in,
-                                   Stability) override;
-  rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const iovec> iov,
-                                   Stability) override;
-  rt::Task<Result<void>> commit(OpenCtx, uint64_t off, uint64_t len) override;
-  rt::Task<Result<uint64_t>> seek(OpenCtx, uint64_t off, SeekWhat) override;
-  rt::Task<Result<void>> allocate(OpenCtx, uint64_t off, uint64_t len) override;
-  rt::Task<Result<void>> deallocate(OpenCtx, uint64_t off, uint64_t len) override;
-  rt::Task<Result<uint64_t>> copy_range(OpenCtx, Object& dst, OpenCtx, uint64_t src_off,
-                                        uint64_t dst_off, uint64_t len) override;
+    rt::Task<Result<Attr>> getattr() override;
+    rt::Task<Result<Attr>> setattr(const Cred&, const SetAttr&) override;
+    // access(): the Object default (mode bits from getattr) — libcephfs has no access
+    // call; mutations and opens are still authorized by the library under the caller.
+    rt::Task<Result<ObjPtr>> lookup(const Cred&, std::string_view name) override;
+    rt::Task<Result<Created>> create(const Cred&, std::string_view, const SetAttr&, ExclVerf*) override;
+    rt::Task<Result<Created>> mkdir(const Cred&, std::string_view, const SetAttr&) override;
+    rt::Task<Result<Created>> symlink(const Cred&, std::string_view, std::string_view, const SetAttr&) override;
+    rt::Task<Result<Created>> mknod(const Cred&, std::string_view, FType, DevT, const SetAttr&) override;
+    rt::Task<Result<void>> unlink(const Cred&, std::string_view) override;
+    rt::Task<Result<void>> rmdir(const Cred&, std::string_view) override;
+    rt::Task<Result<void>> rename(const Cred&, std::string_view, Object&, std::string_view) override;
+    rt::Task<Result<void>> link(const Cred&, Object&, std::string_view) override;
+    rt::Task<Result<DirPage>> readdir(const Cred&, uint64_t cookie, uint32_t max_entries) override;
+    rt::Task<Result<std::string>> readlink() override;
+    rt::Task<Result<OpenPtr>> open(const Cred&, OpenFlags) override;
+    rt::Task<Result<uint32_t>> read(OpenCtx, uint64_t off, std::span<std::byte> out, bool& eof) override;
+    rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const std::byte> in, Stability) override;
+    rt::Task<Result<uint32_t>> write(OpenCtx, uint64_t off, std::span<const iovec> iov, Stability) override;
+    rt::Task<Result<void>> commit(OpenCtx, uint64_t off, uint64_t len) override;
+    rt::Task<Result<uint64_t>> seek(OpenCtx, uint64_t off, SeekWhat) override;
+    rt::Task<Result<void>> allocate(OpenCtx, uint64_t off, uint64_t len) override;
+    rt::Task<Result<void>> deallocate(OpenCtx, uint64_t off, uint64_t len) override;
+    rt::Task<Result<uint64_t>> copy_range(OpenCtx, Object& dst, OpenCtx, uint64_t src_off, uint64_t dst_off,
+                                          uint64_t len) override;
 
-  Inode* handle() const { return ref_->in; }
+    Inode* handle() const { return ref_->in; }
 
  private:
-  friend class CephBackend;
-  friend class CephLockMgr;
-  CephObject(CephBackend& backend, CephBackend::ObjRef ref, ObjId id, FType type)
-      : Object(std::move(id), type), backend_(backend), ref_(std::move(ref)) {}
+    friend class CephBackend;
+    friend class CephLockMgr;
+    CephObject(CephBackend& backend, CephBackend::ObjRef ref, ObjId id, FType type)
+        : Object(std::move(id), type), backend_(backend), ref_(std::move(ref)) {}
 
-  // Anonymous-IO precondition: regular file + mode-bit check for the requested
-  // direction (an open state carries its own permission, settled at OPEN time).
-  rt::Task<Result<void>> io_gate(const Cred& cred, bool write);
-  rt::Task<Result<void>> require_dir(const Cred& cred);
-  // Creation-family tail shared by create/mkdir/symlink/mknod (offload thread).
-  Result<Created> created_sync(Inode* child, struct ceph_statx st, const UserPerm* perms,
-                               std::optional<uint32_t> want_mode);
+    // Anonymous-IO precondition: regular file + mode-bit check for the requested
+    // direction (an open state carries its own permission, settled at OPEN time).
+    rt::Task<Result<void>> io_gate(const Cred& cred, bool write);
+    rt::Task<Result<void>> require_dir(const Cred& cred);
+    // Creation-family tail shared by create/mkdir/symlink/mknod (offload thread).
+    Result<Created> created_sync(Inode* child, struct ceph_statx st, const UserPerm* perms,
+                                 std::optional<uint32_t> want_mode);
 
-  CephBackend& backend_;
-  CephBackend::ObjRef ref_;
+    CephBackend& backend_;
+    CephBackend::ObjRef ref_;
 };
 
 // Native byte-range locks (design 05 §5.8): one Fh per (file, lock-owner) — Ceph
@@ -244,34 +235,32 @@ class CephObject final : public Object {
 // ceph_ll_getlk through a probe Fh under an owner no client can have.
 class CephLockMgr final : public LockMgr {
  public:
-  explicit CephLockMgr(CephBackend& backend) : backend_(backend) {}
-  ~CephLockMgr() override;
-  rt::Task<Result<void>> lock(Object&, const LockOwnerId&, LockRange, bool exclusive,
-                              bool wait) override;
-  rt::Task<Result<void>> unlock(Object&, const LockOwnerId&, LockRange) override;
-  rt::Task<Result<std::optional<LockConflict>>> test(Object&, LockRange,
-                                                     bool exclusive) override;
-  rt::Task<Result<void>> release(Object&, const LockOwnerId&) override;
-  size_t fds() const;
-  void close_all();  // backend stop
+    explicit CephLockMgr(CephBackend& backend) : backend_(backend) {}
+    ~CephLockMgr() override;
+    rt::Task<Result<void>> lock(Object&, const LockOwnerId&, LockRange, bool exclusive, bool wait) override;
+    rt::Task<Result<void>> unlock(Object&, const LockOwnerId&, LockRange) override;
+    rt::Task<Result<std::optional<LockConflict>>> test(Object&, LockRange, bool exclusive) override;
+    rt::Task<Result<void>> release(Object&, const LockOwnerId&) override;
+    size_t fds() const;
+    void close_all();  // backend stop
 
-  static uint64_t owner_key(const LockOwnerId& owner);  // FNV-1a over the bytes
+    static uint64_t owner_key(const LockOwnerId& owner);  // FNV-1a over the bytes
 
  private:
-  struct Key {
-    ObjId oid;
-    std::string owner;
-    friend bool operator==(const Key&, const Key&) = default;
-  };
-  struct KeyHash {
-    size_t operator()(const Key& k) const noexcept;
-  };
-  Result<Fh*> fh_for(CephObject& obj, const LockOwnerId& owner, bool create);
-  static struct flock make_flock(LockRange range, short type);
+    struct Key {
+        ObjId oid;
+        std::string owner;
+        friend bool operator==(const Key&, const Key&) = default;
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const noexcept;
+    };
+    Result<Fh*> fh_for(CephObject& obj, const LockOwnerId& owner, bool create);
+    static struct flock make_flock(LockRange range, short type);
 
-  CephBackend& backend_;
-  std::mutex mu_;
-  std::unordered_map<Key, Fh*, KeyHash> fhs_;
+    CephBackend& backend_;
+    std::mutex mu_;
+    std::unordered_map<Key, Fh*, KeyHash> fhs_;
 };
 
 // Registers "cephfs" with the backend registry (called from register_builtin_backends).

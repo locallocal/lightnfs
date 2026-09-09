@@ -17,31 +17,31 @@
 namespace lnfs::testing {
 
 struct FakeGfapi {
-  // The table every fake-backed GlusterBackend uses.
-  static std::shared_ptr<const backend::gfapi::Api> api();
+    // The table every fake-backed GlusterBackend uses.
+    static std::shared_ptr<const backend::gfapi::Api> api();
 
-  // The directory that stands in for the volume (glfs_new/glfs_init bind to it).
-  static void set_root(std::string dir);
-  // glfs_init fails with `err` when non-zero.
-  static void fail_init(int err);
-  // The next `count` fops (metadata or data) fail with `err` — transport-error tests.
-  static void fail_next(int err, int count = 1);
-  // Identity the last fop ran under (thread-local in the real library too).
-  static uint32_t last_fsuid();
-  static uint32_t last_fsgid();
-  // Leak assertions: live glfs_object / glfs_fd counts.
-  static int live_objects();
-  static int live_fds();
-  // Number of glfs_h_access calls (round-trip accounting).
-  static uint64_t access_calls();
+    // The directory that stands in for the volume (glfs_new/glfs_init bind to it).
+    static void set_root(std::string dir);
+    // glfs_init fails with `err` when non-zero.
+    static void fail_init(int err);
+    // The next `count` fops (metadata or data) fail with `err` — transport-error tests.
+    static void fail_next(int err, int count = 1);
+    // Identity the last fop ran under (thread-local in the real library too).
+    static uint32_t last_fsuid();
+    static uint32_t last_fsgid();
+    // Leak assertions: live glfs_object / glfs_fd counts.
+    static int live_objects();
+    static int live_fds();
+    // Number of glfs_h_access calls (round-trip accounting).
+    static uint64_t access_calls();
 
-  // A failed gateway's residue (plan 10 E2): an exclusive lock on `rel_path` under a
-  // ghost owner; false if the file is missing.  release_stale_locks_after(ms) drops it
-  // from a timer thread — the brick letting go on ping-timeout.
-  static bool plant_stale_lock(const std::string& rel_path, uint64_t start, uint64_t len);
-  static size_t stale_locks();
-  static void release_stale_locks_after(int ms);
-  static void join_stale_timer();  // join the pending release (before process exit)
+    // A failed gateway's residue (plan 10 E2): an exclusive lock on `rel_path` under a
+    // ghost owner; false if the file is missing.  release_stale_locks_after(ms) drops it
+    // from a timer thread — the brick letting go on ping-timeout.
+    static bool plant_stale_lock(const std::string& rel_path, uint64_t start, uint64_t len);
+    static size_t stale_locks();
+    static void release_stale_locks_after(int ms);
+    static void join_stale_timer();  // join the pending release (before process exit)
 };
 
 }  // namespace lnfs::testing

@@ -16,38 +16,37 @@ namespace lnfs::rpc {
 enum class AuthFlavor : uint32_t { kNone = 0, kSys = 1 };
 
 struct Cred {
-  uint32_t uid = 65534;  // nobody
-  uint32_t gid = 65534;
-  SmallVec<uint32_t, 16> gids;
-  AuthFlavor flavor = AuthFlavor::kNone;
-  std::string machine;  // AUTH_SYS machinename (v4 principal comparisons)
+    uint32_t uid = 65534;  // nobody
+    uint32_t gid = 65534;
+    SmallVec<uint32_t, 16> gids;
+    AuthFlavor flavor = AuthFlavor::kNone;
+    std::string machine;  // AUTH_SYS machinename (v4 principal comparisons)
 
-  // v4 principal identity (RFC 8881 CLID_IN_USE checks): flavor + machine + uid.
-  std::string principal() const {
-    return std::to_string(static_cast<uint32_t>(flavor)) + "/" + machine + "/" +
-           std::to_string(uid);
-  }
+    // v4 principal identity (RFC 8881 CLID_IN_USE checks): flavor + machine + uid.
+    std::string principal() const {
+        return std::to_string(static_cast<uint32_t>(flavor)) + "/" + machine + "/" + std::to_string(uid);
+    }
 };
 
 class Authenticator {
  public:
-  virtual ~Authenticator() = default;
-  // Err(EACCES) -> MSG_DENIED(AUTH_ERROR, AUTH_BADCRED)
-  virtual Result<Cred> authenticate(const OpaqueAuth& cred, const OpaqueAuth& verf) = 0;
+    virtual ~Authenticator() = default;
+    // Err(EACCES) -> MSG_DENIED(AUTH_ERROR, AUTH_BADCRED)
+    virtual Result<Cred> authenticate(const OpaqueAuth& cred, const OpaqueAuth& verf) = 0;
 };
 
 class AuthRegistry {
  public:
-  void add(uint32_t flavor, std::unique_ptr<Authenticator> a);
-  // Err(EPERM): unknown flavor (AUTH_REJECTEDCRED); Err(EACCES): bad cred body.
-  Result<Cred> authenticate(const RpcCall& call) const;
+    void add(uint32_t flavor, std::unique_ptr<Authenticator> a);
+    // Err(EPERM): unknown flavor (AUTH_REJECTEDCRED); Err(EACCES): bad cred body.
+    Result<Cred> authenticate(const RpcCall& call) const;
 
-  // AUTH_NONE + AUTH_SYS preinstalled.
-  static AuthRegistry& default_registry();
+    // AUTH_NONE + AUTH_SYS preinstalled.
+    static AuthRegistry& default_registry();
 
  private:
-  static constexpr size_t kMaxFlavor = 8;
-  std::unique_ptr<Authenticator> by_flavor_[kMaxFlavor];
+    static constexpr size_t kMaxFlavor = 8;
+    std::unique_ptr<Authenticator> by_flavor_[kMaxFlavor];
 };
 
 }  // namespace lnfs::rpc
