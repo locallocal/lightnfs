@@ -136,7 +136,8 @@ void append_local(std::string& out, const std::string& labels,
 // Per-export data-path counters with {export,fsid} labels, followed by whatever the
 // export's backend exposes. Lustre inherits the local cache rows, so it gets both.
 void append_exports(std::string& out, core::ExportTable& exports) {
-  for (const auto& entry : exports.entries()) {
+  auto set = exports.snapshot();
+  for (const auto& entry : set->entries) {
     std::string labels = std::format("export=\"{}\",fsid=\"{}\"", entry->path, entry->fsid);
     const auto& em = entry->metrics;
     out += std::format(

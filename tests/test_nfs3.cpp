@@ -47,7 +47,7 @@ struct NfsFixture {
   }
 
   NfsFixture()
-      : handles(core::FileHandleCodec::from_key(key, exports)),
+      : handles(core::FileHandleCodec::from_key(key)),
         engine(exports, handles, locks),
         mount(exports, handles) {
     auto mem = std::make_unique<backend::MemoryBackend>(23);

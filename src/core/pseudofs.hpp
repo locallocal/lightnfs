@@ -24,11 +24,16 @@ class PseudoFs {
     ExportEntry* exp = nullptr;  // set: this node crosses into that export
   };
 
-  // `boot_epoch` feeds the synthesized change attribute so clients revalidate the
-  // pseudo tree after a restart/reconfig (plan doc 10 §1.6).
-  explicit PseudoFs(const ExportTable& exports, uint64_t boot_epoch = 1);
+  // Built over an ExportSet's entries by ExportSetBuilder::finish (plan 12 B1) and
+  // owned by that set; nodes keep raw pointers into `entries`.  `boot_epoch` feeds the
+  // synthesized change attribute so clients revalidate the pseudo tree after a
+  // restart/reconfig (plan doc 10 §1.6).
+  explicit PseudoFs(const std::vector<std::shared_ptr<ExportEntry>>& entries,
+                    uint64_t boot_epoch = 1);
 
-  Node* root() { return &root_; }
+  // Nodes are handed out non-const like find()/for_export(): the tree is frozen with
+  // its ExportSet, but engines walk it through mutable Node pointers.
+  Node* root() const { return const_cast<Node*>(&root_); }
   Node* find(uint64_t id) const;
   Node* for_export(uint32_t fsid) const;  // pseudo node crossing into fsid (or null)
 

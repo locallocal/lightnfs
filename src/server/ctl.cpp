@@ -394,7 +394,7 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
                        : dp              ? "active"
                                          : "standby";
     bool draining = dp && dp->draining && dp->draining->load(std::memory_order_relaxed);
-    size_t exports = dp && dp->exports ? dp->exports->entries().size() : 0;
+    size_t exports = dp && dp->exports ? dp->exports->size() : 0;
     bool grace = dp && dp->state && dp->state->in_grace();
     int64_t grace_left = dp && dp->state ? dp->state->grace_remaining_seconds() : 0;
     if (json)
@@ -491,7 +491,8 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     size_t total = 0;
     bool any = false;
     if (dp->exports) {
-      for (const auto& entry : dp->exports->entries()) {
+      auto set = dp->exports->snapshot();
+      for (const auto& entry : set->entries) {
         if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
           any = true;
           total += g->flush_fd_cache();
@@ -517,7 +518,8 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     if (json) out = "[";
     size_t emitted = 0;
     if (dp->exports) {
-      for (const auto& entry : dp->exports->entries()) {
+      auto set = dp->exports->snapshot();
+      for (const auto& entry : set->entries) {
         if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
           auto s = g->stats();
           if (json) {
@@ -592,7 +594,8 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     size_t total = 0;
     bool any = false;
     if (dp->exports) {
-      for (const auto& entry : dp->exports->entries()) {
+      auto set = dp->exports->snapshot();
+      for (const auto& entry : set->entries) {
         if (auto* g = dynamic_cast<backend::GlusterBackend*>(entry->backend.get())) {
           any = true;
           total += g->clear_poison();

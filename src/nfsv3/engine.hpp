@@ -32,6 +32,9 @@ class Engine {
     core::ExportEntry* exp;
     backend::ObjPtr obj;
     backend::ObjId oid;
+    // The export-set snapshot `exp` was resolved from (plan 12 B1): keeps the entry
+    // alive for the rest of the procedure.
+    std::shared_ptr<const core::ExportSet> set;
   };
   // Reply bytes captured for the DRC; null for procedures it does not cache.
   using Capture = std::vector<std::byte>;

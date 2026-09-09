@@ -17,6 +17,7 @@
 #include <sstream>
 
 #include "backend/api.hpp"
+#include "core/pseudofs.hpp"
 #include "util/log.hpp"
 #include "util/sha256.hpp"
 
@@ -816,24 +817,39 @@ std::string cluster_node_name(const ClusterConfig& cluster) {
   return host;
 }
 
-Result<std::unique_ptr<ExportTable>> ExportTable::build(Config config) {
-  LNFS_TRY(validate_config(config));
-  auto table = std::make_unique<ExportTable>();
-  for (auto& cfg : config.exports) {
-    cfg.backend_config.path = cfg.path;
-    cfg.backend_config.fsid = cfg.fsid;
-    const auto* factory = backend::find_backend(cfg.backend);
-    if (!factory) return Err(errno_from(ENODEV));
-    auto made = factory->make(cfg.backend_config);
-    if (!made) return Err(errno_from(EINVAL));
-    LNFS_TRY(table->add(std::move(cfg), std::move(made)));
-  }
-  return table;
+// ---- ExportSet / ExportSetBuilder / ExportTable (plan 12 B1) ----------------------
+
+ExportSet::ExportSet() = default;
+ExportSet::~ExportSet() = default;  // pseudo (raw entry pointers) goes before entries
+
+ExportEntry* ExportSet::by_fsid(uint32_t fsid) const {
+  auto it = std::lower_bound(
+      entries.begin(), entries.end(), fsid,
+      [](const std::shared_ptr<ExportEntry>& entry, uint32_t f) { return entry->fsid < f; });
+  return it != entries.end() && (*it)->fsid == fsid ? it->get() : nullptr;
 }
 
-Result<void> ExportTable::add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend) {
-  if (!backend || cfg.fsid == 0 || by_fsid(cfg.fsid)) return Err(errno_from(EINVAL));
-  auto entry = std::make_unique<ExportEntry>();
+ExportEntry* ExportSet::for_mount_path(std::string_view raw, std::string& relative) const {
+  std::string path = normalize_path(std::string(raw));
+  ExportEntry* best = nullptr;
+  for (const auto& entry : entries) {
+    if (!path.starts_with(entry->path)) continue;
+    if (path.size() != entry->path.size() &&
+        !(entry->path == "/" || path[entry->path.size()] == '/'))
+      continue;
+    if (!best || entry->path.size() > best->path.size()) best = entry.get();
+  }
+  if (!best) return nullptr;
+  relative = path.substr(best->path.size());
+  while (!relative.empty() && relative.front() == '/') relative.erase(relative.begin());
+  return best;
+}
+
+Result<void> ExportSetBuilder::add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend) {
+  if (!backend || cfg.fsid == 0) return Err(errno_from(EINVAL));
+  for (const auto& existing : entries_)
+    if (existing->fsid == cfg.fsid) return Err(errno_from(EINVAL));
+  auto entry = std::make_shared<ExportEntry>();
   entry->path = normalize_path(std::move(cfg.path));
   entry->fsid = cfg.fsid;
   entry->squash = cfg.squash;
@@ -852,45 +868,73 @@ Result<void> ExportTable::add(ExportConfig cfg, std::unique_ptr<backend::Backend
   return {};
 }
 
-ExportEntry* ExportTable::by_fsid(uint32_t fsid) {
-  for (auto& entry : entries_)
-    if (entry->fsid == fsid) return entry.get();
-  return nullptr;
-}
-const ExportEntry* ExportTable::by_fsid(uint32_t fsid) const {
-  for (const auto& entry : entries_)
-    if (entry->fsid == fsid) return entry.get();
-  return nullptr;
+std::shared_ptr<const ExportSet> ExportSetBuilder::finish(uint64_t epoch, uint64_t generation) {
+  auto set = std::make_shared<ExportSet>();
+  set->generation = generation;
+  set->epoch = epoch;
+  set->entries = std::move(entries_);
+  entries_.clear();
+  std::stable_sort(set->entries.begin(), set->entries.end(),
+                   [](const auto& a, const auto& b) { return a->fsid < b->fsid; });
+  set->pseudo = std::make_unique<PseudoFs>(set->entries, epoch);
+  return set;
 }
 
-ExportEntry* ExportTable::for_mount_path(std::string_view raw, std::string& relative) {
-  std::string path = normalize_path(std::string(raw));
-  ExportEntry* best = nullptr;
-  for (auto& entry : entries_) {
-    if (!path.starts_with(entry->path)) continue;
-    if (path.size() != entry->path.size() &&
-        !(entry->path == "/" || path[entry->path.size()] == '/'))
-      continue;
-    if (!best || entry->path.size() > best->path.size()) best = entry.get();
+ExportTable::ExportTable() : set_(ExportSetBuilder().finish(1, 0)) {}
+
+ExportTable::ExportTable(std::shared_ptr<const ExportSet> initial)
+    : set_(initial ? std::move(initial) : ExportSetBuilder().finish(1, 0)) {}
+
+Result<std::unique_ptr<ExportTable>> ExportTable::build(Config config) {
+  LNFS_TRY(validate_config(config));
+  ExportSetBuilder builder;
+  for (auto& cfg : config.exports) {
+    cfg.backend_config.path = cfg.path;
+    cfg.backend_config.fsid = cfg.fsid;
+    const auto* factory = backend::find_backend(cfg.backend);
+    if (!factory) return Err(errno_from(ENODEV));
+    auto made = factory->make(cfg.backend_config);
+    if (!made) return Err(errno_from(EINVAL));
+    LNFS_TRY(builder.add(std::move(cfg), std::move(made)));
   }
-  if (!best) return nullptr;
-  relative = path.substr(best->path.size());
-  while (!relative.empty() && relative.front() == '/') relative.erase(relative.begin());
-  return best;
+  return std::make_unique<ExportTable>(builder.finish(1, 0));
 }
 
-bool ExportTable::check_client(const sockaddr_storage& peer, const ExportEntry& entry) const {
+Result<void> ExportTable::add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend) {
+  auto current = snapshot();
+  ExportSetBuilder builder(*current);
+  LNFS_TRY(builder.add(std::move(cfg), std::move(backend)));
+  publish(builder.finish(current->epoch, current->generation + 1));
+  return {};
+}
+
+void ExportTable::set_epoch(uint64_t epoch) {
+  auto current = snapshot();
+  if (current->epoch == epoch) return;
+  publish(ExportSetBuilder(*current).finish(epoch, current->generation + 1));
+}
+
+void ExportTable::publish_for_test(std::shared_ptr<const ExportSet> set) {
+  if (set) publish(std::move(set));
+}
+
+void ExportTable::publish(std::shared_ptr<const ExportSet> set) {
+  set_.store(std::move(set), std::memory_order_release);
+}
+
+bool ExportTable::check_client(const sockaddr_storage& peer, const ExportEntry& entry) {
   const auto& clients = entry.client_list();
   return std::any_of(clients.begin(), clients.end(),
                      [&](const Cidr& cidr) { return cidr.contains(peer); });
 }
 
 std::string ExportTable::reload_dynamic(const Config& fresh) {
+  auto set = snapshot();  // updates go to the entries in place; membership is fixed
   std::string report;
   std::set<uint32_t> seen;
   for (const auto& cfg : fresh.exports) {
     seen.insert(cfg.fsid);
-    ExportEntry* entry = by_fsid(cfg.fsid);
+    ExportEntry* entry = set->by_fsid(cfg.fsid);
     if (!entry) {
       report += std::format("export fsid={} ({}): new export, restart required\n",
                             cfg.fsid, cfg.path);
@@ -916,7 +960,7 @@ std::string ExportTable::reload_dynamic(const Config& fresh) {
     report += std::format("export fsid={}: clients ({}) and qos applied\n", cfg.fsid,
                           cfg.clients.size());
   }
-  for (const auto& entry : entries_)
+  for (const auto& entry : set->entries)
     if (!seen.contains(entry->fsid))
       report += std::format("export fsid={} ({}): removed from config, restart required "
                             "(still being served)\n",
@@ -924,7 +968,7 @@ std::string ExportTable::reload_dynamic(const Config& fresh) {
   return report;
 }
 
-MappedCred ExportTable::squash_cred(const rpc::Cred& cred, const ExportEntry& entry) const {
+MappedCred ExportTable::squash_cred(const rpc::Cred& cred, const ExportEntry& entry) {
   MappedCred out{cred.uid, cred.gid, {cred.gids.begin(), cred.gids.end()}};
   if (entry.squash == Squash::kAll ||
       (entry.squash == Squash::kRoot && out.uid == 0)) {

@@ -188,6 +188,7 @@ add_executable(lnfs_tests
   tests/test_lock_mgr.cpp
   tests/test_ctl.cpp
   tests/test_catalog.cpp
+  tests/test_export_set.cpp
   tests/test_cluster_controller.cpp
   tests/test_cluster_store.cpp
   tests/test_daemon_lifecycle.cpp

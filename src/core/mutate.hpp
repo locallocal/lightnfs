@@ -53,9 +53,8 @@ class MutateGuard {
     explicit operator bool() const { return kind == kOk; }
   };
 
-  MutateGuard(ObjLockRegistry& locks, const ExportTable& exports, const ExportEntry& exp,
-              const rpc::Cred& rpc_cred)
-      : locks_(locks), exports_(exports), exp_(exp), rpc_cred_(rpc_cred) {}
+  MutateGuard(ObjLockRegistry& locks, const ExportEntry& exp, const rpc::Cred& rpc_cred)
+      : locks_(locks), exp_(exp), rpc_cred_(rpc_cred) {}
   MutateGuard(const MutateGuard&) = delete;
   MutateGuard& operator=(const MutateGuard&) = delete;
 
@@ -81,7 +80,6 @@ class MutateGuard {
   void squash();
 
   ObjLockRegistry& locks_;
-  const ExportTable& exports_;
   const ExportEntry& exp_;
   const rpc::Cred& rpc_cred_;
   MappedCred mapped_;

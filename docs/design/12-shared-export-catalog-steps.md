@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A 已完成；B1 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -207,7 +207,7 @@
 
 ## 阶段 B：运行期可变导出集
 
-### B1 `ExportSet` 快照 + RCU 发布（无行为变化）
+### B1 `ExportSet` 快照 + RCU 发布（无行为变化） ✅ 2026-09-09
 
 **目标**：把"导出表 + 伪根"变成不可变快照，读者每请求取一次；这一步**永不换版**，行为与今天
 逐字节相同。
@@ -252,6 +252,28 @@
 
 **验收**：`scripts/accept_m6_local.sh` 与 `bench fullpath` 吞吐无回退（快照取用是一次 atomic
 load + shared_ptr 拷贝）。
+
+**实现注**（2026-09-09）：`ExportSet{generation, epoch, entries, pseudo}` 与 `ExportSetBuilder`
+（`add(cfg, backend)` / `finish(epoch, generation)`，可从既有集构建以共享条目）进 `core/config.hpp`；
+`ExportTable` 只剩 `std::atomic<std::shared_ptr<const ExportSet>>`，`snapshot()` / `set_epoch()` /
+`publish_for_test()`，`entries()` 删除（`size()` 顶替），`by_fsid()` 保留为启动代码与测试的便捷转发。
+与草案的差异：`ExportSet::by_fsid` / `for_mount_path` 返回**非 const** `ExportEntry*`——集的成员关系冻结，
+但条目自身的运行态（指标、QoS 桶、clients 指针）本来就是可变的，v3/v4 的 `Resolved::exp`、`PseudoFs::Node::exp`
+都沿用非 const 指针；`check_client` / `squash_cred` 不依赖表状态，改成 `ExportTable` 的静态函数，
+`MutateGuard` 不再收表，`FileHandleCodec` 不再绑定表（`from_key(key)` 单参，`decode` / `decode_v4`
+显式收 `const ExportSet&`）。`entries` 按 fsid 升序（`by_fsid` 二分），因此 MOUNT EXPORT 枚举、
+`/metrics` 的 export 行、`fdcache` 等 ctl 列表从配置顺序变为 fsid 顺序——这是唯一可见的顺序差异，协议语义
+不变。`generation` 每次发布 +1（`add` / `set_epoch` / `publish_for_test` 都算）。伪根的 change 基值：
+`ExportTable::build` 先以 epoch=1 发布，`ProtocolStack` 构造时 `set_epoch(core.epoch)` 重发一版
+（主备重激活换 epoch 时同样生效）；`PseudoFs` 构造改收 `entries` 向量，`root()` 改 const。持快照的
+粒度：v4 `Ctx::set`（一个 COMPOUND 一版，`resolved` 里的伪根节点指针随之有效）；v3 `Resolved::set`
+（一次 resolve 一版，rename/link 两次 resolve 各持一份，都不失效）；MNT / EXPORT 每次调用一版；
+`StateMgr` 的 native-lock 钩子每次调用一版；指标 / ctl / daemon 启停各自一版。
+`FsClusterController::Fs::exp` 仍取启动集（B3 改）。测试 `tests/test_export_set.cpp`（7 例：空表伪根、
+`SnapshotIsStable`、fsid 排序与跨版共享、构建器拒绝项、`for_mount_path` 最长前缀、`set_epoch` 重建伪根、
+`reload_dynamic` 就地更新不发布）；bench / fuzz 夹具改用构建器。验收：`lnfs_tests`（332 例）+ 三个 accept 脚本
+（Release + ASAN）合并前后原样通过；`bench fullpath 1 4 20000 32` GETATTR 基线 347–361k rps → 353–387k rps，
+READ4k 289–312k → 315–322k rps（同机连跑三次，无回退）。
 
 ### B2 换版：新增 / 就地更新 / 退休
 

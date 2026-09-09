@@ -155,11 +155,11 @@ rt::Task<Result<Engine::Resolved>> Engine::resolve(Ctx& ctx, const FhBytes& fh) 
   // (oids embed inode+generation), so reuse within one compound is sound; staleness
   // detection is deferred to the next compound at worst.
   if (ctx.resolved && ctx.resolved_fh == fh) co_return *ctx.resolved;
-  auto decoded = handles_.decode_v4(fh, ctx.conn.peer.addr);
+  auto decoded = handles_.decode_v4(fh, ctx.conn.peer.addr, *ctx.set);
   if (!decoded) co_return Err(decoded.error());
   Resolved out;
   if (decoded->fsid == 0) {
-    out.node = pseudo_.resolve(decoded->oid);
+    out.node = ctx.set->pseudo->resolve(decoded->oid);
     if (!out.node) co_return Err(errno_from(ESTALE));
     if (core::ExportEntry* exp = out.node->exp) {
       // A crossing node's handle (minted for an export served elsewhere, plan 12
@@ -212,7 +212,7 @@ rt::Task<void> Engine::compound(ConnCtx& conn, RpcCall& call, const rpc::Cred& c
   std::vector<std::byte> tag_bytes(tag->begin(), tag->end());
   bool tag_ok = core::valid_utf8(tag_bytes);
 
-  Ctx ctx{.conn = conn, .cred = cred};
+  Ctx ctx{.conn = conn, .cred = cred, .set = exports_.snapshot()};
   ctx.minor = *minor;
 
   // Per-request summary line (design 08 §8.2): op names are only collected when debug
@@ -698,7 +698,7 @@ rt::Task<uint32_t> Engine::exec_op_impl(Ctx& ctx, uint32_t opcode, xdr::XdrDec& 
 // ---- filehandle ops --------------------------------------------------------
 
 rt::Task<uint32_t> Engine::op_putrootfh(Ctx& ctx, xdr::XdrEnc& enc) {
-  core::PseudoFs::Node* root = pseudo_.root();
+  core::PseudoFs::Node* root = ctx.set->pseudo->root();
   if (root->exp) {  // "/" itself is an export: PUTROOTFH lands on the export root
     if (!exports_.check_client(ctx.conn.peer.addr, *root->exp)) {
       enc.u32(st(Status::kAccess));
@@ -733,7 +733,7 @@ rt::Task<uint32_t> Engine::op_putfh(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     co_return st(Status::kBadxdr);
   }
   FhBytes bytes(fh->begin(), fh->end());
-  auto decoded = handles_.decode_v4(bytes, ctx.conn.peer.addr);
+  auto decoded = handles_.decode_v4(bytes, ctx.conn.peer.addr, *ctx.set);
   if (!decoded) {
     uint32_t code = st(core::to_v4(decoded.error(), Op::kPutfh));
     enc.u32(code);
@@ -859,7 +859,7 @@ rt::Task<uint32_t> Engine::op_lookupp(Ctx& ctx, xdr::XdrEnc& enc) {
   // At the export root, the parent lives in the pseudo tree.
   auto root_obj = co_await resolved->exp->backend->root();
   if (root_obj && (*root_obj)->id() == resolved->oid) {
-    core::PseudoFs::Node* crossing = pseudo_.for_export(resolved->exp->fsid);
+    core::PseudoFs::Node* crossing = ctx.set->pseudo->for_export(resolved->exp->fsid);
     if (!crossing || !crossing->parent) {
       enc.u32(st(Status::kNoent));
       co_return st(Status::kNoent);
@@ -965,7 +965,7 @@ rt::Task<uint32_t> Engine::absent_attr_reply(Ctx& ctx, core::ExportEntry& exp,
   note_moved(exp.fsid);
   backend::Attr attr;
   if (crossing)
-    attr = pseudo_.attr_of(*crossing);
+    attr = ctx.set->pseudo->attr_of(*crossing);
   else
     attr.type = backend::FType::kDir;
   core::FsOwner owner = owner_of(exp.fsid);
@@ -998,7 +998,7 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
   core::FsOwner owner;
   std::vector<std::string> fs_root;
   if (resolved.pseudo()) {
-    attr = pseudo_.attr_of(*resolved.node);
+    attr = ctx.set->pseudo->attr_of(*resolved.node);
     src.fsid = 0;  // src.fs stays null: pseudo defaults
   } else {
     auto lock = locks_.get(resolved.exp->fsid, resolved.oid);
@@ -1023,14 +1023,14 @@ rt::Task<uint32_t> Engine::attr_reply(Ctx& ctx, const Resolved& resolved,
       // backend->root() (fd dup + handle encode) each time.
       auto root_oid = co_await root_oid_of(*resolved.exp);
       if (root_oid && *root_oid == resolved.oid) {
-        if (auto* crossing = pseudo_.for_export(resolved.exp->fsid))
+        if (auto* crossing = ctx.set->pseudo->for_export(resolved.exp->fsid))
           src.mounted_on_fileid = crossing->id;
       }
     }
     if (referrals_ && (wanted.test(attr::kFsLocations) || wanted.test(attr::kFsLocationsInfo))) {
       owner = owner_of(resolved.exp->fsid);
       src.owner = &owner;
-      if (auto* crossing = pseudo_.for_export(resolved.exp->fsid))
+      if (auto* crossing = ctx.set->pseudo->for_export(resolved.exp->fsid))
         fs_root = core::PseudoFs::path_of(*crossing);
       src.fs_root = fs_root;
     }
@@ -1068,18 +1068,18 @@ rt::Task<uint32_t> Engine::op_getattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     co_return st(Status::kNofilehandle);
   }
   if (referrals_) {  // an absent export answers its referral attributes (plan 12 B3)
-    auto decoded = handles_.decode_v4(ctx.cfh, ctx.conn.peer.addr);
+    auto decoded = handles_.decode_v4(ctx.cfh, ctx.conn.peer.addr, *ctx.set);
     core::ExportEntry* absent = nullptr;
     const core::PseudoFs::Node* crossing = nullptr;
     if (decoded && decoded->fsid == 0) {
-      if (auto* node = pseudo_.resolve(decoded->oid);
+      if (auto* node = ctx.set->pseudo->resolve(decoded->oid);
           node && node->exp && role_of(node->exp->fsid) != core::FsRole::kActive) {
         absent = node->exp;
         crossing = node;
       }
     } else if (decoded && role_of(decoded->fsid) != core::FsRole::kActive) {
       absent = decoded->exp;
-      crossing = pseudo_.for_export(decoded->fsid);
+      crossing = ctx.set->pseudo->for_export(decoded->fsid);
     }
     if (absent) {
       if (role_of(absent->fsid) == core::FsRole::kUnowned) {
@@ -1423,7 +1423,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
   // missing entries against stale cookies.
   uint64_t dir_change = 0;
   if (resolved->pseudo()) {
-    dir_change = pseudo_.attr_of(*resolved->node).change;
+    dir_change = ctx.set->pseudo->attr_of(*resolved->node).change;
   } else {
     auto dattr = co_await resolved->obj->getattr();
     if (!dattr) {
@@ -1551,7 +1551,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
         absent.rdattr_error = dropped ? st(Status::kMoved) : 0;
         absent.owner = owner_of(child->exp->fsid);
         absent.fs_root = core::PseudoFs::path_of(*child);
-        auto attr = pseudo_.attr_of(*child);
+        auto attr = ctx.set->pseudo->attr_of(*child);
         ok = emit(this_cookie, name, attr, pseudo_fh(*child), child->exp->fsid, child->id, nullptr,
                   &absent);
       } else if (child->exp) {
@@ -1564,7 +1564,7 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
         ok = emit(this_cookie, name, *attr, export_fh(*child->exp, (*obj)->id()),
                   child->exp->fsid, child->id, &child_fs);
       } else {
-        auto attr = pseudo_.attr_of(*child);
+        auto attr = ctx.set->pseudo->attr_of(*child);
         ok = emit(this_cookie, name, attr, pseudo_fh(*child), 0, child->id, nullptr);
       }
       if (!ok) {
@@ -1823,7 +1823,7 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
       }
       file = std::move(*found);
     } else {
-      MutateGuard guard(locks_, exports_, *exp, ctx.cred);
+      MutateGuard guard(locks_, *exp, ctx.cred);
       if (auto verdict = guard.precheck({}); !verdict) {
         uint32_t code = verdict_status4(verdict);
         enc.u32(code);
@@ -2172,7 +2172,7 @@ rt::Task<uint32_t> Engine::op_write(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     enc.u32(check.status);
     co_return check.status;
   }
-  MutateGuard guard(locks_, exports_, *resolved->exp, ctx.cred);
+  MutateGuard guard(locks_, *resolved->exp, ctx.cred);
   if (auto verdict = guard.precheck({}); !verdict) {
     uint32_t code = verdict_status4(verdict);
     enc.u32(code);
@@ -2292,7 +2292,7 @@ rt::Task<uint32_t> Engine::op_setattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
                                           resolved->oid, state::kShareWrite);
     if (check.status != 0) co_return fail(check.status);
   }
-  MutateGuard guard(locks_, exports_, *resolved->exp, ctx.cred);
+  MutateGuard guard(locks_, *resolved->exp, ctx.cred);
   if (auto verdict = guard.precheck({}); !verdict)
     co_return fail(verdict_status4(verdict));
   // Attribute changes invalidate read delegations (plan doc 10 §5.2): recall + DELAY.
@@ -2425,7 +2425,7 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     co_return st(Status::kNotdir);
   }
   // Mutate-guard order (plan doc 10 §6.1): readonly -> name -> capability gates.
-  MutateGuard guard(locks_, exports_, *dir->exp, ctx.cred);
+  MutateGuard guard(locks_, *dir->exp, ctx.cred);
   if (auto verdict = guard.precheck({*name}); !verdict) {
     uint32_t code = verdict_status4(verdict);
     enc.u32(code);
@@ -2502,7 +2502,7 @@ rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kNotdir));
     co_return st(Status::kNotdir);
   }
-  MutateGuard guard(locks_, exports_, *dir->exp, ctx.cred);
+  MutateGuard guard(locks_, *dir->exp, ctx.cred);
   if (auto verdict = guard.precheck({*name}); !verdict) {
     uint32_t code = verdict_status4(verdict);
     enc.u32(code);
@@ -2581,7 +2581,7 @@ rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     enc.u32(st(Status::kXdev));
     co_return st(Status::kXdev);
   }
-  MutateGuard guard(locks_, exports_, *from->exp, ctx.cred);
+  MutateGuard guard(locks_, *from->exp, ctx.cred);
   if (auto verdict = guard.precheck({*oldname, *newname}); !verdict) {
     uint32_t code = verdict_status4(verdict);
     enc.u32(code);
@@ -2659,7 +2659,7 @@ rt::Task<uint32_t> Engine::op_link(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     co_return st(Status::kXdev);
   }
   // Mutate-guard order (plan doc 10 §6.1): readonly -> name -> capability gate.
-  MutateGuard guard(locks_, exports_, *dir->exp, ctx.cred);
+  MutateGuard guard(locks_, *dir->exp, ctx.cred);
   if (auto verdict = guard.precheck({*newname}); !verdict) {
     uint32_t code = verdict_status4(verdict);
     enc.u32(code);
@@ -3131,7 +3131,7 @@ rt::Task<uint32_t> Engine::op_allocate(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& 
     enc.u32(check.status);
     co_return check.status;
   }
-  MutateGuard guard(locks_, exports_, *resolved->exp, ctx.cred);
+  MutateGuard guard(locks_, *resolved->exp, ctx.cred);
   if (auto verdict = guard.precheck({}); !verdict) {
     uint32_t code = verdict_status4(verdict);
     enc.u32(code);
@@ -3345,7 +3345,7 @@ rt::Task<uint32_t> Engine::op_clone(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
     enc.u32(dcheck.status);
     co_return dcheck.status;
   }
-  MutateGuard guard(locks_, exports_, *dst->exp, ctx.cred);
+  MutateGuard guard(locks_, *dst->exp, ctx.cred);
   if (auto verdict = guard.precheck({}); !verdict) {
     uint32_t code = verdict_status4(verdict);
     enc.u32(code);

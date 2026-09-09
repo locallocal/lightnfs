@@ -21,7 +21,7 @@ MutateGuard::Verdict MutateGuard::precheck(std::initializer_list<std::string_vie
 }
 
 void MutateGuard::squash() {
-  mapped_ = exports_.squash_cred(rpc_cred_, exp_);
+  mapped_ = ExportTable::squash_cred(rpc_cred_, exp_);
   cred_ = mapped_.view();
 }
 

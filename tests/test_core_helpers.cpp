@@ -71,11 +71,10 @@ TEST(CoreFsProps, DerivesAndClampsFromBackend) {
 
 TEST(CoreMutate, PrecheckOrderAndVerdicts) {
   core::ObjLockRegistry locks;
-  core::ExportTable exports;
   rpc::Cred cred;
   core::ExportEntry entry;
 
-  core::MutateGuard rw(locks, exports, entry, cred);
+  core::MutateGuard rw(locks, entry, cred);
   EXPECT_TRUE(static_cast<bool>(rw.precheck({})));
   EXPECT_TRUE(static_cast<bool>(rw.precheck({"a", "b"})));
   auto bad = rw.precheck({"ok-name", "with/slash"});
@@ -88,7 +87,7 @@ TEST(CoreMutate, PrecheckOrderAndVerdicts) {
 
   // Readonly is evaluated before names (plan doc 10 §6.1).
   entry.readonly = true;
-  core::MutateGuard ro(locks, exports, entry, cred);
+  core::MutateGuard ro(locks, entry, cred);
   auto verdict = ro.precheck({"with/slash"});
   EXPECT_TRUE(verdict.kind == core::MutateGuard::Verdict::kReadonly);
 }

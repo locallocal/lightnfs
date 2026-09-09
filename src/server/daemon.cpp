@@ -140,11 +140,9 @@ std::optional<CoreState> build_core_state(core::Config&& config, const Identity&
                  .key = core::FileHandleCodec::from_key_only(identity.key),
                  .epoch = identity.epoch,
                  .cluster = cluster,
-                 .owners = nullptr,        // set under active-active in run_server
-                 .active_active = false,   // "
-                 .node = {}};              // "
-
-  core.key.bind(*core.exports);
+                 .owners = nullptr,       // set under active-active in run_server
+                 .active_active = false,  // "
+                 .node = {}};             // "
   return core;
 }
 
@@ -158,7 +156,8 @@ bool check_cluster_backends(const core::ClusterConfig& cluster,
                             const core::ExportTable& exports) {
   if (!cluster.enabled) return true;
   bool ok = true;
-  for (const auto& entry : exports.entries()) {
+  auto set = exports.snapshot();
+  for (const auto& entry : set->entries) {
     auto caps = entry->backend->caps();
     std::string missing;
     if (!caps.has(backend::Cap::kStableHandles)) missing += " stable-handles";
@@ -265,7 +264,8 @@ void log_backend_traits(const core::ExportEntry& entry) {
 
 // Start every backend on reactor 0 (cluster backends connect here).
 bool start_backends(rt::Runtime& runtime, core::ExportTable& exports) {
-  for (const auto& entry : exports.entries()) {
+  auto set = exports.snapshot();
+  for (const auto& entry : set->entries) {
     auto started = run_on_reactor(runtime.reactor(0), entry->backend->start());
     if (!started) {
       LNFS_ERROR("backend {} failed to start: {}", entry->path, errno_name(started.error()));
@@ -277,7 +277,8 @@ bool start_backends(rt::Runtime& runtime, core::ExportTable& exports) {
 }
 
 void stop_backends(rt::Runtime& runtime, core::ExportTable& exports) {
-  for (const auto& entry : exports.entries())
+  auto set = exports.snapshot();
+  for (const auto& entry : set->entries)
     (void)run_on_reactor(runtime.reactor(0), entry->backend->stop());
 }
 
@@ -513,9 +514,9 @@ int run_server(const std::string& config_path) {
     plane = activate(server_cfg, cluster_cfg, *core, runtime, *mgmt);
     if (!plane) return Err(errno_from(EIO));
     active_stack.store(plane->stack.get(), std::memory_order_release);
-    LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={} epoch={}",
-              LIGHTNFS_VERSION, plane->frontend->nfs->port(), plane->frontend->mount->port(),
-              core->exports->entries().size(), epoch);
+    LNFS_INFO("lightnfs {} ready: nfs_port={} mount_port={} exports={} epoch={}", LIGHTNFS_VERSION,
+              plane->frontend->nfs->port(), plane->frontend->mount->port(), core->exports->size(),
+              epoch);
     return {};
   };
   auto take_down = [&](std::chrono::milliseconds grace) {
@@ -583,7 +584,8 @@ int run_server(const std::string& config_path) {
     // whatever is still held).
     hooks.backend_takeover = [&](const TakeoverContext& ctx) -> Result<void> {
       Result<void> outcome{};
-      for (const auto& entry : core->exports->entries()) {
+      auto set = core->exports->snapshot();
+      for (const auto& entry : set->entries) {
         auto took = run_on_reactor(runtime.reactor(0), entry->backend->takeover(ctx.identity));
         if (!took) {
           LNFS_WARN("cluster: backend {} takeover failed: {}", entry->path,

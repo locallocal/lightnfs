@@ -63,7 +63,6 @@ int lnfs::bench::fullpath_main(int argc, char** argv) {
   set_log_level(LogLevel::kWarn);
   Runtime rt(Runtime::Config{.reactors = reactors, .offload_threads = 2});
 
-  core::ExportTable exports;
   auto mem = std::make_unique<backend::MemoryBackend>(9);
   auto* memory = mem.get();
   (void)memory->add_file("/bench.bin", std::string(4096, 'x'));
@@ -72,10 +71,12 @@ int lnfs::bench::fullpath_main(int argc, char** argv) {
   cfg.fsid = 9;
   cfg.clients = {"127.0.0.0/8", "::/0"};
   cfg.squash = core::Squash::kNone;
-  (void)exports.add(cfg, std::move(mem));
+  core::ExportSetBuilder builder;
+  (void)builder.add(cfg, std::move(mem));
+  core::ExportTable exports(builder.finish(1, 0));
 
   std::array<std::byte, 16> key{};
-  auto handles = core::FileHandleCodec::from_key(key, exports);
+  auto handles = core::FileHandleCodec::from_key(key);
   core::ObjLockRegistry locks;
   nfsv3::Engine engine(exports, handles, locks);
   rpc::Dispatcher disp;

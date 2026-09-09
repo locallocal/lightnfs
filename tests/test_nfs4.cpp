@@ -50,7 +50,6 @@ struct V4Fixture {
   core::FileHandleCodec handles;
   core::ObjLockRegistry locks;
   std::string state_dir;
-  std::optional<core::PseudoFs> pseudo;
   std::optional<state::StateMgr> state;
   std::optional<nfsv4::Engine> engine;
 
@@ -63,7 +62,7 @@ struct V4Fixture {
     return p;
   }
 
-  V4Fixture() : handles(core::FileHandleCodec::from_key(key, exports)) {
+  V4Fixture() : handles(core::FileHandleCodec::from_key(key)) {
     auto mem = std::make_unique<backend::MemoryBackend>(23);
     memory = mem.get();
     (void)memory->add_dir("/d");
@@ -78,9 +77,8 @@ struct V4Fixture {
     (void)exports.add(cfg, std::move(mem));
     char tmpl[] = "/tmp/lnfs-v4-XXXXXX";
     state_dir = mkdtemp(tmpl);
-    pseudo.emplace(exports);
     state.emplace(state::StateMgr::Config{.boot_epoch = 7, .state_dir = state_dir});
-    engine.emplace(exports, handles, locks, *pseudo, *state);
+    engine.emplace(exports, handles, locks, *state);
   }
   ~V4Fixture() {
     // Release any callback sender parked on an unanswered CB call (plan doc 10 §5.2)
@@ -921,9 +919,9 @@ TEST(Nfs4, ExclusiveCreateReplayAndOpenmode) {
   ASSERT_TRUE(ro.status == 0);
   EXPECT_EQ(do_write(f, ro.fh, ro.stateid, 0, "x", 0), stv(Status::kOpenmode));
   // Write to a read-only export is ROFS via OPEN itself.
-  f.exports.entries()[0]->readonly = true;
+  f.exports.snapshot()->entries[0]->readonly = true;
   EXPECT_EQ(do_open(f, dir_fh, "hello", 2, 0, "owner-ro").status, stv(Status::kRofs));
-  f.exports.entries()[0]->readonly = false;
+  f.exports.snapshot()->entries[0]->readonly = false;
   EXPECT_EQ(do_close(f, ro.fh, ro.stateid), 0u);
   EXPECT_EQ(do_close(f, first.fh, first.stateid), stv(Status::kOldStateid));
   EXPECT_EQ(do_close(f, first.fh, replay.stateid), 0u);
@@ -1135,7 +1133,7 @@ TEST(Nfs4, RestartReclaimWithinGrace) {
   f.state.emplace(state::StateMgr::Config{.boot_epoch = 8, .state_dir = f.state_dir});
   f.state->load_grace_list();
   EXPECT_TRUE(f.state->in_grace());
-  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state);
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.state);
   f.establish_session(false);  // same co_ownerid: listed; reclaim first
   EXPECT_TRUE(f.clientid >> 32 == 8u);
 
@@ -1168,7 +1166,7 @@ TEST(Nfs4, RestartReclaimWithinGrace) {
   f.engine.reset();
   f.state.emplace(state::StateMgr::Config{.boot_epoch = 9, .state_dir = f.state_dir});
   f.state->load_grace_list();
-  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state);
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.state);
   {
     xdr::XdrEnc body(f.pool);
     body.u32(0);
@@ -1232,7 +1230,7 @@ TEST(Nfs4, ClaimDelegPrevFhReclaimsAsPlainOpen) {
   f.state.emplace(state::StateMgr::Config{.boot_epoch = 21, .state_dir = f.state_dir});
   f.state->load_grace_list();
   ASSERT_TRUE(f.state->in_grace());
-  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state);
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.state);
   f.establish_session(false);
 
   // CLAIM_DELEG_PREV_FH: accepted, plain open stateid, OPEN_DELEGATE_NONE even when
@@ -1269,7 +1267,7 @@ TEST(Nfs4, ClaimDelegPrevFhReclaimsAsPlainOpen) {
   f.engine.reset();
   f.state.emplace(state::StateMgr::Config{.boot_epoch = 22, .state_dir = f.state_dir});
   f.state->load_grace_list();
-  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state);
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.state);
   {
     xdr::XdrEnc body(f.pool);
     body.u32(0);
@@ -1895,7 +1893,7 @@ TEST(Nfs4, PseudoIdsStableAcrossReconfig) {
     d.fsid = 2;
     (void)ta.add(d, std::make_unique<backend::MemoryBackend>(2));
   }
-  core::PseudoFs a(ta, 7);
+  core::PseudoFs a(ta.snapshot()->entries, 7);
 
   core::ExportTable tb;  // reconfig: /other dropped, a new export inserted first
   {
@@ -1908,7 +1906,7 @@ TEST(Nfs4, PseudoIdsStableAcrossReconfig) {
     c.fsid = 1;
     (void)tb.add(c, std::make_unique<backend::MemoryBackend>(1));
   }
-  core::PseudoFs b(tb, 8);
+  core::PseudoFs b(tb.snapshot()->entries, 8);
 
   auto* na = a.for_export(1);
   auto* nb = b.for_export(1);
@@ -1930,8 +1928,7 @@ TEST(Nfs4, PseudoIdsStableAcrossReconfig) {
 // CDFS4_BACK.  EXCHANGE_ID presents the configured server identity (plan doc 10 §1.7).
 TEST(Nfs4, BindConnGrantsForeOnlyAndConfiguredIdentity) {
   V4Fixture fx;
-  fx.engine.emplace(fx.exports, fx.handles, fx.locks, *fx.pseudo, *fx.state, "nodeA",
-                    "scopeX");
+  fx.engine.emplace(fx.exports, fx.handles, fx.locks, *fx.state, "nodeA", "scopeX");
   fx.establish_session();
 
   // BIND_CONN_TO_SESSION asking for CDFC4_BACK: granted, connection now carries CB.
@@ -2616,7 +2613,7 @@ TEST(Nfs4, FsLocationsEncoding) {
   V4Fixture f;
   core::FsOwnerView view;
   view.publish({{23, {core::FsRole::kRemote, "gw2", "10.0.0.12:2049", 3}}});
-  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state, "lightnfs-cluster:c:gw1",
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.state, "lightnfs-cluster:c:gw1",
                    "lightnfs-cluster:c", true);
   f.engine->set_owner_view(&view);
   EXPECT_EQ(static_cast<int>(f.engine->role_of(23)), static_cast<int>(core::FsRole::kRemote));
@@ -2729,8 +2726,7 @@ TEST(Nfs4, MovedAtExportBoundary) {
   };
   add_export("/export/b", 2);
   add_export("/export/c", 3);
-  f.pseudo.emplace(f.exports);
-  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state, "lightnfs-cluster:c:gw1",
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.state, "lightnfs-cluster:c:gw1",
                    "lightnfs-cluster:c", true);
   core::FsOwnerView view;
   auto publish = [&](core::FsRole role_b) {
@@ -3000,9 +2996,9 @@ TEST(Nfs4, MovedAtExportedRoot) {
     cfg.squash = core::Squash::kNone;
     ASSERT_TRUE(f.exports.add(cfg, std::move(mem)).has_value());
   }
-  f.pseudo.emplace(f.exports);
-  ASSERT_TRUE(f.pseudo->root()->exp != nullptr && f.pseudo->root()->exp->fsid == 5u);
-  f.engine.emplace(f.exports, f.handles, f.locks, *f.pseudo, *f.state, "lightnfs-cluster:c:gw1",
+  ASSERT_TRUE(f.exports.snapshot()->pseudo->root()->exp != nullptr &&
+              f.exports.snapshot()->pseudo->root()->exp->fsid == 5u);
+  f.engine.emplace(f.exports, f.handles, f.locks, *f.state, "lightnfs-cluster:c:gw1",
                    "lightnfs-cluster:c", true);
   core::FsOwnerView view;
   view.publish({{5, {core::FsRole::kRemote, "gw2", "10.0.0.12:2049", 4}}});
@@ -3090,17 +3086,17 @@ TEST(Nfs4, ActiveActiveIdentityAndFlags) {
   EXPECT_EQ(s.flags & kUseNonPnfs, kUseNonPnfs);
 
   V4Fixture failover;
-  failover.engine.emplace(failover.exports, failover.handles, failover.locks, *failover.pseudo,
-                         *failover.state, "lightnfs-cluster:c", "lightnfs-cluster:c", false);
+  failover.engine.emplace(failover.exports, failover.handles, failover.locks, *failover.state,
+                          "lightnfs-cluster:c", "lightnfs-cluster:c", false);
   auto fo = exchange(failover, "client-f");
   EXPECT_EQ(fo.flags & (kSuppMovedRefer | kSuppMovedMigr), 0u);
   EXPECT_STREQ(fo.owner, "lightnfs-cluster:c");
 
   V4Fixture gw1, gw2;
-  gw1.engine.emplace(gw1.exports, gw1.handles, gw1.locks, *gw1.pseudo, *gw1.state,
-                     "lightnfs-cluster:c:gw1", "lightnfs-cluster:c", true);
-  gw2.engine.emplace(gw2.exports, gw2.handles, gw2.locks, *gw2.pseudo, *gw2.state,
-                     "lightnfs-cluster:c:gw2", "lightnfs-cluster:c", true);
+  gw1.engine.emplace(gw1.exports, gw1.handles, gw1.locks, *gw1.state, "lightnfs-cluster:c:gw1",
+                     "lightnfs-cluster:c", true);
+  gw2.engine.emplace(gw2.exports, gw2.handles, gw2.locks, *gw2.state, "lightnfs-cluster:c:gw2",
+                     "lightnfs-cluster:c", true);
   EXPECT_TRUE(gw1.engine->referrals());
   auto r1 = exchange(gw1, "client-a");
   auto r2 = exchange(gw2, "client-a");
@@ -3132,7 +3128,6 @@ TEST(Nfs4, ClusterIdentityAcrossProtocolStacks) {
     (void)exports->add(cfg, std::make_unique<backend::MemoryBackend>(7));
     std::array<std::byte, 16> key{std::byte{1}};
     server::CoreState core{std::move(exports), core::FileHandleCodec::from_key_only(key), epoch};
-    core.key.bind(*core.exports);
     return core;
   };
   core::ClusterConfig cluster;

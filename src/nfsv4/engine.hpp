@@ -37,13 +37,17 @@ class Engine {
   // referrals: active-active (design 10 §10.2, plan 12 B1) — EXCHANGE_ID announces
   // EXCHGID4_FLAG_SUPP_MOVED_REFER | _MIGR, so clients follow fs_locations across the
   // gateways of one server_scope.
-  Engine(core::ExportTable& exports, core::FileHandleCodec& handles,
-         core::ObjLockRegistry& locks, core::PseudoFs& pseudo, state::StateMgr& state,
-         std::string server_owner = "lightnfs", std::string server_scope = "lightnfs",
-         bool referrals = false)
-      : exports_(exports), handles_(handles), locks_(locks), pseudo_(pseudo),
-        state_(state), write_verf_(core::verifier_from_epoch(state.config().boot_epoch)),
-        server_owner_(std::move(server_owner)), server_scope_(std::move(server_scope)),
+  // The pseudo tree comes with the export-set snapshot each COMPOUND takes (plan 12 B1).
+  Engine(core::ExportTable& exports, core::FileHandleCodec& handles, core::ObjLockRegistry& locks,
+         state::StateMgr& state, std::string server_owner = "lightnfs",
+         std::string server_scope = "lightnfs", bool referrals = false)
+      : exports_(exports),
+        handles_(handles),
+        locks_(locks),
+        state_(state),
+        write_verf_(core::verifier_from_epoch(state.config().boot_epoch)),
+        server_owner_(std::move(server_owner)),
+        server_scope_(std::move(server_scope)),
         referrals_(referrals) {}
 
   void register_with(rpc::Dispatcher& dispatcher);
@@ -85,6 +89,9 @@ class Engine {
   struct Ctx {
     transport::ConnCtx& conn;
     const rpc::Cred& cred;
+    // The export set this COMPOUND runs against (plan 12 B1): taken once at entry, so
+    // every op — and the pseudo nodes in `resolved` — sees one version.
+    std::shared_ptr<const core::ExportSet> set;
     FhBytes cfh{}, sfh{};
     uint32_t minor = 1;  // 1 or 2; gates the v4.2 opcode range
     bool session = false;
@@ -203,7 +210,6 @@ class Engine {
   core::ExportTable& exports_;
   core::FileHandleCodec& handles_;
   core::ObjLockRegistry& locks_;
-  core::PseudoFs& pseudo_;
   state::StateMgr& state_;
   core::WriteVerf write_verf_;
   std::string server_owner_, server_scope_;
