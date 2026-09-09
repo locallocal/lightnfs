@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A 已完成；B1 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A 已完成；B1、B2 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -275,7 +275,7 @@ load + shared_ptr 拷贝）。
 （Release + ASAN）合并前后原样通过；`bench fullpath 1 4 20000 32` GETATTR 基线 347–361k rps → 353–387k rps，
 READ4k 289–312k → 315–322k rps（同机连跑三次，无回退）。
 
-### B2 换版：新增 / 就地更新 / 退休
+### B2 换版：新增 / 就地更新 / 退休 ✅ 2026-09-09
 
 **目标**：`ExportTable::apply(plan)` 发布新集，条目跨版共享，删除的条目退休后 `stop()`。
 
@@ -307,6 +307,28 @@ READ4k 289–312k → 315–322k rps（同机连跑三次，无回退）。
 是同一指针；删除的条目在旧快照释放前 `take_retired()` 为空、释放后返回它）；
 `ExportSet.PseudoChangeMonotonic`；`ExportSet.DynamicFieldsUpdateInPlace`（readonly 翻转后同一条目
 的读值变化）。
+
+**实现注**（2026-09-09）：`ExportTable::apply(plan, started&, epoch)` 返回
+`Result<std::shared_ptr<const ExportSet>>`，`started` 改为**引用**：成功时被消费（清空），失败时原样留给
+调用方（草案按值传入会让已 `start()` 的后端随错误一起丢失，无人 `stop()`）。校验先于任何改动：后端数与
+`add` 不等、`add` 的 fsid 为 0 / 重复 / 已在集中（同一 plan 里 remove + add 同 fsid 视为**替换**，允许）、
+`update` / `remove` 指向未知 fsid、`update` 与 `remove` 同 fsid、`update` 改了 path、clients CIDR 不合法
+→ 全部 EINVAL，不发布、不动条目。通过后：新集共享未删除的条目（`ExportSetBuilder::keep`），`add` 的条目带入
+已启动后端，`update` 在共享条目上就地改 clients / qos / readonly / squash / anon / nodes（老快照上的读者
+同样看到），然后发布（generation +1），被删条目进退休队列（记录入队时刻）。`take_retired()` 只交出
+`use_count()==1` 的条目（所有列过它的快照都已释放），其余留队；另有 `retired_pending()` /
+`oldest_retired()` 供 C2 做 10 × lease 告警。队列有互斥锁保护，虽然 apply / take 都约定在主循环。
+`ExportEntry`：`readonly` / `squash` / `anon_uid` / `anon_gid` 改 `std::atomic`（读点隐式 load，原有
+`if (exp->readonly)` 写法不变）；`nodes` 改为 `node_list()` / `set_nodes()`（与 `clients_` 同一套原子指针
++ 退休列表），默认构造即发布空列表，裸构造的 `ExportEntry` 也能读。伪根 change 基值改为
+`ExportSet::pseudo_change() = epoch << 32 | generation`，`ExportSetBuilder::finish` 用它建
+`PseudoFs`，每次发布（含 `set_epoch`、`add`、就地更新的 apply）都单调递增，重启后 `(epoch+1) << 32`
+仍大于上一代任何版本；B1 里 `PseudoFs` 的 change = 启动 epoch 的断言随之改掉。`reload_dynamic` 已在 B1
+改成快照上就地更新，本步只把 `nodes` 比较换成 `node_list()`。`FsClusterController::Fs::exp` 仍是启动集的
+裸指针，在 B3 改成跟随集之前**不得**对多活网关调用 `apply` 删除导出（C2 接入时以 B3 为前置）。测试：
+`tests/test_export_set.cpp` 新增 4 例（上述三例 + `ApplyRejectsBadPlansWithoutPublishing`），
+`tests/test_nfs4.cpp` 加 `Nfs4.ExportSetSwapUnderRunningEngine`（引擎运行中加导出 → 下一 COMPOUND
+可见；删导出 → 旧 fh STALE、伪根名消失、快照释放后条目退休）。
 
 ### B3 控制器 `sync_exports`
 

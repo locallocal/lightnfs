@@ -3,8 +3,10 @@
 #include <netinet/in.h>
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -215,14 +217,20 @@ std::string canonical_exports_text(const Config& config);
 struct ExportEntry {
   std::string path;
   uint32_t fsid = 0;
-  Squash squash = Squash::kRoot;
-  uint32_t anon_uid = 65534;
-  uint32_t anon_gid = 65534;
-  bool readonly = false;
-  std::vector<std::string> nodes;  // active-active owner priority list (plan 12 A1)
+  // Hot-updatable scalars (plan 12 B2): ExportTable::apply() flips them in place on the
+  // shared entry; every read point loads once per request (squash_cred, the ROFS gates).
+  std::atomic<Squash> squash{Squash::kRoot};
+  std::atomic<uint32_t> anon_uid{65534};
+  std::atomic<uint32_t> anon_gid{65534};
+  std::atomic<bool> readonly{false};
   std::unique_ptr<backend::Backend> backend;
   // Per-export data-path counters (plan doc 10 §3.3), exported with export/fsid labels.
   obs::ExportMetrics metrics;
+
+  ExportEntry() {
+    set_clients({});
+    set_nodes({});
+  }
 
   // Client allowlist, hot-reloadable (plan doc 10 §4.1): readers load one atomic
   // pointer; set_clients publishes a fresh list and retires the old one until the
@@ -234,6 +242,16 @@ struct ExportEntry {
     auto owned = std::make_unique<const std::vector<Cidr>>(std::move(list));
     clients_.store(owned.get(), std::memory_order_release);
     retired_clients_.push_back(std::move(owned));
+  }
+  // Active-active owner priority list (plan 12 A1), published the same way (plan 12
+  // B2): the controller's tick thread reads it while apply() replaces it.
+  const std::vector<std::string>& node_list() const {
+    return *nodes_.load(std::memory_order_acquire);
+  }
+  void set_nodes(std::vector<std::string> list) {
+    auto owned = std::make_unique<const std::vector<std::string>>(std::move(list));
+    nodes_.store(owned.get(), std::memory_order_release);
+    retired_nodes_.push_back(std::move(owned));
   }
 
   // Per-export QoS buckets (plan doc 10 §4.3), enforced at the engine entry for
@@ -249,6 +267,8 @@ struct ExportEntry {
  private:
   std::atomic<const std::vector<Cidr>*> clients_{nullptr};
   std::vector<std::unique_ptr<const std::vector<Cidr>>> retired_clients_;
+  std::atomic<const std::vector<std::string>*> nodes_{nullptr};
+  std::vector<std::unique_ptr<const std::vector<std::string>>> retired_nodes_;
 };
 
 struct MappedCred {
@@ -270,7 +290,10 @@ class PseudoFs;
 // pointers handed out here, which is why they are not const.
 struct ExportSet {
   uint64_t generation = 0;  // +1 on every publish
-  uint64_t epoch = 1;       // the pseudo tree's change attribute base (boot epoch)
+  uint64_t epoch = 1;       // the boot epoch the set serves under
+  // The pseudo tree's change attribute (plan 12 B2): epoch << 32 | generation, so it
+  // moves on every publish and never repeats across restarts.
+  uint64_t pseudo_change() const { return (epoch << 32) | generation; }
   std::vector<std::shared_ptr<ExportEntry>> entries;  // fsid ascending, unique
   std::unique_ptr<const PseudoFs> pseudo;             // built over `entries`
 
@@ -293,6 +316,8 @@ class ExportSetBuilder {
 
   // A fresh entry from its config: EINVAL for fsid 0, a duplicate fsid or no backend.
   Result<void> add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend);
+  // An existing entry carried over as the same object (plan 12 B2).
+  void keep(std::shared_ptr<ExportEntry> entry) { entries_.push_back(std::move(entry)); }
   // `epoch` feeds the pseudo tree's change attribute; `generation` is the set version.
   std::shared_ptr<const ExportSet> finish(uint64_t epoch, uint64_t generation);
 
@@ -300,10 +325,20 @@ class ExportSetBuilder {
   std::vector<std::shared_ptr<ExportEntry>> entries_;
 };
 
+// One export-set change (plan 12 B2), produced by diff_catalog + merge_with_local
+// (C2) or by the ctl export commands (D2).
+struct ExportSetPlan {
+  std::vector<ExportConfig> add;     // new fsids (an export coming back enabled too)
+  std::vector<ExportConfig> update;  // same fsid: clients / qos / readonly / squash /
+                                     // anon / nodes applied in place
+  std::vector<uint32_t> remove;      // deleted or disabled
+};
+
 // The published export set (RCU, plan 12 B1): one atomic pointer to the current
 // ExportSet.  Publishing swaps the pointer; a reader that took a snapshot keeps its
 // version alive until it drops it, so nothing it points at moves under a request.
-// Until plan 12 B2 (apply / retire) the only publishes are at startup.
+// Startup publishes (build / add / set_epoch) and apply() (plan 12 B2) are the only
+// writers, all on the main-loop thread.
 class ExportTable {
  public:
   ExportTable();  // an empty set
@@ -320,8 +355,29 @@ class ExportTable {
   // `epoch`: the boot epoch is only known when the gateway activates, after the table
   // was built.  A no-op when the epoch is already that.
   void set_epoch(uint64_t epoch);
-  // Test hook (plan 12 B1): publish an arbitrary set — B2's apply() replaces it.
+  // Test hook (plan 12 B1): publish an arbitrary set — apply() is the real path.
   void publish_for_test(std::shared_ptr<const ExportSet> set);
+
+  // Publishes the set after `plan` (plan 12 B2), main-loop thread only.  `started`
+  // carries one already started backend per plan.add, in that order; it is consumed
+  // on success and left untouched on failure.  Entries the plan does not remove are
+  // the same objects in the new set; updates land on those objects in place, so a
+  // reader on an older snapshot sees them too.  Removed entries go to the retirement
+  // queue.  EINVAL, with nothing published or changed, when the backend count does
+  // not match, an add's fsid is 0 or already in the set (unless the plan also removes
+  // it), an fsid is listed twice, an update or remove names an unknown fsid, an
+  // update changes the path, or a client CIDR does not parse.
+  Result<std::shared_ptr<const ExportSet>> apply(
+      ExportSetPlan plan, std::vector<std::unique_ptr<backend::Backend>>& started, uint64_t epoch);
+  // Retirement queue (plan 12 B2): entries apply() removed.  Returns — and forgets —
+  // the ones nothing else references any more (use_count() == 1: every snapshot that
+  // listed them is gone), for the caller to stop() their backends and drop; the rest
+  // stay queued until a later call.  Main-loop thread.
+  std::vector<std::shared_ptr<ExportEntry>> take_retired();
+  // Entries still waiting in the queue, and since when the oldest has been waiting
+  // (C2 warns past 10 × lease).
+  size_t retired_pending() const;
+  std::optional<std::chrono::steady_clock::time_point> oldest_retired() const;
 
   // Convenience over snapshot() for startup code and tests.  The pointer is only as
   // stable as the entry's membership: a request-path reader holds the snapshot itself.
@@ -343,6 +399,12 @@ class ExportTable {
   void publish(std::shared_ptr<const ExportSet> set);
 
   std::atomic<std::shared_ptr<const ExportSet>> set_;
+  struct Retired {
+    std::shared_ptr<ExportEntry> entry;
+    std::chrono::steady_clock::time_point since;
+  };
+  mutable std::mutex retired_mu_;
+  std::vector<Retired> retired_;
 };
 
 }  // namespace lnfs::core

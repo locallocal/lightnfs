@@ -417,15 +417,16 @@ std::string FsClusterController::migration_target(const Fs& fs, const StoreView&
 bool FsClusterController::our_turn(const core::ExportEntry& exp, const StoreView& sv,
                                    bool stuck) const {
   if (cfg_.takeover != "auto") return false;
-  auto self = std::find(exp.nodes.begin(), exp.nodes.end(), node_);
-  if (self == exp.nodes.end()) return false;  // not a candidate: ctl --force only
+  const auto& nodes = exp.node_list();  // one load; apply() may swap the list under us
+  auto self = std::find(nodes.begin(), nodes.end(), node_);
+  if (self == nodes.end()) return false;  // not a candidate: ctl --force only
   if (stuck) return true;  // the predecessors had their 2 × ttl and did not take it
   // Everyone ahead of us in the export's list gets the first chance: their heartbeat
   // record (empty or not) still live means they are up and will take it themselves.
   // No record at all is a node we have not heard from: dead, unless we ourselves are
   // younger than one ttl — then it may simply not have written its first heartbeat.
   const bool settling = sv.now_ms - started_ms_ < ttl().count();
-  for (auto it = exp.nodes.begin(); it != self; ++it) {
+  for (auto it = nodes.begin(); it != self; ++it) {
     bool heard = false;
     for (const auto& rec : sv.fences) {
       if (rec.node != *it) continue;
@@ -896,7 +897,7 @@ std::vector<FsClusterController::FsState> FsClusterController::snapshot() const 
                {}};
     if (auto it = view->find(fsid); it != view->end()) st.view = it->second;
     if (fs.exp) {
-      st.nodes = fs.exp->nodes;
+      st.nodes = fs.exp->node_list();
       st.path = fs.exp->path;
     }
     out.push_back(std::move(st));
