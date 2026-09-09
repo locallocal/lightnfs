@@ -47,8 +47,7 @@ struct WriteFixture {
   }
 
   explicit WriteFixture(bool readonly = false)
-      : handles(core::FileHandleCodec::from_key(key, exports)),
-        engine(exports, handles, locks) {
+      : handles(core::FileHandleCodec::from_key(key)), engine(exports, handles, locks) {
     auto mem = std::make_unique<backend::MemoryBackend>(23);
     memory = mem.get();
     (void)memory->add_dir("/d");

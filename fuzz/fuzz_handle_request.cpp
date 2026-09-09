@@ -19,13 +19,12 @@
 #include "core/file_handle.hpp"
 #include "core/obj_lock.hpp"
 #include "mountd/mount3.hpp"
-#include "core/pseudofs.hpp"
 #include "nfsv3/engine.hpp"
 #include "nfsv4/engine.hpp"
-#include "state/state_mgr.hpp"
 #include "rpc/dispatch.hpp"
 #include "runtime/reactor.hpp"
 #include "runtime/testing/fake_ring.hpp"
+#include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
 #include "util/log.hpp"
 #include "xdr/xdr.hpp"
@@ -93,24 +92,24 @@ extern "C" void lnfs_fuzz_entry(const uint8_t* data, size_t size) {
   ConnCtx ctx(3, peer, pool, cfg);
   Dispatcher disp;
   disp.add({kFuzzProg, 1, 1, nullptr, fuzz_handler});
-  core::ExportTable exports;
   core::ExportConfig export_cfg;
   export_cfg.path = "/fuzz";
   export_cfg.fsid = 1;
   export_cfg.clients = {"127.0.0.0/8"};
   auto memory = std::make_unique<backend::MemoryBackend>(1);
-  (void)exports.add(export_cfg, std::move(memory));
+  core::ExportSetBuilder builder;
+  (void)builder.add(export_cfg, std::move(memory));
+  core::ExportTable exports(builder.finish(1, 0));
   std::array<std::byte, 16> key{};
-  auto handles = core::FileHandleCodec::from_key(key, exports);
+  auto handles = core::FileHandleCodec::from_key(key);
   core::ObjLockRegistry locks;
   nfsv3::Engine nfs(exports, handles, locks);
   mountd::Mount3 mount(exports, handles);
   nfs.register_with(disp);
   mount.register_with(disp);
   // v4.1 stack: COMPOUND decode surface + session/state machinery (phase 3).
-  core::PseudoFs pseudo(exports);
   state::StateMgr state({.boot_epoch = 1, .state_dir = fuzz_state_dir()});
-  nfsv4::Engine nfs4(exports, handles, locks, pseudo, state);
+  nfsv4::Engine nfs4(exports, handles, locks, state);
   nfs4.register_with(disp);
 
   BufferChain rec;

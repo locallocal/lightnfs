@@ -142,18 +142,18 @@ std::vector<std::byte> FileHandleCodec::encode(const ExportEntry& exp,
 }
 
 Result<DecodedHandle> FileHandleCodec::decode(std::span<const std::byte> fh,
-                                               const sockaddr_storage& peer) const {
-  if (!exports_ || fh.size() < 14 || fh.size() > 64 ||
-      static_cast<uint8_t>(fh[0]) != kVersion)
+                                              const sockaddr_storage& peer,
+                                              const ExportSet& exports) const {
+  if (fh.size() < 14 || fh.size() > 64 || static_cast<uint8_t>(fh[0]) != kVersion)
     return Err(Errno::kBadHandle);
   uint64_t expected = tag(fh.first(fh.size() - 8));
   uint64_t supplied = read64(fh.data() + fh.size() - 8);
   uint64_t diff = expected ^ supplied;
   if (diff != 0) return Err(Errno::kBadHandle);
   uint32_t fsid = load_be32(fh.data() + 1);
-  ExportEntry* exp = exports_->by_fsid(fsid);
+  ExportEntry* exp = exports.by_fsid(fsid);
   if (!exp) return Err(errno_from(ESTALE));
-  if (!exports_->check_client(peer, *exp)) return Err(errno_from(EACCES));
+  if (!ExportTable::check_client(peer, *exp)) return Err(errno_from(EACCES));
   auto oid = backend::ObjId::from(fh.subspan(5, fh.size() - 13));
   if (!oid) return Err(Errno::kBadHandle);
   return DecodedHandle{exp, *oid};
@@ -175,8 +175,9 @@ std::vector<std::byte> FileHandleCodec::encode_raw(uint32_t fsid,
   return out;
 }
 
-Result<FileHandleCodec::DecodedV4> FileHandleCodec::decode_v4(
-    std::span<const std::byte> fh, const sockaddr_storage& peer) const {
+Result<FileHandleCodec::DecodedV4> FileHandleCodec::decode_v4(std::span<const std::byte> fh,
+                                                              const sockaddr_storage& peer,
+                                                              const ExportSet& exports) const {
   if (fh.size() < 14 || fh.size() > 64 || static_cast<uint8_t>(fh[0]) != kVersion)
     return Err(Errno::kBadHandle);
   if (tag(fh.first(fh.size() - 8)) != read64(fh.data() + fh.size() - 8))
@@ -187,10 +188,9 @@ Result<FileHandleCodec::DecodedV4> FileHandleCodec::decode_v4(
   if (!oid) return Err(Errno::kBadHandle);
   out.oid = *oid;
   if (out.fsid == 0) return out;  // pseudo-fs: no export gate here
-  if (!exports_) return Err(errno_from(ESTALE));
-  out.exp = exports_->by_fsid(out.fsid);
+  out.exp = exports.by_fsid(out.fsid);
   if (!out.exp) return Err(errno_from(ESTALE));
-  if (!exports_->check_client(peer, *out.exp)) return Err(errno_from(EACCES));
+  if (!ExportTable::check_client(peer, *out.exp)) return Err(errno_from(EACCES));
   return out;
 }
 

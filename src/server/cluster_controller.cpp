@@ -338,7 +338,9 @@ FsClusterController::FsClusterController(const core::ClusterConfig& cfg,
       node_(core::cluster_node_name(cfg)),
       node_epoch_(node_epoch) {
   if (!hooks_.post) hooks_.post = [](const std::function<void()>& fn) { fn(); };
-  for (const auto& entry : exports.entries()) fs_[entry->fsid].exp = entry.get();
+  // The boot-time set (plan 12 B1); following the set across versions is B3.
+  auto set = exports.snapshot();
+  for (const auto& entry : set->entries) fs_[entry->fsid].exp = entry.get();
   last_.now_ms = started_ms_ = wall_now_ms();
   // Until the first tick has read the store nothing is known to be ours: every export
   // is Unowned in the view (clients wait), never silently served.

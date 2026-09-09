@@ -139,11 +139,12 @@ void Engine::register_with(rpc::Dispatcher& dispatcher) {
 
 rt::Task<Result<Engine::Resolved>> Engine::resolve(const FileHandle& fh,
                                                     const sockaddr_storage& peer) {
-  auto decoded = handles_.decode(fh.data, peer);
+  auto set = exports_.snapshot();  // one snapshot per resolve, held by the result
+  auto decoded = handles_.decode(fh.data, peer, *set);
   if (!decoded) co_return Err(decoded.error());
   auto obj = co_await decoded->export_entry->backend->resolve(decoded->oid);
   if (!obj) co_return Err(obj.error());
-  co_return Resolved{decoded->export_entry, std::move(*obj), decoded->oid};
+  co_return Resolved{decoded->export_entry, std::move(*obj), decoded->oid, std::move(set)};
 }
 
 rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred) {
@@ -631,7 +632,7 @@ rt::Task<void> Engine::proc_setattr(ConnCtx& ctx, RpcCall& call, const rpc::Cred
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *resolved->exp, rpc_cred);
+  MutateGuard guard(locks_, *resolved->exp, rpc_cred);
   if (auto verdict = guard.precheck({}); !verdict) {
     auto attr = co_await core::sample_attr(resolved->obj);
     begin_result(enc, ctx, call, verdict_status(verdict));
@@ -676,7 +677,7 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *resolved->exp, rpc_cred);
+  MutateGuard guard(locks_, *resolved->exp, rpc_cred);
   if (auto verdict = guard.precheck({}); !verdict) {
     auto attr = co_await core::sample_attr(resolved->obj);
     begin_result(enc, ctx, call, verdict_status(verdict));
@@ -734,7 +735,7 @@ rt::Task<void> Engine::proc_create(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  MutateGuard guard(locks_, *dir->exp, rpc_cred);
   if (auto verdict = guard.precheck({args->where.name}); !verdict) {
     auto attr = co_await core::sample_attr(dir->obj);
     begin_result(enc, ctx, call, verdict_status(verdict));
@@ -809,7 +810,7 @@ rt::Task<void> Engine::proc_mkdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  MutateGuard guard(locks_, *dir->exp, rpc_cred);
   if (auto verdict = guard.precheck({args->where.name}); !verdict) {
     auto attr = co_await core::sample_attr(dir->obj);
     begin_result(enc, ctx, call, verdict_status(verdict));
@@ -848,7 +849,7 @@ rt::Task<void> Engine::proc_symlink(ConnCtx& ctx, RpcCall& call, const rpc::Cred
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  MutateGuard guard(locks_, *dir->exp, rpc_cred);
   Status precheck = verdict_status(guard.precheck({args->where.name}));
   if (precheck == Status::kOk && !dir->exp->backend->caps().has(backend::Cap::kSymlink))
     precheck = Status::kNotsupp;
@@ -891,7 +892,7 @@ rt::Task<void> Engine::proc_mknod(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  MutateGuard guard(locks_, *dir->exp, rpc_cred);
   bool device = args->type == backend::FType::kChr || args->type == backend::FType::kBlk;
   bool special = device || args->type == backend::FType::kSock ||
                  args->type == backend::FType::kFifo;
@@ -940,7 +941,7 @@ rt::Task<void> Engine::proc_remove(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  MutateGuard guard(locks_, *dir->exp, rpc_cred);
   if (auto verdict = guard.precheck({args->name}); !verdict) {
     auto attr = co_await core::sample_attr(dir->obj);
     begin_result(enc, ctx, call, verdict_status(verdict));
@@ -972,7 +973,7 @@ rt::Task<void> Engine::proc_rmdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *dir->exp, rpc_cred);
+  MutateGuard guard(locks_, *dir->exp, rpc_cred);
   if (auto verdict = guard.precheck({args->name}); !verdict) {
     Status status = verdict_status(verdict);
     if (verdict.name == core::NameCheck::kDot)  // RFC 1813 §3.3.13
@@ -1020,7 +1021,7 @@ rt::Task<void> Engine::proc_rename(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *from->exp, rpc_cred);
+  MutateGuard guard(locks_, *from->exp, rpc_cred);
   if (auto verdict = guard.precheck({args->from.name, args->to.name}); !verdict) {
     auto attr_from = co_await core::sample_attr(from->obj);
     auto attr_to = from->oid == to.oid ? attr_from : co_await core::sample_attr(to.obj);
@@ -1069,7 +1070,7 @@ rt::Task<void> Engine::proc_link(ConnCtx& ctx, RpcCall& call, const rpc::Cred& r
     co_await reply(ctx, enc, cap);
     co_return;
   }
-  MutateGuard guard(locks_, exports_, *dir.exp, rpc_cred);
+  MutateGuard guard(locks_, *dir.exp, rpc_cred);
   Status precheck = verdict_status(guard.precheck({args->to.name}));
   if (precheck == Status::kOk && !dir.exp->backend->caps().has(backend::Cap::kHardlink))
     precheck = Status::kNotsupp;

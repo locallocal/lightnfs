@@ -28,12 +28,12 @@ uint64_t PseudoFs::stable_id(std::string_view path) {
   return id;
 }
 
-PseudoFs::PseudoFs(const ExportTable& exports, uint64_t boot_epoch)
+PseudoFs::PseudoFs(const std::vector<std::shared_ptr<ExportEntry>>& entries, uint64_t boot_epoch)
     : boot_epoch_(boot_epoch) {
   root_.id = stable_id("/");
   root_.name = "/";
   by_id_[root_.id] = &root_;
-  for (const auto& entry : exports.entries()) {
+  for (const auto& entry : entries) {
     Node* cur = &root_;
     std::string_view path = entry->path;
     std::string full;

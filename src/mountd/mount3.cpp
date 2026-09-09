@@ -85,7 +85,8 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call,
     }
     xdr::XdrEnc enc(ctx.pool);
     rpc::encode_reply_success(enc, call.xid);
-    for (const auto& exp : exports_.entries()) {
+    auto set = exports_.snapshot();
+    for (const auto& exp : set->entries) {
       enc.boolean(true);
       enc.string(exp->path);
       for (const auto& client : exp->client_list()) {
@@ -105,7 +106,8 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call,
     co_return;
   }
   std::string relative;
-  core::ExportEntry* exp = exports_.for_mount_path(*path_arg, relative);
+  auto set = exports_.snapshot();  // held for the rest of the MNT
+  core::ExportEntry* exp = set->for_mount_path(*path_arg, relative);
   xdr::XdrEnc enc(ctx.pool);
   rpc::encode_reply_success(enc, call.xid);
   if (!exp || !exports_.check_client(ctx.peer.addr, *exp)) {

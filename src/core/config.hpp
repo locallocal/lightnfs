@@ -258,18 +258,79 @@ struct MappedCred {
   backend::Cred view() const { return {uid, gid, groups}; }
 };
 
+class PseudoFs;
+
+// One immutable version of the export set (plan 12 B1): the entries in fsid order
+// plus the v4 pseudo tree built over them.  Readers take one snapshot per request
+// (ExportTable::snapshot) and hold it for as long as they use any entry or pseudo
+// node of it.  Entries are shared between versions (an unchanged export is the same
+// object in the next set, plan 12 B2), so an entry — its backend, fd cache, metrics,
+// QoS buckets and client allowlist — lives while any set listing it does.  The
+// membership is frozen; the entries' own runtime state stays mutable through the
+// pointers handed out here, which is why they are not const.
+struct ExportSet {
+  uint64_t generation = 0;  // +1 on every publish
+  uint64_t epoch = 1;       // the pseudo tree's change attribute base (boot epoch)
+  std::vector<std::shared_ptr<ExportEntry>> entries;  // fsid ascending, unique
+  std::unique_ptr<const PseudoFs> pseudo;             // built over `entries`
+
+  ExportSet();
+  ~ExportSet();
+  ExportSet(const ExportSet&) = delete;
+  ExportSet& operator=(const ExportSet&) = delete;
+
+  ExportEntry* by_fsid(uint32_t fsid) const;  // binary search
+  // Longest export path prefix, component-boundary checked.
+  ExportEntry* for_mount_path(std::string_view path, std::string& relative) const;
+};
+
+// Assembles the next ExportSet: from nothing or from an existing set (whose entries
+// it shares), then finish() sorts the entries, builds the pseudo tree and freezes it.
+class ExportSetBuilder {
+ public:
+  ExportSetBuilder() = default;
+  explicit ExportSetBuilder(const ExportSet& base) : entries_(base.entries) {}
+
+  // A fresh entry from its config: EINVAL for fsid 0, a duplicate fsid or no backend.
+  Result<void> add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend);
+  // `epoch` feeds the pseudo tree's change attribute; `generation` is the set version.
+  std::shared_ptr<const ExportSet> finish(uint64_t epoch, uint64_t generation);
+
+ private:
+  std::vector<std::shared_ptr<ExportEntry>> entries_;
+};
+
+// The published export set (RCU, plan 12 B1): one atomic pointer to the current
+// ExportSet.  Publishing swaps the pointer; a reader that took a snapshot keeps its
+// version alive until it drops it, so nothing it points at moves under a request.
+// Until plan 12 B2 (apply / retire) the only publishes are at startup.
 class ExportTable {
  public:
+  ExportTable();  // an empty set
+  explicit ExportTable(std::shared_ptr<const ExportSet> initial);
+
   static Result<std::unique_ptr<ExportTable>> build(Config config);
+  // Publishes a new set with `cfg` added (startup and tests; the runtime path is B2's
+  // apply()).  EINVAL for fsid 0, a duplicate fsid or no backend.
   Result<void> add(ExportConfig cfg, std::unique_ptr<backend::Backend> backend);
 
-  ExportEntry* by_fsid(uint32_t fsid);
-  const ExportEntry* by_fsid(uint32_t fsid) const;
-  // Longest export path prefix, component-boundary checked.
-  ExportEntry* for_mount_path(std::string_view path, std::string& relative);
-  bool check_client(const sockaddr_storage& peer, const ExportEntry& entry) const;
-  MappedCred squash_cred(const rpc::Cred& cred, const ExportEntry& entry) const;
-  const std::vector<std::unique_ptr<ExportEntry>>& entries() const { return entries_; }
+  // The current set: one atomic load plus one shared_ptr copy.
+  std::shared_ptr<const ExportSet> snapshot() const { return set_.load(std::memory_order_acquire); }
+  // Republishes the current entries with the pseudo tree's change base moved to
+  // `epoch`: the boot epoch is only known when the gateway activates, after the table
+  // was built.  A no-op when the epoch is already that.
+  void set_epoch(uint64_t epoch);
+  // Test hook (plan 12 B1): publish an arbitrary set — B2's apply() replaces it.
+  void publish_for_test(std::shared_ptr<const ExportSet> set);
+
+  // Convenience over snapshot() for startup code and tests.  The pointer is only as
+  // stable as the entry's membership: a request-path reader holds the snapshot itself.
+  ExportEntry* by_fsid(uint32_t fsid) const { return snapshot()->by_fsid(fsid); }
+  size_t size() const { return snapshot()->entries.size(); }
+
+  // Per-entry rules that need no table state.
+  static bool check_client(const sockaddr_storage& peer, const ExportEntry& entry);
+  static MappedCred squash_cred(const rpc::Cred& cred, const ExportEntry& entry);
 
   // Hot reload, step 1 (plan doc 10 §4.1): re-applies the non-topology per-export
   // settings (client CIDR allowlist, QoS rates) from a freshly validated config,
@@ -279,7 +340,9 @@ class ExportTable {
   std::string reload_dynamic(const Config& fresh);
 
  private:
-  std::vector<std::unique_ptr<ExportEntry>> entries_;
+  void publish(std::shared_ptr<const ExportSet> set);
+
+  std::atomic<std::shared_ptr<const ExportSet>> set_;
 };
 
 }  // namespace lnfs::core

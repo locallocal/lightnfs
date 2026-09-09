@@ -24,14 +24,13 @@ class FileHandleCodec {
  public:
   static constexpr uint8_t kVersion = 1;
   static Result<FileHandleCodec> load_or_create(const std::string& state_dir);
-  static FileHandleCodec from_key(std::array<std::byte, 16> key, ExportTable& exports) {
-    return FileHandleCodec(key, exports);
-  }
+  static FileHandleCodec from_key(std::array<std::byte, 16> key) { return FileHandleCodec(key); }
 
   std::vector<std::byte> encode(const ExportEntry& exp, const backend::ObjId& oid) const;
-  Result<DecodedHandle> decode(std::span<const std::byte> fh,
-                               const sockaddr_storage& peer) const;
-  void bind(ExportTable& exports) { exports_ = &exports; }
+  // Decodes against one export-set snapshot (plan 12 B1): the caller takes it and keeps
+  // it alive for as long as it uses the returned entry.
+  Result<DecodedHandle> decode(std::span<const std::byte> fh, const sockaddr_storage& peer,
+                               const ExportSet& exports) const;
 
   // v4 namespace decode (design 04 §4.3): fsid 0 is the pseudo-fs — browsable from any
   // source, no export/IP check (that happens when crossing into an export); fsid != 0
@@ -41,8 +40,8 @@ class FileHandleCodec {
     backend::ObjId oid;
     ExportEntry* exp = nullptr;  // null for pseudo handles
   };
-  Result<DecodedV4> decode_v4(std::span<const std::byte> fh,
-                              const sockaddr_storage& peer) const;
+  Result<DecodedV4> decode_v4(std::span<const std::byte> fh, const sockaddr_storage& peer,
+                              const ExportSet& exports) const;
   // Encode with an explicit fsid (0 = pseudo).
   std::vector<std::byte> encode_raw(uint32_t fsid, const backend::ObjId& oid) const;
 
@@ -53,19 +52,14 @@ class FileHandleCodec {
     backend::ObjId oid;
     bool hmac_ok = false;
   };
-  static FileHandleCodec from_key_only(std::array<std::byte, 16> key) {
-    return FileHandleCodec(key);
-  }
+  static FileHandleCodec from_key_only(std::array<std::byte, 16> key) { return from_key(key); }
   Result<Inspection> inspect(std::span<const std::byte> fh) const;
 
  private:
-  FileHandleCodec(std::array<std::byte, 16> key, ExportTable& exports)
-      : key_(key), exports_(&exports) {}
   explicit FileHandleCodec(std::array<std::byte, 16> key) : key_(key) {}
   uint64_t tag(std::span<const std::byte> bytes) const;
 
   std::array<std::byte, 16> key_{};
-  ExportTable* exports_ = nullptr;
 };
 
 }  // namespace lnfs::core

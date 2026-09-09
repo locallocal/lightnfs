@@ -54,7 +54,6 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
     : drc({.ttl = std::chrono::milliseconds(cfg.drc_ttl_ms), .max_memory = cfg.drc_mem}),
       nfs3(*core.exports, core.key, locks),
       mount(*core.exports, core.key),
-      pseudofs(*core.exports, core.epoch),
       state({.boot_epoch = core.epoch,
              .state_dir = cfg.state_dir,
              .lease_seconds = cfg.lease_seconds,
@@ -66,23 +65,26 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
              // Native byte-range locks (plan doc 10 §5.3): exports whose backend has
              // native_locks() get every LOCK/LOCKU/LOCKT mirrored into storage.
              .native_locks = {
-                 .manager =
-                     [exports = core.exports.get()](uint32_t fsid) -> backend::LockMgr* {
-                       const auto* entry = exports->by_fsid(fsid);
-                       if (!entry) return nullptr;
-                       auto native = entry->backend->native_locks();
-                       return native ? &native->get() : nullptr;
-                     },
-                 .resolve =
-                     [exports = core.exports.get()](uint32_t fsid, const backend::ObjId& oid)
-                         -> rt::Task<Result<backend::ObjPtr>> {
-                       const auto* entry = exports->by_fsid(fsid);
-                       if (!entry) co_return Err(errno_from(ESTALE));
-                       co_return co_await entry->backend->resolve(oid);
-                     }},
+                 .manager = [exports = core.exports.get()](uint32_t fsid) -> backend::LockMgr* {
+                   auto set = exports->snapshot();
+                   const auto* entry = set->by_fsid(fsid);
+                   if (!entry) return nullptr;
+                   auto native = entry->backend->native_locks();
+                   return native ? &native->get() : nullptr;
+                 },
+                 .resolve = [exports = core.exports.get()](uint32_t fsid, const backend::ObjId& oid)
+                     -> rt::Task<Result<backend::ObjPtr>> {
+                   auto set = exports->snapshot();
+                   const auto* entry = set->by_fsid(fsid);
+                   if (!entry) co_return Err(errno_from(ESTALE));
+                   co_return co_await entry->backend->resolve(oid);
+                 }},
              .stable = core.cluster ? cluster_stable_store(*core.cluster)
                                     : state::StateMgr::Config::StableStore{},
              .per_fsid_reclaim = core.active_active}) {
+  // The pseudo tree's change attribute follows the epoch this stack serves (plan doc 10
+  // §1.6): the set is republished with it before any request can take a snapshot.
+  core.exports->set_epoch(core.epoch);
   // Active-active: gateways keep independent epochs, so the node name goes into the
   // verifier too — an export that migrates must not look like the same server.
   nfs3.set_write_verifier(core.active_active ? core::verifier_for_node(core.epoch, core.node)
@@ -116,7 +118,7 @@ void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::Cluster
   // C1); the global window is the single-gateway / failover restart.
   if (!core.active_active) state.load_grace_list();
   auto identity = derive_server_identity(cfg, cluster);
-  nfs4.emplace(*core.exports, core.key, locks, pseudofs, state, std::move(identity.owner),
+  nfs4.emplace(*core.exports, core.key, locks, state, std::move(identity.owner),
                std::move(identity.scope), core::cluster_active_active(cluster));
   if (core.active_active) nfs4->set_write_verifier(core::verifier_for_node(core.epoch, core.node));
   nfs4->set_owner_view(core.owners);

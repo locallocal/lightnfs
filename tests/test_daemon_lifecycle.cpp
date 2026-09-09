@@ -78,7 +78,6 @@ server::CoreState make_core(uint64_t epoch) {
   (void)exports->add(cfg, std::make_unique<backend::MemoryBackend>(3));
   std::array<std::byte, 16> key{std::byte{9}};
   server::CoreState core{std::move(exports), core::FileHandleCodec::from_key_only(key), epoch};
-  core.key.bind(*core.exports);
   return core;
 }
 

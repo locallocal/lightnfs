@@ -346,30 +346,30 @@ TEST(Core, FileHandleAuthenticatesAndClassifiesFailures) {
   ASSERT_TRUE(table.add(cfg, std::move(memory)).has_value());
   std::array<std::byte, 16> key{};
   for (size_t i = 0; i < key.size(); ++i) key[i] = static_cast<std::byte>(i);
-  auto codec = core::FileHandleCodec::from_key(key, table);
+  auto codec = core::FileHandleCodec::from_key(key);
+  auto set = table.snapshot();
   rt::testing::FakeRing ring;
   rt::Reactor reactor(ring);
   auto root = run_immediate(reactor, raw->root());
   ASSERT_TRUE(root.has_value());
   auto* exp = table.by_fsid(17);
   auto fh = codec.encode(*exp, (*root)->id());
-  auto decoded = codec.decode(fh, loopback());
+  auto decoded = codec.decode(fh, loopback(), *set);
   ASSERT_TRUE(decoded.has_value());
   EXPECT_TRUE(decoded->oid == (*root)->id());
   sockaddr_storage denied{};
   auto* denied4 = reinterpret_cast<sockaddr_in*>(&denied);
   denied4->sin_family = AF_INET;
   inet_pton(AF_INET, "10.0.0.1", &denied4->sin_addr);
-  auto inaccessible = codec.decode(fh, denied);
+  auto inaccessible = codec.decode(fh, denied, *set);
   EXPECT_FALSE(inaccessible.has_value());
   EXPECT_EQ((int)inaccessible.error(), EACCES);
-  core::ExportTable empty;
-  auto stale_codec = core::FileHandleCodec::from_key(key, empty);
-  auto stale = stale_codec.decode(fh, loopback());
+  core::ExportTable empty;  // the same key over a set without the export: stale
+  auto stale = codec.decode(fh, loopback(), *empty.snapshot());
   EXPECT_FALSE(stale.has_value());
   EXPECT_EQ((int)stale.error(), ESTALE);
   fh[6] ^= std::byte{1};
-  auto forged = codec.decode(fh, loopback());
+  auto forged = codec.decode(fh, loopback(), *set);
   EXPECT_FALSE(forged.has_value());
   EXPECT_EQ((int)forged.error(), (int)Errno::kBadHandle);
 }
