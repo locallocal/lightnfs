@@ -46,6 +46,15 @@ struct CoreState {
   // export and grace is armed per export by the FsClusterController, never globally.
   bool active_active = false;
   std::string node;  // this gateway's node name under active-active (verifier, logs)
+  // This host's side of the configuration (plan 12 C1): [server], [cluster] and
+  // [backend_defaults.*] without the exports, kept for merging later catalog versions
+  // (C2).  Empty exports in local mode too; the table holds the running set.
+  core::Config local_config;
+  // exports_source = "catalog" (plan 12 C1): the catalog version the table was built
+  // from (0 = none published yet), for `cluster status` (C3) and the apply pipeline
+  // (C2), which replaces it.
+  bool catalog_exports = false;
+  uint64_t applied_catalog_version = 0;
 };
 
 // Protocol engines and their shared state, wired onto one dispatcher.

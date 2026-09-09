@@ -194,6 +194,10 @@ struct Config {
   // merged into every catalog export of that backend.  Ignored (with a warning) under
   // exports_source = "local".  Keyed by backend name; `path`/`fsid` unused.
   std::map<std::string, backend::BackendConfig> backend_defaults;
+  // Set when `exports` were filled from the shared catalog (plan 12 C1): under
+  // exports_source = "catalog" a local [[export]] block is an error, a merged catalog
+  // export is what validate_config / ExportTable::build are meant to see.
+  bool exports_from_catalog = false;
 };
 
 Result<Config> parse_config(std::string_view toml);

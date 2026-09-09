@@ -527,6 +527,49 @@ TEST(Nfs4, ExportSetSwapUnderRunningEngine) {
   EXPECT_TRUE(retired[0]->backend.get() == f.memory);
 }
 
+// Plan 12 C1: with no export at all the pseudo root still answers — PUTROOTFH, an
+// empty READDIR, NOENT on any name — so a catalog-mode gateway can boot before the
+// first catalog and clients can mount "/".
+TEST(Nfs4, EmptyExportSetHasABarePseudoRoot) {
+  V4Fixture f;
+  core::ExportSetPlan plan;
+  plan.remove.push_back(23);
+  std::vector<std::unique_ptr<backend::Backend>> none;
+  ASSERT_TRUE(f.exports.apply(std::move(plan), none, 1).has_value());
+  f.establish_session();
+  auto root_fh = f.path_fh({});
+  ASSERT_TRUE(!root_fh.empty());
+  EXPECT_TRUE(f.path_fh({"export"}).empty());
+
+  xdr::XdrEnc ops(f.pool);
+  ops.u32(static_cast<uint32_t>(Op::kPutfh));
+  ops.opaque(root_fh);
+  ops.u32(static_cast<uint32_t>(Op::kReaddir));
+  ops.u64(0);
+  std::array<std::byte, 8> verf{};
+  ops.opaque_fixed(verf);
+  ops.u32(1u << 20);
+  ops.u32(1u << 20);
+  nfsv4::Bitmap want;
+  want.set(nfsv4::attr::kFileid);
+  want.encode(ops);
+  auto reply = f.parse(f.compound_raw(f.session_body(2, ops.take())));
+  ASSERT_TRUE(reply.status == 0);
+  V4Fixture::expect_op(reply.dec, Op::kSequence, 0);
+  (void)reply.dec.skip(16 + 5 * 4);
+  V4Fixture::expect_op(reply.dec, Op::kPutfh, 0);
+  V4Fixture::expect_op(reply.dec, Op::kReaddir, 0);
+  (void)reply.dec.opaque_fixed(8);
+  EXPECT_FALSE(*reply.dec.boolean());  // no entries
+  EXPECT_TRUE(*reply.dec.boolean());   // eof
+
+  xdr::XdrEnc lookup(f.pool);
+  lookup.u32(static_cast<uint32_t>(Op::kPutrootfh));
+  lookup.u32(static_cast<uint32_t>(Op::kLookup));
+  lookup.string("export");
+  EXPECT_EQ(f.parse(f.compound_raw(f.session_body(2, lookup.take()))).status, stv(Status::kNoent));
+}
+
 TEST(Nfs4, OpenReadCloseAndSpecialStateids) {
   V4Fixture f;
   f.establish_session();

@@ -24,13 +24,14 @@
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "runtime/runtime.hpp"
+#include "server/catalog_boot.hpp"
 #include "server/cluster_controller.hpp"
 #include "server/cluster_store.hpp"
-#include "server/takeover_hook.hpp"
 #include "server/data_plane.hpp"
 #include "server/frontend.hpp"
 #include "server/metrics_providers.hpp"
 #include "server/protocol_stack.hpp"
+#include "server/takeover_hook.hpp"
 #include "util/log.hpp"
 
 namespace lnfs::server {
@@ -131,6 +132,11 @@ std::optional<Identity> cluster_identity(ClusterStore& store,
 
 std::optional<CoreState> build_core_state(core::Config&& config, const Identity& identity,
                                           ClusterStore* cluster) {
+  // This host's side stays behind for later catalog versions (plan 12 C1/C2); the
+  // exports go into the table.
+  core::Config local = config;
+  local.exports.clear();
+  local.exports_from_catalog = false;
   auto exports = core::ExportTable::build(std::move(config));
   if (!exports) {
     LNFS_ERROR("cannot initialize exports: {}", errno_name(exports.error()));
@@ -142,7 +148,8 @@ std::optional<CoreState> build_core_state(core::Config&& config, const Identity&
                  .cluster = cluster,
                  .owners = nullptr,       // set under active-active in run_server
                  .active_active = false,  // "
-                 .node = {}};             // "
+                 .node = {},              // "
+                 .local_config = std::move(local)};
   return core;
 }
 
@@ -332,7 +339,12 @@ std::string reload_config(const std::string& config_path, const core::ServerConf
   }
   apply_observability(sc);
   if (stack) apply_client_qos(*stack, sc);
-  report += core.exports->reload_dynamic(*fresh);
+  if (core::cluster_catalog_exports(running_cluster))
+    report +=
+        "exports come from the catalog: `cluster catalog apply` picks up a new version "
+        "(plan 12 C2)\n";
+  else
+    report += core.exports->reload_dynamic(*fresh);
   report += restart_required_report(sc, running);
   report += cluster_restart_required_report(fresh->cluster, running_cluster);
   LNFS_INFO("configuration reloaded from {}", config_path);
@@ -418,6 +430,20 @@ int check_config(const std::string& config_path) {
   // Also constructs the backends so per-backend keys ([export.local] identity, ...)
   // are validated exactly as a real startup would.
   const core::ClusterConfig cluster_cfg = config->cluster;
+  if (core::cluster_catalog_exports(cluster_cfg)) {
+    // Catalog mode (plan 12 C1): the exports are read from shared_dir (never written
+    // to) and merged exactly as the startup would.
+    auto store = make_posix_cluster_store(
+        cluster_cfg.shared_dir, std::chrono::milliseconds(2 * cluster_cfg.fence_lease_ms));
+    std::string why;
+    auto boot = load_catalog_exports(*store, *config, &why);
+    if (!boot) {
+      LNFS_ERROR("invalid config {}: {}", config_path, why);
+      return 1;
+    }
+    std::printf("catalog: %s\n", boot->present ? ("v" + std::to_string(boot->version)).c_str()
+                                               : "none yet (empty export table)");
+  }
   auto exports = core::ExportTable::build(std::move(*config));
   if (!exports) {
     LNFS_ERROR("invalid config {}: {}", config_path, errno_name(exports.error()));
@@ -440,26 +466,31 @@ int run_server(const std::string& config_path) {
   const core::ServerConfig server_cfg = config->server;
   const core::ClusterConfig cluster_cfg = config->cluster;
   const bool active_active = core::cluster_active_active(cluster_cfg);
-  if (core::cluster_catalog_exports(cluster_cfg)) {
-    // Plan 12 A1 ships the keys; booting from the catalog is C1.  Refuse rather than run
-    // a gateway with an empty export table nobody can fill yet.
-    LNFS_WARN("[cluster] exports_source = \"catalog\" is not implemented yet (plan 12 C1)");
-    return 1;
-  }
-  const std::string exports_digest = core::canonical_exports_digest(*config);
+  const bool catalog_mode = core::cluster_catalog_exports(cluster_cfg);
   apply_log_level(server_cfg);
 
   // 2. durable identity: handle HMAC key + epoch (state_dir, or the shared cluster
-  //    store), then the export table
+  //    store), the exports (the local file, or the shared catalog — plan 12 C1: the
+  //    catalog's exports merged with this host's [backend_defaults]; no catalog yet
+  //    means an empty table until one is published), then the export table
   std::unique_ptr<ClusterStore> cluster_store;
   if (cluster_cfg.enabled)
     cluster_store = make_posix_cluster_store(
         cluster_cfg.shared_dir, std::chrono::milliseconds(2 * cluster_cfg.fence_lease_ms));
+  CatalogBoot catalog;
+  if (catalog_mode) {
+    auto boot = load_catalog_exports(*cluster_store, *config);
+    if (!boot) return 1;
+    catalog = *boot;
+  }
+  const std::string exports_digest = core::canonical_exports_digest(*config);
   auto identity = cluster_store ? cluster_identity(*cluster_store, cluster_cfg)
                                 : local_identity(server_cfg.state_dir);
   if (!identity) return 1;
   auto core = build_core_state(std::move(*config), *identity, cluster_store.get());
   if (!core) return 1;
+  core->catalog_exports = catalog_mode;
+  core->applied_catalog_version = catalog.version;
   if (!check_cluster_backends(cluster_cfg, *core->exports)) return 1;
   // Per-export ownership as the v4 engine sees it (plan 12 B2): published by the
   // FsClusterController under active-active, left null (everything served here)
@@ -467,7 +498,12 @@ int run_server(const std::string& config_path) {
   core::FsOwnerView owner_view;
   if (cluster_store) {
     const std::string node = core::cluster_node_name(cluster_cfg);
-    if (!check_exports_consistency(*cluster_store, node, exports_digest)) return 1;
+    if (catalog_mode) {
+      if (!check_catalog_consistency(*cluster_store, node, catalog.version, exports_digest))
+        return 1;
+    } else if (!check_exports_consistency(*cluster_store, node, exports_digest)) {
+      return 1;
+    }
     if (active_active) {
       // Where our fs_locations point (design 10 §10.3): peers copy it into the view
       // for the exports we own.
@@ -480,9 +516,12 @@ int run_server(const std::string& config_path) {
       core->active_active = true;
       core->node = node;
     }
-    LNFS_INFO("cluster mode: id={} node={} mode={} shared_dir={} epoch={} exports={}",
+    LNFS_INFO("cluster mode: id={} node={} mode={} shared_dir={} epoch={} exports={}{}",
               cluster_cfg.id, node, cluster_cfg.mode, cluster_cfg.shared_dir, core->epoch,
-              exports_digest);
+              exports_digest,
+              !catalog_mode     ? ""
+              : catalog.present ? std::format(" catalog=v{}", catalog.version)
+                                : " catalog=none");
   }
   init_async_logging({.file = server_cfg.log_file,
                       .rotate_size = server_cfg.log_rotate_size,
@@ -495,6 +534,11 @@ int run_server(const std::string& config_path) {
     runtime.stop_and_join();
     return 1;
   }
+  // The catalog version this host now serves (design 11 §11.4): catalog.<node>, for
+  // `cluster catalog status` and the peers' consistency warnings.
+  if (catalog_mode)
+    record_catalog_applied(*cluster_store, core::cluster_node_name(cluster_cfg), catalog.version,
+                           exports_digest, "ok");
 
   // 3b. management plane (ctl socket + metrics endpoint): up before the engines and
   //     down after them, so it answers while no data plane exists (plan 10 A4).

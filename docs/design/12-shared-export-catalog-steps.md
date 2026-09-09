@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A、B 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A、B 已完成；C1 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -377,7 +377,7 @@ erase）与退休队列配合。
 
 ## 阶段 C：启动与跟进
 
-### C1 清单模式启动
+### C1 清单模式启动 ✅ 2026-09-09
 
 **目标**：11 §11.4 的启动流程与空表引导。
 
@@ -398,6 +398,34 @@ erase）与退休队列配合。
 **测试**：`tests/test_daemon_lifecycle.cpp` 加 `CatalogBootFromStore`（内存 store 里放 v3 清单 →
 表有其导出、`catalog.<node>` = 3 ok）、`CatalogBootEmpty`（无清单 → 零导出、伪根可 PUTROOTFH）、
 `CatalogBootLocalMergeFails`（缺 `[backend_defaults.cephfs]` → 启动 EINVAL 指出 fsid 与键）。
+
+**实现注**（2026-09-09）：启动逻辑抽成新文件 `src/server/catalog_boot.hpp/.cpp`（只依赖 `ClusterStore`
+接口，内存 store 可测）：`load_catalog_exports(store, local&, why*)` = `read_catalog` → `parse_catalog`
+→ 头版本与存储版本一致性 → `validate_catalog`（按本机 `mode` 决定 nodes 是否必填）→ 本机
+`[backend_defaults.<b>]` 只含本机键（否则 EINVAL，文案带 catalog 版本、fsid、path、键名）→ `merge_with_local`
+→ 填 `local.exports` 并置 `Config::exports_from_catalog`（新增字段：`validate_config` 在清单模式下拒绝的是
+"本地文件里的 `[[export]]`"，合并来的导出要放行，否则 `ExportTable::build` 的再校验会拒）→ `validate_config`；
+`validate_config` 不报是哪个导出，失败时逐个导出单独校验一遍定位（`blame_export`），文案 "catalog vN:
+export fsid=X (path): ENOENT" 之类；跨导出规则（同卷同进退）定位不到就只报 errno。无清单 → WARN 并返回
+`present=false`，`local.exports` 空。与草案的差异：本仓库没有任何后端把本机键设为**必填**（cephfs 缺 conf
+用库默认、gluster 同理），所以"缺 `[backend_defaults.cephfs]`"只 WARN 一行不报错，`CatalogBootLocalMergeFails`
+钉住的是三种真实失败：本机 defaults 混入集群键（解析器在文件里就拒，测试用内存构造）、本机不存在的导出
+路径（指出 fsid 与路径）、清单本身不过集群级校验，外加解析失败与 store 读错误（errno 透传，不是 EINVAL）。
+`record_catalog_applied(store, node, v, digest, status)` 写 `catalog.<node>`，失败只 WARN；
+`check_catalog_consistency` 列出同伴的 `catalog.<node>`：同版 ok 记 INFO，落后 / 领先 / error 记 WARN，
+从不拒绝；`exports.<node>` 摘要照写（本地模式同伴的 09 §9.3 校验用）。`daemon.cpp`：`run_server` 在建
+store 之后、算摘要之前调 `load_catalog_exports`，`check_exports_consistency` 在清单模式下换成
+`check_catalog_consistency`，后端全部 `start()` 成功后写 `catalog.<node> = v ok`（无清单写 `0 ok`，让
+同伴看得到这台在清单模式）；`cluster mode:` 日志尾部加 `catalog=vN|none`。`CoreState` 新增 `local_config`
+（去掉 exports 的本机 Config，供 C2 合并）、`catalog_exports`、`applied_catalog_version`（供 C2/C3）。
+`--check-config` 在清单模式下也建 store 读清单（只读，`PosixClusterStore` 构造与 `read_catalog` 不写共享
+目录）并打印 `catalog: vN` / `none yet`。`reload`（ctl / SIGHUP）在清单模式下跳过 `reload_dynamic`，报告
+一行"exports come from the catalog"，避免把清单导出全报成 "removed from config"；真正的应用在 C2。空表
+路径：`Mount3.EmptyExportSetServesNothing`（MNT ACCES、EXPORT 空、旧句柄 STALE）、
+`Nfs4.EmptyExportSetHasABarePseudoRoot`（PUTROOTFH、READDIR 空、LOOKUP NOENT），`CatalogBootEmpty`
+还用 `activate()` 起了一个零导出数据面并经 ctl 看到 `exports=0`。手工冒烟：真实 `lightnfsd` 在
+`shared_dir` 放 v1 清单 → `--check-config` 打印 `catalog: v1`，起服务 `status` 报 `exports=1`，
+`catalog.gw1` = `1 <digest> <ms> ok`；删掉清单再起 → `exports=0`、`catalog.gw1` = `0 … ok`。
 
 ### C2 轮询 + auto / manual 应用
 

@@ -681,7 +681,7 @@ Result<void> validate_config(const Config& config) {
         LNFS_WARN("[cluster] exports_source = \"catalog\" needs [cluster] enabled = true");
         return Err(errno_from(EINVAL));
       }
-      if (!config.exports.empty()) {
+      if (!config.exports.empty() && !config.exports_from_catalog) {
         LNFS_WARN(
             "[cluster] exports_source = \"catalog\": exports come from the catalog, "
             "remove the {} local [[export]] block(s)",
