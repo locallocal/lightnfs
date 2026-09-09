@@ -45,7 +45,8 @@ struct CoreState {
     // `[cluster] mode = "active-active"` (plan 12 C1): the reclaim list is kept per
     // export and grace is armed per export by the FsClusterController, never globally.
     bool active_active = false;
-    std::string node;  // this gateway's node name under active-active (verifier, logs)
+    // this gateway's node name under active-active (verifier, logs)
+    std::string node;
     // This host's side of the configuration (plan 12 C1): [server], [cluster] and
     // [backend_defaults.*] without the exports, kept for merging later catalog versions
     // (C2).  Empty exports in local mode too; the table holds the running set.

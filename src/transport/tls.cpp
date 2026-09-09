@@ -79,7 +79,8 @@ Result<std::unique_ptr<TlsConn>> TlsConn::create(const TlsContext& tctx) {
     // An empty memory rbio must mean "want more bytes", not EOF, or SSL_read would treat
     // a momentarily-drained buffer as a closed connection.
     BIO_set_mem_eof_return(rbio, -1);
-    SSL_set_bio(ssl, rbio, wbio);  // SSL takes ownership of both BIOs
+    // SSL takes ownership of both BIOs
+    SSL_set_bio(ssl, rbio, wbio);
     return std::unique_ptr<TlsConn>(new TlsConn(ssl));
 }
 
@@ -88,12 +89,14 @@ TlsConn::~TlsConn() {
 }
 
 rt::Task<Result<void>> TlsConn::flush_out(int fd) {
-    auto lk = co_await send_mu_.lock();  // one ciphertext drain-and-send at a time
+    // one ciphertext drain-and-send at a time
+    auto lk = co_await send_mu_.lock();
     SSL* ssl = static_cast<SSL*>(ssl_);
     BIO* wbio = SSL_get_wbio(ssl);
     for (;;) {
         int pending = BIO_read(wbio, netbuf_.data(), static_cast<int>(netbuf_.size()));
-        if (pending <= 0) break;  // nothing more buffered
+        // nothing more buffered
+        if (pending <= 0) break;
         size_t sent = 0;
         while (sent < static_cast<size_t>(pending)) {
             iovec iov{netbuf_.data() + sent, static_cast<size_t>(pending) - sent};
@@ -117,7 +120,8 @@ rt::Task<Result<void>> TlsConn::feed_in(int fd) {
         int off = 0;
         while (off < n) {
             int w = BIO_write(rbio, netbuf_.data() + off, n - off);
-            if (w <= 0) co_return Err(errno_from(EPROTO));  // mem BIO never refuses a write
+            // mem BIO never refuses a write
+            if (w <= 0) co_return Err(errno_from(EPROTO));
             off += w;
         }
         co_return Result<void>{};
@@ -130,7 +134,8 @@ rt::Task<Result<void>> TlsConn::accept(int fd) {
     for (;;) {
         int r = SSL_do_handshake(ssl);
         if (auto f = co_await flush_out(fd); !f) co_return Err(f.error());
-        if (r == 1) co_return Result<void>{};  // handshake complete
+        // handshake complete
+        if (r == 1) co_return Result<void>{};
         int err = SSL_get_error(ssl, r);
         if (err == SSL_ERROR_WANT_READ) {
             if (auto f = co_await feed_in(fd); !f) co_return Err(f.error());
@@ -146,11 +151,13 @@ rt::Task<Result<uint32_t>> TlsConn::read(int fd, std::span<std::byte> out) {
     for (;;) {
         int r = SSL_read(ssl, out.data(), static_cast<int>(out.size()));
         if (r > 0) {
-            if (auto f = co_await flush_out(fd); !f) co_return Err(f.error());  // e.g. KeyUpdate
+            // e.g. KeyUpdate
+            if (auto f = co_await flush_out(fd); !f) co_return Err(f.error());
             co_return static_cast<uint32_t>(r);
         }
         int err = SSL_get_error(ssl, r);
-        if (err == SSL_ERROR_ZERO_RETURN) co_return Err(Errno::kEof);  // clean TLS close
+        // clean TLS close
+        if (err == SSL_ERROR_ZERO_RETURN) co_return Err(Errno::kEof);
         if (auto f = co_await flush_out(fd); !f) co_return Err(f.error());
         if (err == SSL_ERROR_WANT_READ) {
             if (auto f = co_await feed_in(fd); !f) co_return Err(f.error());

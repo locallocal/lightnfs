@@ -127,9 +127,11 @@ bool v3_error_allowed(P proc, S status) {
         case P::kLink:
             return one_of(status, std::array{S::kAcces, S::kExist, S::kXdev, S::kMlink, S::kNametoolong, S::kNoent,
                                              S::kNotdir, S::kDquot, S::kRofs, S::kInval, S::kNotsupp, S::kPerm,
-                                             S::kNospc});  // NOSPC: RFC 1813 §3.3.15
+                                             // NOSPC: RFC 1813 §3.3.15
+                                             S::kNospc});
         case P::kCommit:
-            return false;  // only IO/STALE/BADHANDLE/SERVERFAULT
+            // only IO/STALE/BADHANDLE/SERVERFAULT
+            return false;
         default:
             return true;
     }
@@ -211,7 +213,8 @@ bool v4_error_allowed(O4 op, S4 status) {
     // Universally legal results (RFC 8881 §15.2 common rows).
     if (status == S4::kOk || status == S4::kIo || status == S4::kServerfault || status == S4::kStale ||
         status == S4::kBadhandle || status == S4::kAccess || status == S4::kDelay ||
-        status == S4::kMoved)  // MOVED: any op on an absent fs
+        // MOVED: any op on an absent fs
+        status == S4::kMoved)
         return true;
     switch (op) {
         case O4::kLookup:
@@ -311,7 +314,8 @@ bool v4_error_allowed(O4 op, S4 status) {
                                               S4::kGrace, S4::kExpired, S4::kRofs, S4::kFbig, S4::kNospc, S4::kDquot,
                                               S4::kXdev, S4::kLocked, S4::kOffloadDenied});
         default:
-            return true;  // remaining implemented ops answer session/state errors
+            // remaining implemented ops answer session/state errors
+            return true;
     }
 }
 

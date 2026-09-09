@@ -92,7 +92,8 @@ class [[nodiscard]] Task {
             bool await_ready() const noexcept { return false; }
             std::coroutine_handle<> await_suspend(std::coroutine_handle<> cont) noexcept {
                 h.promise().continuation = cont;
-                return h;  // symmetric transfer: start the callee
+                // symmetric transfer: start the callee
+                return h;
             }
             T await_resume() { return h.promise().take(); }
         };

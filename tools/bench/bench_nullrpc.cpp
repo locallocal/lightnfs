@@ -17,18 +17,23 @@ using namespace lnfs::rpc;
 using namespace lnfs::transport;
 
 namespace {
-constexpr uint32_t kProg = 100003;  // where the NFS program will live
+// where the NFS program will live
+constexpr uint32_t kProg = 100003;
 
 std::vector<std::byte> build_null_call() {
     BufferPool pool;
     xdr::XdrEnc enc(pool);
-    enc.u32(42);  // xid (constant: server does not care in this bench)
-    enc.u32(0);   // CALL
+    // xid (constant: server does not care in this bench)
+    enc.u32(42);
+    // CALL
+    enc.u32(0);
     enc.u32(2);
     enc.u32(kProg);
     enc.u32(3);
-    enc.u32(0);  // NULL proc
-    enc.u32(1);  // AUTH_SYS cred, minimal body
+    // NULL proc
+    enc.u32(0);
+    // AUTH_SYS cred, minimal body
+    enc.u32(1);
     xdr::XdrEnc body(pool);
     body.u32(0);
     body.string("bench");
@@ -37,7 +42,8 @@ std::vector<std::byte> build_null_call() {
     body.u32(0);
     auto bb = body.take().to_bytes();
     enc.opaque(bb);
-    enc.u32(0);  // verf
+    // verf
+    enc.u32(0);
     enc.u32(0);
     auto payload = enc.take().to_bytes();
     std::vector<std::byte> rec(4 + payload.size());

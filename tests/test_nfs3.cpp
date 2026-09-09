@@ -79,7 +79,8 @@ struct NfsFixture {
         enc.u32(program);
         enc.u32(nfsv3::kVersion);
         enc.u32(proc);
-        enc.u32(0);  // AUTH_NONE
+        // AUTH_NONE
+        enc.u32(0);
         enc.u32(0);
         enc.u32(0);
         enc.u32(0);
@@ -119,12 +120,18 @@ struct NfsFixture {
 
     xdr::XdrDec result(std::vector<std::byte>& bytes) {
         xdr::XdrDec dec(std::span<const std::byte>(bytes.data(), bytes.size()));
-        (void)dec.u32();  // xid
-        (void)dec.u32();  // reply
-        (void)dec.u32();  // accepted
-        (void)dec.u32();  // verf flavor
-        (void)dec.u32();  // verf len
-        (void)dec.u32();  // RPC success
+        // xid
+        (void)dec.u32();
+        // reply
+        (void)dec.u32();
+        // accepted
+        (void)dec.u32();
+        // verf flavor
+        (void)dec.u32();
+        // verf len
+        (void)dec.u32();
+        // RPC success
+        (void)dec.u32();
         return dec;
     }
 };
@@ -178,8 +185,10 @@ TEST(Nfs3, GetattrLookupReadAndReaddirPlusWireFlow) {
     reply = f.request((uint32_t)nfsv3::Proc::kRead, readarg.take());
     result = f.result(reply);
     EXPECT_EQ(*result.u32(), (uint32_t)nfsv3::Status::kOk);
-    EXPECT_TRUE(*result.boolean());                   // post-op attrs follow
-    for (int i = 0; i < 21; ++i) (void)result.u32();  // fattr3 = 84 bytes
+    // post-op attrs follow
+    EXPECT_TRUE(*result.boolean());
+    // fattr3 = 84 bytes
+    for (int i = 0; i < 21; ++i) (void)result.u32();
     EXPECT_EQ(*result.u32(), 11u);
     EXPECT_TRUE(*result.boolean());
     auto data = *result.opaque(64);
@@ -202,7 +211,8 @@ TEST(Nfs3, ErrorWhitelistFiltersInvalidMappings) {
 TEST(Nfs3, ReaddirRejectsMismatchedCookieVerifier) {
     NfsFixture f;
     std::array<std::byte, 8> verifier{};
-    verifier[7] = std::byte{0xFF};  // cannot collide with a logical-clock change attr
+    // cannot collide with a logical-clock change attr
+    verifier[7] = std::byte{0xFF};
     xdr::XdrEnc args(f.pool);
     nfsv3::ReaddirArgs{f.root_fh, 3, verifier, 4096}.encode(args);
     auto reply = f.request((uint32_t)nfsv3::Proc::kReaddir, args.take());
@@ -221,7 +231,8 @@ TEST(Mount3, MountAndExportWireFlow) {
     ASSERT_TRUE(fh.has_value());
     EXPECT_TRUE(!fh->empty());
     EXPECT_EQ(*result.u32(), 1u);
-    EXPECT_EQ(*result.u32(), 1u);  // AUTH_SYS
+    // AUTH_SYS
+    EXPECT_EQ(*result.u32(), 1u);
 
     reply = f.mount_request(5);
     result = f.result(reply);
@@ -243,10 +254,12 @@ TEST(Mount3, EmptyExportSetServesNothing) {
     args.string("/export");
     auto reply = f.mount_request(1, args.take());
     auto result = f.result(reply);
-    EXPECT_EQ(*result.u32(), 13u);  // MNT3ERR_ACCES
+    // MNT3ERR_ACCES
+    EXPECT_EQ(*result.u32(), 13u);
     reply = f.mount_request(5);
     result = f.result(reply);
-    EXPECT_FALSE(*result.boolean());  // no exports
+    // no exports
+    EXPECT_FALSE(*result.boolean());
     // NFS GETATTR on the handle minted before the removal: STALE.
     xdr::XdrEnc getattr(f.pool);
     getattr.opaque(f.root_fh.data);
@@ -298,11 +311,13 @@ TEST(Nfs3, ReaddirVerifierRoundTripAndChangeDetection) {
         auto result = f.result(reply);
         *status = *result.u32();
         if (*status != 0) return;
-        if (*result.boolean()) (void)result.skip(84);  // post_op_attr
+        // post_op_attr
+        if (*result.boolean()) (void)result.skip(84);
         auto got = *result.opaque_fixed(8);
         std::copy(got.begin(), got.end(), out_verf->begin());
         while (*result.boolean()) {
-            (void)result.u64();  // fileid
+            // fileid
+            (void)result.u64();
             (void)result.string(255);
             *last_cookie = *result.u64();
         }
@@ -318,13 +333,15 @@ TEST(Nfs3, ReaddirVerifierRoundTripAndChangeDetection) {
     uint64_t ignore = 0;
     std::array<std::byte, 8> verf2{};
     list(last_cookie, verf, &status, &ignore, &verf2);
-    EXPECT_EQ(status, 0u);  // unchanged directory: pair accepted
+    // unchanged directory: pair accepted
+    EXPECT_EQ(status, 0u);
 
     ASSERT_TRUE(f.memory->add_file("/added-mid-listing", "x").has_value());
     list(last_cookie, verf, &status, &ignore, &verf2);
     EXPECT_EQ(status, (uint32_t)nfsv3::Status::kBadCookie);
 
-    list(0, {}, &status, &last_cookie, &verf2);  // restart recovers with a fresh verifier
+    // restart recovers with a fresh verifier
+    list(0, {}, &status, &last_cookie, &verf2);
     EXPECT_EQ(status, 0u);
     EXPECT_FALSE(verf2 == verf);
 }
@@ -351,7 +368,8 @@ TEST(Nfs3, JukeboxReachesTheWireAndRetrySucceeds) {
     reply = f.request((uint32_t)nfsv3::Proc::kRead, readarg.take());
     result = f.result(reply);
     EXPECT_EQ(*result.u32(), (uint32_t)nfsv3::Status::kJukebox);
-    EXPECT_TRUE(*result.boolean());  // post-op attrs still follow (WCC for the retry)
+    // post-op attrs still follow (WCC for the retry)
+    EXPECT_TRUE(*result.boolean());
     EXPECT_EQ(drc.stats().inserts, 0u);
 
     // Same xid, same args: re-executed, not replayed.

@@ -278,7 +278,8 @@ Result<Config> parse_config(std::string_view text) {
     // The `[[export]]` block being filled (keys + `[export.<backend>]`), shared with the
     // catalog parser; a vector push only happens while no block is open.
     std::optional<ExportBlockParser> block;
-    backend::BackendConfig* defaults = nullptr;  // the [backend_defaults.<name>] being filled
+    // the [backend_defaults.<name>] being filled
+    backend::BackendConfig* defaults = nullptr;
     std::istringstream input{std::string(text)};
     std::string raw_line;
     while (std::getline(input, raw_line)) {
@@ -396,7 +397,8 @@ Result<Config> parse_config(std::string_view text) {
                 config.server.log_level = lv;
             } else if (key == "slow_request_ms") {
                 uint64_t n = LNFS_TRY(uint_value(value));
-                if (n > 3600000) return Err(errno_from(EINVAL));  // 0 disables the slow log
+                // 0 disables the slow log
+                if (n > 3600000) return Err(errno_from(EINVAL));
                 config.server.slow_request_ms = static_cast<uint32_t>(n);
             } else if (key == "error_ring") {
                 uint64_t n = LNFS_TRY(uint_value(value));
@@ -406,7 +408,8 @@ Result<Config> parse_config(std::string_view text) {
                 config.server.log_file = LNFS_TRY(string_value(value));
             } else if (key == "log_rotate_size") {
                 uint64_t n = LNFS_TRY(size_value(value));
-                if (n < (1u << 16)) return Err(errno_from(EINVAL));  // < 64K rotates constantly
+                // < 64K rotates constantly
+                if (n < (1u << 16)) return Err(errno_from(EINVAL));
                 config.server.log_rotate_size = n;
             } else if (key == "log_rotate_keep") {
                 uint64_t n = LNFS_TRY(uint_value(value));
@@ -559,10 +562,12 @@ bool valid_node_address(std::string_view address) {
     size_t colon = address.rfind(':');
     if (colon == std::string_view::npos || colon == 0) return false;
     std::string_view host = address.substr(0, colon), port = address.substr(colon + 1);
-    if (host.front() == '[') {  // bracketed IPv6 literal
+    // bracketed IPv6 literal
+    if (host.front() == '[') {
         if (host.size() < 3 || host.back() != ']') return false;
     } else if (host.find(':') != std::string_view::npos) {
-        return false;  // an unbracketed v6 literal has no unambiguous port
+        // an unbracketed v6 literal has no unambiguous port
+        return false;
     }
     if (port.empty() || port.size() > 5 ||
         !std::all_of(port.begin(), port.end(), [](unsigned char ch) { return std::isdigit(ch); }))
@@ -678,9 +683,10 @@ Result<void> validate_config(const Config& config) {
     if (config.server.offload_threads <= 0 || config.server.max_connections <= 0 ||
         config.server.inflight_per_conn <= 0)
         return Err(errno_from(EINVAL));
-    {  // Export source (design 11 §11.2, plan 12 A1): local [[export]] blocks or the
-       // shared catalog.  A catalog gateway starts with whatever the catalog holds — an
-       // empty table before the first publish — so only "local" insists on exports here.
+    // Export source (design 11 §11.2, plan 12 A1): local [[export]] blocks or the
+    // shared catalog.  A catalog gateway starts with whatever the catalog holds — an
+    // empty table before the first publish — so only "local" insists on exports here.
+    {
         const auto& c = config.cluster;
         if (c.exports_source != "local" && c.exports_source != "catalog") {
             LNFS_WARN("[cluster] exports_source must be \"local\" or \"catalog\"");
@@ -712,19 +718,22 @@ Result<void> validate_config(const Config& config) {
     }
     for (const auto& cidr : config.server.metrics_allow)
         if (!Cidr::parse(cidr)) return Err(errno_from(EINVAL));
-    if (!config.server.bind.empty()) {  // listener bind must be an address literal
+    // listener bind must be an address literal
+    if (!config.server.bind.empty()) {
         in6_addr a6;
         in_addr a4;
         if (inet_pton(AF_INET, config.server.bind.c_str(), &a4) != 1 &&
             inet_pton(AF_INET6, config.server.bind.c_str(), &a6) != 1)
             return Err(errno_from(EINVAL));
     }
-    {  // RPC-over-TLS (RFC 9289): validate the [tls] section up front (plan doc 10 §5.4).
+    // RPC-over-TLS (RFC 9289): validate the [tls] section up front (plan doc 10 §5.4).
+    {
         const auto& s = config.server;
         if (s.tls_mode != "off" && s.tls_mode != "optional" && s.tls_mode != "required") return Err(errno_from(EINVAL));
         if (s.tls_mode != "off") {
 #ifndef LNFS_TLS
-            return Err(errno_from(ENOTSUP));  // built without OpenSSL: a non-off mode is invalid
+            // built without OpenSSL: a non-off mode is invalid
+            return Err(errno_from(ENOTSUP));
 #endif
             if (s.tls_cert.empty() || s.tls_key.empty()) return Err(errno_from(EINVAL));
             struct stat st{};
@@ -732,10 +741,12 @@ Result<void> validate_config(const Config& config) {
                 return Err(errno_from(errno ? errno : ENOENT));
             if (!s.tls_ca.empty() && stat(s.tls_ca.c_str(), &st) < 0) return Err(errno_from(errno ? errno : ENOENT));
             if (s.tls_require_client_cert && s.tls_ca.empty())
-                return Err(errno_from(EINVAL));  // mutual TLS needs a CA bundle to verify against
+                // mutual TLS needs a CA bundle to verify against
+                return Err(errno_from(EINVAL));
         }
     }
-    {  // Multi-gateway failover (design 09 §9.3, plan 10 A1): the [cluster] section.
+    // Multi-gateway failover (design 09 §9.3, plan 10 A1): the [cluster] section.
+    {
         const auto& c = config.cluster;
         auto valid_role = c.role == "active" || c.role == "standby" || c.role == "auto";
         auto valid_takeover = c.takeover == "auto" || c.takeover == "manual";
@@ -767,7 +778,8 @@ Result<void> validate_config(const Config& config) {
             return Err(errno_from(EINVAL));
         const auto* factory = backend::find_backend(exp.backend);
         if (!factory) return Err(errno_from(ENODEV));
-        if (!factory->virtual_path) {  // cluster backends: the path is a mount name only
+        // cluster backends: the path is a mount name only
+        if (!factory->virtual_path) {
             struct stat st{};
             if (stat(exp.path.c_str(), &st) < 0) return Err(errno_from(errno));
             if (!S_ISDIR(st.st_mode)) return Err(errno_from(ENOTDIR));
@@ -801,7 +813,8 @@ std::string canonical_exports_text(const Config& config) {
                 if (key == exempt) per_node = true;
             if (!per_node) out += std::format("  {}={}\n", key, value);
         }
-        if (!exp->nodes.empty()) {  // owner order must agree cluster-wide (plan 12 A1)
+        // owner order must agree cluster-wide (plan 12 A1)
+        if (!exp->nodes.empty()) {
             out += "  nodes=";
             for (size_t i = 0; i < exp->nodes.size(); ++i) out += (i ? "," : "") + exp->nodes[i];
             out += "\n";
@@ -824,7 +837,8 @@ std::string cluster_node_name(const ClusterConfig& cluster) {
 // ---- ExportSet / ExportSetBuilder / ExportTable (plan 12 B1) ----------------------
 
 ExportSet::ExportSet() = default;
-ExportSet::~ExportSet() = default;  // pseudo (raw entry pointers) goes before entries
+// pseudo (raw entry pointers) goes before entries
+ExportSet::~ExportSet() = default;
 
 ExportEntry* ExportSet::by_fsid(uint32_t fsid) const {
     auto it = std::lower_bound(entries.begin(), entries.end(), fsid,
@@ -985,7 +999,8 @@ Result<std::shared_ptr<const ExportSet>> ExportTable::apply(ExportSetPlan plan,
     }
     for (size_t i = 0; i < plan.add.size(); ++i) {
         auto made = builder.add(std::move(plan.add[i]), std::move(started[i]));
-        if (!made) return Err(made.error());  // unreachable after the checks above
+        // unreachable after the checks above
+        if (!made) return Err(made.error());
     }
     started.clear();
     // In-place updates on the shared entries, then the publish.
@@ -1031,7 +1046,8 @@ bool ExportTable::check_client(const sockaddr_storage& peer, const ExportEntry& 
 }
 
 std::string ExportTable::reload_dynamic(const Config& fresh) {
-    auto set = snapshot();  // updates go to the entries in place; membership is fixed
+    // updates go to the entries in place; membership is fixed
+    auto set = snapshot();
     std::string report;
     std::set<uint32_t> seen;
     for (const auto& cfg : fresh.exports) {
@@ -1051,7 +1067,8 @@ std::string ExportTable::reload_dynamic(const Config& fresh) {
         if (cfg.nodes != entry->node_list())
             report += std::format("export fsid={}: nodes changed, restart required\n", cfg.fsid);
         std::vector<Cidr> clients;
-        for (const auto& client : cfg.clients) clients.push_back(*Cidr::parse(client));  // fresh passed validate_config
+        // fresh passed validate_config
+        for (const auto& client : cfg.clients) clients.push_back(*Cidr::parse(client));
         entry->set_clients(std::move(clients));
         entry->qos.read_bytes.configure(cfg.read_bps);
         entry->qos.write_bytes.configure(cfg.write_bps);

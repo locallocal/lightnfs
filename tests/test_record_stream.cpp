@@ -97,7 +97,8 @@ TEST(RecordStream, ShortReadsAndEintr) {
 TEST(RecordStream, EofBetweenRecords) {
     Fixture f;
     f.start_read();
-    f.ring.complete(f.ring.take(FakeRing::Kind::kRecv, 5), 0);  // orderly EOF
+    // orderly EOF
+    f.ring.complete(f.ring.take(FakeRing::Kind::kRecv, 5), 0);
     f.pump();
     ASSERT_TRUE(f.done);
     EXPECT_FALSE(f.result.has_value());
@@ -108,7 +109,8 @@ TEST(RecordStream, EofMidRecordIsFramingError) {
     Fixture f;
     f.start_read();
     auto whole = frag("abcdefgh", true);
-    f.feed(std::span(whole).subspan(0, 6));  // header + 2 payload bytes
+    // header + 2 payload bytes
+    f.feed(std::span(whole).subspan(0, 6));
     f.ring.complete(f.ring.take(FakeRing::Kind::kRecv, 5), 0);
     f.pump();
     ASSERT_TRUE(f.done);
@@ -120,7 +122,8 @@ TEST(RecordStream, OversizeFragmentRejected) {
     FakeRing ring;
     Reactor r{ring};
     BufferPool pool;
-    RecordStream rs{5, pool, 1024, 2048};  // small caps
+    // small caps
+    RecordStream rs{5, pool, 1024, 2048};
     Result<BufferChain> res = Err(Errno::kOk);
     bool done = false;
     spawn(
@@ -131,7 +134,8 @@ TEST(RecordStream, OversizeFragmentRejected) {
         r);
     while (r.poll_once()) {
     }
-    uint32_t hdr = xdr::to_be32(0x80000000u | 4096u);  // fragment larger than cap
+    // fragment larger than cap
+    uint32_t hdr = xdr::to_be32(0x80000000u | 4096u);
     ring.complete_with_data(ring.take(FakeRing::Kind::kRecv, 5), std::span<const std::byte>((std::byte*)&hdr, 4));
     while (r.poll_once()) {
     }
@@ -157,12 +161,14 @@ TEST(RecordStream, WritePartialSendContinues) {
     size_t total1 = 0;
     for (int i = 0; i < op1.iovcnt; ++i) total1 += op1.iov[i].iov_len;
     EXPECT_EQ(total1, 24u);
-    f.ring.complete(op1, 10);  // partial
+    // partial
+    f.ring.complete(op1, 10);
     f.pump();
     auto op2 = f.ring.take(FakeRing::Kind::kSendv, 5);
     size_t total2 = 0;
     for (int i = 0; i < op2.iovcnt; ++i) total2 += op2.iov[i].iov_len;
-    EXPECT_EQ(total2, 14u);  // remainder
+    // remainder
+    EXPECT_EQ(total2, 14u);
     f.ring.complete(op2, 14);
     f.pump();
     EXPECT_TRUE(ok);

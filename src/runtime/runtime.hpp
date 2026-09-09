@@ -18,14 +18,20 @@ namespace lnfs::rt {
 class Runtime {
  public:
     struct Config {
-        int reactors = 0;  // 0 = hardware concurrency
+        // 0 = hardware concurrency
+        int reactors = 0;
         int offload_threads = 8;
-        int offload_heavy_threads = 0;    // 0 = max(1, offload_threads/4) (plan §2.5)
-        size_t offload_queue_cap = 4096;  // per-class admission cap (plan §2.5)
-        std::string ring = "auto";        // auto | uring | epoll
+        // 0 = max(1, offload_threads/4) (plan §2.5)
+        int offload_heavy_threads = 0;
+        // per-class admission cap (plan §2.5)
+        size_t offload_queue_cap = 4096;
+        // auto | uring | epoll
+        std::string ring = "auto";
         unsigned ring_entries = 1024;
-        unsigned ring_cq_entries = 0;  // 0 = 8 × ring_entries (plan §2.3)
-        bool ring_sqpoll = false;      // io_uring SQPOLL submission (design 02 §2.63)
+        // 0 = 8 × ring_entries (plan §2.3)
+        unsigned ring_cq_entries = 0;
+        // io_uring SQPOLL submission (design 02 §2.63)
+        bool ring_sqpoll = false;
     };
 
     explicit Runtime(Config cfg);
@@ -38,8 +44,10 @@ class Runtime {
     OffloadPool& offload() { return *offload_; }
     const std::string& ring_kind() const { return ring_kind_; }
 
-    void start();          // one thread per reactor
-    void stop_and_join();  // stop all reactors and join their threads
+    // one thread per reactor
+    void start();
+    // stop all reactors and join their threads
+    void stop_and_join();
 
  private:
     std::vector<std::unique_ptr<RingOps>> rings_;

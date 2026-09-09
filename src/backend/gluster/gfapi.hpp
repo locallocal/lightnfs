@@ -30,13 +30,15 @@
 struct glfs;
 struct glfs_fd;
 struct glfs_object;
-struct glfs_stat;  // also the name of a function in glfs.h: always `struct glfs_stat`
+// also the name of a function in glfs.h: always `struct glfs_stat`
+struct glfs_stat;
 struct glfs_xreaddirp_stat;
 
 namespace lnfs::backend::gfapi {
 
 // glfs-handles.h
-inline constexpr int kHandleLength = 16;  // GFAPI_HANDLE_LENGTH: a GFID (UUID)
+// GFAPI_HANDLE_LENGTH: a GFID (UUID)
+inline constexpr int kHandleLength = 16;
 // glfs.h GFAPI_SET_ATTR_*
 inline constexpr int kSetMode = 0x1, kSetUid = 0x2, kSetGid = 0x4, kSetSize = 0x8, kSetAtime = 0x10, kSetMtime = 0x20;
 // glfs.h GFAPI_XREADDIRP_*

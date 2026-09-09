@@ -141,10 +141,12 @@ TEST(Catalog, PeekVersion) {
     EXPECT_EQ(*core::peek_catalog_version(core::serialize_catalog(core::Catalog{})), 0u);
     auto bad = [](const char* text) { return !core::peek_catalog_version(text).has_value(); };
     EXPECT_TRUE(bad(""));
-    EXPECT_TRUE(bad("[[export]]\nversion = 1\n"));  // wrong section
+    // wrong section
+    EXPECT_TRUE(bad("[[export]]\nversion = 1\n"));
     EXPECT_TRUE(bad("[catalog]\ncomment = \"no version\"\n"));
     EXPECT_TRUE(bad("[catalog]\nversion = \"7\"\n"));
-    EXPECT_TRUE(bad("version = 7\n[catalog]\n"));  // before the header
+    // before the header
+    EXPECT_TRUE(bad("version = 7\n[catalog]\n"));
     EXPECT_TRUE(bad("[catalog]\n[[export]]\nversion = 7\n"));
 }
 
@@ -153,18 +155,30 @@ TEST(Catalog, ParseRejects) {
     const std::string header = "[catalog]\nversion = 1\n";
     const std::string exp = "[[export]]\npath = \"/a\"\nfsid = 1\n";
     EXPECT_FALSE(bad(header + exp));
-    EXPECT_TRUE(bad(exp));                                              // no [catalog] header
-    EXPECT_TRUE(bad("[catalog]\ncomment = \"x\"\n" + exp));             // no version
-    EXPECT_TRUE(bad(header + header + exp));                            // header twice
-    EXPECT_TRUE(bad(header + "author = \"x\"\n" + exp));                // unknown header key
-    EXPECT_TRUE(bad(header + "version = \"1\"\n"));                     // version must be a number
-    EXPECT_TRUE(bad("version = 1\n" + exp));                            // key outside any section
-    EXPECT_TRUE(bad(header + "[server]\nport = 1\n"));                  // local-only section
-    EXPECT_TRUE(bad(header + exp + "sec = \"sys\"\n"));                 // unknown export key
-    EXPECT_TRUE(bad(header + exp + "disabled = \"yes\"\n"));            // disabled is a bool
-    EXPECT_TRUE(bad(header + "[export.local]\nhandles = \"auto\"\n"));  // subtable w/o export
-    EXPECT_TRUE(bad(header + exp + "path\n"));                          // not key = value
-    EXPECT_TRUE(bad(header + exp + "[export.local\n"));                 // unterminated header
+    // no [catalog] header
+    EXPECT_TRUE(bad(exp));
+    // no version
+    EXPECT_TRUE(bad("[catalog]\ncomment = \"x\"\n" + exp));
+    // header twice
+    EXPECT_TRUE(bad(header + header + exp));
+    // unknown header key
+    EXPECT_TRUE(bad(header + "author = \"x\"\n" + exp));
+    // version must be a number
+    EXPECT_TRUE(bad(header + "version = \"1\"\n"));
+    // key outside any section
+    EXPECT_TRUE(bad("version = 1\n" + exp));
+    // local-only section
+    EXPECT_TRUE(bad(header + "[server]\nport = 1\n"));
+    // unknown export key
+    EXPECT_TRUE(bad(header + exp + "sec = \"sys\"\n"));
+    // disabled is a bool
+    EXPECT_TRUE(bad(header + exp + "disabled = \"yes\"\n"));
+    // subtable w/o export
+    EXPECT_TRUE(bad(header + "[export.local]\nhandles = \"auto\"\n"));
+    // not key = value
+    EXPECT_TRUE(bad(header + exp + "path\n"));
+    // unterminated header
+    EXPECT_TRUE(bad(header + exp + "[export.local\n"));
     // Duplicate fsids parse (validate_catalog names them); the order is by fsid, stable.
     auto dup = core::parse_catalog(header + exp + exp);
     ASSERT_TRUE(dup.has_value());
@@ -215,8 +229,10 @@ TEST(Catalog, MergeWithLocal) {
 
     auto merged = core::merge_with_local(cat, *local);
     ASSERT_TRUE(merged.has_value());
-    ASSERT_TRUE(merged->size() == 3u);  // the disabled export is not served
-    EXPECT_EQ((*merged)[0].fsid, 1u);   // fsid ascending regardless of input order
+    // the disabled export is not served
+    ASSERT_TRUE(merged->size() == 3u);
+    // fsid ascending regardless of input order
+    EXPECT_EQ((*merged)[0].fsid, 1u);
     EXPECT_EQ((*merged)[1].fsid, 2u);
     EXPECT_EQ((*merged)[2].fsid, 3u);
     // Every cephfs export gets this host's keys; a per-node key smuggled into the catalog
@@ -275,7 +291,8 @@ TEST(Catalog, ValidateRules) {
     EXPECT_TRUE(contains(reason(with(make_export(3, "/a")), true), "fsid=1 and fsid=3 share path /a"));
     EXPECT_TRUE(contains(reason(with(make_export(3, "/a/sub")), true), "fsid=3 (/a/sub) is nested in fsid=1 (/a)"));
     EXPECT_TRUE(contains(reason(with(make_export(3, "/")), true), "fsid=1 (/a) is nested in fsid=3 (/)"));
-    EXPECT_STREQ(reason(with(make_export(3, "/ab")), true), "(accepted)");  // not a prefix
+    // not a prefix
+    EXPECT_STREQ(reason(with(make_export(3, "/ab")), true), "(accepted)");
     EXPECT_TRUE(contains(reason(with(make_export(3, "/z", "bogus")), true, ENODEV), "no such backend \"bogus\""));
     EXPECT_TRUE(
         contains(reason(with(make_export(3, "/z", "local", {})), true), "nodes is required under active-active"));
@@ -319,7 +336,8 @@ TEST(Catalog, Diff) {
         e.cfg.backend_config.values = {{"fs_name", "fs"}, {"subdir", "/e" + std::to_string(fsid)}};
         from.exports.push_back(e);
     }
-    from.exports[2].disabled = true;  // fsid 3
+    // fsid 3
+    from.exports[2].disabled = true;
     core::Catalog to = from;
     to.meta.version = from.meta.version + 1;
     // 1: nodes and clients changed; 2: removed; 3: enabled (and nodes changed); 4: disabled;

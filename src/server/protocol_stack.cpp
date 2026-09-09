@@ -91,7 +91,8 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
 }
 
 ServerIdentity derive_server_identity(const core::ServerConfig& cfg, const core::ClusterConfig& cluster) {
-    if (cluster.enabled) {  // config validation rejects explicit owner/scope here
+    // config validation rejects explicit owner/scope here
+    if (cluster.enabled) {
         std::string derived = "lightnfs-cluster:" + cluster.id;
         // Active-active (design 10 §10.2, plan 12 B1): one scope (one administrative
         // domain, the precondition for referrals), but every gateway is its own server —

@@ -47,7 +47,8 @@ class Drc {
     };
 
     struct Claim {
-        bool owner = false;  // true: execute, then complete() or abort()
+        // true: execute, then complete() or abort()
+        bool owner = false;
         // owner==false: the reply to retransmit — shared with the cache entry, no
         // under-lock value copy (plan doc 10 §2.4).
         std::shared_ptr<const std::vector<std::byte>> cached{};
@@ -88,11 +89,13 @@ class Drc {
         // Written under mu only; atomic so stats() can read without taking every shard
         // lock (plan doc 10 §3.8 — the plain reads were a TSAN-level data race).
         std::atomic<size_t> bytes{0};
-        std::atomic<size_t> count{0};  // == entries.size()
+        // == entries.size()
+        std::atomic<size_t> count{0};
     };
 
     Shard& shard_of(const Key& key) { return shards_[KeyHash{}(key) % kShards]; }
-    void purge(Shard& sh);  // caller holds sh.mu
+    // caller holds sh.mu
+    void purge(Shard& sh);
 
     static constexpr size_t kShards = 16;
     Config cfg_;

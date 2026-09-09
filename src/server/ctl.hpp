@@ -41,8 +41,10 @@ class FsClusterController;
 struct DataPlane {
     core::ExportTable* exports = nullptr;
     rpc::Drc* drc = nullptr;
-    state::StateMgr* state = nullptr;    // v4 state table dump / forced client reclaim
-    std::function<std::string()> drain;  // stop accepting new connections
+    // v4 state table dump / forced client reclaim
+    state::StateMgr* state = nullptr;
+    // stop accepting new connections
+    std::function<std::string()> drain;
     std::atomic<bool>* draining = nullptr;
 };
 
@@ -90,7 +92,8 @@ class DataPlaneSlot {
 
 struct CtlDeps {
     // Process-lifetime hooks (plan doc 10 §4.1); a null hook reports the feature unavailable.
-    std::function<std::string()> reload;  // re-apply reloadable config, returns report
+    // re-apply reloadable config, returns report
+    std::function<std::string()> reload;
     std::chrono::steady_clock::time_point started{};
     // The switchable data plane; a null slot or a null pointer in it means not active.
     std::shared_ptr<DataPlaneSlot> plane;
@@ -157,7 +160,8 @@ class MetricsHttp {
                                                        std::vector<core::Cidr> allow);
     ~MetricsHttp();
     rt::Task<void> run();
-    void start(rt::Reactor& reactor);  // as CtlServer::start
+    // as CtlServer::start
+    void start(rt::Reactor& reactor);
     void request_stop();
     void wait_stopped();
     uint16_t port() const { return port_; }

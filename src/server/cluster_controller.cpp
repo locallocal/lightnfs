@@ -105,7 +105,8 @@ void ClusterController::tick_once() {
             renew();
             return;
         case Role::kDraining:
-            return;  // the posted drain finishes the transition
+            // the posted drain finishes the transition
+            return;
     }
 }
 
@@ -170,7 +171,8 @@ void ClusterController::run_activation(uint64_t epoch, std::string prev_node) {
     }
     Result<void> activated = hooks_.activate ? hooks_.activate(epoch) : Result<void>{};
     std::lock_guard lock(mu_);
-    if (role_ != Role::kActivating) return;  // stopped or drained meanwhile
+    // stopped or drained meanwhile
+    if (role_ != Role::kActivating) return;
     if (activated) {
         role_ = Role::kActive;
         ++takeovers_;
@@ -412,10 +414,13 @@ std::string FsClusterController::migration_target(const Fs& fs, const StoreView&
 
 bool FsClusterController::our_turn(const core::ExportEntry& exp, const StoreView& sv, bool stuck) const {
     if (cfg_.takeover != "auto") return false;
-    const auto& nodes = exp.node_list();  // one load; apply() may swap the list under us
+    // one load; apply() may swap the list under us
+    const auto& nodes = exp.node_list();
     auto self = std::find(nodes.begin(), nodes.end(), node_);
-    if (self == nodes.end()) return false;  // not a candidate: ctl --force only
-    if (stuck) return true;                 // the predecessors had their 2 × ttl and did not take it
+    // not a candidate: ctl --force only
+    if (self == nodes.end()) return false;
+    // the predecessors had their 2 × ttl and did not take it
+    if (stuck) return true;
     // Everyone ahead of us in the export's list gets the first chance: their heartbeat
     // record (empty or not) still live means they are up and will take it themselves.
     // No record at all is a node we have not heard from: dead, unless we ourselves are
@@ -504,7 +509,8 @@ void FsClusterController::tick_once() {
         uint32_t fsid;
         std::vector<std::string> nodes;
     };
-    std::vector<Unlisted> unlisted;  // served here, no longer in the export's nodes
+    // served here, no longer in the export's nodes
+    std::vector<Unlisted> unlisted;
     {
         std::lock_guard lock(mu_);
         last_ = sv;
@@ -537,8 +543,9 @@ void FsClusterController::tick_once() {
                         fs.unowned_since_ms = 0;
                         break;
                     }
-                    if (ours) {  // our own live record still names it (drained on a renew
-                                 // outage, or a restart): nobody else can take it — retake now
+                    // our own live record still names it (drained on a renew
+                    // outage, or a restart): nobody else can take it — retake now
+                    if (ours) {
                         fs.unowned_since_ms = 0;
                         if (!fs.held_off && cfg_.takeover == "auto") take.push_back({fsid, "takeover"});
                         break;
@@ -546,7 +553,8 @@ void FsClusterController::tick_once() {
                     // Free: lapsed (since the record's expiry) or never held (since first seen).
                     const int64_t since = holder ? holder->rec->expires_at_ms : sv.now_ms;
                     if (fs.unowned_since_ms == 0 || since < fs.unowned_since_ms) fs.unowned_since_ms = since;
-                    if (fs.held_off) break;  // released by the operator: not until someone else had it
+                    // released by the operator: not until someone else had it
+                    if (fs.held_off) break;
                     const bool stuck = sv.now_ms - fs.unowned_since_ms > stuck_after().count();
                     // A pending migration (plan 12 D1): the owner record names its target.  The
                     // target takes the export at once, ahead of the node order and whatever the
@@ -564,7 +572,8 @@ void FsClusterController::tick_once() {
                     break;
                 }
                 case Role::kDraining:
-                    break;  // the posted drain finishes the transition
+                    // the posted drain finishes the transition
+                    break;
             }
         }
     }
@@ -592,7 +601,8 @@ bool FsClusterController::migrate_off(uint32_t fsid, const std::vector<std::stri
             LNFS_INFO("cluster: {} no longer listed for fsid {}: handed to {}", node_, fsid, candidate);
             return true;
         }
-        if (moved.error() != errno_from(EHOSTDOWN)) return false;  // not Active any more, or IO
+        // not Active any more, or IO
+        if (moved.error() != errno_from(EHOSTDOWN)) return false;
     }
     return false;
 }
@@ -612,14 +622,16 @@ void FsClusterController::sync_exports(const std::shared_ptr<const core::ExportS
                 continue;
             }
             Fs& fs = it->second;
-            fs.exp = entry;  // the same object unless the export was replaced
+            // the same object unless the export was replaced
+            fs.exp = entry;
             fs.removed = false;
             const auto& nodes = entry->node_list();
             if (nodes == fs.nodes) continue;
             fs.nodes = nodes;
             const bool listed = std::find(nodes.begin(), nodes.end(), node_) != nodes.end();
             const bool serving = fs.role == Role::kActive || fs.role == Role::kActivating;
-            fs.evict = serving && !listed;  // Activating: the tick after it completes hands over
+            // Activating: the tick after it completes hands over
+            fs.evict = serving && !listed;
             if (fs.role == Role::kActive && fs.evict) unlisted.emplace_back(entry->fsid, nodes);
         }
         for (auto it = fs_.begin(); it != fs_.end();) {
@@ -633,7 +645,8 @@ void FsClusterController::sync_exports(const std::shared_ptr<const core::ExportS
                 it = fs_.erase(it);
                 continue;
             }
-            fs.removed = true;  // Active / Activating: drain first; Draining: erase when done
+            // Active / Activating: drain first; Draining: erase when done
+            fs.removed = true;
             if (fs.role != Role::kDraining) drain.push_back(it->first);
             ++it;
         }
@@ -641,7 +654,8 @@ void FsClusterController::sync_exports(const std::shared_ptr<const core::ExportS
     for (uint32_t fsid : added) LNFS_INFO("cluster: fsid {} added to the export set", fsid);
     for (uint32_t fsid : dropped) {
         LNFS_INFO("cluster: fsid {} removed from the export set", fsid);
-        (void)store_.release_fs_fence(fsid, node_);  // a lapsed hold of ours, if any
+        // a lapsed hold of ours, if any
+        (void)store_.release_fs_fence(fsid, node_);
     }
     for (uint32_t fsid : drain) begin_draining(fsid, "removed from catalog", false, true);
     for (const auto& [fsid, nodes] : unlisted)
@@ -701,13 +715,15 @@ Result<void> FsClusterController::begin_activation(uint32_t fsid, bool force, co
         if (Fs* fs = find(fsid)) {
             fs->fence = *fence;
             fs->fs_epoch = *epoch;
-            fs->last_holder = node_;  // our record names it from here on
+            // our record names it from here on
+            fs->last_holder = node_;
         }
     }
     LNFS_INFO("cluster: {} taking over fsid {} (fs epoch {}, fence ttl {} ms{}{}{})", node_, fsid, *epoch,
               ttl().count(), force ? ", forced" : "", prev_node.empty() ? "" : ", from " + prev_node,
               std::string_view(reason) == "migrate" ? ", migrated" : "");
-    publish(nullptr);  // Activating: Unowned in the view until the data plane is ready
+    // Activating: Unowned in the view until the data plane is ready
+    publish(nullptr);
     // 3+4. the per-export data-plane work, on its own thread; the batched renew keeps the
     //      fence alive meanwhile (our record already names the export).
     uint64_t e = *epoch;
@@ -739,7 +755,8 @@ void FsClusterController::run_activation(uint32_t fsid, uint64_t fs_epoch, std::
     {
         std::lock_guard lock(mu_);
         Fs* fs = find(fsid);
-        if (!fs || fs->role != Role::kActivating) return;  // drained or shut down meanwhile
+        // drained or shut down meanwhile
+        if (!fs || fs->role != Role::kActivating) return;
         if (activated) {
             fs->role = Role::kActive;
             ++fs->takeovers;
@@ -776,7 +793,8 @@ void FsClusterController::begin_draining(uint32_t fsid, const char* why, bool fe
         if (fence_lost) ++fs->fence_lost;
     }
     LNFS_WARN("cluster: {} draining fsid {}: {}", node_, fsid, why);
-    publish(nullptr);  // referred on from now; the state goes on the posting thread
+    // referred on from now; the state goes on the posting thread
+    publish(nullptr);
     hooks_.post([this, fsid, release] { run_draining(fsid, release); });
 }
 
@@ -795,12 +813,14 @@ void FsClusterController::run_draining(uint32_t fsid, bool release) {
         std::lock_guard lock(mu_);
         if (Fs* fs = find(fsid)) {
             if (fs->removed) {
-                fs_.erase(fsid);  // the entry's last controller reference goes with it
+                // the entry's last controller reference goes with it
+                fs_.erase(fsid);
             } else {
                 fs->role = Role::kStandby;
                 fs->fs_epoch = 0;
                 fs->evict = false;
-                if (release) fs->fence.reset();  // our record no longer names it
+                // our record no longer names it
+                if (release) fs->fence.reset();
             }
         }
     }
@@ -961,7 +981,8 @@ void FsClusterController::publish(const StoreView* sv) {
                     o.fs_epoch = fs.owner->fs_epoch;
                 } else {
                     o.role = core::FsRole::kUnowned;
-                    if (holder) o.node = holder->rec->node;  // who lapsed
+                    // who lapsed
+                    if (holder) o.node = holder->rec->node;
                 }
                 break;
             }

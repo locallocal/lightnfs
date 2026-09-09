@@ -32,7 +32,7 @@ namespace lnfs::server {
 // failure is logged with the script path and what happened.
 Result<void> run_takeover_hook(const std::string& path, const backend::ClusterIdentity& id, std::string_view prev_node,
                                std::chrono::milliseconds timeout,
-                               uint32_t fsid = 0,  // 0 = not scoped to one export
-                               std::string_view reason = "takeover");
+                               // 0 = not scoped to one export
+                               uint32_t fsid = 0, std::string_view reason = "takeover");
 
 }  // namespace lnfs::server

@@ -155,7 +155,8 @@ void UringRing::bind_submitter() {
     }
     enabled_ = true;
     if (!wake_armed_) {
-        wake_armed_ = true;  // before arm_wake(): it re-enters get_sqe()
+        // before arm_wake(): it re-enters get_sqe()
+        wake_armed_ = true;
         arm_wake();
         submit_all();
     }
@@ -276,7 +277,8 @@ void UringRing::purge_stream(int fd) {
 }
 
 void UringRing::prep_accept(OpHandle* op, int fd, sockaddr* addr, socklen_t* alen) {
-    if (!multishot_accept_ || addr != nullptr) {  // single-shot (or old kernel)
+    // single-shot (or old kernel)
+    if (!multishot_accept_ || addr != nullptr) {
         auto* sqe = get_sqe();
         io_uring_prep_accept(sqe, fd, addr, alen, SOCK_CLOEXEC);
         io_uring_sqe_set_data(sqe, op);
@@ -284,12 +286,14 @@ void UringRing::prep_accept(OpHandle* op, int fd, sockaddr* addr, socklen_t* ale
     }
     AcceptStream& s = accept_streams_[fd];
     s.fd = fd;
-    if (!s.queued.empty()) {  // connection already accepted by the standing op
+    // connection already accepted by the standing op
+    if (!s.queued.empty()) {
         backlog_.push_back({op, s.queued.front()});
         s.queued.pop_front();
         return;
     }
-    if (s.pending_err != 0) {  // terminal error observed with nobody waiting
+    // terminal error observed with nobody waiting
+    if (s.pending_err != 0) {
         backlog_.push_back({op, s.pending_err});
         purge_stream(fd);
         return;
@@ -309,7 +313,8 @@ void UringRing::prep_openat(OpHandle* op, int dirfd, const char* path, int flags
     io_uring_sqe_set_data(sqe, op);
 }
 void UringRing::prep_close(OpHandle* op, int fd) {
-    purge_stream(fd);  // a listener being closed: drop its stream before the fd recycles
+    // a listener being closed: drop its stream before the fd recycles
+    purge_stream(fd);
     auto* sqe = get_sqe();
     io_uring_prep_close(sqe, fd);
     io_uring_sqe_set_data(sqe, op);
@@ -335,10 +340,12 @@ size_t UringRing::reap_ready(std::span<Completion> out) {
         void* p = io_uring_cqe_get_data(cqe);
         if (p == &wake_tag_) {
             ++consumed;
-            wake_rearm_pending_ = true;  // prepped at the top of the next wait()
+            // prepped at the top of the next wait()
+            wake_rearm_pending_ = true;
             continue;
         }
-        if (ud & 1) {  // multishot accept stream CQE
+        // multishot accept stream CQE
+        if (ud & 1) {
             auto* s = reinterpret_cast<AcceptStream*>(ud & ~uint64_t(1));
             bool more = false;
 #ifdef IORING_CQE_F_MORE
@@ -388,7 +395,8 @@ void UringRing::park_ready() {
 }
 
 size_t UringRing::wait(std::span<Completion> out, std::optional<std::chrono::nanoseconds> timeout) {
-    bind_submitter();  // idempotent; first wait() from the reactor thread enables the ring
+    // idempotent; first wait() from the reactor thread enables the ring
+    bind_submitter();
     // Completions parked by get_sqe() backpressure relief go out first, in order.
     size_t n = 0;
     while (n < out.size() && backlog_head_ < backlog_.size()) out[n++] = backlog_[backlog_head_++];
@@ -396,7 +404,8 @@ size_t UringRing::wait(std::span<Completion> out, std::optional<std::chrono::nan
         backlog_.clear();
         backlog_head_ = 0;
     }
-    if (wake_rearm_pending_) {  // must be armed before this pass may block
+    // must be armed before this pass may block
+    if (wake_rearm_pending_) {
         wake_rearm_pending_ = false;
         arm_wake();
     }

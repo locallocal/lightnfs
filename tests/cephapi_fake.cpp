@@ -20,7 +20,8 @@
 // fake defines them.
 struct ceph_mount_info {
     std::string id;
-    std::string root;  // the directory bound at ceph_mount
+    // the directory bound at ceph_mount
+    std::string root;
     int root_fd = -1;
     bool inited = false;
     bool mounted = false;
@@ -34,8 +35,10 @@ struct ceph_mount_info {
 
 struct Inode {
     ceph_mount_info* mount = nullptr;
-    int fd = -1;       // O_PATH
-    uint64_t ino = 0;  // synthetic, never reused
+    // O_PATH
+    int fd = -1;
+    // synthetic, never reused
+    uint64_t ino = 0;
 };
 
 class Fh {
@@ -88,13 +91,15 @@ struct State {
     std::unordered_map<Real, uint64_t, RealHash> synthetic;
     std::unordered_map<uint64_t, std::string> paths;
     std::unordered_map<uint64_t, uint64_t> versions;
-    uint64_t next_ino = 0x10000000000ull;  // Ceph inode numbers start high too
+    // Ceph inode numbers start high too
+    uint64_t next_ino = 0x10000000000ull;
     // fcntl locks: (ino, owner) segments, remembered per Fh
     struct Seg {
         uint64_t ino;
         uint64_t owner;
         Fh* fh;
-        uint64_t start, end;  // end exclusive, UINT64_MAX = EOF
+        // end exclusive, UINT64_MAX = EOF
+        uint64_t start, end;
         bool excl;
     };
     std::vector<Seg> locks;
@@ -104,7 +109,8 @@ struct State {
     std::vector<std::unique_ptr<ceph_mount_info>> ghosts;
     std::vector<std::unique_ptr<Fh>> ghost_fhs;
     std::atomic<uint64_t> reclaim_calls{0};
-    std::vector<std::string> reclaimed_uuids;  // every ceph_start_reclaim argument
+    // every ceph_start_reclaim argument
+    std::vector<std::string> reclaimed_uuids;
     std::string last_uuid;
     int fail_reclaim = 0;
 };
@@ -219,7 +225,8 @@ void fill_statx(const struct stat& sb, uint64_t ino, struct ceph_statx* stx) {
     stx->stx_ino = ino;
     stx->stx_size = static_cast<uint64_t>(sb.st_size);
     stx->stx_blocks = static_cast<uint64_t>(sb.st_blocks);
-    stx->stx_dev = static_cast<dev_t>(capi::kNoSnap);  // the snapid, as libcephfs reports it
+    // the snapid, as libcephfs reports it
+    stx->stx_dev = static_cast<dev_t>(capi::kNoSnap);
     stx->stx_rdev = sb.st_rdev;
     stx->stx_atime = sb.st_atim;
     stx->stx_ctime = sb.st_ctim;
@@ -296,7 +303,8 @@ int f_create(ceph_mount_info** out, const char* const id) {
     return 0;
 }
 int f_conf_read_file(ceph_mount_info* m, const char* path) {
-    if (!path) return -ENOENT;  // no default ceph.conf on this host
+    // no default ceph.conf on this host
+    if (!path) return -ENOENT;
     if (access(path, R_OK) != 0) return -errno;
     m->conf["conf"] = path;
     return 0;
@@ -439,7 +447,8 @@ int f_ll_lookup_root(ceph_mount_info* m, Inode** out) {
 
 int f_ll_lookup_vino(ceph_mount_info* m, vinodeno_t vino, Inode** out) {
     FAKE_FAIL();
-    if (vino.snapid != capi::kNoSnap) return -ENOENT;  // no snapshots in the fake
+    // no snapshots in the fake
+    if (vino.snapid != capi::kNoSnap) return -ENOENT;
     std::string rel = path_of(vino.ino);
     if (rel.empty()) return -ENOENT;
     int fd = openat(m->root_fd, rel.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
@@ -455,7 +464,8 @@ int f_ll_lookup_vino(ceph_mount_info* m, vinodeno_t vino, Inode** out) {
         auto it = s.synthetic.find(State::Real{sb.st_dev, sb.st_ino});
         if (it == s.synthetic.end() || it->second != vino.ino) {
             close(fd);
-            return -ENOENT;  // the path now holds a different (re-created) inode
+            // the path now holds a different (re-created) inode
+            return -ENOENT;
         }
     }
     auto* in = new Inode;
@@ -667,7 +677,8 @@ int f_ll_unlink(ceph_mount_info*, Inode* parent, const char* name, const UserPer
         auto it = s.synthetic.find(State::Real{sb.st_dev, sb.st_ino});
         if (it != s.synthetic.end()) {
             ++s.versions[it->second];
-            if (sb.st_nlink <= 1) {  // last link gone: the inode number is retired
+            // last link gone: the inode number is retired
+            if (sb.st_nlink <= 1) {
                 s.paths.erase(it->second);
                 s.synthetic.erase(it);
             }
@@ -810,7 +821,8 @@ int f_ll_close(ceph_mount_info*, Fh* fh) {
 int do_lock(Fh* fh, struct flock* fl, uint64_t owner, bool test) {
     auto& s = st();
     std::lock_guard lock(s.mu);
-    if (fh->mount && fh->mount->evicted) return -ESHUTDOWN;  // EBLOCKLISTED
+    // EBLOCKLISTED
+    if (fh->mount && fh->mount->evicted) return -ESHUTDOWN;
     uint64_t start = static_cast<uint64_t>(fl->l_start);
     uint64_t end = fl->l_len == 0 ? UINT64_MAX : start + static_cast<uint64_t>(fl->l_len);
     auto overlaps = [&](const State::Seg& seg) { return seg.ino == fh->ino && seg.start < end && start < seg.end; };

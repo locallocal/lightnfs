@@ -31,7 +31,8 @@ TEST(Xdr, RoundTripScalars) {
     enc.boolean(true);
     enc.string("hello");
     auto chain = enc_to_chain(enc);
-    EXPECT_EQ(chain.size(), 4u + 8 + 4 + 4 + 8);  // "hello" -> 5 + 3 pad
+    // "hello" -> 5 + 3 pad
+    EXPECT_EQ(chain.size(), 4u + 8 + 4 + 4 + 8);
 
     XdrDec dec(chain);
     EXPECT_EQ(*dec.u32(), 0xdeadbeefu);
@@ -56,7 +57,8 @@ TEST(Xdr, OpaqueMaxViolation) {
     enc.opaque(std::span<const std::byte>(reinterpret_cast<const std::byte*>("abcdef"), 6));
     auto chain = enc_to_chain(enc);
     XdrDec dec(chain);
-    auto r = dec.opaque(4);  // max 4 < 6
+    // max 4 < 6
+    auto r = dec.opaque(4);
     EXPECT_FALSE(r.has_value());
     EXPECT_EQ((int)r.error(), (int)Errno::kGarbage);
 }
@@ -64,7 +66,8 @@ TEST(Xdr, OpaqueMaxViolation) {
 TEST(Xdr, TruncatedInput) {
     rt::BufferPool pool;
     XdrEnc enc(pool);
-    enc.u32(100);  // claims 100-byte opaque, then nothing
+    // claims 100-byte opaque, then nothing
+    enc.u32(100);
     auto chain = enc_to_chain(enc);
     XdrDec dec(chain);
     auto r = dec.opaque(1000);
@@ -77,7 +80,8 @@ TEST(Xdr, SpanningSegmentsGather) {
     XdrEnc enc(pool);
     enc.u64(0x1122334455667788ULL);
     auto flat = enc_to_chain(enc).to_bytes();
-    auto chain = make_chain(pool, flat, 3);  // u64 straddles the segment boundary
+    // u64 straddles the segment boundary
+    auto chain = make_chain(pool, flat, 3);
     EXPECT_EQ(chain.seg_count(), 2u);
     XdrDec dec(chain);
     EXPECT_EQ(*dec.u64(), 0x1122334455667788ULL);
@@ -104,7 +108,8 @@ TEST(Xdr, RawGapPatch) {
     std::byte* gap = enc.raw_gap(4);
     enc.u32(9);
     uint32_t be = to_be32(0x42);
-    std::memcpy(gap, &be, 4);  // patch after later fields were written
+    // patch after later fields were written
+    std::memcpy(gap, &be, 4);
     auto chain = enc_to_chain(enc);
     XdrDec dec(chain);
     EXPECT_EQ(*dec.u32(), 7u);
@@ -117,11 +122,14 @@ TEST(Xdr, AttachZeroCopySegment) {
     XdrEnc enc(pool);
     auto data = pool.alloc(10);
     std::memcpy(data.data(), "0123456789", 10);
-    enc.u32(10);              // opaque length
-    enc.attach(data, 0, 10);  // spliced, padded to 12
+    // opaque length
+    enc.u32(10);
+    // spliced, padded to 12
+    enc.attach(data, 0, 10);
     enc.u32(0xff);
     auto chain = enc_to_chain(enc);
-    EXPECT_TRUE(chain.seg_count() >= 3);  // head, attached, pad+tail
+    // head, attached, pad+tail
+    EXPECT_TRUE(chain.seg_count() >= 3);
     XdrDec dec(chain);
     auto sp = *dec.opaque(64);
     EXPECT_EQ(sp.size(), 10u);
@@ -180,7 +188,8 @@ TEST(Xdr, MarkRollbackAcrossAttach) {
     auto data = pool.alloc(6);
     std::memcpy(data.data(), "abcdef", 6);
     enc.u32(6);
-    enc.attach(data, 0, 6);  // closes the tail, splices a segment, pads
+    // closes the tail, splices a segment, pads
+    enc.attach(data, 0, 6);
     enc.rollback(m);
     enc.u32(2);
     auto chain = enc_to_chain(enc);
@@ -199,7 +208,8 @@ TEST(Xdr, MarkRollbackKeepsEarlierGapPatchable) {
     enc.rollback(m);
     enc.u32(0xbeef);
     uint32_t v = to_be32(42);
-    std::memcpy(gap, &v, 4);  // gap pointer from before the mark stays valid
+    // gap pointer from before the mark stays valid
+    std::memcpy(gap, &v, 4);
     auto chain = enc_to_chain(enc);
     XdrDec dec(chain);
     EXPECT_EQ(*dec.u32(), 42u);
@@ -227,11 +237,13 @@ TEST(Xdr, OpaqueSpansZeroCopyAcrossSegments) {
     auto len = dec.opaque_spans(64, segs);
     ASSERT_TRUE(len.has_value());
     EXPECT_EQ(*len, 9u);
-    ASSERT_TRUE(segs.size() == 2);  // no gather: one span per chain segment
+    // no gather: one span per chain segment
+    ASSERT_TRUE(segs.size() == 2);
     std::string got;
     for (auto s : segs) got.append(reinterpret_cast<const char*>(s.data()), s.size());
     EXPECT_STREQ(got, "abcdefghi");
-    EXPECT_EQ(*dec.u32(), 0x77u);  // padding was consumed
+    // padding was consumed
+    EXPECT_EQ(*dec.u32(), 0x77u);
     EXPECT_TRUE(dec.at_end());
 }
 
@@ -241,16 +253,19 @@ TEST(Xdr, OpaqueSpansRejectsOverMaxAndTruncated) {
     uint32_t v = to_be32(100);
     auto* p = reinterpret_cast<const std::byte*>(&v);
     raw.insert(raw.end(), p, p + 4);
-    raw.insert(raw.end(), 4, std::byte{0x11});  // only 4 payload bytes present
+    // only 4 payload bytes present
+    raw.insert(raw.end(), 4, std::byte{0x11});
     auto chain = make_chain(pool, raw, 3);
     {
         XdrDec dec(chain);
         lnfs::SmallVec<std::span<const std::byte>, 4> segs;
-        EXPECT_FALSE(dec.opaque_spans(50, segs).has_value());  // len > max
+        // len > max
+        EXPECT_FALSE(dec.opaque_spans(50, segs).has_value());
     }
     {
         XdrDec dec(chain);
         lnfs::SmallVec<std::span<const std::byte>, 4> segs;
-        EXPECT_FALSE(dec.opaque_spans(200, segs).has_value());  // len > remaining
+        // len > remaining
+        EXPECT_FALSE(dec.opaque_spans(200, segs).has_value());
     }
 }

@@ -46,7 +46,8 @@ class ShardedCounter {
     }
 
  private:
-    static constexpr size_t kSlots = 8;  // power of two (slot index is masked)
+    // power of two (slot index is masked)
+    static constexpr size_t kSlots = 8;
     struct alignas(64) Slot {
         std::atomic<T> v{0};
     };
@@ -60,7 +61,8 @@ class LatencyHistogram {
  public:
     static constexpr uint64_t kBoundsUs[] = {100,   250,    500,    1000,   2500,    5000,    10000,  25000,
                                              50000, 100000, 250000, 500000, 1000000, 2500000, 5000000};
-    static constexpr size_t kBuckets = std::size(kBoundsUs) + 1;  // + the +Inf bucket
+    // + the +Inf bucket
+    static constexpr size_t kBuckets = std::size(kBoundsUs) + 1;
 
     void observe_us(uint64_t us) {
         size_t b = 0;
@@ -71,7 +73,8 @@ class LatencyHistogram {
     }
 
     struct Snapshot {
-        uint64_t buckets[kBuckets]{};  // per-bucket (non-cumulative) counts
+        // per-bucket (non-cumulative) counts
+        uint64_t buckets[kBuckets]{};
         uint64_t sum_us = 0;
         uint64_t count = 0;
     };
@@ -89,7 +92,8 @@ class LatencyHistogram {
     }
 
  private:
-    static constexpr size_t kSlots = 4;  // power of two (slot index is masked)
+    // power of two (slot index is masked)
+    static constexpr size_t kSlots = 4;
     struct alignas(64) Slot {
         std::atomic<uint64_t> buckets[kBuckets]{};
         std::atomic<uint64_t> sum_us{0};

@@ -838,7 +838,8 @@ Result<std::unique_ptr<CtlServer>> CtlServer::create(const std::string& socket_p
     if (socket_path.size() >= sizeof(addr.sun_path)) return Err(errno_from(ENAMETOOLONG));
     int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return Err(errno_from(errno));
-    ::unlink(socket_path.c_str());  // stale socket from a previous run
+    // stale socket from a previous run
+    ::unlink(socket_path.c_str());
     addr.sun_family = AF_UNIX;
     socket_path.copy(addr.sun_path, socket_path.size());
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 || ::listen(fd, 16) < 0) {
@@ -902,7 +903,8 @@ void CtlServer::wait_stopped() {
 }
 
 rt::Task<void> CtlServer::run() {
-    struct Exit {  // signals wait_stopped() however the loop ends
+    // signals wait_stopped() however the loop ends
+    struct Exit {
         std::promise<void>* p;
         ~Exit() { p->set_value(); }
     } exit_guard{&exited_};
@@ -944,7 +946,8 @@ Result<std::unique_ptr<MetricsHttp>> MetricsHttp::create(uint16_t port, const st
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     if (ss.ss_family == AF_INET6) {
-        int zero = 0;  // "::" keeps serving mapped v4 peers as before
+        // "::" keeps serving mapped v4 peers as before
+        int zero = 0;
         setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
     }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&ss), slen) < 0 || ::listen(fd, 64) < 0) {
@@ -983,7 +986,8 @@ rt::Task<void> MetricsHttp::serve(int cfd) {
         }(cfd, buf),
         std::chrono::seconds(5));
     if (!got) {
-        co_await uring_cancel_fd(cfd);  // release the parked recv before the fd goes away
+        // release the parked recv before the fd goes away
+        co_await uring_cancel_fd(cfd);
         co_await uring_close(cfd);
         co_return;
     }
@@ -1022,7 +1026,8 @@ rt::Task<void> MetricsHttp::run() {
         }
         if (cfd == -EINTR || cfd == -ECANCELED) continue;
         if (cfd < 0) continue;
-        if (!allowed(peer)) {  // CIDR allowlist (plan doc 10 §1.8)
+        // CIDR allowlist (plan doc 10 §1.8)
+        if (!allowed(peer)) {
             ::close(cfd);
             continue;
         }

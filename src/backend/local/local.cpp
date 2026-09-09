@@ -34,7 +34,8 @@ namespace {
 
 constexpr std::byte kKernelHandle{1};
 constexpr std::byte kFallbackHandle{2};
-constexpr size_t kMaxKernelHandle = ObjId::kMax - 6;  // tag + type + byte count
+// tag + type + byte count
+constexpr size_t kMaxKernelHandle = ObjId::kMax - 6;
 
 FType mode_type(mode_t mode) {
     if (S_ISREG(mode)) return FType::kReg;
@@ -90,9 +91,11 @@ class LocalBackend::FdCache {
         ~Entry() {
             if (fd >= 0) ::close(fd);
         }
-        ObjId oid;  // map key copy: lets the LRU walk erase without a reverse lookup
+        // map key copy: lets the LRU walk erase without a reverse lookup
+        ObjId oid;
         int fd;
-        int accmode;  // O_RDONLY or O_RDWR
+        // O_RDONLY or O_RDWR
+        int accmode;
         // getdents position guard: readdir pages share this cached fd (plan doc 10 §2.6),
         // and the directory offset is fd state — concurrent pages must serialize.
         std::mutex dents_mu;
@@ -133,12 +136,14 @@ class LocalBackend::FdCache {
             if (inserted) {
                 push_back(shard, value.get());
             } else if (write && it->second->accmode != O_RDWR) {
-                unlink(shard, it->second.get());  // upgrade: old refs drain via shared_ptr
+                // upgrade: old refs drain via shared_ptr
+                unlink(shard, it->second.get());
                 it->second = value;
                 push_back(shard, value.get());
             } else {
                 touch(shard, it->second.get());
-                value = it->second;  // lost an insert race: adopt the winner, our fd closes
+                // lost an insert race: adopt the winner, our fd closes
+                value = it->second;
             }
             evict(shard);
         }
@@ -182,8 +187,10 @@ class LocalBackend::FdCache {
     struct Shard {
         std::mutex mu;
         std::unordered_map<ObjId, Ref, ObjIdHash> entries;
-        Entry* lru_head = nullptr;  // least recently used
-        Entry* lru_tail = nullptr;  // most recently used
+        // least recently used
+        Entry* lru_head = nullptr;
+        // most recently used
+        Entry* lru_tail = nullptr;
     };
 
     static void push_back(Shard& shard, Entry* e) {
@@ -215,7 +222,8 @@ class LocalBackend::FdCache {
             auto it = shard.entries.find(victim->oid);
             if (it->second.use_count() == 1) {
                 unlink(shard, victim);
-                shard.entries.erase(it);  // Entry closes only its fd; ObjId remains valid.
+                // Entry closes only its fd; ObjId remains valid.
+                shard.entries.erase(it);
                 evictions_.fetch_add(1, std::memory_order_relaxed);
             } else {
                 touch(shard, victim);
@@ -250,9 +258,11 @@ class LocalBackend::PathCache {
             if (fd >= 0) ::close(fd);
         }
         ObjId oid;
-        int fd;  // O_PATH|O_NOFOLLOW
+        // O_PATH|O_NOFOLLOW
+        int fd;
         FType type;
-        Entry* prev = nullptr;  // intrusive LRU, guarded by the shard mutex
+        // intrusive LRU, guarded by the shard mutex
+        Entry* prev = nullptr;
         Entry* next = nullptr;
     };
     using Ref = std::shared_ptr<Entry>;
@@ -283,7 +293,8 @@ class LocalBackend::PathCache {
             push_back(shard, value.get());
         else {
             touch(shard, it->second.get());
-            value = it->second;  // lost the race: adopt the winner, our fd closes
+            // lost the race: adopt the winner, our fd closes
+            value = it->second;
         }
         size_t budget = shard.entries.size();
         while (shard.entries.size() > per_shard_capacity_ && budget-- > 0) {
@@ -299,7 +310,8 @@ class LocalBackend::PathCache {
         return value;
     }
 
-    size_t flush() {  // same semantics as FdCache::flush
+    // same semantics as FdCache::flush
+    size_t flush() {
         size_t dropped = 0;
         for (auto& shard : shards_) {
             std::lock_guard lock(shard.mu);
@@ -416,7 +428,8 @@ LocalBackend::LocalBackend(Config cfg, int root_fd, int mount_fd)
     : cfg_(std::move(cfg)), root_fd_(root_fd), mount_fd_(mount_fd) {
     caps_.set(Cap::kSymlink).set(Cap::kHardlink).set(Cap::kMknod);
     fd_cache_ = std::make_unique<FdCache>(*this, cfg_.fd_cache);
-    path_cache_ = std::make_unique<PathCache>(cfg_.fd_cache);  // same knob, parallel cache
+    // same knob, parallel cache
+    path_cache_ = std::make_unique<PathCache>(cfg_.fd_cache);
     long name = fpathconf(root_fd_, _PC_NAME_MAX);
     long link = fpathconf(root_fd_, _PC_LINK_MAX);
     if (name > 0) limits_.max_name = static_cast<uint32_t>(name);
@@ -547,7 +560,8 @@ Result<ObjId> LocalBackend::oid_from_fd(int fd, std::string_view relative, bool 
         std::lock_guard lock(generation_mu_);
         InodeKey key{static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino)};
         if (fallback_generations_.size() >= cfg_.max_fallback_entries && !fallback_generations_.contains(key))
-            fallback_generations_.erase(fallback_generations_.begin());  // §1.5 hard cap
+            // §1.5 hard cap
+            fallback_generations_.erase(fallback_generations_.begin());
         auto [it, inserted] = fallback_generations_.try_emplace(key, next_fallback_generation_);
         if (inserted && ++next_fallback_generation_ == 0) ++next_fallback_generation_;
         generation = it->second;
@@ -873,7 +887,8 @@ rt::Task<Result<uint32_t>> LocalObject::read(OpenCtx ctx, uint64_t off, std::spa
     if (type() == FType::kDir) co_return Err(errno_from(EISDIR));
     if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
     int fd = -1;
-    LocalBackend::FdCache::Ref ref;  // pins the cache entry while fd is in use
+    // pins the cache entry while fd is in use
+    LocalBackend::FdCache::Ref ref;
     if (auto* os = open_state(ctx)) {
         // The open's own fd (design 05 §5.5): permission was settled at OPEN time — POSIX
         // open semantics, and a mode change after OPEN no longer breaks reads.
@@ -896,7 +911,8 @@ rt::Task<Result<uint32_t>> LocalObject::read(OpenCtx ctx, uint64_t off, std::spa
     if (fault::take(fault::Kind::kJukebox)) co_return Err(Errno::kJukebox);
     int n = fault::take(fault::Kind::kReadEio) ? -EIO : co_await rt::uring_read(fd, out, off);
     if (n < 0) co_return Err(errno_from_neg(n));
-    if (out.empty()) {  // zero-length read: only a size probe can answer eof
+    // zero-length read: only a size probe can answer eof
+    if (out.empty()) {
         auto attr = co_await getattr();
         eof = attr && off >= attr->size;
     } else {
@@ -999,7 +1015,8 @@ rt::Task<Result<AccessMask>> LocalObject::access(const Cred& cred, AccessMask wa
 rt::Task<Result<void>> LocalObject::require_dir_write(const Cred& cred) {
     if (type() != FType::kDir) co_return Err(errno_from(ENOTDIR));
     if (backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid)
-        co_return Result<void>{};  // the kernel enforces under the switched fsuid
+        // the kernel enforces under the switched fsuid
+        co_return Result<void>{};
     auto allowed = co_await access(cred, AccessMask{}.set(Access::kModify).set(Access::kLookup));
     if (!allowed) co_return Err(allowed.error());
     if (!allowed->has(Access::kModify) || !allowed->has(Access::kLookup)) co_return Err(errno_from(EACCES));
@@ -1015,7 +1032,8 @@ Result<Created> LocalObject::created_child_sync(std::string_view name) {
         ::close(fd);
         return Err(attr.error());
     }
-    auto obj = backend_.object_from_fd(fd, child_path(relative_, owned));  // consumes fd
+    // consumes fd
+    auto obj = backend_.object_from_fd(fd, child_path(relative_, owned));
     if (!obj) return Err(obj.error());
     return Created{std::move(*obj), *attr};
 }
@@ -1304,7 +1322,8 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off, std::sp
     int fd = -1;
     LocalBackend::FdCache::Ref ref;
     if (auto* os = open_state(ctx); os && os->writable()) {
-        fd = os->fd();  // the open's own fd (design 05 §5.5); checked at OPEN time
+        // the open's own fd (design 05 §5.5); checked at OPEN time
+        fd = os->fd();
     } else {
         // Anonymous IO, or a same-owner merge upgraded a read-only open (the state layer
         // keeps the original handle): the fd-cache path with its per-IO checks.
@@ -1351,7 +1370,8 @@ rt::Task<Result<uint32_t>> LocalObject::write(OpenCtx ctx, uint64_t off, std::sp
     int fd = -1;
     LocalBackend::FdCache::Ref ref;
     if (auto* os = open_state(ctx); os && os->writable()) {
-        fd = os->fd();  // the open's own fd (design 05 §5.5); checked at OPEN time
+        // the open's own fd (design 05 §5.5); checked at OPEN time
+        fd = os->fd();
     } else {
         auto gate = co_await io_gate(ctx.cred, /*write=*/true);
         if (!gate) co_return Err(gate.error());
@@ -1422,11 +1442,13 @@ rt::Task<Result<void>> LocalObject::io_gate(const Cred& cred, bool write) {
     if (type() == FType::kDir) co_return Err(errno_from(EISDIR));
     if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
     if (write && backend_.cfg_.identity == LocalBackend::Identity::kSetFsuid)
-        co_return Result<void>{};  // the kernel decides under the client's fsuid
+        // the kernel decides under the client's fsuid
+        co_return Result<void>{};
     auto allowed = co_await access(cred, write ? Access::kModify : Access::kRead);
     if (!allowed) co_return Err(allowed.error());
     if (!allowed->has(write ? Access::kModify : Access::kRead)) {
-        auto attr = co_await getattr();  // v3 open-less owner relaxation (nfsv3/04 §6)
+        // v3 open-less owner relaxation (nfsv3/04 §6)
+        auto attr = co_await getattr();
         if (!attr) co_return Err(attr.error());
         if (cred.uid != attr->uid) co_return Err(errno_from(EACCES));
     }
@@ -1439,7 +1461,8 @@ rt::Task<Result<uint64_t>> LocalObject::seek(OpenCtx ctx, uint64_t off, SeekWhat
     int fd = -1;
     LocalBackend::FdCache::Ref ref;
     if (auto* os = open_state(ctx)) {
-        fd = os->fd();  // the open's own fd (design 05 §5.5)
+        // the open's own fd (design 05 §5.5)
+        fd = os->fd();
     } else {
         auto gate = co_await io_gate(ctx.cred, false);
         if (!gate) co_return Err(gate.error());
@@ -1450,7 +1473,8 @@ rt::Task<Result<uint64_t>> LocalObject::seek(OpenCtx ctx, uint64_t off, SeekWhat
     }
     co_return co_await rt::offload([fd, off, what]() -> Result<uint64_t> {
         off_t r = ::lseek(fd, static_cast<off_t>(off), what == SeekWhat::kData ? SEEK_DATA : SEEK_HOLE);
-        if (r < 0) return Err(errno_from(errno));  // ENXIO past EOF / no data
+        // ENXIO past EOF / no data
+        if (r < 0) return Err(errno_from(errno));
         return static_cast<uint64_t>(r);
     });
 }
@@ -1512,7 +1536,8 @@ rt::Task<Result<void>> LocalObject::clone(OpenCtx sctx, Object& dst, OpenCtx dct
             struct file_clone_range range{};
             range.src_fd = sfd;
             range.src_offset = src_off;
-            range.src_length = len;  // 0 = to EOF (FICLONERANGE semantics match CLONE's)
+            // 0 = to EOF (FICLONERANGE semantics match CLONE's)
+            range.src_length = len;
             range.dest_offset = dst_off;
             if (::ioctl(dfd, FICLONERANGE, &range) < 0) {
                 // Kernel speaks EOPNOTSUPP/EINVAL/EXDEV for "not reflinkable here"; all three
@@ -1543,7 +1568,8 @@ rt::Task<Result<uint64_t>> LocalObject::copy_range(OpenCtx sctx, Object& dst, Op
         [sfd, dfd, src_off, dst_off, len, fsuid, cred]() -> Result<uint64_t> {
             ScopedFsIds ids(cred, fsuid);
             uint64_t want = len;
-            if (want == 0) {  // to EOF
+            // to EOF
+            if (want == 0) {
                 struct stat st{};
                 if (::fstat(sfd, &st) < 0) return Err(errno_from(errno));
                 if (static_cast<uint64_t>(st.st_size) <= src_off) return 0;
@@ -1559,7 +1585,8 @@ rt::Task<Result<uint64_t>> LocalObject::copy_range(OpenCtx sctx, Object& dst, Op
                 if (offload_ok) {
                     n = ::copy_file_range(sfd, &in, dfd, &out, chunk, 0);
                     if (n < 0 && (errno == EXDEV || errno == EOPNOTSUPP || errno == ENOSYS || errno == EINVAL)) {
-                        offload_ok = false;  // fall back below (same byte semantics, more CPU)
+                        // fall back below (same byte semantics, more CPU)
+                        offload_ok = false;
                         n = -1;
                     } else if (n < 0) {
                         return Err(errno_from(errno));
@@ -1569,7 +1596,8 @@ rt::Task<Result<uint64_t>> LocalObject::copy_range(OpenCtx sctx, Object& dst, Op
                     std::vector<std::byte> buf(std::min<size_t>(chunk, 1u << 20));
                     ssize_t r = ::pread(sfd, buf.data(), buf.size(), in);
                     if (r < 0) return Err(errno_from(errno));
-                    if (r == 0) break;  // source EOF
+                    // source EOF
+                    if (r == 0) break;
                     size_t w = 0;
                     while (w < static_cast<size_t>(r)) {
                         ssize_t k = ::pwrite(dfd, buf.data() + w, static_cast<size_t>(r) - w, out + w);
@@ -1578,7 +1606,8 @@ rt::Task<Result<uint64_t>> LocalObject::copy_range(OpenCtx sctx, Object& dst, Op
                     }
                     n = r;
                 }
-                if (n == 0) break;  // source EOF
+                // source EOF
+                if (n == 0) break;
                 done += static_cast<uint64_t>(n);
             }
             return done;

@@ -17,7 +17,8 @@
 namespace lnfs::backend {
 namespace {
 
-constexpr std::byte kLustreHandle{4};  // local uses 1/2, gluster 3
+// local uses 1/2, gluster 3
+constexpr std::byte kLustreHandle{4};
 constexpr size_t kHandleLen = 1 + sizeof(llapi::Fid);
 
 // The mount root is the highest ancestor on the same device.  Bind mounts of a
@@ -63,7 +64,8 @@ Result<llapi::Fid> LustreBackend::fid_from_oid(const ObjId& oid) {
     std::memcpy(&fid.seq, bytes.data() + 1, sizeof fid.seq);
     std::memcpy(&fid.oid, bytes.data() + 9, sizeof fid.oid);
     std::memcpy(&fid.ver, bytes.data() + 13, sizeof fid.ver);
-    if (fid.seq == 0 && fid.oid == 0) return Err(errno_from(ESTALE));  // FID_ZERO
+    // FID_ZERO
+    if (fid.seq == 0 && fid.oid == 0) return Err(errno_from(ESTALE));
     return fid;
 }
 
@@ -90,7 +92,8 @@ Result<std::unique_ptr<LustreBackend>> LustreBackend::create(Config cfg, const l
     base.path = cfg.path;
     base.fsid = cfg.fsid;
     base.fd_cache = cfg.fd_cache;
-    base.handles = HandleMode::kKernel;  // handles are FIDs; the fallback tables stay unused
+    // handles are FIDs; the fallback tables stay unused
+    base.handles = HandleMode::kKernel;
     base.identity = cfg.identity;
     base.enrich_readdir = cfg.enrich_readdir;
     auto [root, mount] = LNFS_TRY(open_roots(base));
@@ -212,7 +215,8 @@ Result<void> LustreBackend::hsm_gate(int fd, const llapi::Fid& fid) {
     if (::fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) return {};
     hsm_checks_.fetch_add(1, std::memory_order_relaxed);
     auto state = ops_.hsm_state(fd);
-    if (!state) return {};  // no HSM on this client: nothing can be released
+    // no HSM on this client: nothing can be released
+    if (!state) return {};
     if (!(state->states & llapi::kHsReleased)) return {};
     // A read/write/truncate on a released file makes the kernel restore it inline and
     // blocks the caller for the whole restore — that would park an offload worker (or
@@ -265,7 +269,8 @@ struct flock LustreLockMgr::make_flock(LockRange range, short type) {
         fl.l_len = 0;
     else
         fl.l_len = static_cast<off_t>(range.length);
-    fl.l_pid = 0;  // required for the OFD commands
+    // required for the OFD commands
+    fl.l_pid = 0;
     return fl;
 }
 
@@ -286,7 +291,8 @@ Result<int> LustreLockMgr::fd_for(const ObjId& oid, const LockOwnerId& owner, bo
     if (!fd) return Err(fd.error());
     std::lock_guard lock(mu_);
     auto [it, inserted] = fds_.emplace(key, *fd);
-    if (!inserted) {  // lost a race: keep the winner
+    // lost a race: keep the winner
+    if (!inserted) {
         ::close(*fd);
         return it->second;
     }
@@ -308,7 +314,8 @@ rt::Task<Result<void>> LustreLockMgr::lock(Object& object, const LockOwnerId& ow
         (void)wait;
         if (::fcntl(*fd, F_OFD_SETLK, &fl) < 0) {
             int e = errno;
-            if (e == EAGAIN || e == EACCES) return Err(errno_from(EAGAIN));  // conflict
+            // conflict
+            if (e == EAGAIN || e == EACCES) return Err(errno_from(EAGAIN));
             return Err(errno_from(e));
         }
         return {};
@@ -321,7 +328,8 @@ rt::Task<Result<void>> LustreLockMgr::unlock(Object& object, const LockOwnerId& 
     ObjId oid = obj->id();
     co_return co_await rt::offload([this, oid, owner, range]() -> Result<void> {
         auto fd = fd_for(oid, owner, false);
-        if (!fd) return {};  // nothing held by this owner on this file: unlocking is idempotent
+        // nothing held by this owner on this file: unlocking is idempotent
+        if (!fd) return {};
         struct flock fl = make_flock(range, F_UNLCK);
         if (::fcntl(*fd, F_OFD_SETLK, &fl) < 0) return Err(errno_from(errno));
         return {};

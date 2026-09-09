@@ -25,7 +25,8 @@ struct Env {
     std::shared_ptr<const core::ExportSet> exports;
     std::unique_ptr<core::FileHandleCodec> codec;
     sockaddr_storage peer{};
-    std::vector<std::byte> valid;  // a correctly tagged handle to mutate
+    // a correctly tagged handle to mutate
+    std::vector<std::byte> valid;
 
     Env() {
         lnfs::set_log_level(lnfs::LogLevel::kError);

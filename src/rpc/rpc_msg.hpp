@@ -15,8 +15,10 @@
 namespace lnfs::rpc {
 
 inline constexpr uint32_t kRpcVersion = 2;
-inline constexpr uint32_t kMaxAuthBody = 400;  // RFC 5531 limit
-inline constexpr uint32_t kAuthTls = 7;        // RFC 9289 AUTH_TLS (STARTTLS probe)
+// RFC 5531 limit
+inline constexpr uint32_t kMaxAuthBody = 400;
+// RFC 9289 AUTH_TLS (STARTTLS probe)
+inline constexpr uint32_t kAuthTls = 7;
 
 enum MsgType : uint32_t { kCall = 0, kReply = 1 };
 enum ReplyStat : uint32_t { kMsgAccepted = 0, kMsgDenied = 1 };
@@ -49,8 +51,10 @@ struct RpcCall {
     uint32_t vers = 0;
     uint32_t proc = 0;
     OpaqueAuth cred{}, verf{};
-    uint64_t args_hash = 0;  // FNV over the first 256 bytes of args (DRC key component)
-    xdr::XdrDec args;        // positioned at the start of procedure arguments
+    // FNV over the first 256 bytes of args (DRC key component)
+    uint64_t args_hash = 0;
+    // positioned at the start of procedure arguments
+    xdr::XdrDec args;
 };
 
 // Parses through the auth fields; `rec` must outlive the returned RpcCall (spans reference

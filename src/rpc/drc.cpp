@@ -9,7 +9,8 @@ Drc::Key Drc::Key::make(const sockaddr_storage& peer, uint32_t xid, uint32_t pro
     Key k;
     if (peer.ss_family == AF_INET) {
         auto* a = reinterpret_cast<const sockaddr_in*>(&peer);
-        k.peer_addr[10] = k.peer_addr[11] = 0xff;  // ::ffff:a.b.c.d
+        // ::ffff:a.b.c.d
+        k.peer_addr[10] = k.peer_addr[11] = 0xff;
         std::memcpy(k.peer_addr.data() + 12, &a->sin_addr, 4);
         k.peer_port = ntohs(a->sin_port);
     } else if (peer.ss_family == AF_INET6) {
@@ -46,7 +47,8 @@ void Drc::purge(Shard& sh) {
     while (!sh.completed.empty()) {
         const Key& oldest = sh.completed.front();
         auto it = sh.entries.find(oldest);
-        if (it == sh.entries.end()) {  // aborted or already evicted
+        // aborted or already evicted
+        if (it == sh.entries.end()) {
             sh.completed.pop_front();
             continue;
         }
@@ -119,7 +121,8 @@ rt::Task<size_t> Drc::flush() {
         sh.completed.clear();
         sh.bytes.store(0, std::memory_order_relaxed);
         sh.count.store(0, std::memory_order_relaxed);
-        sh.cv.notify_all();  // waiting retransmits re-check, find no entry, re-execute
+        // waiting retransmits re-check, find no entry, re-execute
+        sh.cv.notify_all();
     }
     co_return dropped;
 }

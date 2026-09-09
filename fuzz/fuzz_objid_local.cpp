@@ -57,7 +57,8 @@ T run_blocking(rt::Runtime& runtime, rt::Task<T> task) {
 struct Env {
     std::unique_ptr<rt::Runtime> runtime;
     std::unique_ptr<backend::LocalBackend> be;
-    backend::ObjId valid{};  // a live fallback ObjId (reverse map populated)
+    // a live fallback ObjId (reverse map populated)
+    backend::ObjId valid{};
 
     Env() {
         lnfs::set_log_level(lnfs::LogLevel::kError);

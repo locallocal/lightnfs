@@ -185,7 +185,8 @@ Buffer BufferPool::alloc(size_t n) {
 
 void BufferPool::recycle(detail::Block* b) {
     int cls = class_for(b->cap);
-    if (cls < 0 || kClassCaps[cls] != b->cap) {  // odd size (config change): don't cache
+    // odd size (config change): don't cache
+    if (cls < 0 || kClassCaps[cls] != b->cap) {
         detail::free_block(b);
         return;
     }

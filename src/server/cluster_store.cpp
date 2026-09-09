@@ -189,7 +189,8 @@ class PosixClusterStore final : public ClusterStore {
 
     Result<std::optional<FenceRecord>> read_fs_fence(uint32_t fsid) override {
         auto records = LNFS_TRY(list_fences());
-        std::optional<FenceRecord> best;  // a live record wins; else the latest expired one
+        // a live record wins; else the latest expired one
+        std::optional<FenceRecord> best;
         for (const auto& rec : records) {
             const NodeFences::Hold* hold = find_hold(rec, fsid);
             if (!hold) continue;
@@ -248,7 +249,8 @@ class PosixClusterStore final : public ClusterStore {
             std::erase_if(rec.holds, [&](const NodeFences::Hold& h) { return h.fsid == fsid; });
             return write_node_fences(rec);
         }
-        return {};  // nobody holds it
+        // nobody holds it
+        return {};
     }
 
     Result<std::vector<NodeFences>> list_fences() override {
@@ -331,7 +333,8 @@ class PosixClusterStore final : public ClusterStore {
         if (version != expected + 1) return Err(errno_from(EINVAL));
         LNFS_TRY(ensure_layout());
         auto guard = LNFS_TRY(lock("catalog"));
-        auto current = LNFS_TRY(read_catalog());  // a corrupt current file is EINVAL: fix it first
+        // a corrupt current file is EINVAL: fix it first
+        auto current = LNFS_TRY(read_catalog());
         if ((current ? current->version : 0) != expected) return Err(errno_from(EAGAIN));
         if (current) {
             LNFS_TRY(ensure_dir(history_dir()));
@@ -389,7 +392,8 @@ class PosixClusterStore final : public ClusterStore {
             if (!name.starts_with("catalog.") || name.find(".tmp.") != std::string::npos || !entry.is_regular_file(ec))
                 continue;
             std::string node = name.substr(sizeof("catalog.") - 1);
-            if (!valid_applied_node(node)) continue;  // catalog.toml / catalog.lock
+            // catalog.toml / catalog.lock
+            if (!valid_applied_node(node)) continue;
             auto text = core::read_file_if_exists(entry.path().string());
             if (!text || !*text) continue;
             out.push_back(LNFS_TRY(parse_catalog_applied(std::move(node), **text)));
@@ -479,12 +483,14 @@ class PosixClusterStore final : public ClusterStore {
         std::vector<std::string> out;
         std::error_code ec;
         std::filesystem::directory_iterator it(dir, ec);
-        if (ec == std::errc::no_such_file_or_directory) return out;  // nothing persisted yet
+        // nothing persisted yet
+        if (ec == std::errc::no_such_file_or_directory) return out;
         if (ec) return Err(errno_from(ec.value()));
         for (const auto& entry : it) {
             if (!entry.is_regular_file(ec)) continue;
             auto name = entry.path().filename().string();
-            if (name.find(".tmp.") != std::string::npos) continue;  // in-flight atomic write
+            // in-flight atomic write
+            if (name.find(".tmp.") != std::string::npos) continue;
             auto text = core::read_file_if_exists(entry.path().string());
             if (text && *text && !(*text)->empty()) out.push_back(std::move(**text));
         }
@@ -584,7 +590,8 @@ class PosixClusterStore final : public ClusterStore {
                 LNFS_WARN("cluster store: reclaiming stale lock {}", path);
                 (void)::unlink(path.c_str());
                 reclaimed = true;
-                continue;  // the retry after a reclaim never counts against the wait budget
+                // the retry after a reclaim never counts against the wait budget
+                continue;
             }
             if (std::chrono::steady_clock::now() >= deadline) return Err(errno_from(EBUSY));
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -599,9 +606,11 @@ class PosixClusterStore final : public ClusterStore {
             if (sp != std::string_view::npos)
                 if (auto ms = parse_u64(line.substr(sp + 1))) taken_ms = static_cast<int64_t>(*ms);
         }
-        if (taken_ms == 0) {  // unreadable or empty: fall back to the file's mtime
+        // unreadable or empty: fall back to the file's mtime
+        if (taken_ms == 0) {
             struct stat st{};
-            if (::stat(path.c_str(), &st) < 0) return errno == ENOENT;  // vanished: not stale, retry
+            // vanished: not stale, retry
+            if (::stat(path.c_str(), &st) < 0) return errno == ENOENT;
             taken_ms = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000 + st.st_mtim.tv_nsec / 1000000;
         }
         return now_ms() - taken_ms > stale_lock_after_.count();

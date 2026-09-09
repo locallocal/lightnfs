@@ -37,10 +37,12 @@ using MemStore = test::MemClusterStore;
 struct Recorder {
     std::vector<std::string> calls;
     std::vector<uint64_t> epochs;
-    std::vector<server::TakeoverContext> takeovers;  // what the backends/hook were told
+    // what the backends/hook were told
+    std::vector<server::TakeoverContext> takeovers;
     Errno fail_activate = Errno::kOk;
     server::ClusterController::Hooks hooks() {
-        return {.post = {},  // inline
+        // inline
+        return {.post = {},
                 .activate = [this](uint64_t epoch) -> Result<void> {
                     calls.push_back("activate");
                     epochs.push_back(epoch);
@@ -128,7 +130,8 @@ TEST(ClusterController, StandbyTakesOverAFreeOrExpiredFence) {
     other.tick();
     EXPECT_TRUE(other.role() == server::Role::kStandby);
     EXPECT_TRUE(rec2.calls.empty());
-    shared.age_out();  // gw1 died: no renewals
+    // gw1 died: no renewals
+    shared.age_out();
     other.tick();
     EXPECT_TRUE(other.role() == server::Role::kActive);
     EXPECT_STREQ(joined(rec2.calls), "takeover activate");
@@ -243,9 +246,11 @@ TEST(ClusterController, ActiveLosesFenceAndDrainsWithoutReleasingIt) {
     // Split brain / forced takeover elsewhere: the next renew is EPERM.
     store.taken_by("gw2", 9);
     ctl.tick();
-    EXPECT_TRUE(ctl.role() == server::Role::kStandby);  // drained inline
+    // drained inline
+    EXPECT_TRUE(ctl.role() == server::Role::kStandby);
     EXPECT_STREQ(joined(rec.calls), "deactivate reset");
-    EXPECT_STREQ(joined(store.log), "renew");  // no release of gw2's record
+    // no release of gw2's record
+    EXPECT_STREQ(joined(store.log), "renew");
     EXPECT_STREQ(store.fence->node, "gw2");
     auto snap = ctl.snapshot();
     EXPECT_EQ(snap.fence_lost, 1u);
@@ -264,7 +269,8 @@ TEST(ClusterController, ActiveLosesFenceAndDrainsWithoutReleasingIt) {
     store.fail_renew = errno_from(EIO);
     ctl.tick();
     ctl.tick();
-    EXPECT_TRUE(ctl.role() == server::Role::kActive);  // two strikes
+    // two strikes
+    EXPECT_TRUE(ctl.role() == server::Role::kActive);
     ctl.tick();
     EXPECT_TRUE(ctl.role() == server::Role::kStandby);
     EXPECT_STREQ(joined(rec.calls), "deactivate reset");
@@ -280,7 +286,8 @@ TEST(ClusterController, ManualTakeoverPolicyAndForce) {
     server::ClusterController manual(config("gw1", "auto", "manual"), store, rec.hooks());
     manual.tick();
     manual.tick();
-    EXPECT_TRUE(manual.role() == server::Role::kStandby);  // expired fence, still nothing
+    // expired fence, still nothing
+    EXPECT_TRUE(manual.role() == server::Role::kStandby);
     EXPECT_TRUE(rec.calls.empty());
     // role = standby never takes over on its own either.
     Recorder rec_sb;
@@ -331,7 +338,8 @@ TEST(ClusterController, ActivationFailureReleasesFenceAndKeepsEpochMonotonic) {
     EXPECT_STREQ(joined(store.log), "acquire epoch release");
     EXPECT_STREQ(joined(rec.calls), "takeover activate");
     EXPECT_FALSE(store.fence.has_value());
-    EXPECT_EQ(store.epoch, 11u);  // consumed: monotonic is all that matters
+    // consumed: monotonic is all that matters
+    EXPECT_EQ(store.epoch, 11u);
     auto snap = ctl.snapshot();
     EXPECT_EQ(snap.activation_failures, 1u);
     EXPECT_EQ(snap.takeovers, 0u);
@@ -368,7 +376,8 @@ TEST(ClusterController, PostedActivationRenewsMeanwhileAndTimerThreadRuns) {
     ctl.tick();
     EXPECT_TRUE(ctl.role() == server::Role::kDraining);
     EXPECT_EQ(queue.size(), 1u);
-    ctl.tick();  // Draining ticks do nothing
+    // Draining ticks do nothing
+    ctl.tick();
     queue.front()();
     EXPECT_TRUE(ctl.role() == server::Role::kStandby);
 
@@ -382,7 +391,8 @@ TEST(ClusterController, PostedActivationRenewsMeanwhileAndTimerThreadRuns) {
         std::this_thread::sleep_for(10ms);
     EXPECT_TRUE(timed.role() == server::Role::kActive);
     timed.stop();
-    EXPECT_TRUE(timed.role() == server::Role::kActive);  // stop() leaves the role alone
+    // stop() leaves the role alone
+    EXPECT_TRUE(timed.role() == server::Role::kActive);
     EXPECT_STREQ(store2.fence->node, "gw9");
 }
 
@@ -398,7 +408,8 @@ TEST(ClusterController, PostedActivationRenewsMeanwhileAndTimerThreadRuns) {
 namespace {
 
 struct FsRecorder {
-    std::vector<std::string> calls;  // "takeover:F" / "activate:F" / "deactivate:F"
+    // "takeover:F" / "activate:F" / "deactivate:F"
+    std::vector<std::string> calls;
     std::vector<server::TakeoverContext> takeovers;
     Errno fail_activate = Errno::kOk;
     server::FsClusterController::Hooks hooks() {
@@ -436,7 +447,8 @@ struct Exports {
 core::ClusterConfig aa_config(const std::string& node, const std::string& takeover = "auto") {
     core::ClusterConfig c = config(node, "auto", takeover);
     c.mode = "active-active";
-    c.node_address = "10.0.0." + node.substr(2) + ":2049";  // gwN → 10.0.0.N
+    // gwN → 10.0.0.N
+    c.node_address = "10.0.0." + node.substr(2) + ":2049";
     return c;
 }
 
@@ -530,7 +542,8 @@ TEST(FsClusterController, RenewIsOneWritePerTick) {
     EXPECT_EQ(count(store.log, "renew_fences"), 5u);
     EXPECT_TRUE(rec.calls.empty());
     int64_t expires = store.fences["gw1"].expires_at_ms;
-    EXPECT_TRUE(expires > test::wall_now_ms() + 2500);  // 3 × 1 s lease, just renewed
+    // 3 × 1 s lease, just renewed
+    EXPECT_TRUE(expires > test::wall_now_ms() + 2500);
 }
 
 // One export taken elsewhere (forced takeover or split brain) drains that export
@@ -554,11 +567,13 @@ TEST(FsClusterController, ActiveLosesOneFsidDrainsOnlyThat) {
     (void)store.put_owner(2, {"gw2", "10.0.0.2:2049", 7});
     store.log.clear();
     ctl.tick();
-    EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);  // drained inline
+    // drained inline
+    EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);
     EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
     EXPECT_TRUE(fs_role(ctl, 3) == server::Role::kActive);
     EXPECT_STREQ(joined(rec.calls), "deactivate:2");
-    EXPECT_STREQ(joined(store.log), "renew_fences");  // no release of gw2's hold
+    // no release of gw2's hold
+    EXPECT_STREQ(joined(store.log), "renew_fences");
     ASSERT_TRUE(store.fences["gw2"].holds.size() == 1u);
     ASSERT_TRUE(store.fences["gw1"].holds.size() == 2u);
     // The view refers F2 to gw2 (owner record: address + fs epoch), serves F1/F3.
@@ -603,7 +618,8 @@ TEST(FsClusterController, ActiveLosesOneFsidDrainsOnlyThat) {
     EXPECT_EQ(count(rec.calls, "deactivate:1"), 1u);
     EXPECT_EQ(count(rec.calls, "deactivate:3"), 1u);
     EXPECT_EQ(ctl.snapshot()[0].fence_lost, 1u);
-    EXPECT_TRUE(store.fences["gw1"].holds.size() == 3u);  // not released
+    // not released
+    EXPECT_TRUE(store.fences["gw1"].holds.size() == 3u);
     // Still unreachable: nothing is retaken (a fence we cannot renew is not worth
     // taking); once the store answers again our own live record makes them ours.
     ctl.tick();
@@ -612,7 +628,8 @@ TEST(FsClusterController, ActiveLosesOneFsidDrainsOnlyThat) {
     store.fail_renew = Errno::kOk;
     ctl.tick();
     for (uint32_t f = 1; f <= 3; ++f) EXPECT_TRUE(fs_role(ctl, f) == server::Role::kActive);
-    EXPECT_STREQ(rec.takeovers.back().prev_node, "");  // our own record: nobody to evict
+    // our own record: nobody to evict
+    EXPECT_STREQ(rec.takeovers.back().prev_node, "");
 }
 
 // Remote and unowned exports as the view reports them, and the node-order policy:
@@ -629,9 +646,12 @@ TEST(FsClusterController, RemoteUnownedAndNodeOrder) {
     // gw2 is alive (heartbeat) but holds nothing yet.
     (void)store.renew_fences("gw2", 60s);
     ctl.tick();
-    EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);   // first in line
-    EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);  // gw2's turn: yielded
-    EXPECT_TRUE(fs_role(ctl, 3) == server::Role::kStandby);  // not ours to take
+    // first in line
+    EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+    // gw2's turn: yielded
+    EXPECT_TRUE(fs_role(ctl, 2) == server::Role::kStandby);
+    // not ours to take
+    EXPECT_TRUE(fs_role(ctl, 3) == server::Role::kStandby);
     EXPECT_TRUE(view_of(view, 2).role == core::FsRole::kUnowned);
     EXPECT_TRUE(view_of(view, 3).role == core::FsRole::kUnowned);
     EXPECT_STREQ(view_of(view, 2).address, "");
@@ -752,7 +772,8 @@ TEST(FsClusterController, PostedActivationFailureAndShutdown) {
     EXPECT_TRUE(rec.calls.empty());
     EXPECT_EQ(queue.size(), 2u);
     ASSERT_TRUE(store.fences["gw1"].holds.size() == 2u);
-    ctl.tick();  // still Activating: renewed, not re-taken, not drained
+    // still Activating: renewed, not re-taken, not drained
+    ctl.tick();
     EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActivating);
     EXPECT_EQ(queue.size(), 2u);
     EXPECT_EQ(count(store.log, "acquire_fs:1"), 1u);
@@ -790,7 +811,8 @@ TEST(FsClusterController, PostedActivationFailureAndShutdown) {
     EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kStandby);
     EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kUnowned);
     EXPECT_TRUE(view_of(view, 2).role == core::FsRole::kUnowned);
-    ctl.shutdown();  // idempotent
+    // idempotent
+    ctl.shutdown();
 
     // The timer thread: with a 1 s lease it takes its exports over within a tick.
     MemStore store2;
@@ -821,13 +843,16 @@ TEST(FsClusterController, TakeoverFollowsNodeOrder) {
     store.fs_taken_by(1, "gw1", 4);
     store.fs_epochs[1] = 4;
     (void)store.put_owner(1, {"gw1", "10.0.0.1:2049", 4});
-    (void)store.renew_fences("gw2", 60s);  // alive, holds nothing
-    store.age_out_node("gw1", 1000);       // dead one second ago
+    // alive, holds nothing
+    (void)store.renew_fences("gw2", 60s);
+    // dead one second ago
+    store.age_out_node("gw1", 1000);
     gw3.tick();
     gw3.tick();
     EXPECT_TRUE(fs_role(gw3, 1) == server::Role::kStandby);
     EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kUnowned);
-    EXPECT_STREQ(view_of(view, 1).node, "gw1");  // who lapsed
+    // who lapsed
+    EXPECT_STREQ(view_of(view, 1).node, "gw1");
     EXPECT_TRUE(rec.calls.empty());
     EXPECT_EQ(count(store.log, "acquire_fs:1"), 0u);
     // gw2 lapses as well: gw3 is next in line.
@@ -837,7 +862,8 @@ TEST(FsClusterController, TakeoverFollowsNodeOrder) {
     EXPECT_TRUE(fs_role(gw3, 1) == server::Role::kActive);
     EXPECT_TRUE(joined(rec.calls).starts_with("takeover:1 activate:1"));
     EXPECT_TRUE(joined(store.log).starts_with("renew_fences acquire_fs:1 fs_epoch:1 put_owner:1=gw3"));
-    ASSERT_TRUE(rec.takeovers.size() == 3u);  // F2/F3 on the same tick, see below
+    // F2/F3 on the same tick, see below
+    ASSERT_TRUE(rec.takeovers.size() == 3u);
     EXPECT_STREQ(rec.takeovers[0].prev_node, "gw1");
     EXPECT_EQ(rec.takeovers[0].identity.epoch, 5u);
     EXPECT_STREQ(rec.takeovers[0].identity.node, "gw3");
@@ -901,7 +927,8 @@ TEST(FsClusterController, DeadNodeSpreadsAcrossSuccessors) {
     ASSERT_TRUE(store.fences["gw3"].holds.size() == 1u);
     EXPECT_EQ(store.fences["gw2"].holds[0].fsid, 1u);
     EXPECT_EQ(store.fences["gw3"].holds[0].fsid, 2u);
-    EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);  // F3, lapsed
+    // F3, lapsed
+    EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);
     // Each view refers the other's export to its new owner, with its address.
     EXPECT_TRUE(view_of(view2, 2).role == core::FsRole::kRemote);
     EXPECT_STREQ(view_of(view2, 2).node, "gw3");
@@ -922,9 +949,11 @@ TEST(FsClusterController, StuckUnownedFsidSkipsIdlePredecessor) {
     core::FsOwnerView view;
     FsRecorder rec;
     core::ClusterConfig cfg = aa_config("gw2");
-    cfg.fence_lease_ms = 100;  // ttl 300 ms, stuck after 600 ms
+    // ttl 300 ms, stuck after 600 ms
+    cfg.fence_lease_ms = 100;
     server::FsClusterController gw2(cfg, exports.table, store, view, rec.hooks());
-    (void)store.renew_fences("gw1", 60s);  // alive, idle
+    // alive, idle
+    (void)store.renew_fences("gw1", 60s);
     // F1: held by gw0 (a node since removed from the list) whose record lapsed 700 ms
     // ago, and gw1 — live, first in line — has not taken it: already past the wait,
     // gw2 takes it on its first tick, evicting gw0.
@@ -975,7 +1004,8 @@ TEST(FsClusterController, UnheardPredecessorGetsOneTtlAtStartup) {
     core::FsOwnerView view;
     FsRecorder rec;
     core::ClusterConfig cfg = aa_config("gw2");
-    cfg.fence_lease_ms = 100;  // ttl 300 ms
+    // ttl 300 ms
+    cfg.fence_lease_ms = 100;
     server::FsClusterController gw2(cfg, exports.table, store, view, rec.hooks());
     // gw1 (F1) and gw3 (F2) have no record; F3 is ours outright.
     gw2.tick();
@@ -998,7 +1028,8 @@ TEST(FsClusterController, UnheardPredecessorGetsOneTtlAtStartup) {
     store2.age_out_node("gw1", 1000);
     late.tick();
     EXPECT_TRUE(fs_role(late, 1) == server::Role::kActive);
-    EXPECT_TRUE(fs_role(late, 2) == server::Role::kStandby);  // gw3 unheard, still settling
+    // gw3 unheard, still settling
+    EXPECT_TRUE(fs_role(late, 2) == server::Role::kStandby);
 }
 
 // ---- plan 12 D1: planned migration ---------------------------------------------------
@@ -1051,7 +1082,8 @@ TEST(FsClusterController, MigrateHandsOverViaOwnerRecord) {
     EXPECT_STREQ(store.owners[1].node, "gw2");
     EXPECT_STREQ(store.owners[1].address, "10.0.0.2:2049");
     EXPECT_EQ(store.owners[1].fs_epoch, 1u);
-    EXPECT_TRUE(store.fences["gw1"].holds.size() == 2u);  // F2/F3 only
+    // F2/F3 only
+    EXPECT_TRUE(store.fences["gw1"].holds.size() == 2u);
     // gw1 refers to gw2 already (owner record, gw2's heartbeat live).
     const auto& one = view_of(view1, 1);
     EXPECT_TRUE(one.role == core::FsRole::kRemote);
@@ -1103,7 +1135,8 @@ TEST(FsClusterController, MigrateToDeadTargetFallsBack) {
     core::FsOwnerView view;
     FsRecorder rec;
     core::ClusterConfig cfg = aa_config("gw1");
-    cfg.fence_lease_ms = 100;  // ttl 300 ms
+    // ttl 300 ms
+    cfg.fence_lease_ms = 100;
     server::FsClusterController gw1(cfg, exports.table, store, view, rec.hooks());
     gw1.tick();
     ASSERT_TRUE(fs_role(gw1, 1) == server::Role::kActive);
@@ -1118,7 +1151,8 @@ TEST(FsClusterController, MigrateToDeadTargetFallsBack) {
     EXPECT_TRUE(fs_role(gw1, 1) == server::Role::kActive);
     EXPECT_TRUE(store.log.empty());
     EXPECT_TRUE(rec.calls.empty());
-    EXPECT_STREQ(store.owners[1].node, "gw1");  // still ours
+    // still ours
+    EXPECT_STREQ(store.owners[1].node, "gw1");
     EXPECT_EQ(gw1.migrations(), 0u);
 
     // gw2 alive: the handover goes through; gw2 then dies without taking the export.
@@ -1192,7 +1226,8 @@ TEST(FsClusterController, SyncExportsAddsAndTakes) {
     ctl.sync_exports(set);
     EXPECT_TRUE(fs_role(ctl, 4) == server::Role::kStandby);
     EXPECT_TRUE(view_of(view, 4).role == core::FsRole::kUnowned);
-    EXPECT_TRUE(rec.calls.empty());  // nothing is taken at sync time
+    // nothing is taken at sync time
+    EXPECT_TRUE(rec.calls.empty());
     auto snap = ctl.snapshot();
     ASSERT_TRUE(snap.size() == 4u);
     EXPECT_EQ(snap[3].fsid, 4u);
@@ -1241,7 +1276,8 @@ TEST(FsClusterController, SyncExportsNodesChangeMigratesOwner) {
     plan.update.push_back(export_cfg(1, {"gw3", "gw2"}));
     auto set = apply_plan(exports.table, std::move(plan));
     ASSERT_TRUE(set != nullptr);
-    EXPECT_TRUE(set->by_fsid(1) == exports.table.snapshot()->by_fsid(1));  // updated in place
+    // updated in place
+    EXPECT_TRUE(set->by_fsid(1) == exports.table.snapshot()->by_fsid(1));
     store.log.clear();
     gw1.sync_exports(set);
     EXPECT_STREQ(joined(store.log), "put_owner:1=gw2 release_fs:1");
@@ -1249,7 +1285,8 @@ TEST(FsClusterController, SyncExportsNodesChangeMigratesOwner) {
     EXPECT_TRUE(fs_role(gw1, 1) == server::Role::kStandby);
     EXPECT_EQ(gw1.migrations(), 1u);
     EXPECT_STREQ(store.owners[1].node, "gw2");
-    EXPECT_TRUE(store.fences["gw1"].holds.size() == 2u);  // F2/F3 only
+    // F2/F3 only
+    EXPECT_TRUE(store.fences["gw1"].holds.size() == 2u);
     EXPECT_TRUE(view_of(view1, 1).role == core::FsRole::kRemote);
     EXPECT_STREQ(view_of(view1, 1).node, "gw2");
     EXPECT_STREQ(joined(gw1.snapshot()[0].nodes), "gw3 gw2");
@@ -1316,17 +1353,20 @@ TEST(FsClusterController, SyncExportsRemovalDrainsOwner) {
     store.log.clear();
     gw2.sync_exports(set);
     EXPECT_TRUE(rec2.calls.empty());
-    EXPECT_STREQ(joined(store.log), "release_fs:2");  // a no-op release of a hold it never had
+    // a no-op release of a hold it never had
+    EXPECT_STREQ(joined(store.log), "release_fs:2");
     EXPECT_TRUE(gw2.snapshot().size() == 2u);
     EXPECT_TRUE(view2.snapshot()->find(2) == view2.snapshot()->end());
-    EXPECT_TRUE(exports.table.take_retired().empty());  // gw1 still holds it
+    // gw1 still holds it
+    EXPECT_TRUE(exports.table.take_retired().empty());
 
     // The owner: drained inline (deactivate, fence released), then gone.
     store.log.clear();
     gw1.sync_exports(set);
     EXPECT_STREQ(joined(rec1.calls), "deactivate:2");
     EXPECT_STREQ(joined(store.log), "release_fs:2");
-    EXPECT_TRUE(fs_role(gw1, 2) == server::Role::kStandby);  // unknown fsid reads as Standby
+    // unknown fsid reads as Standby
+    EXPECT_TRUE(fs_role(gw1, 2) == server::Role::kStandby);
     auto snap = gw1.snapshot();
     ASSERT_TRUE(snap.size() == 2u);
     EXPECT_EQ(snap[0].fsid, 1u);
@@ -1359,7 +1399,8 @@ TEST(FsClusterController, SyncExportsRemovalDrainsOwner) {
     hooks.post = [&](std::function<void()> fn) { posted.push_back(std::move(fn)); };
     core::FsOwnerView view1b;
     server::FsClusterController gw1b(aa_config("gw1"), exports.table, store, view1b, std::move(hooks));
-    gw1b.tick();  // F1 and F3 taken: activations posted, not yet run
+    // F1 and F3 taken: activations posted, not yet run
+    gw1b.tick();
     ASSERT_TRUE(fs_role(gw1b, 3) == server::Role::kActivating);
     core::ExportSetPlan drop3;
     drop3.remove.push_back(3);
@@ -1367,7 +1408,8 @@ TEST(FsClusterController, SyncExportsRemovalDrainsOwner) {
     ASSERT_TRUE(set != nullptr);
     gw1b.sync_exports(set);
     EXPECT_TRUE(fs_role(gw1b, 3) == server::Role::kDraining);
-    for (auto& fn : posted) fn();  // the activation finds it Draining and steps aside
+    // the activation finds it Draining and steps aside
+    for (auto& fn : posted) fn();
     posted.clear();
     EXPECT_TRUE(gw1b.snapshot().size() == 1u);
     EXPECT_EQ(gw1b.snapshot()[0].fsid, 1u);
@@ -1434,7 +1476,8 @@ TEST(FsClusterController, SyncExportsNodesChangeNoCandidateKeeps) {
     rec.calls.clear();
     ASSERT_TRUE(ctl.request_takeover(1, false).has_value());
     EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
-    (void)store.renew_fences("gw3", 60s);  // a listed node alive again changes nothing
+    // a listed node alive again changes nothing
+    (void)store.renew_fences("gw3", 60s);
     ctl.tick();
     ctl.tick();
     EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
@@ -1471,7 +1514,8 @@ struct CatalogGateway {
     std::optional<server::CatalogApplier> applier;
     size_t posts = 0, starts = 0, stops = 0;
     std::vector<uint32_t> started, stopped;
-    uint32_t fail_start_fsid = 0;  // start_backend fails for this fsid
+    // start_backend fails for this fsid
+    uint32_t fail_start_fsid = 0;
 
     // `first` builds v1's [[export]] blocks from the box's directory.
     CatalogGateway(const std::string& refresh, const std::function<std::string(const std::string&)>& first) {
@@ -1492,7 +1536,8 @@ struct CatalogGateway {
         auto built = core::ExportTable::build(local);
         ASSERT_TRUE(built.has_value());
         table = std::move(*built);
-        local.exports.clear();  // CoreState::local_config: the host's side only
+        // CoreState::local_config: the host's side only
+        local.exports.clear();
         local.exports_from_catalog = false;
         auto hooks = rec.hooks();
         hooks.after_tick = [this] {
@@ -1547,7 +1592,8 @@ TEST(FsClusterController, CatalogAutoApplyOnTick) {
     EXPECT_EQ(gw.table->size(), 1u);
     gw.ctl->tick();
     ASSERT_TRUE(fs_role(*gw.ctl, 1) == server::Role::kActive);
-    EXPECT_EQ(gw.posts, 0u);  // v1 is current: nothing to post
+    // v1 is current: nothing to post
+    EXPECT_EQ(gw.posts, 0u);
     EXPECT_EQ(gw.applier->pending(), 0u);
 
     // v2 adds fsid 2.
@@ -1573,7 +1619,8 @@ TEST(FsClusterController, CatalogAutoApplyOnTick) {
     EXPECT_TRUE(fs_role(*gw.ctl, 2) == server::Role::kStandby);
     gw.ctl->tick();
     EXPECT_TRUE(fs_role(*gw.ctl, 2) == server::Role::kActive);
-    EXPECT_EQ(gw.posts, 1u);  // nothing new: no second post
+    // nothing new: no second post
+    EXPECT_EQ(gw.posts, 1u);
     EXPECT_EQ(count(gw.rec.calls, "activate:2"), 1u);
 
     // v3 drops fsid 1: drained on the apply, its backend stopped by the sweep the next
@@ -1590,7 +1637,8 @@ TEST(FsClusterController, CatalogAutoApplyOnTick) {
     EXPECT_EQ(gw.table->retired_pending(), 1u);
     EXPECT_EQ(gw.stops, 0u);
     gw.ctl->tick();
-    EXPECT_EQ(gw.posts, 3u);  // the retirement sweep
+    // the retirement sweep
+    EXPECT_EQ(gw.posts, 3u);
     EXPECT_EQ(gw.stops, 1u);
     EXPECT_TRUE(gw.stopped == std::vector<uint32_t>{1});
     EXPECT_EQ(gw.table->retired_pending(), 0u);
@@ -1668,7 +1716,8 @@ TEST(FsClusterController, CatalogApplyFailureKeepsOld) {
     EXPECT_EQ(gw.applier->failures(), 1u);
     EXPECT_TRUE(gw.applier->last_error().find("catalog v2") != std::string::npos);
     EXPECT_TRUE(gw.applier->last_error().find("fsid=2") != std::string::npos);
-    EXPECT_TRUE(gw.table->snapshot() == before);  // nothing published
+    // nothing published
+    EXPECT_TRUE(gw.table->snapshot() == before);
     EXPECT_EQ(gw.starts, 0u);
     EXPECT_EQ(gw.store.catalog_applied["gw1"].version, 1u);
     EXPECT_TRUE(gw.store.catalog_applied["gw1"].status.starts_with("error:catalog v2"));
@@ -1686,7 +1735,8 @@ TEST(FsClusterController, CatalogApplyFailureKeepsOld) {
     ASSERT_TRUE(!again.has_value());
     EXPECT_EQ(gw.applier->failures(), 2u);
     for (int i = 0; i < server::CatalogApplier::kRetryEveryPolls; ++i) gw.ctl->tick();
-    EXPECT_EQ(gw.posts, 2u);  // the automatic retry came around once
+    // the automatic retry came around once
+    EXPECT_EQ(gw.posts, 2u);
     EXPECT_EQ(gw.applier->failures(), 3u);
 
     // A rejected change: fsid 1's path moved.
@@ -1735,7 +1785,8 @@ TEST(FsClusterController, CatalogApplyFailureKeepsOld) {
     gw.ctl->tick();
     EXPECT_EQ(gw.applier->applied(), 5u);
     EXPECT_EQ(gw.applier->pending(), 0u);
-    EXPECT_EQ(gw.applier->failures(), 5u);  // v2 three times, the rejected v3, the failed start
+    // v2 three times, the rejected v3, the failed start
+    EXPECT_EQ(gw.applier->failures(), 5u);
 }
 
 // The failover controller polls the same way: a standby applies too, so the table
@@ -1751,7 +1802,8 @@ TEST(ClusterController, CatalogPollAfterTick) {
     ctl.tick();
     EXPECT_EQ(polls, 2u);
     EXPECT_TRUE(ctl.role() == server::Role::kStandby);
-    store.fail_read = errno_from(EIO);  // an unreadable store still polls
+    // an unreadable store still polls
+    store.fail_read = errno_from(EIO);
     ctl.tick();
     EXPECT_EQ(polls, 3u);
 }

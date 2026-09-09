@@ -29,7 +29,8 @@ void CatalogApplier::poll() {
         std::lock_guard lock(mu_);
         poll_failures_ = 0;
         pending_ = latest > applied_ ? latest : 0;
-        bool held_back = false;  // a failed version: retried on the kRetryEveryPolls-th poll
+        // a failed version: retried on the kRetryEveryPolls-th poll
+        bool held_back = false;
         if (pending_ && pending_ == failed_version_ && polls_until_retry_ > 0 && --polls_until_retry_ > 0)
             held_back = true;
         if (pending_ && !held_back && !applying_ && deps_.local.cluster.catalog_refresh == "auto") {
@@ -106,12 +107,14 @@ Result<uint64_t> CatalogApplier::apply_locked_pipeline(std::string& why) {
     if (!*doc || (*doc)->version <= applied_now) {
         std::lock_guard lock(mu_);
         pending_ = 0;
-        return applied_now;  // nothing newer: idempotent
+        // nothing newer: idempotent
+        return applied_now;
     }
     const uint64_t version = (*doc)->version;
     {
         std::lock_guard lock(mu_);
-        pending_ = version;  // what a failure below is about
+        // what a failure below is about
+        pending_ = version;
     }
     auto next = core::parse_catalog((*doc)->text);
     if (!next)
@@ -172,7 +175,8 @@ Result<uint64_t> CatalogApplier::apply_locked_pipeline(std::string& why) {
     std::set<uint32_t> planned;
     auto want_add = [&](uint32_t fsid) {
         const auto* cfg = merged_by_fsid(fsid);
-        if (!cfg || !planned.insert(fsid).second) return;  // disabled / already planned
+        // disabled / already planned
+        if (!cfg || !planned.insert(fsid).second) return;
         if (set->by_fsid(fsid))
             plan.update.push_back(*cfg);
         else

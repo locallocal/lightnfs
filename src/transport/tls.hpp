@@ -38,10 +38,14 @@ enum class TlsPolicy { kOff, kOptional, kRequired };
 
 struct TlsConfig {
     TlsPolicy policy = TlsPolicy::kOff;
-    std::string cert;                  // server certificate chain, PEM
-    std::string key;                   // server private key, PEM
-    std::string ca;                    // optional CA bundle: when set, client certs are requested+verified
-    bool require_client_cert = false;  // mutual TLS (needs `ca`)
+    // server certificate chain, PEM
+    std::string cert;
+    // server private key, PEM
+    std::string key;
+    // optional CA bundle: when set, client certs are requested+verified
+    std::string ca;
+    // mutual TLS (needs `ca`)
+    bool require_client_cert = false;
 };
 
 // True when this build was compiled with OpenSSL support.
@@ -56,7 +60,8 @@ class TlsContext {
     TlsContext(const TlsContext&) = delete;
     TlsContext& operator=(const TlsContext&) = delete;
 
-    void* native() const { return ctx_; }  // SSL_CTX* (opaque to non-TLS TUs)
+    // SSL_CTX* (opaque to non-TLS TUs)
+    void* native() const { return ctx_; }
 
  private:
     explicit TlsContext(void* ctx) : ctx_(ctx) {}
@@ -86,8 +91,10 @@ class TlsConn {
     rt::Task<Result<void>> flush_out(int fd);
     rt::Task<Result<void>> feed_in(int fd);
 
-    void* ssl_ = nullptr;                                            // SSL*
-    std::vector<std::byte> netbuf_ = std::vector<std::byte>(16384);  // ciphertext scratch
+    // SSL*
+    void* ssl_ = nullptr;
+    // ciphertext scratch
+    std::vector<std::byte> netbuf_ = std::vector<std::byte>(16384);
     // Serializes ciphertext egress: SSL_write on a reply handler and an incidental write
     // from the read loop's SSL_read (TLS 1.3 KeyUpdate/ticket) both drain the outgoing
     // BIO, so their socket sends must not interleave and reorder the byte stream.

@@ -64,7 +64,8 @@ T run(rt::Runtime& runtime, rt::Task<T> task) {
 struct MountOpts {
     bool jukebox = true;
     bool locks = true;
-    std::string uuid;  // [export.cephfs] uuid; empty = derived at takeover
+    // [export.cephfs] uuid; empty = derived at takeover
+    std::string uuid;
     std::shared_ptr<const backend::cephapi::Api> api = testing::FakeCephApi::api();
 };
 struct Mount {
@@ -121,8 +122,10 @@ TEST(Cephfs, CapsHandlesAndResolve) {
     Mount m;
     auto caps = m.be->caps();
     EXPECT_TRUE(caps.has(backend::Cap::kStableHandles));
-    EXPECT_TRUE(caps.has(backend::Cap::kNativeChange));   // stx_version
-    EXPECT_FALSE(caps.has(backend::Cap::kNativeAccess));  // no ceph_ll_access
+    // stx_version
+    EXPECT_TRUE(caps.has(backend::Cap::kNativeChange));
+    // no ceph_ll_access
+    EXPECT_FALSE(caps.has(backend::Cap::kNativeAccess));
     EXPECT_TRUE(caps.has(backend::Cap::kByteLocks));
     EXPECT_TRUE(caps.has(backend::Cap::kJukebox));
     EXPECT_TRUE(caps.has(backend::Cap::kSparseOps));
@@ -134,7 +137,8 @@ TEST(Cephfs, CapsHandlesAndResolve) {
     EXPECT_FALSE(m.be->cluster_fsid().empty());
 
     auto root = m.root();
-    EXPECT_EQ(root->id().len, 17);  // tag + ino + snapid
+    // tag + ino + snapid
+    EXPECT_EQ(root->id().len, 17);
     EXPECT_EQ(static_cast<int>(root->id().bytes[0]), 5);
     EXPECT_EQ(root->type(), backend::FType::kDir);
     auto vino = backend::CephBackend::vino_from_oid(root->id());
@@ -145,7 +149,8 @@ TEST(Cephfs, CapsHandlesAndResolve) {
     auto again = run(m.runtime, m.be->resolve(root->id()));
     ASSERT_TRUE(again.has_value());
     EXPECT_TRUE((*again)->id() == root->id());
-    EXPECT_TRUE(m.be->stats().obj_hits >= 1);  // second resolve hit the handle cache
+    // second resolve hit the handle cache
+    EXPECT_TRUE(m.be->stats().obj_hits >= 1);
 
     // Malformed / foreign handle bytes → ESTALE, never a crash (and no cluster trip).
     std::array<std::byte, 21> local_like{};
@@ -166,7 +171,8 @@ TEST(Cephfs, CapsHandlesAndResolve) {
     std::array<std::byte, 17> unknown{};
     unknown[0] = std::byte{5};
     unknown[1] = std::byte{0x7f};
-    unknown[9] = std::byte{0xfe};  // snapid NOSNAP low byte
+    // snapid NOSNAP low byte
+    unknown[9] = std::byte{0xfe};
     auto gone = run(m.runtime, m.be->resolve(*backend::ObjId::from(unknown)));
     EXPECT_FALSE(gone.has_value());
     EXPECT_EQ(raw(gone.error()), ESTALE);
@@ -183,7 +189,8 @@ TEST(Cephfs, NamespaceOpsAndReaddirCookies) {
     sa.mode = 0750;
     auto dir = run(m.runtime, root->mkdir(m.root_cred, "d", sa));
     ASSERT_TRUE(dir.has_value());
-    EXPECT_EQ(dir->attr.mode, 0750u);  // exact mode regardless of umask
+    // exact mode regardless of umask
+    EXPECT_EQ(dir->attr.mode, 0750u);
     EXPECT_EQ(dir->obj->type(), backend::FType::kDir);
 
     backend::SetAttr fa;
@@ -195,7 +202,8 @@ TEST(Cephfs, NamespaceOpsAndReaddirCookies) {
         EXPECT_EQ(f->attr.mode, 0640u);
         EXPECT_EQ(f->attr.type, backend::FType::kReg);
     }
-    EXPECT_EQ(testing::FakeCephApi::live_fhs(), 0);  // create's Fh is closed right away
+    // create's Fh is closed right away
+    EXPECT_EQ(testing::FakeCephApi::live_fhs(), 0);
     // lookup, ".", ".." at the export root clamps to the root
     auto a = run(m.runtime, dir->obj->lookup(m.root_cred, "a"));
     ASSERT_TRUE(a.has_value());
@@ -244,7 +252,8 @@ TEST(Cephfs, NamespaceOpsAndReaddirCookies) {
     ASSERT_TRUE(run(m.runtime, dir->obj->rename(m.root_cred, "a2", *root, "a3")).has_value());
     auto a3 = run(m.runtime, root->lookup(m.root_cred, "a3"));
     ASSERT_TRUE(a3.has_value());
-    EXPECT_TRUE((*a3)->id() == (*a)->id());  // same inode → same handle (P1)
+    // same inode → same handle (P1)
+    EXPECT_TRUE((*a3)->id() == (*a)->id());
 
     // hard link + nlink, symlink + readlink, mknod fifo
     ASSERT_TRUE(run(m.runtime, dir->obj->link(m.root_cred, **a3, "alink")).has_value());
@@ -305,7 +314,8 @@ TEST(Cephfs, RecreatedObjectGetsNewHandle) {
     ASSERT_TRUE(run(m.runtime, root->unlink(m.root_cred, "f")).has_value());
     auto f2 = run(m.runtime, root->create(m.root_cred, "f", backend::SetAttr{}, nullptr));
     ASSERT_TRUE(f2.has_value());
-    EXPECT_FALSE(f2->obj->id() == oid1);  // P2: inode numbers are never reused
+    // P2: inode numbers are never reused
+    EXPECT_FALSE(f2->obj->id() == oid1);
     auto stale = run(m.runtime, m.be->resolve(oid1));
     EXPECT_FALSE(stale.has_value());
     EXPECT_EQ(raw(stale.error()), ESTALE);
@@ -318,7 +328,8 @@ TEST(Cephfs, ExclusiveCreateReplay) {
                            std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}};
     auto first = run(m.runtime, root->create(m.root_cred, "x", backend::SetAttr{}, &verf));
     ASSERT_TRUE(first.has_value());
-    EXPECT_EQ(first->attr.mode, 0u);  // EXCLUSIVE leaves mode for the follow-up SETATTR
+    // EXCLUSIVE leaves mode for the follow-up SETATTR
+    EXPECT_EQ(first->attr.mode, 0u);
     auto replay = run(m.runtime, root->create(m.root_cred, "x", backend::SetAttr{}, &verf));
     ASSERT_TRUE(replay.has_value());
     EXPECT_TRUE(replay->obj->id() == first->obj->id());
@@ -487,16 +498,19 @@ TEST(Cephfs, NativeChangeCounter) {
     EXPECT_TRUE(a0->change < 1000000000ull);
     auto a1 = run(m.runtime, obj.getattr());
     ASSERT_TRUE(a1.has_value());
-    EXPECT_EQ(a1->change, a0->change);  // nothing changed → same value
+    // nothing changed → same value
+    EXPECT_EQ(a1->change, a0->change);
     ASSERT_TRUE(run(m.runtime, obj.write(anon, 0, m.bytes("v"), backend::Stability::kUnstable)).has_value());
     auto a2 = run(m.runtime, obj.getattr());
     ASSERT_TRUE(a2.has_value());
-    EXPECT_TRUE(a2->change > a1->change);  // data change bumps it
+    // data change bumps it
+    EXPECT_TRUE(a2->change > a1->change);
     backend::SetAttr sa;
     sa.mode = 0600;
     auto a3 = run(m.runtime, obj.setattr(m.root_cred, sa));
     ASSERT_TRUE(a3.has_value());
-    EXPECT_TRUE(a3->change > a2->change);  // metadata change bumps it
+    // metadata change bumps it
+    EXPECT_TRUE(a3->change > a2->change);
     // Directory change: creating an entry bumps the parent's counter.
     auto d0 = run(m.runtime, root->getattr());
     ASSERT_TRUE(d0.has_value());
@@ -534,7 +548,8 @@ TEST(Cephfs, IdentityAndAccess) {
     EXPECT_TRUE(mine->has(backend::Access::kRead));
     EXPECT_TRUE(mine->has(backend::Access::kModify));
     EXPECT_FALSE(mine->has(backend::Access::kExecute));
-    EXPECT_FALSE(mine->has(backend::Access::kLookup));  // not a directory
+    // not a directory
+    EXPECT_FALSE(mine->has(backend::Access::kLookup));
     EXPECT_EQ(testing::FakeCephApi::getattr_calls() - before, 1u);
     auto theirs = run(m.runtime, f->obj->access(stranger, all));
     ASSERT_TRUE(theirs.has_value());
@@ -574,7 +589,8 @@ TEST(Cephfs, IdentityAndAccess) {
     EXPECT_FALSE(nope.has_value());
     EXPECT_EQ(raw(nope.error()), EACCES);
     // No UserPerm leaks across all of the above.
-    EXPECT_EQ(testing::FakeCephApi::live_perms(), 1);  // the gateway's own root perms
+    // the gateway's own root perms
+    EXPECT_EQ(testing::FakeCephApi::live_perms(), 1);
 }
 
 TEST(Cephfs, JukeboxAndBlocklistMapping) {
@@ -709,13 +725,15 @@ TEST(Cephfs, ReclaimLockDelayUntilTakeover) {
             co_return co_await be->resolve(o);
         });
     ASSERT_TRUE(probe.in_grace());
-    EXPECT_EQ(probe.open_reclaim(), 0u);  // OPEN(CLAIM_PREVIOUS) inside grace
+    // OPEN(CLAIM_PREVIOUS) inside grace
+    EXPECT_EQ(probe.open_reclaim(), 0u);
 
     // While the stale lock is held the reclaim push is DELAY, not DENIED.
     for (int i = 0; i < 3; ++i) {
         EXPECT_EQ(probe.lock_reclaim(), test::ReclaimProbe::delay());
         EXPECT_EQ(probe.reclaim_delays(), static_cast<uint64_t>(i + 1));
-        EXPECT_EQ(probe.lock_states(), 0u);  // nothing minted while it retries
+        // nothing minted while it retries
+        EXPECT_EQ(probe.lock_states(), 0u);
         EXPECT_TRUE(probe.in_grace());
     }
     EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);
@@ -772,7 +790,8 @@ TEST(Cephfs, TakeoverReclaimsStaleLocks) {
         ASSERT_TRUE(!conflict.has_value());
         EXPECT_EQ(raw(conflict.error()), EAGAIN);
     }
-    EXPECT_TRUE(m.be->session_uuid().empty());  // a standby's session carries no uuid
+    // a standby's session carries no uuid
+    EXPECT_TRUE(m.be->session_uuid().empty());
 
     // Takeover: reclaim(uuid, RESET) evicted the ghost, our session now carries the
     // uuid, the remounted export serves and the range is free.
@@ -783,7 +802,8 @@ TEST(Cephfs, TakeoverReclaimsStaleLocks) {
     EXPECT_STREQ(m.be->session_uuid(), "cluster-x-9");
     EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);
     EXPECT_TRUE(m.be->started());
-    EXPECT_EQ(m.be->stats().lock_fds, 0u);  // caches and lock Fhs were dropped for the remount
+    // caches and lock Fhs were dropped for the remount
+    EXPECT_EQ(m.be->stats().lock_fds, 0u);
     {
         auto lk = child(m, "lk");
         ASSERT_TRUE(run(m.runtime, mgr.lock(*lk, a, {0, 10}, true, false)).has_value());
@@ -818,7 +838,8 @@ TEST(Cephfs, TakeoverReclaimsStaleLocks) {
 // ("<cluster id>-<fsid>"); taking fsid 10 over reclaims cluster-x-10 alone — the ghost
 // holding cluster-x-9's lock survives until fsid 9's own takeover.
 TEST(Cephfs, TakeoverIsScopedToOneExport) {
-    Mount m;  // fsid 9
+    // fsid 9
+    Mount m;
     backend::CephBackend::Config cfg;
     cfg.fsid = 10;
     cfg.fs_name = "cephfs";
@@ -852,8 +873,10 @@ TEST(Cephfs, TakeoverIsScopedToOneExport) {
     ASSERT_TRUE(testing::FakeCephApi::reclaimed_uuids().size() == 1u);
     EXPECT_STREQ(testing::FakeCephApi::reclaimed_uuids()[0], "cluster-x-10");
     EXPECT_STREQ(be10->session_uuid(), "cluster-x-10");
-    EXPECT_TRUE(m.be->session_uuid().empty());           // fsid 9's session untouched
-    EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);  // cluster-x-9's ghost lock stays
+    // fsid 9's session untouched
+    EXPECT_TRUE(m.be->session_uuid().empty());
+    // cluster-x-9's ghost lock stays
+    EXPECT_EQ(testing::FakeCephApi::stale_locks(), 1u);
     {
         // fsid 10's range is free; fsid 9's is still held by the ghost.
         auto lk10b = run(m.runtime, (*root10)->lookup(m.root_cred, "lk10"));
@@ -891,7 +914,8 @@ TEST(Cephfs, TakeoverIsScopedToOneExport) {
 // reclaims cluster-x-10, and the retry wins — while fsid 9's session, uuid and ghost
 // lock never move (design 10 §10.6 "only that fsid is reclaimed").
 TEST(Cephfs, PerFsidTakeoverReclaimIsolation) {
-    Mount m;  // fsid 9
+    // fsid 9
+    Mount m;
     backend::CephBackend::Config cfg;
     cfg.fsid = 10;
     cfg.fs_name = "cephfs";
@@ -936,7 +960,8 @@ TEST(Cephfs, PerFsidTakeoverReclaimIsolation) {
                 co_return co_await be->resolve(o);
             });
         ASSERT_TRUE(probe.in_grace());
-        EXPECT_EQ(probe.open_reclaim(), 0u);  // OPEN(CLAIM_PREVIOUS) inside grace
+        // OPEN(CLAIM_PREVIOUS) inside grace
+        EXPECT_EQ(probe.open_reclaim(), 0u);
 
         // While cluster-x-10's ghost holds the range the reclaim push is DELAY.
         for (int i = 0; i < 3; ++i) {
@@ -1009,7 +1034,8 @@ TEST(Cephfs, TakeoverExplicitUuidAndFailures) {
     EXPECT_EQ(testing::FakeCephApi::reclaim_calls(), 2u);
     testing::FakeCephApi::fail_reclaim(0);
     ASSERT_TRUE(run(m.runtime, m.be->takeover(who)).has_value());
-    EXPECT_STREQ(testing::FakeCephApi::last_uuid(), "ha-uuid-1");  // the configured one
+    // the configured one
+    EXPECT_STREQ(testing::FakeCephApi::last_uuid(), "ha-uuid-1");
     EXPECT_STREQ(m.be->session_uuid(), "ha-uuid-1");
     EXPECT_EQ(testing::FakeCephApi::stale_locks(), 0u);
     {
@@ -1082,7 +1108,8 @@ TEST(Cephfs, StopRestartAndLeakFree) {
         EXPECT_FALSE(down.has_value());
         EXPECT_EQ(raw(down.error()), ENOTCONN);
         ASSERT_TRUE(run(m.runtime, m.be->start()).has_value());
-        auto back = run(m.runtime, m.be->resolve(oid));  // inode numbers survive a remount (P1)
+        // inode numbers survive a remount (P1)
+        auto back = run(m.runtime, m.be->resolve(oid));
         ASSERT_TRUE(back.has_value());
         EXPECT_STREQ(m.read_all(**back), "abc");
         back->reset();
@@ -1143,7 +1170,8 @@ TEST(Cephfs, ConfigFactory) {
     EXPECT_FALSE(c->native_locks().has_value());
     EXPECT_FALSE(c->started());
 
-    backend::BackendConfig minimal;  // everything can come from ceph.conf
+    // everything can come from ceph.conf
+    backend::BackendConfig minimal;
     minimal.path = "/data";
     minimal.fsid = 5;
     EXPECT_TRUE(factory->make(minimal) != nullptr);

@@ -34,7 +34,8 @@ static_assert(sizeof(Fid) == 16, "struct lu_fid layout");
 // name_to_handle_at handle type for Lustre; the handle body is
 // struct lustre_nfs_fid { struct lu_fid lnf_child; struct lu_fid lnf_parent; }.
 inline constexpr int kFileIdLustre = 0x97;
-inline constexpr uint64_t kSuperMagic = 0x0BD00BD0;  // LL_SUPER_MAGIC
+// LL_SUPER_MAGIC
+inline constexpr uint64_t kSuperMagic = 0x0BD00BD0;
 
 // HSM state bits (enum hsm_states).
 inline constexpr uint32_t kHsExists = 0x01;
@@ -53,10 +54,13 @@ inline constexpr uint32_t kHpsRunning = 2;
 inline constexpr uint32_t kHpsDone = 3;
 
 struct HsmState {
-    uint32_t states = 0;  // kHs* bits
+    // kHs* bits
+    uint32_t states = 0;
     uint32_t archive_id = 0;
-    uint32_t in_progress_state = 0;   // kHps*
-    uint32_t in_progress_action = 0;  // kHua*
+    // kHps*
+    uint32_t in_progress_state = 0;
+    // kHua*
+    uint32_t in_progress_action = 0;
 };
 
 // "0x200000401:0x1:0x0" — the DFID_NOBRACE form .lustre/fid accepts.

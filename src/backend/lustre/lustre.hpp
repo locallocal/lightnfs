@@ -41,14 +41,18 @@ class LustreLockMgr;
 class LustreBackend final : public LocalBackend {
  public:
     struct Config {
-        std::string path;  // export root (a directory inside the Lustre mount)
+        // export root (a directory inside the Lustre mount)
+        std::string path;
         uint64_t fsid = 0;
-        std::string mount;  // Lustre mount root; empty = walk up from path while st_dev matches
+        // Lustre mount root; empty = walk up from path while st_dev matches
+        std::string mount;
         size_t fd_cache = 4096;
         Identity identity = Identity::kCheck;
         bool enrich_readdir = true;
-        bool hsm = true;           // released files → kJukebox + RESTORE kick
-        bool native_locks = true;  // OFD locks → kByteLocks / native_locks()
+        // released files → kJukebox + RESTORE kick
+        bool hsm = true;
+        // OFD locks → kByteLocks / native_locks()
+        bool native_locks = true;
     };
 
     // `ops` null: the real kernel client.  Fails with EOPNOTSUPP when the mount root is
@@ -63,10 +67,14 @@ class LustreBackend final : public LocalBackend {
     const std::string& mount_path() const { return mount_path_; }
 
     struct Stats {
-        uint64_t jukebox = 0;       // data opens answered kJukebox (file released)
-        uint64_t hsm_checks = 0;    // HSM state queries (one per regular-file data open)
-        uint64_t hsm_restores = 0;  // RESTORE requests submitted
-        size_t lock_fds = 0;        // descriptors pinned by native byte-range locks
+        // data opens answered kJukebox (file released)
+        uint64_t jukebox = 0;
+        // HSM state queries (one per regular-file data open)
+        uint64_t hsm_checks = 0;
+        // RESTORE requests submitted
+        uint64_t hsm_restores = 0;
+        // descriptors pinned by native byte-range locks
+        size_t lock_fds = 0;
     };
     Stats stats() const;
 
@@ -90,7 +98,8 @@ class LustreBackend final : public LocalBackend {
 
     Config lcfg_;
     const llapi::Ops& ops_;
-    int lustre_fd_ = -1;  // O_RDONLY directory fd on the mount root (.lustre/fid lives there)
+    // O_RDONLY directory fd on the mount root (.lustre/fid lives there)
+    int lustre_fd_ = -1;
     std::string mount_path_;
     std::unique_ptr<LustreLockMgr> locks_;
     std::atomic<uint64_t> jukebox_{0}, hsm_checks_{0}, hsm_restores_{0};
@@ -112,7 +121,8 @@ class LustreLockMgr final : public LockMgr {
     rt::Task<Result<std::optional<LockConflict>>> test(Object&, LockRange, bool exclusive) override;
     rt::Task<Result<void>> release(Object&, const LockOwnerId&) override;
     size_t fds() const;
-    void close_all();  // backend stop
+    // backend stop
+    void close_all();
 
  private:
     struct Key {

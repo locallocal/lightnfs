@@ -118,14 +118,17 @@ std::vector<std::byte> build_call(uint32_t xid, uint32_t proc, uint32_t cred_fla
     BufferPool pool;
     xdr::XdrEnc enc(pool);
     enc.u32(xid);
-    enc.u32(0);  // CALL
+    // CALL
+    enc.u32(0);
     enc.u32(2);
     enc.u32(kProg);
     enc.u32(1);
     enc.u32(proc);
     enc.u32(cred_flavor);
-    enc.u32(0);  // cred body len
-    enc.u32(0);  // verf AUTH_NONE
+    // cred body len
+    enc.u32(0);
+    // verf AUTH_NONE
+    enc.u32(0);
     enc.u32(0);
     if (proc == 1)
         enc.opaque(std::span<const std::byte>(reinterpret_cast<const std::byte*>(payload.data()), payload.size()));
@@ -235,14 +238,16 @@ bool do_starttls_probe(int fd) {
     auto verf_flavor = dec.u32();
     if (!xid || !reply || !accepted || !verf_flavor) return false;
     if (*reply != 1 || *accepted != 0) return false;
-    if (*verf_flavor != kAuthTls) return false;  // declined: AUTH_NONE
+    // declined: AUTH_NONE
+    if (*verf_flavor != kAuthTls) return false;
     auto body = dec.opaque(64);
     return body && std::string(reinterpret_cast<const char*>(body->data()), body->size()) == "STARTTLS";
 }
 
 SSL_CTX* client_ctx() {
     SSL_CTX* c = SSL_CTX_new(TLS_client_method());
-    SSL_CTX_set_verify(c, SSL_VERIFY_NONE, nullptr);  // test cert is self-signed
+    // test cert is self-signed
+    SSL_CTX_set_verify(c, SSL_VERIFY_NONE, nullptr);
     return c;
 }
 
@@ -256,12 +261,14 @@ TEST(Tls, StartTlsHandshakeAndEcho) {
     int fd = connect_loopback(srv.port());
     ASSERT_TRUE(fd >= 0);
 
-    ASSERT_TRUE(do_starttls_probe(fd));  // RFC 9289 STARTTLS reply
+    // RFC 9289 STARTTLS reply
+    ASSERT_TRUE(do_starttls_probe(fd));
 
     SSL_CTX* cctx = client_ctx();
     SSL* ssl = SSL_new(cctx);
     SSL_set_fd(ssl, fd);
-    ASSERT_TRUE(SSL_connect(ssl) == 1);  // TLS handshake over the same connection
+    // TLS handshake over the same connection
+    ASSERT_TRUE(SSL_connect(ssl) == 1);
 
     // An echo RPC now travels inside TLS.
     auto call = build_call(42, 1, 0, "over-tls");
@@ -269,12 +276,18 @@ TEST(Tls, StartTlsHandshakeAndEcho) {
     std::vector<std::byte> rep;
     ASSERT_TRUE(read_record([&](std::byte* p, size_t n) { return ssl_read_all(ssl, p, n); }, rep));
     xdr::XdrDec dec{std::span<const std::byte>(rep.data(), rep.size())};
-    EXPECT_EQ(*dec.u32(), 42u);  // xid
-    (void)dec.u32();             // REPLY
-    (void)dec.u32();             // MSG_ACCEPTED
-    (void)dec.u32();             // verf flavor
-    (void)dec.u32();             // verf len
-    EXPECT_EQ(*dec.u32(), 0u);   // SUCCESS
+    // xid
+    EXPECT_EQ(*dec.u32(), 42u);
+    // REPLY
+    (void)dec.u32();
+    // MSG_ACCEPTED
+    (void)dec.u32();
+    // verf flavor
+    (void)dec.u32();
+    // verf len
+    (void)dec.u32();
+    // SUCCESS
+    EXPECT_EQ(*dec.u32(), 0u);
     auto echoed = *dec.opaque(1 << 16);
     EXPECT_STREQ(std::string(reinterpret_cast<const char*>(echoed.data()), echoed.size()), "over-tls");
 
@@ -312,11 +325,16 @@ TEST(Tls, RequiredRejectsCleartextOps) {
     std::vector<std::byte> rep;
     ASSERT_TRUE(read_record([&](std::byte* p, size_t n) { return raw_read(fd, p, n); }, rep));
     xdr::XdrDec dec{std::span<const std::byte>(rep.data(), rep.size())};
-    EXPECT_EQ(*dec.u32(), 9u);  // xid
-    (void)dec.u32();            // REPLY
-    EXPECT_EQ(*dec.u32(), 1u);  // MSG_DENIED
-    EXPECT_EQ(*dec.u32(), 1u);  // AUTH_ERROR
-    EXPECT_EQ(*dec.u32(), 5u);  // AUTH_TOOWEAK
+    // xid
+    EXPECT_EQ(*dec.u32(), 9u);
+    // REPLY
+    (void)dec.u32();
+    // MSG_DENIED
+    EXPECT_EQ(*dec.u32(), 1u);
+    // AUTH_ERROR
+    EXPECT_EQ(*dec.u32(), 1u);
+    // AUTH_TOOWEAK
+    EXPECT_EQ(*dec.u32(), 5u);
     close(fd);
 
     // The STARTTLS probe (a NULL) is still accepted, and TLS then works.
@@ -350,12 +368,18 @@ TEST(Tls, OffDeclinesProbeAndStaysCleartext) {
     std::vector<std::byte> rep;
     ASSERT_TRUE(read_record([&](std::byte* p, size_t n) { return raw_read(fd, p, n); }, rep));
     xdr::XdrDec dec{std::span<const std::byte>(rep.data(), rep.size())};
-    EXPECT_EQ(*dec.u32(), 3u);  // xid
-    (void)dec.u32();            // REPLY
-    (void)dec.u32();            // MSG_ACCEPTED
-    EXPECT_EQ(*dec.u32(), 0u);  // verf flavor AUTH_NONE (declined)
-    EXPECT_EQ(*dec.u32(), 0u);  // verf len 0
-    EXPECT_EQ(*dec.u32(), 0u);  // SUCCESS
+    // xid
+    EXPECT_EQ(*dec.u32(), 3u);
+    // REPLY
+    (void)dec.u32();
+    // MSG_ACCEPTED
+    (void)dec.u32();
+    // verf flavor AUTH_NONE (declined)
+    EXPECT_EQ(*dec.u32(), 0u);
+    // verf len 0
+    EXPECT_EQ(*dec.u32(), 0u);
+    // SUCCESS
+    EXPECT_EQ(*dec.u32(), 0u);
 
     // The connection stays usable in cleartext.
     auto call = build_call(4, 1, 0, "still-here");
@@ -382,7 +406,8 @@ TEST(Tls, ConfigSectionParsesAndValidates) {
     ASSERT_TRUE(ok.has_value());
     EXPECT_STREQ(ok->server.tls_mode, "required");
     EXPECT_STREQ(ok->server.tls_cert, cert.cert);
-    EXPECT_TRUE(core::validate_config(*ok).has_value());  // real cert files: valid
+    // real cert files: valid
+    EXPECT_TRUE(core::validate_config(*ok).has_value());
 
     // A non-off mode with no cert/key is rejected by validate_config.
     auto no_cert = core::parse_config("[tls]\nmode = \"optional\"\n" + exp);

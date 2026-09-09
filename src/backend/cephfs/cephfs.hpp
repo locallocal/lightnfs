@@ -63,22 +63,32 @@ class CephLockMgr;
 class CephBackend final : public Backend {
  public:
     struct Config {
-        std::string conf;          // ceph.conf; empty = library defaults ($CEPH_CONF, /etc/ceph/ceph.conf)
-        std::string id;            // client id without the "client." prefix; empty = library default
-        std::string keyring;       // ceph_conf_set("keyring", …)
-        std::string mon_host;      // ceph_conf_set("mon_host", …)
-        std::string fs_name;       // ceph_select_filesystem; empty = the cluster's default fs
-        std::string subdir = "/";  // export root inside the filesystem (the mount root)
-        std::string log_file;      // ceph_conf_set("log_file", …); empty = library default
+        // ceph.conf; empty = library defaults ($CEPH_CONF, /etc/ceph/ceph.conf)
+        std::string conf;
+        // client id without the "client." prefix; empty = library default
+        std::string id;
+        // ceph_conf_set("keyring", …)
+        std::string keyring;
+        // ceph_conf_set("mon_host", …)
+        std::string mon_host;
+        // ceph_select_filesystem; empty = the cluster's default fs
+        std::string fs_name;
+        // export root inside the filesystem (the mount root)
+        std::string subdir = "/";
+        // ceph_conf_set("log_file", …); empty = library default
+        std::string log_file;
         // Session uuid every gateway of the cluster reclaims on takeover; empty = derived
         // from the cluster id and fsid at takeover time (the same on every gateway).
         std::string uuid;
-        std::vector<std::pair<std::string, std::string>> options;  // extra ceph_conf_set pairs
+        // extra ceph_conf_set pairs
+        std::vector<std::pair<std::string, std::string>> options;
         uint64_t fsid = 0;
         size_t fd_cache = 1024;
         bool enrich_readdir = true;
-        bool jukebox = true;       // transport-class errors → kJukebox (else EIO)
-        bool native_locks = true;  // ceph_ll_setlk → kByteLocks / native_locks()
+        // transport-class errors → kJukebox (else EIO)
+        bool jukebox = true;
+        // ceph_ll_setlk → kByteLocks / native_locks()
+        bool native_locks = true;
     };
 
     // `api` null: dlopen the system libcephfs at start().  Construction never touches
@@ -113,12 +123,16 @@ class CephBackend final : public Backend {
         size_t fd_entries = 0;
         uint64_t obj_hits = 0, obj_misses = 0;
         size_t obj_entries = 0;
-        uint64_t jukebox = 0;      // transport errors surfaced as kJukebox
-        uint64_t blocklisted = 0;  // EBLOCKLISTED seen (permanent until restart)
-        size_t lock_fds = 0;       // Fh pinned by native byte-range locks
+        // transport errors surfaced as kJukebox
+        uint64_t jukebox = 0;
+        // EBLOCKLISTED seen (permanent until restart)
+        uint64_t blocklisted = 0;
+        // Fh pinned by native byte-range locks
+        size_t lock_fds = 0;
     };
     Stats stats() const;
-    size_t flush_fd_cache();  // `lightnfs-ctl fdcache flush`: drops unpinned entries
+    // `lightnfs-ctl fdcache flush`: drops unpinned entries
+    size_t flush_fd_cache();
 
     // Sticky fsync failure per design 06 §6.2 (same contract as the local backend).
     void poison(const ObjId& oid);
@@ -155,13 +169,15 @@ class CephBackend final : public Backend {
     Result<Attr> stat_sync(Inode* in, const UserPerm* perms) const;
     static ObjId oid_of(const struct ceph_statx& st);
     ObjPtr wrap(ObjRef ref, const ObjId& oid, FType type);
-    Result<ObjPtr> wrap_new(Inode* in, const struct ceph_statx& st);  // adopts the reference
+    // adopts the reference
+    Result<ObjPtr> wrap_new(Inode* in, const struct ceph_statx& st);
     static bool valid_name(std::string_view name, bool allow_dotdot = false);
 
     Config cfg_;
     std::shared_ptr<const cephapi::Api> api_;
     ceph_mount_info* mount_ = nullptr;
-    UserPerm* root_perms_ = nullptr;  // the gateway's own identity (fd cache, locks)
+    // the gateway's own identity (fd cache, locks)
+    UserPerm* root_perms_ = nullptr;
     Caps caps_;
     FsLimits limits_;
     ObjRef root_;
@@ -242,9 +258,11 @@ class CephLockMgr final : public LockMgr {
     rt::Task<Result<std::optional<LockConflict>>> test(Object&, LockRange, bool exclusive) override;
     rt::Task<Result<void>> release(Object&, const LockOwnerId&) override;
     size_t fds() const;
-    void close_all();  // backend stop
+    // backend stop
+    void close_all();
 
-    static uint64_t owner_key(const LockOwnerId& owner);  // FNV-1a over the bytes
+    // FNV-1a over the bytes
+    static uint64_t owner_key(const LockOwnerId& owner);
 
  private:
     struct Key {

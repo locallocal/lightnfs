@@ -2,7 +2,8 @@
 
 #include <spdlog/async.h>
 #include <spdlog/sinks/rotating_file_sink.h>
-#include <spdlog/sinks/stdout_sinks.h>  // also provides stderr_sink_mt
+// also provides stderr_sink_mt
+#include <spdlog/sinks/stdout_sinks.h>
 
 #include <memory>
 #include <mutex>
@@ -36,7 +37,8 @@ spdlog::logger* logger() {
 }  // namespace detail
 
 void init_async_logging(const LogSinkConfig& cfg) {
-    auto level = detail::logger()->level();  // keep what set_log_level configured
+    // keep what set_log_level configured
+    auto level = detail::logger()->level();
     spdlog::init_thread_pool(8192, 1);
     spdlog::sink_ptr sink;
     if (cfg.file.empty()) {

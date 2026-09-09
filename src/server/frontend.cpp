@@ -37,7 +37,8 @@ Management Management::start(const core::ServerConfig& cfg, rt::Runtime& runtime
     if (cfg.metrics_port != 0) {
         std::vector<core::Cidr> allow;
         for (const auto& text : cfg.metrics_allow) {
-            auto cidr = core::Cidr::parse(text);  // validated at config load
+            // validated at config load
+            auto cidr = core::Cidr::parse(text);
             if (cidr) allow.push_back(std::move(*cidr));
         }
         auto metrics = MetricsHttp::create(cfg.metrics_port, cfg.metrics_bind, std::move(allow));
@@ -106,7 +107,8 @@ std::optional<Frontend> Frontend::start(const core::ServerConfig& cfg, rt::Runti
         return std::nullopt;
     }
     Frontend fe{std::move(*nfs_listener), std::move(*mount_listener), std::move(tls_ctx)};
-    fe.nfs->start();  // per-reactor REUSEPORT accept loops (plan doc 10 §2.3)
+    // per-reactor REUSEPORT accept loops (plan doc 10 §2.3)
+    fe.nfs->start();
     fe.mount->start();
     // Buffer-pool watermark (plan doc 10 §3.5); the listeners are heap-allocated and
     // outlive every metrics scrape (the frontend stops before run_server returns).

@@ -21,7 +21,8 @@
 #include <optional>
 #include <span>
 
-struct statx;  // <sys/stat.h> may not pull it on old glibc; linux/stat.h does
+// <sys/stat.h> may not pull it on old glibc; linux/stat.h does
+struct statx;
 
 namespace lnfs::rt {
 

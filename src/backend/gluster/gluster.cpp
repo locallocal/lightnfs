@@ -20,7 +20,8 @@
 namespace lnfs::backend {
 namespace {
 
-constexpr std::byte kGfidHandle{3};  // ObjId tag (local uses 1 = kernel, 2 = fallback)
+// ObjId tag (local uses 1 = kernel, 2 = fallback)
+constexpr std::byte kGfidHandle{3};
 constexpr size_t kObjIdLen = 1 + gfapi::kHandleLength;
 
 FType mode_type(mode_t mode) {
@@ -261,7 +262,8 @@ class GlusterBackend::FdCache {
             (write && it != shard.entries.end() ? upgrades_ : misses_).fetch_add(1, std::memory_order_relaxed);
         }
         int flags = write ? O_RDWR : O_RDONLY;
-        auto ref = obj.ref_;  // keeps the glfs_object alive across the hop
+        // keeps the glfs_object alive across the hop
+        auto ref = obj.ref_;
         auto opened = co_await rt::offload([this, ref, flags]() -> Result<glfs_fd*> {
             const auto& api = *backend_.api_;
             ScopedIds ids(api, 0, 0, {});
@@ -282,7 +284,8 @@ class GlusterBackend::FdCache {
                 push_back(shard, value.get());
             } else {
                 touch(shard, it->second.get());
-                value = it->second;  // lost the race: adopt the winner, ours closes
+                // lost the race: adopt the winner, ours closes
+                value = it->second;
             }
             evict(shard);
         }
@@ -412,8 +415,10 @@ GlusterBackend::ObjHandle::~ObjHandle() {
 GlusterBackend::GlusterBackend(Config cfg, std::shared_ptr<const gfapi::Api> api)
     : cfg_(std::move(cfg)), api_(std::move(api)) {
     caps_.set(Cap::kSymlink).set(Cap::kHardlink).set(Cap::kMknod);
-    caps_.set(Cap::kStableHandles);  // GFIDs are cluster-persistent (06 §6.6)
-    caps_.set(Cap::kNativeAccess);   // glfs_h_access: bricks decide
+    // GFIDs are cluster-persistent (06 §6.6)
+    caps_.set(Cap::kStableHandles);
+    // glfs_h_access: bricks decide
+    caps_.set(Cap::kNativeAccess);
     caps_.set(Cap::kSparseOps).set(Cap::kCopyRange);
     if (cfg_.jukebox) caps_.set(Cap::kJukebox);
     if (cfg_.native_locks) caps_.set(Cap::kByteLocks);
@@ -468,7 +473,8 @@ Errno GlusterBackend::map_errno(int e) const {
             }
             return errno_from(EIO);
         case 0:
-            return errno_from(EIO);  // libgfapi failed without setting errno
+            // libgfapi failed without setting errno
+            return errno_from(EIO);
         default:
             return errno_from(e);
     }
@@ -541,7 +547,8 @@ ObjPtr GlusterBackend::wrap(ObjRef ref, const ObjId& oid, FType type) {
 }
 
 Result<ObjPtr> GlusterBackend::wrap_new(glfs_object* obj, const struct stat& st) {
-    auto ref = std::make_shared<ObjHandle>(api_.get(), obj);  // adopts (closes on error)
+    // adopts (closes on error)
+    auto ref = std::make_shared<ObjHandle>(api_.get(), obj);
     auto oid = oid_of(obj);
     if (!oid) return Err(oid.error());
     auto entry = obj_cache_->insert(*oid, std::make_shared<ObjCache::Entry>(*oid, ref, mode_type(st.st_mode)));
@@ -766,7 +773,8 @@ rt::Task<Result<AccessMask>> GlusterObject::access(const Cred& cred, AccessMask 
 
 rt::Task<Result<void>> GlusterObject::require_dir(const Cred&) {
     if (type() != FType::kDir) co_return Err(errno_from(ENOTDIR));
-    co_return Result<void>{};  // the bricks enforce write permission on the directory
+    // the bricks enforce write permission on the directory
+    co_return Result<void>{};
 }
 
 rt::Task<Result<ObjPtr>> GlusterObject::lookup(const Cred& cred, std::string_view name) {
@@ -851,7 +859,8 @@ Result<Created> GlusterObject::created_sync(glfs_object* child, const struct sta
     }
     (void)cred;
     auto attr = backend_.attr_from_stat(cur);
-    auto obj = backend_.wrap_new(child, cur);  // adopts child (closed on failure)
+    // adopts child (closed on failure)
+    auto obj = backend_.wrap_new(child, cur);
     if (!obj) return Err(obj.error());
     return Created{std::move(*obj), *attr};
 }
@@ -1007,7 +1016,8 @@ rt::Task<Result<void>> GlusterObject::unlink(const Cred& cred, std::string_view 
         api.glfs_h_close(child);
         if (is_dir) return Err(errno_from(EISDIR));
         if (api.glfs_h_unlink(backend_.fs_, ref->obj, owned.c_str()) < 0) return Err(backend_.map_errno(errno));
-        if (oid) backend_.fd_cache_->drop(*oid);  // no reason to keep a glfd on a dead file
+        // no reason to keep a glfd on a dead file
+        if (oid) backend_.fd_cache_->drop(*oid);
         return {};
     });
 }
@@ -1273,7 +1283,8 @@ rt::Task<Result<uint32_t>> GlusterObject::write(OpenCtx ctx, uint64_t off, std::
             size_t done = 0, idx = 0;
             while (done < total) {
                 ssize_t n;
-                if (short_write) {  // fault: 1 byte, exercising the iovec advance below
+                // fault: 1 byte, exercising the iovec advance below
+                if (short_write) {
                     short_write = false;
                     n = api.glfs_pwrite(fd, vec[idx].iov_base, 1, static_cast<off_t>(off + done), 0, nullptr, nullptr);
                 } else {
@@ -1310,7 +1321,8 @@ rt::Task<Result<uint32_t>> GlusterObject::write(OpenCtx ctx, uint64_t off, std::
 
 rt::Task<Result<void>> GlusterObject::commit(OpenCtx ctx, uint64_t, uint64_t) {
     if (type() != FType::kReg) co_return Err(errno_from(EINVAL));
-    if (backend_.is_poisoned(id())) co_return Err(errno_from(EIO));  // sticky (06 §6.2)
+    // sticky (06 §6.2)
+    if (backend_.is_poisoned(id())) co_return Err(errno_from(EIO));
     glfs_fd* fd = nullptr;
     GlusterBackend::FdCache::Ref ref;
     if (auto* os = open_state(ctx); os && os->writable()) {
@@ -1352,7 +1364,8 @@ rt::Task<Result<uint64_t>> GlusterObject::seek(OpenCtx ctx, uint64_t off, SeekWh
     co_return co_await rt::offload([this, fd, off, what]() -> Result<uint64_t> {
         off_t r =
             backend_.api_->glfs_lseek(fd, static_cast<off_t>(off), what == SeekWhat::kData ? SEEK_DATA : SEEK_HOLE);
-        if (r < 0) return Err(backend_.map_errno(errno));  // ENXIO past EOF / no data
+        // ENXIO past EOF / no data
+        if (r < 0) return Err(backend_.map_errno(errno));
         return static_cast<uint64_t>(r);
     });
 }
@@ -1405,7 +1418,8 @@ rt::Task<Result<uint64_t>> GlusterObject::copy_range(OpenCtx sctx, Object& dst, 
         [this, sfd, dfd, src_off, dst_off, len]() -> Result<uint64_t> {
             const auto& api = *backend_.api_;
             uint64_t want = len;
-            if (want == 0) {  // to EOF
+            // to EOF
+            if (want == 0) {
                 struct stat st{};
                 if (api.glfs_fstat(sfd, &st) < 0) return Err(backend_.map_errno(errno));
                 if (static_cast<uint64_t>(st.st_size) <= src_off) return 0;
@@ -1423,7 +1437,8 @@ rt::Task<Result<uint64_t>> GlusterObject::copy_range(OpenCtx sctx, Object& dst, 
                     n = api.glfs_copy_file_range(sfd, &in, dfd, &out, chunk, 0, nullptr, nullptr, nullptr);
                     if (n < 0 && (errno == EXDEV || errno == EOPNOTSUPP || errno == ENOSYS || errno == EINVAL ||
                                   errno == ENOTSUP)) {
-                        native = false;  // volume without the copy_file_range fop: pread/pwrite
+                        // volume without the copy_file_range fop: pread/pwrite
+                        native = false;
                         n = -1;
                     } else if (n < 0) {
                         return Err(backend_.map_errno(errno));
@@ -1514,7 +1529,8 @@ Result<glfs_fd*> GlusterLockMgr::fd_for(GlusterObject& obj, const LockOwnerId& o
     }
     std::lock_guard lock(mu_);
     auto [it, inserted] = fds_.emplace(key, fd);
-    if (!inserted) {  // lost a race: keep the winner
+    // lost a race: keep the winner
+    if (!inserted) {
         api.glfs_close(fd);
         return it->second;
     }
@@ -1536,7 +1552,8 @@ rt::Task<Result<void>> GlusterLockMgr::lock(Object& object, const LockOwnerId& o
         (void)wait;
         if (backend_.api_->glfs_posix_lock(*fd, F_SETLK, &fl) < 0) {
             int e = errno;
-            if (e == EAGAIN || e == EACCES) return Err(errno_from(EAGAIN));  // conflict
+            // conflict
+            if (e == EAGAIN || e == EACCES) return Err(errno_from(EAGAIN));
             return Err(backend_.map_errno(e));
         }
         return {};
@@ -1549,7 +1566,8 @@ rt::Task<Result<void>> GlusterLockMgr::unlock(Object& object, const LockOwnerId&
     auto keep = obj->ref_;
     co_return co_await rt::offload([this, obj, owner, range]() -> Result<void> {
         auto fd = fd_for(*obj, owner, false);
-        if (!fd) return {};  // nothing held by this owner on this file: unlocking is idempotent
+        // nothing held by this owner on this file: unlocking is idempotent
+        if (!fd) return {};
         struct flock fl = make_flock(range, F_UNLCK);
         if (backend_.api_->glfs_posix_lock(*fd, F_SETLK, &fl) < 0) return Err(backend_.map_errno(errno));
         return {};
@@ -1639,7 +1657,8 @@ bool parse_servers(const std::string& value, std::vector<GlusterBackend::Server>
         while (!item.empty() && item.front() == ' ') item.erase(item.begin());
         if (item.empty()) continue;
         GlusterBackend::Server s;
-        if (item.front() == '[') {  // [v6]:port
+        // [v6]:port
+        if (item.front() == '[') {
             size_t close = item.find(']');
             if (close == std::string::npos) return false;
             s.host = item.substr(1, close - 1);

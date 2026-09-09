@@ -15,10 +15,14 @@ inline constexpr size_t kMaxNameLen = 255;
 
 enum class NameCheck : uint8_t {
     kOk,
-    kEmpty,    // zero-length component
-    kTooLong,  // longer than max_len
-    kBadChar,  // contains '/' or NUL
-    kDot,      // "." or ".." — legal to look up, never to create/remove
+    // zero-length component
+    kEmpty,
+    // longer than max_len
+    kTooLong,
+    // contains '/' or NUL
+    kBadChar,
+    // "." or ".." — legal to look up, never to create/remove
+    kDot,
 };
 
 // Evaluation order: empty -> length -> characters -> dots.

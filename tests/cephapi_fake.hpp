@@ -47,11 +47,14 @@ struct FakeCephApi {
     // A failed gateway's residue: an exclusive lock on `rel_path` (relative to the
     // root) held by a ghost session carrying `uuid`; false when the file is missing.
     static bool plant_stale_lock(const std::string& rel_path, const std::string& uuid, uint64_t start, uint64_t len);
-    static size_t stale_locks();      // ghost-held segments still in the table
-    static uint64_t reclaim_calls();  // ceph_start_reclaim calls
+    // ghost-held segments still in the table
+    static size_t stale_locks();
+    // ceph_start_reclaim calls
+    static uint64_t reclaim_calls();
     // Every uuid ceph_start_reclaim was called with, in order (plan 12 C2).
     static std::vector<std::string> reclaimed_uuids();
-    static std::string last_uuid();  // the last ceph_set_uuid value
+    // the last ceph_set_uuid value
+    static std::string last_uuid();
     // ceph_start_reclaim fails with -err (ENOTRECOVERABLE, EOPNOTSUPP) until cleared.
     static void fail_reclaim(int err);
 };

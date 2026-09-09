@@ -10,7 +10,8 @@
 namespace lnfs::core {
 
 struct FsProps {
-    backend::FsLimits limits;  // pref_* clamped to max_*
+    // pref_* clamped to max_*
+    backend::FsLimits limits;
     bool link_support = false;
     bool symlink_support = false;
     bool case_insensitive = false;

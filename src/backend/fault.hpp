@@ -12,14 +12,21 @@
 namespace lnfs::backend::fault {
 
 enum class Kind : int {
-    kFsyncEio = 0,  // fsync/fdatasync fails EIO           (LNFS_FAULT_FSYNC_EIO=N)
-    kWriteEnospc,   // data write fails ENOSPC             (LNFS_FAULT_WRITE_ENOSPC=N)
-    kWriteEdquot,   // data write fails EDQUOT             (LNFS_FAULT_WRITE_EDQUOT=N)
-    kReadEio,       // data read fails EIO                 (LNFS_FAULT_READ_EIO=N)
-    kShortWrite,    // data write completes only 1 byte    (LNFS_FAULT_SHORT_WRITE=N)
-    kSlowIo,        // data op sleeps slow_ms() first      (LNFS_FAULT_SLOW_IO=N)
-    kJukebox,       // data op answers kJukebox (v3 JUKEBOX / v4 DELAY): the HSM/cluster
-                    // "try again later" path end to end   (LNFS_FAULT_JUKEBOX=N)
+    // fsync/fdatasync fails EIO (LNFS_FAULT_FSYNC_EIO=N)
+    kFsyncEio = 0,
+    // data write fails ENOSPC (LNFS_FAULT_WRITE_ENOSPC=N)
+    kWriteEnospc,
+    // data write fails EDQUOT (LNFS_FAULT_WRITE_EDQUOT=N)
+    kWriteEdquot,
+    // data read fails EIO (LNFS_FAULT_READ_EIO=N)
+    kReadEio,
+    // data write completes only 1 byte (LNFS_FAULT_SHORT_WRITE=N)
+    kShortWrite,
+    // data op sleeps slow_ms() first (LNFS_FAULT_SLOW_IO=N)
+    kSlowIo,
+    // data op answers kJukebox (v3 JUKEBOX / v4 DELAY): the HSM/cluster
+    // "try again later" path end to end (LNFS_FAULT_JUKEBOX=N)
+    kJukebox,
     kCount,
 };
 

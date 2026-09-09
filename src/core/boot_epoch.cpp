@@ -29,7 +29,8 @@ WriteVerf verifier_from_epoch(uint64_t epoch) {
 }
 
 WriteVerf verifier_for_node(uint64_t epoch, std::string_view node) {
-    uint64_t hash = 1469598103934665603ULL;  // FNV-1a
+    // FNV-1a
+    uint64_t hash = 1469598103934665603ULL;
     for (unsigned char ch : node) {
         hash ^= ch;
         hash *= 1099511628211ULL;

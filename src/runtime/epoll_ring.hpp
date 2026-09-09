@@ -13,7 +13,8 @@
 #include <thread>
 #include <vector>
 
-#include "runtime/offload_pool.hpp"  // MoveOnlyFn
+// MoveOnlyFn
+#include "runtime/offload_pool.hpp"
 #include "runtime/ring_ops.hpp"
 
 namespace lnfs::rt {
@@ -51,7 +52,8 @@ class EpollRing final : public RingOps {
     struct FdQ {
         std::deque<SockOp> in, out;
         bool nonblock_set = false;
-        uint32_t armed = 0;  // current epoll interest
+        // current epoll interest
+        uint32_t armed = 0;
     };
 
     void submit_file(MoveOnlyFn job);
@@ -61,7 +63,8 @@ class EpollRing final : public RingOps {
     void update_interest(int fd, FdQ& q);
     // Runs queued socket ops that are ready; pushes completions to ready_.
     void service_fd(int fd, uint32_t events);
-    static int try_sock_op(SockOp& s, int fd);  // returns res or -EAGAIN
+    // returns res or -EAGAIN
+    static int try_sock_op(SockOp& s, int fd);
 
     // Dense fd-indexed table (plan doc 10 §2.6): fds are small and dense, so direct
     // indexing beats a std::map. null slot = no queued ops for that fd.
@@ -75,10 +78,12 @@ class EpollRing final : public RingOps {
     int epfd_ = -1;
     int evfd_ = -1;
     std::vector<std::unique_ptr<FdQ>> socks_;
-    std::vector<Completion> ready_;  // reactor-thread completions
+    // reactor-thread completions
+    std::vector<Completion> ready_;
 
     std::mutex rmu_;
-    std::vector<Completion> remote_ready_;  // worker completions
+    // worker completions
+    std::vector<Completion> remote_ready_;
 
     std::mutex wmu_;
     std::condition_variable wcv_;

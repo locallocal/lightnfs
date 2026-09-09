@@ -75,10 +75,12 @@ class CatalogApplier {
     size_t retire_exports();
 
     uint64_t applied() const;
-    uint64_t pending() const;  // a newer version seen but not applied (0 = none)
+    // a newer version seen but not applied (0 = none)
+    uint64_t pending() const;
     std::string last_error() const;
     uint64_t failures() const;
-    std::string digest() const;  // of what the table serves
+    // of what the table serves
+    std::string digest() const;
     bool applying() const;
 
  private:
@@ -89,13 +91,18 @@ class CatalogApplier {
     uint64_t applied_ = 0;
     uint64_t pending_ = 0;
     uint64_t failures_ = 0;
-    bool applying_ = false;  // an apply is posted or running
-    bool retiring_ = false;  // a retirement sweep is posted
+    // an apply is posted or running
+    bool applying_ = false;
+    // a retirement sweep is posted
+    bool retiring_ = false;
     std::string last_error_;
-    uint64_t failed_version_ = 0;  // the version the last failure was for
-    int polls_until_retry_ = 0;    // auto retries of failed_version_ wait this many polls
+    // the version the last failure was for
+    uint64_t failed_version_ = 0;
+    // auto retries of failed_version_ wait this many polls
+    int polls_until_retry_ = 0;
     std::string digest_;
-    core::Catalog current_;  // the applied document
+    // the applied document
+    core::Catalog current_;
     int poll_failures_ = 0;
     std::chrono::steady_clock::time_point last_overdue_warning_{};
 };

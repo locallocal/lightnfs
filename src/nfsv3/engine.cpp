@@ -147,7 +147,8 @@ void Engine::register_with(rpc::Dispatcher& dispatcher) {
 }
 
 rt::Task<Result<Engine::Resolved>> Engine::resolve(const FileHandle& fh, const sockaddr_storage& peer) {
-    auto set = exports_.snapshot();  // one snapshot per resolve, held by the result
+    // one snapshot per resolve, held by the result
+    auto set = exports_.snapshot();
     auto decoded = handles_.decode(fh.data, peer, *set);
     if (!decoded) co_return Err(decoded.error());
     auto obj = co_await decoded->export_entry->backend->resolve(decoded->oid);
@@ -174,7 +175,8 @@ rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rp
     if (drc_ && drc_cached(proc)) {
         auto key = rpc::Drc::Key::make(ctx.peer.addr, call.xid, call.prog, call.vers, call.proc, call.args_hash);
         auto claim = co_await drc_->begin(key);
-        if (!claim.owner) {  // retransmission: replay the cached reply bytes verbatim
+        // retransmission: replay the cached reply bytes verbatim
+        if (!claim.owner) {
             xdr::XdrEnc enc(ctx.pool);
             enc.opaque_fixed(*claim.cached);
             co_await ctx.send(enc.take());
@@ -204,28 +206,50 @@ rt::Task<void> Engine::dispatch(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rp
 rt::Task<void> Engine::dispatch_proc(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred, Capture* cap) {
     // Indexed by Proc; NULL and out-of-range procedures never reach here (dispatch).
     static constexpr Handler kHandlers[] = {
-        nullptr,                 // 0  NULL
-        &Engine::proc_getattr,   // 1
-        &Engine::proc_setattr,   // 2
-        &Engine::proc_lookup,    // 3
-        &Engine::proc_access,    // 4
-        &Engine::proc_readlink,  // 5
-        &Engine::proc_read,      // 6
-        &Engine::proc_write,     // 7
-        &Engine::proc_create,    // 8
-        &Engine::proc_mkdir,     // 9
-        &Engine::proc_symlink,   // 10
-        &Engine::proc_mknod,     // 11
-        &Engine::proc_remove,    // 12
-        &Engine::proc_rmdir,     // 13
-        &Engine::proc_rename,    // 14
-        &Engine::proc_link,      // 15
-        &Engine::proc_readdir,   // 16 READDIR
-        &Engine::proc_readdir,   // 17 READDIRPLUS
-        &Engine::proc_fs_query,  // 18 FSSTAT
-        &Engine::proc_fs_query,  // 19 FSINFO
-        &Engine::proc_fs_query,  // 20 PATHCONF
-        &Engine::proc_commit,    // 21
+        // 0  NULL
+        nullptr,
+        // 1
+        &Engine::proc_getattr,
+        // 2
+        &Engine::proc_setattr,
+        // 3
+        &Engine::proc_lookup,
+        // 4
+        &Engine::proc_access,
+        // 5
+        &Engine::proc_readlink,
+        // 6
+        &Engine::proc_read,
+        // 7
+        &Engine::proc_write,
+        // 8
+        &Engine::proc_create,
+        // 9
+        &Engine::proc_mkdir,
+        // 10
+        &Engine::proc_symlink,
+        // 11
+        &Engine::proc_mknod,
+        // 12
+        &Engine::proc_remove,
+        // 13
+        &Engine::proc_rmdir,
+        // 14
+        &Engine::proc_rename,
+        // 15
+        &Engine::proc_link,
+        // 16 READDIR
+        &Engine::proc_readdir,
+        // 17 READDIRPLUS
+        &Engine::proc_readdir,
+        // 18 FSSTAT
+        &Engine::proc_fs_query,
+        // 19 FSINFO
+        &Engine::proc_fs_query,
+        // 20 PATHCONF
+        &Engine::proc_fs_query,
+        // 21
+        &Engine::proc_commit,
     };
     static_assert(std::size(kHandlers) == static_cast<size_t>(Proc::kCommit) + 1);
     return (this->*kHandlers[call.proc])(ctx, call, rpc_cred, cap);
@@ -652,7 +676,8 @@ rt::Task<void> Engine::proc_setattr(ConnCtx& ctx, RpcCall& call, const rpc::Cred
         co_await guard.finish();
         begin_result(enc, ctx, call, core::to_v3(result.error(), Proc::kSetattr));
         encode_wcc_sample(enc, guard.first(), resolved->exp->fsid);
-    } else {  // setattr returns the post-op attributes: no second sample needed
+    } else {
+        // setattr returns the post-op attributes: no second sample needed
         begin_result(enc, ctx, call, Status::kOk);
         encode_wcc(enc, wcc_pre(before), *result, resolved->exp->fsid);
     }
@@ -708,7 +733,8 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
         resolved->exp->metrics.write_bytes.fetch_add(*written, std::memory_order_relaxed);
         resolved->exp->metrics.write_ops.fetch_add(1, std::memory_order_relaxed);
         enc.u32(*written);
-        enc.u32(args->stable);  // the backend honored the requested stability exactly
+        // the backend honored the requested stability exactly
+        enc.u32(args->stable);
         enc.opaque_fixed(verf_);
     }
     co_await reply(ctx, enc, cap);
@@ -959,8 +985,8 @@ rt::Task<void> Engine::proc_rmdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     MutateGuard guard(locks_, *dir->exp, rpc_cred);
     if (auto verdict = guard.precheck({args->name}); !verdict) {
         Status status = verdict_status(verdict);
-        if (verdict.name == core::NameCheck::kDot)  // RFC 1813 §3.3.13
-            status = args->name == "." ? Status::kInval : Status::kExist;
+        // RFC 1813 §3.3.13
+        if (verdict.name == core::NameCheck::kDot) status = args->name == "." ? Status::kInval : Status::kExist;
         auto attr = co_await core::sample_attr(dir->obj);
         begin_result(enc, ctx, call, status);
         encode_wcc_unchanged(enc, attr, dir->exp->fsid);

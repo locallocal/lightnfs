@@ -33,13 +33,20 @@ void put32(std::vector<std::byte>& out, uint32_t v) {
 }
 
 enum class Reply {
-    kSuccess,        // well-formed accept, bool true
-    kPaddedVerf,     // same, but with an 8-byte AUTH verifier before the accept body
-    kShort,          // 8 bytes only
-    kBadXid,         // xid+1
-    kDenied,         // reply_stat = MSG_DENIED
-    kAcceptFailure,  // accept_stat = PROG_UNAVAIL
-    kBoolFalse,      // accepted, but the portmapper answered false
+    // well-formed accept, bool true
+    kSuccess,
+    // same, but with an 8-byte AUTH verifier before the accept body
+    kPaddedVerf,
+    // 8 bytes only
+    kShort,
+    // xid+1
+    kBadXid,
+    // reply_stat = MSG_DENIED
+    kDenied,
+    // accept_stat = PROG_UNAVAIL
+    kAcceptFailure,
+    // accepted, but the portmapper answered false
+    kBoolFalse,
 };
 
 struct FakePortmapper {
@@ -52,7 +59,8 @@ struct FakePortmapper {
     explicit FakePortmapper(Reply mode) {
         fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         ASSERT_TRUE(fd >= 0);
-        timeval to{5, 0};  // a lost datagram must not hang the suite
+        // a lost datagram must not hang the suite
+        timeval to{5, 0};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
         sockaddr_in a{};
         a.sin_family = AF_INET;
@@ -73,7 +81,8 @@ struct FakePortmapper {
         sockaddr_in from{};
         socklen_t fl = sizeof(from);
         ssize_t n = recvfrom(fd, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &fl);
-        if (n < 56) return;  // caller will time out and the test fails on the result
+        // caller will time out and the test fails on the result
+        if (n < 56) return;
         uint32_t xid = get32(req);
         req_prog = get32(req + 12);
         req_vers = get32(req + 16);
@@ -82,18 +91,24 @@ struct FakePortmapper {
         req_arg_port = get32(req + 52);
         std::vector<std::byte> rep;
         put32(rep, mode == Reply::kBadXid ? xid + 1 : xid);
-        put32(rep, 1);                               // REPLY
-        put32(rep, mode == Reply::kDenied ? 1 : 0);  // MSG_ACCEPTED / MSG_DENIED
-        put32(rep, 0);                               // verifier flavor
+        // REPLY
+        put32(rep, 1);
+        // MSG_ACCEPTED / MSG_DENIED
+        put32(rep, mode == Reply::kDenied ? 1 : 0);
+        // verifier flavor
+        put32(rep, 0);
         if (mode == Reply::kPaddedVerf) {
-            put32(rep, 8);  // verifier length: parser must skip 8 payload bytes
+            // verifier length: parser must skip 8 payload bytes
+            put32(rep, 8);
             put32(rep, 0xdeadbeef);
             put32(rep, 0xfeedface);
         } else {
             put32(rep, 0);
         }
-        put32(rep, mode == Reply::kAcceptFailure ? 1 : 0);  // accept_stat
-        put32(rep, mode == Reply::kBoolFalse ? 0 : 1);      // bool result
+        // accept_stat
+        put32(rep, mode == Reply::kAcceptFailure ? 1 : 0);
+        // bool result
+        put32(rep, mode == Reply::kBoolFalse ? 0 : 1);
         size_t send_len = mode == Reply::kShort ? 8 : rep.size();
         sendto(fd, rep.data(), send_len, 0, reinterpret_cast<sockaddr*>(&from), fl);
     }
@@ -107,9 +122,12 @@ TEST(Rpcbind, SetEncodesCallAndParsesSuccess) {
     auto r = server::rpcbind_set(100003, 3, 2049);
     EXPECT_TRUE(r.has_value());
     pm.th.join();
-    EXPECT_EQ(pm.req_prog, 100000u);  // portmapper program
-    EXPECT_EQ(pm.req_vers, 2u);       // PMAP v2
-    EXPECT_EQ(pm.req_proc, 1u);       // PMAPPROC_SET
+    // portmapper program
+    EXPECT_EQ(pm.req_prog, 100000u);
+    // PMAP v2
+    EXPECT_EQ(pm.req_vers, 2u);
+    // PMAPPROC_SET
+    EXPECT_EQ(pm.req_proc, 1u);
     EXPECT_EQ(pm.req_arg_prog, 100003u);
     EXPECT_EQ(pm.req_arg_port, 2049u);
 }
@@ -119,7 +137,8 @@ TEST(Rpcbind, UnsetUsesProcTwo) {
     server::rpcbind_target_port(pm.port);
     EXPECT_TRUE(server::rpcbind_unset(100003, 3).has_value());
     pm.th.join();
-    EXPECT_EQ(pm.req_proc, 2u);  // PMAPPROC_UNSET
+    // PMAPPROC_UNSET
+    EXPECT_EQ(pm.req_proc, 2u);
     EXPECT_EQ(pm.req_arg_port, 0u);
 }
 

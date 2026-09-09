@@ -21,7 +21,8 @@ struct HsmExtent {
     uint64_t offset;
     uint64_t length;
 };
-struct HsmUserState {  // struct hsm_user_state
+// struct hsm_user_state
+struct HsmUserState {
     uint32_t hus_states;
     uint32_t hus_archive_id;
     uint32_t hus_in_progress_state;
@@ -29,7 +30,8 @@ struct HsmUserState {  // struct hsm_user_state
     HsmExtent hus_in_progress_location;
 };
 static_assert(sizeof(HsmUserState) == 32);
-struct HsmRequest {  // struct hsm_request
+// struct hsm_request
+struct HsmRequest {
     uint32_t hr_action;
     uint32_t hr_archive_id;
     uint64_t hr_flags;
@@ -37,25 +39,35 @@ struct HsmRequest {  // struct hsm_request
     uint32_t hr_data_len;
 };
 static_assert(sizeof(HsmRequest) == 24);
-struct HsmUserItem {  // struct hsm_user_item (packed upstream; naturally 32 bytes here)
+// struct hsm_user_item (packed upstream; naturally 32 bytes here)
+struct HsmUserItem {
     Fid hui_fid;
     HsmExtent hui_extent;
 };
 static_assert(sizeof(HsmUserItem) == 32);
-struct HsmUserRequest {  // struct hsm_user_request (header; packed upstream, 24 bytes)
+// struct hsm_user_request (header; packed upstream, 24 bytes)
+struct HsmUserRequest {
     HsmRequest hur_request;
 };
 static_assert(sizeof(HsmUserRequest) == 24);
 
-constexpr unsigned long kIocPath2Fid = _IOR('f', 173, long);              // LL_IOC_PATH2FID
-constexpr unsigned long kIocHsmStateGet = _IOR('f', 211, HsmUserState);   // LL_IOC_HSM_STATE_GET
-constexpr unsigned long kIocHsmRequest = _IOW('f', 217, HsmUserRequest);  // LL_IOC_HSM_REQUEST
+// LL_IOC_PATH2FID
+constexpr unsigned long kIocPath2Fid = _IOR('f', 173, long);
+// LL_IOC_HSM_STATE_GET
+constexpr unsigned long kIocHsmStateGet = _IOR('f', 211, HsmUserState);
+// LL_IOC_HSM_REQUEST
+constexpr unsigned long kIocHsmRequest = _IOW('f', 217, HsmUserRequest);
 
-constexpr uint32_t kLovMagicV1 = 0x0BD10BD0;      // LOV_USER_MAGIC_V1
-constexpr uint32_t kLovMagicV3 = 0x0BD30BD0;      // LOV_USER_MAGIC_V3
-constexpr uint32_t kLovMagicCompV1 = 0x0BD60BD0;  // LOV_USER_MAGIC_COMP_V1
-constexpr size_t kLovMdV1Size = 32;               // sizeof(struct lov_user_md_v1)
-constexpr size_t kLovStripeSizeOffset = 24;       // offsetof(lov_user_md_v1, lmm_stripe_size)
+// LOV_USER_MAGIC_V1
+constexpr uint32_t kLovMagicV1 = 0x0BD10BD0;
+// LOV_USER_MAGIC_V3
+constexpr uint32_t kLovMagicV3 = 0x0BD30BD0;
+// LOV_USER_MAGIC_COMP_V1
+constexpr uint32_t kLovMagicCompV1 = 0x0BD60BD0;
+// sizeof(struct lov_user_md_v1)
+constexpr size_t kLovMdV1Size = 32;
+// offsetof(lov_user_md_v1, lmm_stripe_size)
+constexpr size_t kLovStripeSizeOffset = 24;
 
 // Lustre's struct file_handle body for FILEID_LUSTRE: child FID then parent FID.
 constexpr unsigned kNfsFidBytes = 32;
@@ -125,7 +137,8 @@ class KernelOps final : public Ops {
         HsmUserItem item{};
         item.hui_fid = fid;
         item.hui_extent.offset = 0;
-        item.hui_extent.length = UINT64_MAX;  // whole file
+        // whole file
+        item.hui_extent.length = UINT64_MAX;
         std::memcpy(buf, &req, sizeof req);
         std::memcpy(buf + sizeof req, &item, sizeof item);
         if (::ioctl(mount_fd, kIocHsmRequest, buf) < 0) return Err(errno_from(errno));
@@ -158,7 +171,8 @@ Result<uint32_t> stripe_size_from_lov(const void* data, size_t size) {
     if (magic == kLovMagicV1 || magic == kLovMagicV3) {
         if (size < kLovMdV1Size) return Err(errno_from(EINVAL));
         uint32_t stripe = load_u32(p + kLovStripeSizeOffset);
-        if (stripe == 0) return Err(errno_from(ENODATA));  // "filesystem default"
+        // "filesystem default"
+        if (stripe == 0) return Err(errno_from(ENODATA));
         return stripe;
     }
     if (magic == kLovMagicCompV1) {
@@ -175,7 +189,8 @@ Result<uint32_t> stripe_size_from_lov(const void* data, size_t size) {
         }
         return Err(errno_from(ENODATA));
     }
-    return Err(errno_from(ENODATA));  // foreign / unknown layout: use defaults
+    // foreign / unknown layout: use defaults
+    return Err(errno_from(ENODATA));
 }
 
 const Ops& kernel_ops() {

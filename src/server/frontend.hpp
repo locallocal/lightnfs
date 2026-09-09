@@ -29,8 +29,10 @@
 namespace lnfs::server {
 
 struct Management {
-    std::unique_ptr<CtlServer> ctl;        // null when unavailable
-    std::unique_ptr<MetricsHttp> metrics;  // null when disabled/unavailable
+    // null when unavailable
+    std::unique_ptr<CtlServer> ctl;
+    // null when disabled/unavailable
+    std::unique_ptr<MetricsHttp> metrics;
     // The data plane the ctl commands address: null until a frontend attaches one.
     std::shared_ptr<DataPlaneSlot> plane = std::make_shared<DataPlaneSlot>(nullptr);
 

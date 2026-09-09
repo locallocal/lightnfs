@@ -37,7 +37,8 @@ T run_runtime(rt::Runtime& runtime, rt::Task<T> task) {
             {
                 std::lock_guard lock(*mu);
                 out->emplace(std::move(value));
-                cv->notify_one();  // under the lock: the waiter cannot destroy cv first
+                // under the lock: the waiter cannot destroy cv first
+                cv->notify_one();
             }
         }(std::move(task), &mu, &cv, &result),
         runtime.reactor(0));
@@ -303,7 +304,8 @@ TEST(BackendWrite, V42SparseCopyClone) {
         ASSERT_TRUE(made.has_value());
         auto& be = **made;
         auto caps = be.caps();
-        EXPECT_TRUE(caps.has(backend::Cap::kCopyRange));  // pread/pwrite fallback always
+        // pread/pwrite fallback always
+        EXPECT_TRUE(caps.has(backend::Cap::kCopyRange));
         auto root = run_runtime(runtime, be.root());
         ASSERT_TRUE(root.has_value());
         auto cred = self_cred();
@@ -330,7 +332,8 @@ TEST(BackendWrite, V42SparseCopyClone) {
             EXPECT_EQ(attr->size, 3u << 16);
             auto hole = run_runtime(runtime, src->obj->seek(open, 0, backend::SeekWhat::kHole));
             ASSERT_TRUE(hole.has_value());
-            EXPECT_TRUE(*hole >= (1u << 16) && *hole <= (2u << 16));  // fs granularity
+            // fs granularity
+            EXPECT_TRUE(*hole >= (1u << 16) && *hole <= (2u << 16));
             auto data = run_runtime(runtime, src->obj->seek(open, 1 << 16, backend::SeekWhat::kData));
             ASSERT_TRUE(data.has_value());
             EXPECT_TRUE(*data >= (1u << 16) && *data <= (2u << 16));

@@ -113,11 +113,13 @@ rt::Task<Result<uint32_t>> Object::write(OpenCtx ctx, uint64_t off, std::span<co
             co_await write(ctx, off + done,
                            std::span<const std::byte>(static_cast<const std::byte*>(v.iov_base), v.iov_len), stability);
         if (!n) {
-            if (done > 0) co_return done;  // partial success: report what landed
+            // partial success: report what landed
+            if (done > 0) co_return done;
             co_return Err(n.error());
         }
         done += *n;
-        if (*n < v.iov_len) break;  // short write: stop at the backend's boundary
+        // short write: stop at the backend's boundary
+        if (*n < v.iov_len) break;
     }
     co_return done;
 }

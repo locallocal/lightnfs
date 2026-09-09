@@ -143,7 +143,8 @@ std::string serialize_catalog(const Catalog& catalog) {
             "write_bps = {}\niops = {}\ndisabled = {}\n",
             quote(cfg.path), cfg.fsid, quote(cfg.backend), quote_array(cfg.nodes), quote_array(cfg.clients),
             cfg.readonly, squash, cfg.anon_uid, cfg.anon_gid, cfg.read_bps, cfg.write_bps, cfg.iops, exp.disabled);
-        auto keys = cluster_backend_keys(cfg);  // sorted; per-node keys never leave a host
+        // sorted; per-node keys never leave a host
+        auto keys = cluster_backend_keys(cfg);
         if (keys.empty()) continue;
         out += std::format("[export.{}]\n", cfg.backend);
         for (const auto& [key, value] : keys) out += std::format("{} = {}\n", key, backend_value_text(value));
@@ -156,7 +157,8 @@ Result<std::vector<ExportConfig>> merge_with_local(const Catalog& catalog, const
     for (const auto& exp : catalog.exports) {
         if (exp.disabled) continue;
         ExportConfig cfg = exp.cfg;
-        strip_per_node_keys(cfg);  // per-node keys come from this host only
+        // per-node keys come from this host only
+        strip_per_node_keys(cfg);
         auto defaults = local.backend_defaults.find(cfg.backend);
         if (defaults != local.backend_defaults.end()) {
             for (const auto& [key, value] : defaults->second.values) {
@@ -257,7 +259,8 @@ CatalogDiff diff_catalog(const Catalog& from, const Catalog& to) {
             a.readonly != b.readonly || a.squash != b.squash || a.anon_uid != b.anon_uid || a.anon_gid != b.anon_gid)
             diff.dynamic_changed.push_back(fsid);
     }
-    return diff;  // map iteration made every list fsid ascending
+    // map iteration made every list fsid ascending
+    return diff;
 }
 
 Catalog catalog_from_config(const Config& config) {

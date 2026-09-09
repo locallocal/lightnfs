@@ -43,7 +43,8 @@ TEST(LockMgr, PosixMergeSplitAndConflicts) {
     EXPECT_FALSE(c->exclusive);
     // Upgrade inside a's own shared range beyond b's: carve + coalesce.
     mgr.unlock(f, b, {50, 100});
-    EXPECT_FALSE(mgr.lock(f, a, {20, 30}, true).has_value());  // [0,20)R [20,50)W [50,100)R
+    // [0,20)R [20,50)W [50,100)R
+    EXPECT_FALSE(mgr.lock(f, a, {20, 30}, true).has_value());
     auto segs = mgr.segments(f);
     ASSERT_TRUE(segs.size() == 3);
     EXPECT_EQ(segs[0].start, 0u);

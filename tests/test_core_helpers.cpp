@@ -34,22 +34,31 @@ TEST(CoreNames, CheckComponentClassification) {
 }
 
 TEST(CoreNames, ValidComponentDotPolicy) {
-    EXPECT_TRUE(core::valid_component(".", /*allow_dots=*/true));    // v3 LOOKUP
-    EXPECT_FALSE(core::valid_component(".", /*allow_dots=*/false));  // creation family
+    // v3 LOOKUP
+    EXPECT_TRUE(core::valid_component(".", /*allow_dots=*/true));
+    // creation family
+    EXPECT_FALSE(core::valid_component(".", /*allow_dots=*/false));
     EXPECT_FALSE(core::valid_component("a/b", true));
     EXPECT_TRUE(core::valid_component("regular", false));
 }
 
 TEST(CoreNames, ValidUtf8) {
     EXPECT_TRUE(core::valid_utf8(std::string_view("ascii")));
-    EXPECT_TRUE(core::valid_utf8(std::string_view("\xc3\xa9")));          // é
-    EXPECT_TRUE(core::valid_utf8(std::string_view("\xe4\xb8\xad")));      // 中
-    EXPECT_TRUE(core::valid_utf8(std::string_view("\xf0\x9f\x98\x80")));  // emoji
+    // é
+    EXPECT_TRUE(core::valid_utf8(std::string_view("\xc3\xa9")));
+    // 中
+    EXPECT_TRUE(core::valid_utf8(std::string_view("\xe4\xb8\xad")));
+    // emoji
+    EXPECT_TRUE(core::valid_utf8(std::string_view("\xf0\x9f\x98\x80")));
     EXPECT_FALSE(core::valid_utf8(std::string_view("\xff")));
-    EXPECT_FALSE(core::valid_utf8(std::string_view("\xc0\xaf")));      // overlong
-    EXPECT_FALSE(core::valid_utf8(std::string_view("\xed\xa0\x80")));  // surrogate
-    EXPECT_FALSE(core::valid_utf8(std::string_view("\xef\xbf\xbe")));  // U+FFFE
-    EXPECT_FALSE(core::valid_utf8(std::string_view("\xc3")));          // truncated
+    // overlong
+    EXPECT_FALSE(core::valid_utf8(std::string_view("\xc0\xaf")));
+    // surrogate
+    EXPECT_FALSE(core::valid_utf8(std::string_view("\xed\xa0\x80")));
+    // U+FFFE
+    EXPECT_FALSE(core::valid_utf8(std::string_view("\xef\xbf\xbe")));
+    // truncated
+    EXPECT_FALSE(core::valid_utf8(std::string_view("\xc3")));
 }
 
 TEST(CoreFsProps, DerivesAndClampsFromBackend) {
@@ -140,7 +149,8 @@ TEST(CoreFsProps, NativeBitsFeedChangeAttrType) {
     EXPECT_EQ(change_type(&fs), nfsv4::attr::kChangeTypeTimeMetadata);
     fs.native_change = true;
     EXPECT_EQ(change_type(&fs), nfsv4::attr::kChangeTypeMonotonicIncr);
-    EXPECT_EQ(change_type(nullptr), nfsv4::attr::kChangeTypeMonotonicIncr);  // pseudo-fs
+    // pseudo-fs
+    EXPECT_EQ(change_type(nullptr), nfsv4::attr::kChangeTypeMonotonicIncr);
 }
 
 // Write verifiers (plan 12 E1): failover / single gateway use the epoch alone; under

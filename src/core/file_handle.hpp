@@ -38,7 +38,8 @@ class FileHandleCodec {
     struct DecodedV4 {
         uint32_t fsid = 0;
         backend::ObjId oid;
-        ExportEntry* exp = nullptr;  // null for pseudo handles
+        // null for pseudo handles
+        ExportEntry* exp = nullptr;
     };
     Result<DecodedV4> decode_v4(std::span<const std::byte> fh, const sockaddr_storage& peer,
                                 const ExportSet& exports) const;

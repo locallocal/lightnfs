@@ -16,11 +16,13 @@ namespace lnfs::rpc {
 enum class AuthFlavor : uint32_t { kNone = 0, kSys = 1 };
 
 struct Cred {
-    uint32_t uid = 65534;  // nobody
+    // nobody
+    uint32_t uid = 65534;
     uint32_t gid = 65534;
     SmallVec<uint32_t, 16> gids;
     AuthFlavor flavor = AuthFlavor::kNone;
-    std::string machine;  // AUTH_SYS machinename (v4 principal comparisons)
+    // AUTH_SYS machinename (v4 principal comparisons)
+    std::string machine;
 
     // v4 principal identity (RFC 8881 CLID_IN_USE checks): flavor + machine + uid.
     std::string principal() const {

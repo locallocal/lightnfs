@@ -83,13 +83,14 @@ Result<std::array<std::byte, 16>> load_or_create_hmac_key(const std::string& pat
         return Err(errno_from(e ? e : EIO));
     }
     int rc = ::link(tmp.c_str(), path.c_str());
-    if (rc < 0 && errno != EEXIST)  // no hard links here: rename, refusing to replace
-        rc = ::renameat2(AT_FDCWD, tmp.c_str(), AT_FDCWD, path.c_str(), RENAME_NOREPLACE);
+    // no hard links here: rename, refusing to replace
+    if (rc < 0 && errno != EEXIST) rc = ::renameat2(AT_FDCWD, tmp.c_str(), AT_FDCWD, path.c_str(), RENAME_NOREPLACE);
     e = errno;
     ::unlink(tmp.c_str());
     if (rc == 0) return key;
     if (e != EEXIST) return Err(errno_from(e));
-    return read_existing();  // lost the race: the winner's file is complete by now
+    // lost the race: the winner's file is complete by now
+    return read_existing();
 }
 
 Result<FileHandleCodec> FileHandleCodec::load_or_create(const std::string& state_dir) {
@@ -182,7 +183,8 @@ Result<FileHandleCodec::DecodedV4> FileHandleCodec::decode_v4(std::span<const st
     auto oid = backend::ObjId::from(fh.subspan(5, fh.size() - 13));
     if (!oid) return Err(Errno::kBadHandle);
     out.oid = *oid;
-    if (out.fsid == 0) return out;  // pseudo-fs: no export gate here
+    // pseudo-fs: no export gate here
+    if (out.fsid == 0) return out;
     out.exp = exports.by_fsid(out.fsid);
     if (!out.exp) return Err(errno_from(ESTALE));
     if (!ExportTable::check_client(peer, *out.exp)) return Err(errno_from(EACCES));

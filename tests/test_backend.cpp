@@ -52,7 +52,8 @@ T run_runtime(rt::Runtime& runtime, rt::Task<T> task) {
             {
                 std::lock_guard lock(*mu);
                 out->emplace(std::move(value));
-                cv->notify_one();  // under the lock: the waiter cannot destroy cv first
+                // under the lock: the waiter cannot destroy cv first
+                cv->notify_one();
             }
         }(std::move(task), &mu, &cv, &result),
         runtime.reactor(0));
@@ -77,7 +78,8 @@ TEST(Backend, MemoryLookupReadAndStableCookies) {
     ASSERT_TRUE(dir.has_value());
     auto first = run_immediate(reactor, core::readdir_page(*dir, cred, 0, 3));
     ASSERT_TRUE(first.has_value());
-    EXPECT_EQ(first->ents.size(), 3u);  // ., .., a
+    // ., .., a
+    EXPECT_EQ(first->ents.size(), 3u);
     EXPECT_STREQ(first->ents[0].name, ".");
     EXPECT_STREQ(first->ents[1].name, "..");
     uint64_t cookie = first->ents.back().cookie;
@@ -108,7 +110,8 @@ TEST(Backend, DefaultTakeoverIsANoOpThatSucceeds) {
     auto took = run_immediate(reactor, memory.takeover(id));
     EXPECT_TRUE(took.has_value());
     auto root = run_immediate(reactor, memory.root());
-    ASSERT_TRUE(root.has_value());  // still serving afterwards
+    // still serving afterwards
+    ASSERT_TRUE(root.has_value());
 }
 
 TEST(Backend, HundredThousandEntryTraversalHasNoDuplicatesOrOmissions) {
@@ -179,7 +182,8 @@ TEST(Backend, LocalFallbackReadDirectoryAndStaleHandle) {
     close(fd);
     auto changed = run_runtime(runtime, (*file)->getattr());
     ASSERT_TRUE(changed.has_value());
-    EXPECT_EQ(changed->size, 8u);  // getattr must not serve a stale cached size.
+    // getattr must not serve a stale cached size.
+    EXPECT_EQ(changed->size, 8u);
 
     auto page = run_runtime(runtime, (*root)->readdir(cred, 0, 1));
     ASSERT_TRUE(page.has_value());
@@ -357,7 +361,8 @@ TEST(Core, FileHandleAuthenticatesAndClassifiesFailures) {
     auto inaccessible = codec.decode(fh, denied, *set);
     EXPECT_FALSE(inaccessible.has_value());
     EXPECT_EQ((int)inaccessible.error(), EACCES);
-    core::ExportTable empty;  // the same key over a set without the export: stale
+    // the same key over a set without the export: stale
+    core::ExportTable empty;
     auto stale = codec.decode(fh, loopback(), *empty.snapshot());
     EXPECT_FALSE(stale.has_value());
     EXPECT_EQ((int)stale.error(), ESTALE);
@@ -635,7 +640,8 @@ TEST(Backend, IdentityStrictDeniesForeignCred) {
         auto root = run_runtime(runtime, (*made)->root());
         ASSERT_TRUE(root.has_value());
         backend::SetAttr attrs;
-        attrs.mode = 0600;  // owner-only: the strict check must deny every other uid
+        // owner-only: the strict check must deny every other uid
+        attrs.mode = 0600;
         auto created = run_runtime(runtime, (*root)->create(self, "secret", attrs, nullptr));
         ASSERT_TRUE(created.has_value());
         auto w = run_runtime(

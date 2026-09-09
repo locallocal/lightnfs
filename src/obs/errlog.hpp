@@ -13,7 +13,8 @@ namespace lnfs::obs {
 // resolves it so both the v3 and v4 engines can share the ring.
 void record_error_reply(std::string_view peer, std::string_view what, uint32_t xid, uint32_t status);
 std::string dump_error_replies();
-std::string dump_error_replies_json();  // ctl --json rendering (plan doc 10 §4.2)
+// ctl --json rendering (plan doc 10 §4.2)
+std::string dump_error_replies_json();
 
 // Ring capacity ([server] error_ring, plan doc 10 §3.7; default 64). Resizing drops the
 // entries recorded so far; call it at startup, before traffic.

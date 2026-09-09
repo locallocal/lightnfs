@@ -143,9 +143,12 @@ std::optional<CoreState> build_core_state(core::Config&& config, const Identity&
                    .key = core::FileHandleCodec::from_key_only(identity.key),
                    .epoch = identity.epoch,
                    .cluster = cluster,
-                   .owners = nullptr,       // set under active-active in run_server
-                   .active_active = false,  // "
-                   .node = {},              // "
+                   // set under active-active in run_server
+                   .owners = nullptr,
+                   // "
+                   .active_active = false,
+                   // "
+                   .node = {},
                    .local_config = std::move(local)};
     return core;
 }
@@ -240,7 +243,8 @@ Result<void> run_on_reactor(rt::Reactor& reactor, rt::Task<Result<void>> task) {
             {
                 std::lock_guard lock(*mu);
                 *done = true;
-                cv->notify_one();  // under the lock: the waiter cannot destroy cv first
+                // under the lock: the waiter cannot destroy cv first
+                cv->notify_one();
             }
         }(std::move(task), &mu, &cv, &done, &result),
         reactor);
@@ -486,7 +490,8 @@ int run_server(const std::string& config_path) {
     //     down after them, so it answers while no data plane exists (plan 10 A4).
     std::atomic<ProtocolStack*> active_stack{nullptr};
     MainLoop loop;
-    std::unique_ptr<CatalogApplier> applier;  // catalog mode (plan 12 C2), built below
+    // catalog mode (plan 12 C2), built below
+    std::unique_ptr<CatalogApplier> applier;
     // A reload runs on the main loop (plan 12 C2): the file IO and, in catalog mode,
     // the apply pipeline belong there, not on the ctl reactor.  SIGHUP is already on
     // that thread; the ctl command posts and waits.
@@ -509,9 +514,12 @@ int run_server(const std::string& config_path) {
         return report ? *report : "reload timed out: the main loop did not run it\n";
     };
     std::optional<DataPlaneInstance> plane;
-    std::unique_ptr<ClusterController> controller;       // failover (plan 10 C2)
-    std::unique_ptr<FsClusterController> fs_controller;  // active-active (plan 12 C1)
-    std::optional<Management> mgmt;                      // started below, once the controller exists
+    // failover (plan 10 C2)
+    std::unique_ptr<ClusterController> controller;
+    // active-active (plan 12 C1)
+    std::unique_ptr<FsClusterController> fs_controller;
+    // started below, once the controller exists
+    std::optional<Management> mgmt;
     // The data-plane hooks the single gateway and the controller share (main thread).
     auto bring_up = [&](uint64_t epoch) -> Result<void> {
         core->epoch = epoch;

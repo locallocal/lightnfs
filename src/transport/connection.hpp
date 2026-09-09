@@ -26,9 +26,12 @@
 namespace lnfs::transport {
 
 struct TransportConfig {
-    uint32_t max_fragment = 1u << 20;                     // 03 §3.2
-    uint32_t max_request_size = (1u << 20) + (64 << 10);  // 01 §1.5: 1MiB + header slack
-    int max_inflight_per_conn = 64;                       // v3 path; v4.1 uses session slots
+    // 03 §3.2
+    uint32_t max_fragment = 1u << 20;
+    // 01 §1.5: 1MiB + header slack
+    uint32_t max_request_size = (1u << 20) + (64 << 10);
+    // v3 path; v4.1 uses session slots
+    int max_inflight_per_conn = 64;
     int max_connections = 4096;
     int per_peer_limit = 128;
     // RPC-over-TLS (RFC 9289): null unless the server was configured with a cert.  The
@@ -55,7 +58,8 @@ struct Peer {
     IpKey ip_key() const;
 };
 
-class ConnTracker {  // global + per-peer connection counting (design 03 §3.1)
+// global + per-peer connection counting (design 03 §3.1)
+class ConnTracker {
  public:
     explicit ConnTracker(const TransportConfig& cfg) : cfg_(cfg) {}
     bool try_add(const Peer& p);
@@ -93,7 +97,8 @@ struct ConnCtx {
     RecordStream rs;
     rt::Semaphore inflight;
     rt::CancelSource cancel;
-    int64_t live = 0;  // in-flight handler coroutines (same-reactor)
+    // in-flight handler coroutines (same-reactor)
+    int64_t live = 0;
     rt::Event drained;
     bool send_failed = false;
 
@@ -115,7 +120,8 @@ struct ConnCtx {
     // without a live read loop can inject replies.
     void route_cb_reply(rt::BufferChain rec);
 
-    std::shared_ptr<CbChannel> cb;  // null until first cb_channel()
+    // null until first cb_channel()
+    std::shared_ptr<CbChannel> cb;
 };
 
 // Live-connection registry for `lightnfs-ctl conns` / `kill-conn` (plan doc 10 §4.2).

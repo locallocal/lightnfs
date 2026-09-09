@@ -30,7 +30,8 @@ TEST(Task, LazyStart) {
     bool started = false;
     bool done = false;
     auto t = forty_two(&started);
-    EXPECT_FALSE(started);  // lazy: nothing ran yet
+    // lazy: nothing ran yet
+    EXPECT_FALSE(started);
     spawn(
         [](Task<int> inner, bool* done_, bool* started_) -> Task<void> {
             int v = co_await add_one(std::move(inner));
@@ -39,7 +40,8 @@ TEST(Task, LazyStart) {
             *done_ = true;
         }(std::move(t), &done, &started),
         r);
-    EXPECT_FALSE(done);  // spawn posts; runs only when the reactor turns
+    // spawn posts; runs only when the reactor turns
+    EXPECT_FALSE(done);
     while (r.poll_once()) {
     }
     EXPECT_TRUE(done);

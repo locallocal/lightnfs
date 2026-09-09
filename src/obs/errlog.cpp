@@ -10,7 +10,8 @@ namespace lnfs::obs {
 namespace {
 
 struct Entry {
-    int64_t when_ms = 0;  // wall clock, milliseconds since the epoch
+    // wall clock, milliseconds since the epoch
+    int64_t when_ms = 0;
     uint32_t xid = 0, status = 0;
     // Sized for the longest v4 op name ("BIND_CONN_TO_SESSION"); the old 20-byte field
     // truncated exactly that class of name (plan doc 10 §3.7).
@@ -54,7 +55,8 @@ std::string dump_error_replies() {
     std::lock_guard lock(g_mu);
     std::string out = std::format("total_errors={}\n", g_total);
     for (size_t i = 0; i < g_ring.size(); ++i) {
-        const Entry& e = g_ring[(g_next + i) % g_ring.size()];  // oldest first
+        // oldest first
+        const Entry& e = g_ring[(g_next + i) % g_ring.size()];
         if (e.when_ms == 0) continue;
         out += std::format("ts={}.{:03} peer={} proc={} xid={:#x} status={}\n", e.when_ms / 1000, e.when_ms % 1000,
                            e.peer, e.what, e.xid, e.status);
@@ -67,7 +69,8 @@ std::string dump_error_replies_json() {
     std::string out = std::format("{{\"total_errors\":{},\"entries\":[", g_total);
     size_t emitted = 0;
     for (size_t i = 0; i < g_ring.size(); ++i) {
-        const Entry& e = g_ring[(g_next + i) % g_ring.size()];  // oldest first
+        // oldest first
+        const Entry& e = g_ring[(g_next + i) % g_ring.size()];
         if (e.when_ms == 0) continue;
         out += std::format("{}{{\"ts_ms\":{},\"peer\":\"{}\",\"proc\":\"{}\",\"xid\":{},\"status\":{}}}",
                            emitted++ ? "," : "", e.when_ms, e.peer, e.what, e.xid, e.status);
