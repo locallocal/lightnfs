@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A 已完成；B1、B2 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A、B 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -330,7 +330,7 @@ READ4k 289–312k → 315–322k rps（同机连跑三次，无回退）。
 `tests/test_nfs4.cpp` 加 `Nfs4.ExportSetSwapUnderRunningEngine`（引擎运行中加导出 → 下一 COMPOUND
 可见；删导出 → 旧 fh STALE、伪根名消失、快照释放后条目退休）。
 
-### B3 控制器 `sync_exports`
+### B3 控制器 `sync_exports` ✅ 2026-09-09
 
 **目标**：11 §11.7。
 
@@ -351,6 +351,27 @@ READ4k 289–312k → 315–322k rps（同机连跑三次，无回退）。
 （新 fsid 下一 tick 被 `nodes[0]` 接管）、`SyncExportsNodesChangeMigratesOwner`（属主不在新名单
 → owner 记录指向名单首个活着的、本机 drain）、`SyncExportsRemovalDrainsOwner`（Active 的被删
 fsid → deactivate 钩子被调、围栏释放、`fs_` 里消失）、`SyncExportsNodesChangeNoCandidateKeeps`。
+
+**实现注**（2026-09-09）：`Fs::exp` 改为 `std::shared_ptr<const ExportEntry>`，并缓存上次 sync 时的
+`nodes` 副本（`Fs::nodes`）——B2 的 `apply` 对同 fsid 是**就地**改 `node_list()`，条目指针不变，所以
+"nodes 变了"只能靠比较内容发现。控制器持有被删条目的引用直到 drain 完成，因此 `ExportTable::take_retired()`
+（`use_count()==1`）不会在状态还没丢干净时把后端交出去 `stop()`；C2 的退休 tick 天然排在 drain 之后。
+`sync_exports(set)`：新 fsid → `Fs{entry, kStandby}`，视图 Unowned，下一 tick 按 `our_turn` 接管（sync
+本身不接管）；`nodes` 变 → 换 `exp`、更新缓存，若 `role == kActive` 且本机不在新名单 → `migrate_off`
+按名单顺序逐个 `request_migrate`（它自己校验目标已注册且心跳活着，EHOSTDOWN 就试下一个），全都不行
+→ WARN 并继续服务；fsid 消失 → Standby 直接 erase（顺手 `release_fs_fence` 清掉可能残留的过期 hold），
+Active / Activating → 标 `removed` 并 `begin_draining("removed from catalog", release=true)`，已在
+Draining 的只标 `removed`；`run_draining` 看到 `removed` 就 erase 而不是回到 Standby，并且**无论**
+`release` 参数如何都释放本机的 hold（没人会再续这个 fsid，留着会挡住它日后回归）。sync 时给该导出标 `Fs::evict`
+（Activating 也标，等它完成），`tick()` 每轮对 "Active 且 `evict`" 的导出重试 `migrate_off`，失败则每
+tick 一条 WARN；只看 `evict` 而不是重新比较名单，是为了保住 `cluster takeover --force` 让名单外节点接管
+后"留在原地"的既有行为——这样 sync 时无候选、
+之后候选上线的情形也能接手（`SyncExportsNodesChangeNoCandidateKeeps` 钉住）。顺带修了一处时序：
+`run_activation` 在跑 takeover / activate 钩子**之前**先检查角色仍是 Activating（原先钩子跑完才检查，
+"投递后被 drain / 删除"会白跑一次 activate 再 deactivate）。`snapshot()` 的 `nodes` 仍取
+`exp->node_list()`。B3 只加控制器能力，没有生产调用方；`daemon.cpp` 在 C2 把 `apply` → `sync_exports`
+→ 退休 tick 串到主循环上。测试 4 例如上，另在删除用例里覆盖了"Activating 中被删"（激活让路、drain、
+erase）与退休队列配合。
 
 ---
 
