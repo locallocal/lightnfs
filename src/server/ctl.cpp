@@ -23,11 +23,12 @@
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
+#include "runtime/io.hpp"
 #include "runtime/offload_pool.hpp"
+#include "server/catalog_applier.hpp"
 #include "server/cluster_controller.hpp"
 #include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
-#include "runtime/io.hpp"
 #include "util/log.hpp"
 
 #ifndef LIGHTNFS_VERSION
@@ -680,6 +681,31 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
     size_t dropped = co_await dp->drc->flush();
     if (json) co_return std::format("{{\"flushed\":{}}}\n", dropped);
     co_return std::format("flushed {} drc entries\n", dropped);
+  }
+  if (cmd.name() == "cluster" && cmd.arg(1) == "catalog") {
+    // The shared export catalog (plan 12 C2): `apply` runs the pipeline on the main
+    // loop and waits for it off this reactor.  The read commands arrive with D1.
+    if (!deps.catalog)
+      co_return json ? "{\"error\":\"catalog not enabled\"}\n"
+                     : "catalog: not enabled (exports_source = \"local\")\n";
+    if (cmd.arg(2) == "apply") {
+      CatalogApplier& applier = *deps.catalog;
+      const uint64_t before = applier.applied();
+      auto applied = co_await rt::offload([&applier] { return applier.apply_now(); });
+      if (applied) {
+        if (json)
+          co_return std::format("{{\"applied\":{},\"changed\":{},\"pending\":{}}}\n", *applied,
+                                *applied != before, applier.pending());
+        co_return *applied == before
+            ? std::format("catalog v{} already applied\n", *applied)
+            : std::format("catalog v{} applied (was v{})\n", *applied, before);
+      }
+      std::string why = applier.last_error();
+      if (applied.error() == errno_from(ETIMEDOUT)) why = "timed out waiting for the main loop";
+      co_return cluster_error(
+          json, std::format("catalog apply failed (still v{}): {}", applier.applied(), why));
+    }
+    co_return json ? "{\"error\":\"bad subcommand\"}\n" : "cluster catalog: expected apply\n";
   }
   if (cmd.name() == "cluster" && deps.cluster) {
     // The controller's store calls block on the shared filesystem (plan 10 A2): run

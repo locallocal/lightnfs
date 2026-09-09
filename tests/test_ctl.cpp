@@ -23,6 +23,8 @@
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
 #include "runtime/runtime.hpp"
+#include "server/catalog_applier.hpp"
+#include "server/catalog_boot.hpp"
 #include "server/cluster_controller.hpp"
 #include "server/ctl.hpp"
 #include "state/state_mgr.hpp"
@@ -1206,5 +1208,83 @@ TEST(Ctl, MetricsHttpHeadersAndBodyContract) {
   // Invalid bind address is rejected up front, not at first use.
   EXPECT_FALSE(server::MetricsHttp::create(0, "not-an-ip", {}).has_value());
   (*ep)->request_stop();
+  runtime.stop_and_join();
+}
+
+// plan 12 C2: `cluster catalog apply` runs the applier's pipeline (posted to the main
+// loop; inline here) and reports the version; without an applier the command says so.
+TEST(Ctl, ClusterCatalogApply) {
+  rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+  runtime.start();
+  {
+    char tmpl[] = "/tmp/lnfs-ctlcat-XXXXXX";
+    std::string dir = mkdtemp(tmpl);
+    std::filesystem::create_directories(dir + "/a");
+    std::filesystem::create_directories(dir + "/b");
+    auto doc = [&](uint64_t v, const std::string& paths) {
+      std::string out = "[catalog]\nversion = " + std::to_string(v) + "\n";
+      uint32_t fsid = 1;
+      for (const auto& path : std::vector<std::string>{dir + "/a", dir + "/b"}) {
+        if (paths.find(path.back()) == std::string::npos) {
+          ++fsid;
+          continue;
+        }
+        out += "[[export]]\npath = \"" + path + "\"\nfsid = " + std::to_string(fsid++) +
+               "\nbackend = \"local\"\nclients = [\"127.0.0.0/8\"]\n";
+      }
+      return out;
+    };
+    test::MemClusterStore store;
+    store.catalog_docs[1] = doc(1, "a");
+    auto local = core::parse_config(
+        "[cluster]\nenabled = true\nid = \"cluster-ctl-test\"\nshared_dir = \"/srv/shared\"\n"
+        "node = \"gw1\"\nexports_source = \"catalog\"\ncatalog_refresh = \"manual\"\n");
+    ASSERT_TRUE(local.has_value());
+    auto boot = server::load_catalog_exports(store, *local);
+    ASSERT_TRUE(boot.has_value());
+    auto table = core::ExportTable::build(*local);
+    ASSERT_TRUE(table.has_value());
+    local->exports.clear();
+    local->exports_from_catalog = false;
+    server::CatalogApplier applier({.store = store,
+                                    .exports = **table,
+                                    .local = *local,
+                                    .node = "gw1",
+                                    .fs_cluster = nullptr,
+                                    .post = {},
+                                    .start_backend = {},
+                                    .stop_backend = {}},
+                                   boot->version, boot->catalog, boot->digest);
+    server::CtlDeps deps{};
+    auto ask = [&](const char* line) {
+      return run_task(runtime, server::CtlServer::answer_async(deps, line));
+    };
+    // Not enabled (exports_source = local): no applier behind the deps.
+    EXPECT_STREQ(ask("cluster catalog apply"),
+                 "catalog: not enabled (exports_source = \"local\")\n");
+    EXPECT_STREQ(ask("cluster catalog apply --json"), "{\"error\":\"catalog not enabled\"}\n");
+    deps.catalog = &applier;
+    EXPECT_STREQ(ask("cluster catalog"), "cluster catalog: expected apply\n");
+    EXPECT_STREQ(ask("cluster catalog apply"), "catalog v1 already applied\n");
+    ASSERT_TRUE(store.write_catalog(1, doc(2, "ab")).has_value());
+    EXPECT_STREQ(ask("cluster catalog apply"), "catalog v2 applied (was v1)\n");
+    EXPECT_EQ((*table)->size(), 2u);
+    EXPECT_EQ(applier.applied(), 2u);
+    EXPECT_STREQ(ask("cluster catalog apply --json"),
+                 "{\"applied\":2,\"changed\":false,\"pending\":0}\n");
+    // A version this host cannot serve: the error names the cause, v2 stays.
+    ASSERT_TRUE(store
+                    .write_catalog(2, doc(3, "a") + "[[export]]\npath = \"/nonexistent/x\"\n"
+                                                    "fsid = 9\nbackend = \"local\"\n"
+                                                    "clients = [\"127.0.0.0/8\"]\n")
+                    .has_value());
+    auto failed = ask("cluster catalog apply");
+    EXPECT_TRUE(failed.find("catalog apply failed (still v2)") != std::string::npos);
+    EXPECT_TRUE(failed.find("fsid=9") != std::string::npos);
+    EXPECT_TRUE(ask("cluster catalog apply --json").find("\"error\":\"catalog apply failed") !=
+                std::string::npos);
+    EXPECT_EQ((*table)->size(), 2u);
+    std::filesystem::remove_all(dir);
+  }
   runtime.stop_and_join();
 }

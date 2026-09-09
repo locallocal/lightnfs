@@ -24,11 +24,13 @@
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "runtime/runtime.hpp"
+#include "server/catalog_applier.hpp"
 #include "server/catalog_boot.hpp"
 #include "server/cluster_controller.hpp"
 #include "server/cluster_store.hpp"
 #include "server/data_plane.hpp"
 #include "server/frontend.hpp"
+#include "server/main_loop.hpp"
 #include "server/metrics_providers.hpp"
 #include "server/protocol_stack.hpp"
 #include "server/takeover_hook.hpp"
@@ -339,12 +341,16 @@ std::string reload_config(const std::string& config_path, const core::ServerConf
   }
   apply_observability(sc);
   if (stack) apply_client_qos(*stack, sc);
-  if (core::cluster_catalog_exports(running_cluster))
-    report +=
-        "exports come from the catalog: `cluster catalog apply` picks up a new version "
-        "(plan 12 C2)\n";
-  else
+  if (core::cluster_catalog_exports(running_cluster)) {
+    // The exports come from the catalog; the caller applies its latest version next.
+    // catalog_refresh is the one [cluster] key that is hot (plan 12 A1/C2).
+    if (fresh->cluster.catalog_refresh != core.local_config.cluster.catalog_refresh) {
+      report += std::format("catalog_refresh -> {}\n", fresh->cluster.catalog_refresh);
+      core.local_config.cluster.catalog_refresh = fresh->cluster.catalog_refresh;
+    }
+  } else {
     report += core.exports->reload_dynamic(*fresh);
+  }
   report += restart_required_report(sc, running);
   report += cluster_restart_required_report(fresh->cluster, running_cluster);
   LNFS_INFO("configuration reloaded from {}", config_path);
@@ -365,57 +371,6 @@ void on_sighup(int) { g_reload_requested = 1; }
 // SIGHUP reloads and whatever other threads post — the cluster controller's activate /
 // deactivate work runs here because the data plane (Frontend::start, backend
 // lifecycle calls) belongs to the main thread.
-class MainLoop {
- public:
-  void post(std::function<void()> fn) {
-    {
-      std::lock_guard lock(mu_);
-      queue_.push_back(std::move(fn));
-    }
-    cv_.notify_one();
-  }
-  void run(const std::function<void()>& on_reload) {
-    std::signal(SIGINT, on_stop_signal);
-    std::signal(SIGTERM, on_stop_signal);
-    std::signal(SIGHUP, on_sighup);
-    while (!g_stopping) {
-      if (g_reload_requested) {
-        g_reload_requested = 0;
-        on_reload();
-      }
-      std::function<void()> work;
-      {
-        std::unique_lock lock(mu_);
-        cv_.wait_for(lock, std::chrono::milliseconds(100), [&] { return !queue_.empty(); });
-        if (!queue_.empty()) {
-          work = std::move(queue_.front());
-          queue_.pop_front();
-        }
-      }
-      if (work) work();
-    }
-  }
-  // Runs what is still queued (a takeover posted just before the stop signal).
-  void drain() {
-    for (;;) {
-      std::function<void()> work;
-      {
-        std::lock_guard lock(mu_);
-        if (queue_.empty()) return;
-        work = std::move(queue_.front());
-        queue_.pop_front();
-      }
-      work();
-    }
-  }
-
- private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::deque<std::function<void()>> queue_;
-};
-
-// One log line for a SIGHUP reload: the multi-line ctl report folded onto one line.
 void log_reload_report(std::string report) {
   while (!report.empty() && report.back() == '\n') report.pop_back();
   std::replace(report.begin(), report.end(), '\n', ';');
@@ -543,11 +498,31 @@ int run_server(const std::string& config_path) {
   // 3b. management plane (ctl socket + metrics endpoint): up before the engines and
   //     down after them, so it answers while no data plane exists (plan 10 A4).
   std::atomic<ProtocolStack*> active_stack{nullptr};
-  auto do_reload = [config_path, server_cfg, cluster_cfg, &core, &active_stack]() -> std::string {
-    return reload_config(config_path, server_cfg, cluster_cfg, *core,
-                         active_stack.load(std::memory_order_acquire));
-  };
   MainLoop loop;
+  std::unique_ptr<CatalogApplier> applier;  // catalog mode (plan 12 C2), built below
+  // A reload runs on the main loop (plan 12 C2): the file IO and, in catalog mode,
+  // the apply pipeline belong there, not on the ctl reactor.  SIGHUP is already on
+  // that thread; the ctl command posts and waits.
+  auto reload_inline = [config_path, server_cfg, cluster_cfg, &core, &active_stack,
+                        &applier]() -> std::string {
+    std::string report = reload_config(config_path, server_cfg, cluster_cfg, *core,
+                                       active_stack.load(std::memory_order_acquire));
+    if (!applier) return report;
+    const uint64_t before = applier->applied();
+    auto applied = applier->apply_latest();
+    if (!applied)
+      report +=
+          std::format("catalog: apply failed, still v{}: {}\n", before, applier->last_error());
+    else if (*applied != before)
+      report += std::format("catalog: v{} applied (was v{})\n", *applied, before);
+    else
+      report += std::format("catalog: v{} is current\n", *applied);
+    return report;
+  };
+  auto do_reload = [&loop, reload_inline]() -> std::string {
+    auto report = loop.call(reload_inline, std::chrono::seconds(60));
+    return report ? *report : "reload timed out: the main loop did not run it\n";
+  };
   std::optional<DataPlaneInstance> plane;
   std::unique_ptr<ClusterController> controller;       // failover (plan 10 C2)
   std::unique_ptr<FsClusterController> fs_controller;  // active-active (plan 12 C1)
@@ -576,6 +551,9 @@ int run_server(const std::string& config_path) {
     // state manager and the owner view.  Its ctl surface arrives with plan 12 C4.
     FsClusterController::Hooks hooks;
     hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
+    hooks.after_tick = [&applier] {
+      if (applier) applier->poll();
+    };
     hooks.activate_fs = [&](uint32_t fsid, uint64_t fs_epoch) -> Result<void> {
       if (!plane) return Err(errno_from(EIO));
       plane->stack->state.load_grace_list(fsid);
@@ -620,6 +598,9 @@ int run_server(const std::string& config_path) {
     // socket can address it (`cluster *`, plan 10 C3); its timer starts after.
     ClusterController::Hooks hooks;
     hooks.post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); };
+    hooks.after_tick = [&applier] {
+      if (applier) applier->poll();
+    };
     hooks.activate = bring_up;
     hooks.deactivate = [&, drain_grace] { take_down(drain_grace); };
     // Storage-side eviction of the failed gateway (plan 10 D1): every backend's
@@ -653,8 +634,30 @@ int run_server(const std::string& config_path) {
     controller = std::make_unique<ClusterController>(cluster_cfg, *cluster_store,
                                                      std::move(hooks));
   }
-  mgmt.emplace(
-      Management::start(server_cfg, runtime, do_reload, {}, controller.get(), fs_controller.get()));
+  if (catalog_mode) {
+    // The catalog follower (plan 12 C2): polled from the controller's tick, applied on
+    // the main loop, backends started / stopped on reactor 0 as at boot.
+    applier = std::make_unique<CatalogApplier>(
+        CatalogApplier::Deps{
+            .store = *cluster_store,
+            .exports = *core->exports,
+            .local = core->local_config,
+            .node = core::cluster_node_name(cluster_cfg),
+            .fs_cluster = fs_controller.get(),
+            .post = [&loop](std::function<void()> fn) { loop.post(std::move(fn)); },
+            .start_backend =
+                [&runtime](backend::Backend& backend) {
+                  return run_on_reactor(runtime.reactor(0), backend.start());
+                },
+            .stop_backend =
+                [&runtime](backend::Backend& backend) {
+                  (void)run_on_reactor(runtime.reactor(0), backend.stop());
+                },
+            .retire_overdue = std::chrono::seconds(10 * server_cfg.lease_seconds)},
+        catalog.version, std::move(catalog.catalog), exports_digest);
+  }
+  mgmt.emplace(Management::start(server_cfg, runtime, do_reload, {}, controller.get(),
+                                 fs_controller.get(), applier.get()));
   apply_observability(server_cfg);
 
   if (!cluster_store || active_active) {
@@ -683,7 +686,16 @@ int run_server(const std::string& config_path) {
               cluster_cfg.takeover, cluster_cfg.fence_lease_ms);
   }
 
-  loop.run([&] { log_reload_report(do_reload()); });
+  std::signal(SIGINT, on_stop_signal);
+  std::signal(SIGTERM, on_stop_signal);
+  std::signal(SIGHUP, on_sighup);
+  loop.run([] { return g_stopping != 0; },
+           [] {
+             if (!g_reload_requested) return false;
+             g_reload_requested = 0;
+             return true;
+           },
+           [&] { log_reload_report(reload_inline()); });
 
   // mirror-image shutdown: controller timer → pending posted work → data plane
   // (detach from ctl → stop accepting → connections → lease scanner → stack) → fence
@@ -695,6 +707,9 @@ int run_server(const std::string& config_path) {
   // fence released) before the connections close, so clients are referred on.
   if (fs_controller) fs_controller->shutdown();
   take_down(kShutdownDrainGrace);
+  // Exports removed by a catalog version and not yet retired (their last snapshot
+  // went with the data plane): stop their backends with the rest.
+  if (applier) (void)applier->retire_exports();
   if (controller && controller->role() != Role::kStandby) {
     (void)cluster_store->release_fence(core::cluster_node_name(cluster_cfg));
     LNFS_INFO("cluster: fence released on exit");

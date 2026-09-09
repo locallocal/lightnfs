@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A、B 已完成；C1 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A、B 已完成；C1、C2 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -427,7 +427,7 @@ store 之后、算摘要之前调 `load_catalog_exports`，`check_exports_consis
 `shared_dir` 放 v1 清单 → `--check-config` 打印 `catalog: v1`，起服务 `status` 报 `exports=1`，
 `catalog.gw1` = `1 <digest> <ms> ok`；删掉清单再起 → `exports=0`、`catalog.gw1` = `0 … ok`。
 
-### C2 轮询 + auto / manual 应用
+### C2 轮询 + auto / manual 应用 ✅ 2026-09-09
 
 **目标**：11 §11.4 的跟进流水线。
 
@@ -461,6 +461,46 @@ store 之后、算摘要之前调 `load_catalog_exports`，`check_exports_consis
 不 post；`apply_latest()` 后清零）、`CatalogApplyFailureKeepsOld`（合并失败 → 旧集不变、
 `catalog.<node>` = old error:…、`last_error()`）。`tests/test_ctl.cpp` 加 `reload` 经主循环的断言
 （`AnswerCommandSurface` `:518` 的 reload 钩子改为主循环投递后行为不变）。
+
+**实现注**（2026-09-09）：B 已落地，直接是真换版，没有桩。新文件 `src/server/catalog_applier.hpp/.cpp`：
+`CatalogApplier{Deps{store, exports, local(CoreState::local_config), node, fs_cluster*, post,
+start_backend, stop_backend, retire_overdue}}`，构造时收启动的 `CatalogBoot`（版本、文档、摘要——
+`CatalogBoot` 为此加了 `catalog` 字段）。轮询没放进控制器内部，而是两个控制器的 `Hooks` 各加
+`after_tick`（tick 线程、每 tick 末尾、不论 tick 做了什么都调），`daemon.cpp` 把它接到 `applier->poll()`；
+`poll()` 只 `read_catalog`（A3 的头解析）比版本：更新 → auto 就 `post(apply_latest)`（`applying_` 标志保证
+同时只有一份在投递 / 运行），manual 只记 `pending_`；退休队列非空时另投递一次 `retire_exports()`
+（`take_retired` → `stop_backend` 走 reactor 0；仍被持有且超过 `retire_overdue` = 10 × lease 的每周期
+WARN 一次）。`apply_latest()`（主循环）= 读最新 → 解析 → 头版本校验 → `validate_catalog` → 本机
+`merge_with_local` + `validate_config`（失败按导出定位，同 C1）→ `diff_catalog(已应用文档, 新文档)`：
+`rejected` 非空整版拒绝（EINVAL，文案 "fsid N changed path / backend / cluster keys: remove and
+re-add"）；added / enabled → `plan.add`，removed / disabled → `plan.remove`，nodes / dynamic 变化 →
+`plan.update`——再与**表里实际有的**对账（表里已有的 add 降为 update、表里没有的 remove 跳过、表里有
+而合并结果没有的补 remove、合并结果有而表里没有的补 add），所以重试与部分失败后的再应用都是幂等的
+→ 新增导出 `find_backend` / `make` / `start_backend`，任何一步失败把**已启动**的停掉、不发布 →
+`ExportTable::apply` → `fs_cluster->sync_exports` → 写 `catalog.<node> = v ok`。失败：旧集不动、
+`catalog.<node> = <old> error:<why>`（摘要仍是运行中的）、`failures()` +1、`last_error()`；同一失败版本
+auto 模式下每 `kRetryEveryPolls`（30）个 poll 才自动重试一次（避免每 tick 刷一条 ERROR），手动
+`apply` 不受限，新版本出现即刻重试。清单从 store 消失不算错（无事可做）。`apply_now()` 投递到主循环并
+等结果（ctl 用，超时 ETIMEDOUT）。**主循环**：`daemon.cpp` 里的 `MainLoop` 抽到
+`src/server/main_loop.hpp`，加 `call(fn, timeout)`（投递 + `promise` 等待；在主循环线程上调用则
+直接执行，避免自等）和 `on_loop_thread()`，`run()` 改收停止 / SIGHUP 两个谓词（信号全局量留在
+`daemon.cpp`）。ctl `reload` 现在是 `loop.call(reload_inline, 60s)`，文件 IO 与清单应用都离开了 ctl
+reactor；SIGHUP 在主循环线程上直接调 `reload_inline`；两者在清单模式下末尾都 `apply_latest()` 并把
+"catalog: vN applied (was vM) / is current / apply failed" 附在报告末尾；`reload_config` 在清单模式下
+跳过 `reload_dynamic`，改为热更新 `local_config.cluster.catalog_refresh`（A1 说好的唯一可热改的
+`[cluster]` 键）。新 ctl `cluster catalog apply`（文本 / `--json`；未启用清单模式答
+"catalog: not enabled"；失败答 "catalog apply failed (still vN): <why>"），经 `CtlDeps::catalog`
+（`Management::start` 多一个参数）。退出路径：`take_down` 之后调一次 `retire_exports()`，把数据面
+消失后才无人引用的被删导出的后端也停掉。测试：计划三例 + `CatalogAutoApplyOnTick` 里的删除 → drain
+→ 退休 → `stop` 与就地更新（同一条目、无后端启停）、`ClusterController.CatalogPollAfterTick`（主备
+控制器也调钩子，store 读错也调）、`Ctl.ClusterCatalogApply`（不启用 / 已是最新 / 应用 / `--json` /
+失败文案）、`DaemonLifecycle.MainLoopCallRunsOnTheLoopThread`（在主循环线程执行、嵌套调用内联、
+SIGHUP 谓词、未运行时超时后 `drain` 补跑）。真机冒烟（`fence_lease = "1s"`，auto）：写 v2 加导出 →
+2.5 s 内 `exports=2`、`catalog.gw1 = 2 … ok`；v3 删导出 → `exports=1`，日志 "retired: backend
+stopped"；`reload` 报 "catalog: v3 is current"；v4 含本机不存在的路径 → 仍 `exports=1`，
+`catalog.gw1 = 3 … error:catalog v4: … fsid=9 … ENOENT`，`cluster catalog apply` 同样文案；manual
+模式下写 v6 不动，`kill -HUP` 后 `exports=2`，日志 "reload (SIGHUP): …;catalog: v6 applied (was v5)"。
+`fence_lease = "300ms"` 这类毫秒写法解析器不收（与本步无关，记在这里）。
 
 ### C3 状态与指标
 
