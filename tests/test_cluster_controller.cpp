@@ -1149,3 +1149,300 @@ TEST(FsClusterController, MigrateToDeadTargetFallsBack) {
   EXPECT_TRUE(fs_role(gw1, 1) == server::Role::kActive);
   EXPECT_EQ(gw1.migrations(), 2u);
 }
+
+// ---- plan 12 B3: the controller follows the export set ------------------------------
+
+namespace {
+
+// Publishes `plan` on `table` (no backends are started: MemoryBackend needs none) and
+// returns the new set.
+std::shared_ptr<const core::ExportSet> apply_plan(core::ExportTable& table,
+                                                  core::ExportSetPlan plan,
+                                                  std::vector<uint32_t> add_fsids = {}) {
+  std::vector<std::unique_ptr<backend::Backend>> started;
+  for (uint32_t fsid : add_fsids) started.push_back(std::make_unique<backend::MemoryBackend>(fsid));
+  auto applied = table.apply(std::move(plan), started, 1);
+  if (!applied) return nullptr;
+  return *applied;
+}
+
+core::ExportConfig export_cfg(uint32_t fsid, std::vector<std::string> nodes) {
+  core::ExportConfig cfg;
+  cfg.path = "/export/" + std::to_string(fsid);
+  cfg.fsid = fsid;
+  cfg.clients = {"127.0.0.0/8"};
+  cfg.nodes = std::move(nodes);
+  return cfg;
+}
+
+}  // namespace
+
+// A new fsid enters Standby / Unowned and is taken on the next tick by the node order.
+TEST(FsClusterController, SyncExportsAddsAndTakes) {
+  MemStore store;
+  Exports exports({{"gw1"}, {"gw1"}, {"gw1"}});
+  core::FsOwnerView view;
+  FsRecorder rec;
+  server::FsClusterController ctl(aa_config("gw1"), exports.table, store, view, rec.hooks());
+  ctl.tick();
+  for (uint32_t f = 1; f <= 3; ++f) ASSERT_TRUE(fs_role(ctl, f) == server::Role::kActive);
+  rec.calls.clear();
+
+  core::ExportSetPlan plan;
+  plan.add.push_back(export_cfg(4, {"gw1"}));
+  auto set = apply_plan(exports.table, std::move(plan), {4});
+  ASSERT_TRUE(set != nullptr);
+  ctl.sync_exports(set);
+  EXPECT_TRUE(fs_role(ctl, 4) == server::Role::kStandby);
+  EXPECT_TRUE(view_of(view, 4).role == core::FsRole::kUnowned);
+  EXPECT_TRUE(rec.calls.empty());  // nothing is taken at sync time
+  auto snap = ctl.snapshot();
+  ASSERT_TRUE(snap.size() == 4u);
+  EXPECT_EQ(snap[3].fsid, 4u);
+  EXPECT_STREQ(snap[3].path, "/export/4");
+  EXPECT_STREQ(joined(snap[3].nodes), "gw1");
+
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 4) == server::Role::kActive);
+  EXPECT_STREQ(joined(rec.calls), "takeover:4 activate:4");
+  EXPECT_TRUE(view_of(view, 4).role == core::FsRole::kActive);
+  EXPECT_EQ(view_of(view, 4).fs_epoch, 1u);
+  ASSERT_TRUE(store.fences["gw1"].holds.size() == 4u);
+  EXPECT_STREQ(store.owners[4].node, "gw1");
+  // The others were not touched.
+  for (uint32_t f = 1; f <= 3; ++f) EXPECT_TRUE(fs_role(ctl, f) == server::Role::kActive);
+  EXPECT_EQ(ctl.snapshot()[0].takeovers, 1u);
+
+  // Syncing the same set again changes nothing.
+  ctl.sync_exports(exports.table.snapshot());
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 4) == server::Role::kActive);
+  EXPECT_STREQ(joined(rec.calls), "takeover:4 activate:4");
+}
+
+// The owner drops out of a changed `nodes`: the export is handed (owner record →
+// first live listed node, local drain) and the target takes it as a migration.
+TEST(FsClusterController, SyncExportsNodesChangeMigratesOwner) {
+  MemStore store;
+  Exports exports({{"gw1", "gw2"}, {"gw1"}, {"gw1"}});
+  (void)store.put_node_address("gw1", "10.0.0.1:2049");
+  (void)store.put_node_address("gw2", "10.0.0.2:2049");
+  (void)store.put_node_address("gw3", "10.0.0.3:2049");
+  core::FsOwnerView view1, view2;
+  FsRecorder rec1, rec2;
+  server::FsClusterController gw1(aa_config("gw1"), exports.table, store, view1, rec1.hooks());
+  server::FsClusterController gw2(aa_config("gw2"), exports.table, store, view2, rec2.hooks());
+  gw1.tick();
+  gw2.tick();
+  ASSERT_TRUE(fs_role(gw1, 1) == server::Role::kActive);
+  ASSERT_TRUE(fs_role(gw2, 1) == server::Role::kStandby);
+  rec1.calls.clear();
+  rec2.calls.clear();
+
+  // gw3 (dead: registered, no heartbeat) first, then gw2: the first *live* one wins.
+  core::ExportSetPlan plan;
+  plan.update.push_back(export_cfg(1, {"gw3", "gw2"}));
+  auto set = apply_plan(exports.table, std::move(plan));
+  ASSERT_TRUE(set != nullptr);
+  EXPECT_TRUE(set->by_fsid(1) == exports.table.snapshot()->by_fsid(1));  // updated in place
+  store.log.clear();
+  gw1.sync_exports(set);
+  EXPECT_STREQ(joined(store.log), "put_owner:1=gw2 release_fs:1");
+  EXPECT_STREQ(joined(rec1.calls), "deactivate:1");
+  EXPECT_TRUE(fs_role(gw1, 1) == server::Role::kStandby);
+  EXPECT_EQ(gw1.migrations(), 1u);
+  EXPECT_STREQ(store.owners[1].node, "gw2");
+  EXPECT_TRUE(store.fences["gw1"].holds.size() == 2u);  // F2/F3 only
+  EXPECT_TRUE(view_of(view1, 1).role == core::FsRole::kRemote);
+  EXPECT_STREQ(view_of(view1, 1).node, "gw2");
+  EXPECT_STREQ(joined(gw1.snapshot()[0].nodes), "gw3 gw2");
+  // gw1 does not take it back (not listed); gw2 takes it as a migration.
+  gw1.tick();
+  EXPECT_TRUE(fs_role(gw1, 1) == server::Role::kStandby);
+  gw2.sync_exports(set);
+  gw2.tick();
+  EXPECT_TRUE(fs_role(gw2, 1) == server::Role::kActive);
+  EXPECT_STREQ(joined(rec2.calls), "takeover:1 activate:1");
+  ASSERT_TRUE(rec2.takeovers.size() == 1u);
+  EXPECT_STREQ(rec2.takeovers[0].prev_node, "gw1");
+  EXPECT_STREQ(rec2.takeovers[0].reason, "migrate");
+  gw1.tick();
+  EXPECT_TRUE(view_of(view1, 1).role == core::FsRole::kRemote);
+  EXPECT_STREQ(view_of(view1, 1).node, "gw2");
+  EXPECT_EQ(view_of(view1, 1).fs_epoch, 2u);
+
+  // A nodes change that keeps the owner listed only swaps the list.
+  core::ExportSetPlan reorder;
+  reorder.update.push_back(export_cfg(1, {"gw2", "gw1"}));
+  set = apply_plan(exports.table, std::move(reorder));
+  ASSERT_TRUE(set != nullptr);
+  rec2.calls.clear();
+  gw2.sync_exports(set);
+  gw2.tick();
+  EXPECT_TRUE(fs_role(gw2, 1) == server::Role::kActive);
+  EXPECT_TRUE(rec2.calls.empty());
+  EXPECT_STREQ(joined(gw2.snapshot()[0].nodes), "gw2 gw1");
+}
+
+// An fsid gone from the set: the owner drains it (deactivate hook, fence released,
+// erased from the controller); a non-owner just forgets it.  The controller's
+// reference kept the entry out of the retirement queue until the drain was done.
+TEST(FsClusterController, SyncExportsRemovalDrainsOwner) {
+  MemStore store;
+  Exports exports({{"gw1", "gw2"}, {"gw1", "gw2"}, {"gw2", "gw1"}});
+  (void)store.put_node_address("gw1", "10.0.0.1:2049");
+  (void)store.put_node_address("gw2", "10.0.0.2:2049");
+  core::FsOwnerView view1, view2;
+  FsRecorder rec1, rec2;
+  server::FsClusterController gw1(aa_config("gw1"), exports.table, store, view1, rec1.hooks());
+  server::FsClusterController gw2(aa_config("gw2"), exports.table, store, view2, rec2.hooks());
+  gw1.tick();
+  gw2.tick();
+  gw1.tick();
+  ASSERT_TRUE(fs_role(gw1, 2) == server::Role::kActive);
+  ASSERT_TRUE(fs_role(gw2, 3) == server::Role::kActive);
+  EXPECT_TRUE(view_of(view1, 3).role == core::FsRole::kRemote);
+  rec1.calls.clear();
+  rec2.calls.clear();
+
+  core::ExportSetPlan plan;
+  plan.remove.push_back(2);
+  auto old_set = exports.table.snapshot();
+  auto set = apply_plan(exports.table, std::move(plan));
+  ASSERT_TRUE(set != nullptr);
+  old_set.reset();
+  // Still referenced by both controllers: not retired yet.
+  EXPECT_TRUE(exports.table.take_retired().empty());
+  EXPECT_EQ(exports.table.retired_pending(), 1u);
+
+  // The non-owner: erased silently, no hooks, no store writes.
+  store.log.clear();
+  gw2.sync_exports(set);
+  EXPECT_TRUE(rec2.calls.empty());
+  EXPECT_STREQ(joined(store.log), "release_fs:2");  // a no-op release of a hold it never had
+  EXPECT_TRUE(gw2.snapshot().size() == 2u);
+  EXPECT_TRUE(view2.snapshot()->find(2) == view2.snapshot()->end());
+  EXPECT_TRUE(exports.table.take_retired().empty());  // gw1 still holds it
+
+  // The owner: drained inline (deactivate, fence released), then gone.
+  store.log.clear();
+  gw1.sync_exports(set);
+  EXPECT_STREQ(joined(rec1.calls), "deactivate:2");
+  EXPECT_STREQ(joined(store.log), "release_fs:2");
+  EXPECT_TRUE(fs_role(gw1, 2) == server::Role::kStandby);  // unknown fsid reads as Standby
+  auto snap = gw1.snapshot();
+  ASSERT_TRUE(snap.size() == 2u);
+  EXPECT_EQ(snap[0].fsid, 1u);
+  EXPECT_EQ(snap[1].fsid, 3u);
+  EXPECT_TRUE(view1.snapshot()->find(2) == view1.snapshot()->end());
+  EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);
+  EXPECT_EQ(store.fences["gw1"].holds[0].fsid, 1u);
+  EXPECT_TRUE(fs_role(gw1, 1) == server::Role::kActive);
+  // Now nothing references the entry: the table hands it out for stop().
+  auto retired = exports.table.take_retired();
+  ASSERT_TRUE(retired.size() == 1u);
+  EXPECT_EQ(retired[0]->fsid, 2u);
+  // Later ticks do not resurrect it.
+  gw1.tick();
+  gw2.tick();
+  EXPECT_TRUE(gw1.snapshot().size() == 2u);
+  EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);
+  EXPECT_TRUE(rec1.calls.size() == 1u);
+  // Operator requests for the removed fsid: unknown.
+  auto take = gw1.request_takeover(2, false);
+  ASSERT_TRUE(!take.has_value());
+  EXPECT_EQ(static_cast<int>(take.error()), EINVAL);
+
+  // Removed while Activating: the activation is abandoned and the export drained.
+  // (fsid 3 is gw2's; gw2 dies, gw1 starts taking it, the set drops it meanwhile.)
+  store.age_out_node("gw2");
+  std::vector<std::function<void()>> posted;
+  FsRecorder rec1b;
+  auto hooks = rec1b.hooks();
+  hooks.post = [&](std::function<void()> fn) { posted.push_back(std::move(fn)); };
+  core::FsOwnerView view1b;
+  server::FsClusterController gw1b(aa_config("gw1"), exports.table, store, view1b,
+                                   std::move(hooks));
+  gw1b.tick();  // F1 and F3 taken: activations posted, not yet run
+  ASSERT_TRUE(fs_role(gw1b, 3) == server::Role::kActivating);
+  core::ExportSetPlan drop3;
+  drop3.remove.push_back(3);
+  set = apply_plan(exports.table, std::move(drop3));
+  ASSERT_TRUE(set != nullptr);
+  gw1b.sync_exports(set);
+  EXPECT_TRUE(fs_role(gw1b, 3) == server::Role::kDraining);
+  for (auto& fn : posted) fn();  // the activation finds it Draining and steps aside
+  posted.clear();
+  EXPECT_TRUE(gw1b.snapshot().size() == 1u);
+  EXPECT_EQ(gw1b.snapshot()[0].fsid, 1u);
+  EXPECT_EQ(count(rec1b.calls, "deactivate:3"), 1u);
+  EXPECT_EQ(count(rec1b.calls, "activate:3"), 0u);
+  EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);
+}
+
+// The owner is dropped from `nodes` but no listed node is alive: it keeps serving
+// (warning each tick) and hands over as soon as one appears.
+TEST(FsClusterController, SyncExportsNodesChangeNoCandidateKeeps) {
+  MemStore store;
+  Exports exports({{"gw1"}, {"gw1"}, {"gw1"}});
+  (void)store.put_node_address("gw1", "10.0.0.1:2049");
+  (void)store.put_node_address("gw3", "10.0.0.3:2049");
+  core::FsOwnerView view;
+  FsRecorder rec;
+  server::FsClusterController ctl(aa_config("gw1"), exports.table, store, view, rec.hooks());
+  ctl.tick();
+  ASSERT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  rec.calls.clear();
+
+  // gw3 is registered but has no heartbeat; gw9 is unknown altogether.
+  core::ExportSetPlan plan;
+  plan.update.push_back(export_cfg(1, {"gw9", "gw3"}));
+  auto set = apply_plan(exports.table, std::move(plan));
+  ASSERT_TRUE(set != nullptr);
+  store.log.clear();
+  ctl.sync_exports(set);
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  EXPECT_TRUE(rec.calls.empty());
+  EXPECT_EQ(ctl.migrations(), 0u);
+  EXPECT_TRUE(store.owners[1].node == "gw1");
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kActive);
+  EXPECT_STREQ(joined(ctl.snapshot()[0].nodes), "gw9 gw3");
+  // Ticks keep it (and keep looking): no drain, no owner change.
+  ctl.tick();
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  EXPECT_TRUE(rec.calls.empty());
+  EXPECT_TRUE(store.owners[1].node == "gw1");
+  EXPECT_TRUE(store.fences["gw1"].holds.size() == 3u);
+
+  // gw3 comes up (heartbeat live): the next tick hands the export over.
+  (void)store.renew_fences("gw3", 60s);
+  store.log.clear();
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kStandby);
+  EXPECT_STREQ(joined(rec.calls), "deactivate:1");
+  EXPECT_EQ(ctl.migrations(), 1u);
+  EXPECT_STREQ(store.owners[1].node, "gw3");
+  EXPECT_STREQ(store.owners[1].address, "10.0.0.3:2049");
+  EXPECT_TRUE(store.fences["gw1"].holds.size() == 2u);
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kRemote);
+  EXPECT_STREQ(view_of(view, 1).node, "gw3");
+  // Not listed: never taken back, even once gw3 dies and the export sits unowned.
+  store.age_out_node("gw3");
+  for (int i = 0; i < 3; ++i) ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kStandby);
+  EXPECT_TRUE(view_of(view, 1).role == core::FsRole::kUnowned);
+
+  // The operator's way out (ctl takeover from outside the list) stays put: taken by
+  // request, not by a nodes change, the export is not handed over on later ticks.
+  rec.calls.clear();
+  ASSERT_TRUE(ctl.request_takeover(1, false).has_value());
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  (void)store.renew_fences("gw3", 60s);  // a listed node alive again changes nothing
+  ctl.tick();
+  ctl.tick();
+  EXPECT_TRUE(fs_role(ctl, 1) == server::Role::kActive);
+  EXPECT_STREQ(joined(rec.calls), "takeover:1 activate:1");
+  EXPECT_EQ(ctl.migrations(), 1u);
+  EXPECT_STREQ(store.owners[1].node, "gw1");
+}

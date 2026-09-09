@@ -338,9 +338,13 @@ FsClusterController::FsClusterController(const core::ClusterConfig& cfg,
       node_(core::cluster_node_name(cfg)),
       node_epoch_(node_epoch) {
   if (!hooks_.post) hooks_.post = [](const std::function<void()>& fn) { fn(); };
-  // The boot-time set (plan 12 B1); following the set across versions is B3.
+  // The boot-time set (plan 12 B1); sync_exports follows later versions (plan 12 B3).
   auto set = exports.snapshot();
-  for (const auto& entry : set->entries) fs_[entry->fsid].exp = entry.get();
+  for (const auto& entry : set->entries) {
+    Fs& fs = fs_[entry->fsid];
+    fs.exp = entry;
+    fs.nodes = entry->node_list();
+  }
   last_.now_ms = started_ms_ = wall_now_ms();
   // Until the first tick has read the store nothing is known to be ours: every export
   // is Unowned in the view (clients wait), never silently served.
@@ -500,6 +504,11 @@ void FsClusterController::tick() {
     const char* reason;
   };
   std::vector<Take> take;
+  struct Unlisted {
+    uint32_t fsid;
+    std::vector<std::string> nodes;
+  };
+  std::vector<Unlisted> unlisted;  // served here, no longer in the export's nodes
   {
     std::lock_guard lock(mu_);
     last_ = sv;
@@ -516,7 +525,11 @@ void FsClusterController::tick() {
       switch (fs.role) {
         case Role::kActive:
         case Role::kActivating:
-          if (ours) break;
+          if (ours) {
+            if (fs.role == Role::kActive && fs.evict && !fs.removed)
+              unlisted.push_back({fsid, fs.nodes});
+            break;
+          }
           // Stripped from our record by a forced takeover elsewhere, or our lease
           // lapsed: the second line of defence behind the referral.
           lost.push_back({fsid, holder && holder->live ? "fence taken by node " + holder->rec->node
@@ -562,6 +575,86 @@ void FsClusterController::tick() {
   }
   for (const auto& l : lost) begin_draining(l.fsid, l.why.c_str(), true, false);
   for (const auto& t : take) (void)begin_activation(t.fsid, false, t.reason);
+  // A nodes change that dropped us (plan 12 B3): hand the export over, or keep
+  // serving — and say so every tick — until a listed node is alive.
+  for (const auto& u : unlisted) {
+    if (migrate_off(u.fsid, u.nodes)) continue;
+    std::string listed;
+    for (const auto& n : u.nodes) listed += (listed.empty() ? "" : ",") + n;
+    LNFS_WARN(
+        "cluster: {} still serves fsid {} although its nodes are now [{}]: none of them is "
+        "alive",
+        node_, u.fsid, listed);
+  }
+  publish(nullptr);
+}
+
+bool FsClusterController::migrate_off(uint32_t fsid, const std::vector<std::string>& nodes) {
+  for (const auto& candidate : nodes) {
+    if (candidate == node_) continue;
+    auto moved = request_migrate(fsid, candidate);
+    if (moved) {
+      LNFS_INFO("cluster: {} no longer listed for fsid {}: handed to {}", node_, fsid, candidate);
+      return true;
+    }
+    if (moved.error() != errno_from(EHOSTDOWN)) return false;  // not Active any more, or IO
+  }
+  return false;
+}
+
+void FsClusterController::sync_exports(const std::shared_ptr<const core::ExportSet>& set) {
+  std::vector<uint32_t> drain, added, dropped;
+  std::vector<std::pair<uint32_t, std::vector<std::string>>> unlisted;
+  {
+    std::lock_guard lock(mu_);
+    for (const auto& entry : set->entries) {
+      auto it = fs_.find(entry->fsid);
+      if (it == fs_.end()) {
+        Fs& fs = fs_[entry->fsid];
+        fs.exp = entry;
+        fs.nodes = entry->node_list();
+        added.push_back(entry->fsid);
+        continue;
+      }
+      Fs& fs = it->second;
+      fs.exp = entry;  // the same object unless the export was replaced
+      fs.removed = false;
+      const auto& nodes = entry->node_list();
+      if (nodes == fs.nodes) continue;
+      fs.nodes = nodes;
+      const bool listed = std::find(nodes.begin(), nodes.end(), node_) != nodes.end();
+      const bool serving = fs.role == Role::kActive || fs.role == Role::kActivating;
+      fs.evict = serving && !listed;  // Activating: the tick after it completes hands over
+      if (fs.role == Role::kActive && fs.evict) unlisted.emplace_back(entry->fsid, nodes);
+    }
+    for (auto it = fs_.begin(); it != fs_.end();) {
+      Fs& fs = it->second;
+      if (set->by_fsid(it->first) || fs.removed) {
+        ++it;
+        continue;
+      }
+      if (fs.role == Role::kStandby) {
+        dropped.push_back(it->first);
+        it = fs_.erase(it);
+        continue;
+      }
+      fs.removed = true;  // Active / Activating: drain first; Draining: erase when done
+      if (fs.role != Role::kDraining) drain.push_back(it->first);
+      ++it;
+    }
+  }
+  for (uint32_t fsid : added) LNFS_INFO("cluster: fsid {} added to the export set", fsid);
+  for (uint32_t fsid : dropped) {
+    LNFS_INFO("cluster: fsid {} removed from the export set", fsid);
+    (void)store_.release_fs_fence(fsid, node_);  // a lapsed hold of ours, if any
+  }
+  for (uint32_t fsid : drain) begin_draining(fsid, "removed from catalog", false, true);
+  for (const auto& [fsid, nodes] : unlisted)
+    if (!migrate_off(fsid, nodes))
+      LNFS_WARN(
+          "cluster: {} is no longer in the nodes of fsid {} and no listed node is alive: "
+          "still serving it",
+          node_, fsid);
   publish(nullptr);
 }
 
@@ -635,6 +728,13 @@ Result<void> FsClusterController::begin_activation(uint32_t fsid, bool force, co
 
 void FsClusterController::run_activation(uint32_t fsid, uint64_t fs_epoch, std::string prev_node,
                                          std::string reason) {
+  {
+    std::lock_guard lock(mu_);
+    Fs* fs = find(fsid);
+    // Drained, removed from the set (plan 12 B3) or shut down since the post: the
+    // data-plane work is not worth starting.
+    if (!fs || fs->role != Role::kActivating) return;
+  }
   if (hooks_.backend_takeover) {
     TakeoverContext ctx{.identity = {cfg_.id, node_, fs_epoch},
                         .prev_node = std::move(prev_node),
@@ -695,17 +795,30 @@ void FsClusterController::begin_draining(uint32_t fsid, const char* why, bool fe
 
 void FsClusterController::run_draining(uint32_t fsid, bool release) {
   if (hooks_.deactivate_fs) hooks_.deactivate_fs(fsid);
-  // Only our own hold is released; an export someone else took stays theirs.
-  if (release) (void)store_.release_fs_fence(fsid, node_);
+  bool removed = false;
+  {
+    std::lock_guard lock(mu_);
+    if (Fs* fs = find(fsid)) removed = fs->removed;
+  }
+  // Only our own hold is released; an export someone else took stays theirs.  An
+  // export gone from the set (plan 12 B3) always drops our hold: nothing will renew
+  // it on purpose and a stale one would block the fsid if it ever came back.
+  if (release || removed) (void)store_.release_fs_fence(fsid, node_);
   {
     std::lock_guard lock(mu_);
     if (Fs* fs = find(fsid)) {
-      fs->role = Role::kStandby;
-      fs->fs_epoch = 0;
-      if (release) fs->fence.reset();  // our record no longer names it
+      if (fs->removed) {
+        fs_.erase(fsid);  // the entry's last controller reference goes with it
+      } else {
+        fs->role = Role::kStandby;
+        fs->fs_epoch = 0;
+        fs->evict = false;
+        if (release) fs->fence.reset();  // our record no longer names it
+      }
     }
   }
-  LNFS_INFO("cluster: {} no longer serves fsid {}", node_, fsid);
+  LNFS_INFO("cluster: {} no longer serves fsid {}{}", node_, fsid,
+            removed ? " (removed from the export set)" : "");
   publish(nullptr);
 }
 

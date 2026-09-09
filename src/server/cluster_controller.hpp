@@ -235,6 +235,18 @@ class FsClusterController {
   Result<void> request_migrate(uint32_t fsid, std::string_view target);
   uint64_t migrations() const;  // request_migrate calls that got as far as the owner record
 
+  // Follows the export set across versions (design 11 §11.7, plan 12 B3); main-loop
+  // thread, after ExportTable::apply.  A new fsid starts Standby (Unowned in the view)
+  // and the next tick takes it by the ordinary rule.  A changed `nodes` list replaces
+  // the entry; if this gateway serves the export but is no longer listed, it hands
+  // the export to the first listed node that is alive (request_migrate), else keeps
+  // serving and warns on every tick until one appears.  An fsid gone from the set is
+  // dropped: at once when Standby, after the drain ("removed from catalog", fence
+  // released) when Active / Activating.  The controller keeps a removed entry alive
+  // until that drain is done, so ExportTable::take_retired() cannot hand it out
+  // (and stop its backend) while its state is still being dropped.
+  void sync_exports(const std::shared_ptr<const core::ExportSet>& set);
+
   std::vector<FsState> snapshot() const;
   Role role_of(uint32_t fsid) const;  // kStandby for an unknown fsid
   const core::ClusterConfig& config() const { return cfg_; }
@@ -254,7 +266,16 @@ class FsClusterController {
 
  private:
   struct Fs {
-    const core::ExportEntry* exp = nullptr;
+    std::shared_ptr<const core::ExportEntry> exp;
+    // `exp->node_list()` as of the last sync_exports: how a changed list is noticed
+    // when apply() updated the entry in place (plan 12 B2).
+    std::vector<std::string> nodes;
+    // Gone from the export set (plan 12 B3): erased once the drain has finished.
+    bool removed = false;
+    // Dropped from `nodes` while served here (plan 12 B3): handed over on the next
+    // tick that finds a listed node alive.  Not set by an operator's forced takeover
+    // from outside the list, which stays put.
+    bool evict = false;
     Role role = Role::kStandby;
     uint64_t fs_epoch = 0;
     std::optional<FenceRecord> fence;
@@ -299,6 +320,10 @@ class FsClusterController {
   // start (gateways starting together must not race each other's exports away) and
   // dead after that.
   bool our_turn(const core::ExportEntry& exp, const StoreView& sv, bool stuck) const;
+  // Hands an export we serve but are no longer listed for to the first node of
+  // `nodes` that request_migrate accepts (registered, heartbeat live).  False when
+  // none is; the caller warns.  No lock held.
+  bool migrate_off(uint32_t fsid, const std::vector<std::string>& nodes);
   // 2 × ttl: how long an unowned export waits for its live predecessors.
   std::chrono::milliseconds stuck_after() const { return 2 * ttl(); }
   Result<void> begin_activation(uint32_t fsid, bool force, const char* reason = "takeover");
