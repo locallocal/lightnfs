@@ -14,7 +14,7 @@ VERSION="$(sed -n 's/^project(lightnfs VERSION \([0-9.]*\).*/\1/p' "$ROOT/CMakeL
 
 build_release() {
   cmake -S "$ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null
-  cmake --build "$BUILD_DIR" -j"$(nproc)" --target lightnfsd lightnfs-ctl lightnfs-fh
+  cmake --build "$BUILD_DIR" -j"${LNFS_JOBS:-$(nproc)}" --target lightnfsd lightnfs-ctl lightnfs-fh
 }
 
 # stage <install-prefix>: install into a fresh staging root under $BUILD_DIR.
