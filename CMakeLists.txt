@@ -93,6 +93,7 @@ add_library(lnfs_core STATIC
   src/nfsv3/engine.cpp
   src/mountd/mount3.cpp
   src/server/rpcbind.cpp
+  src/server/catalog_boot.cpp
   src/server/cluster_controller.cpp
   src/server/cluster_store.cpp
   src/server/ctl.cpp
