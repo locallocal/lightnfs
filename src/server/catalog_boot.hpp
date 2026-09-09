@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 
+#include "core/catalog.hpp"
 #include "core/config.hpp"
 #include "server/cluster_store.hpp"
 
@@ -16,6 +17,7 @@ struct CatalogBoot {
   bool present = false;  // the store holds a catalog
   uint64_t version = 0;  // its version; 0 while absent (the bootstrap case)
   std::string digest;    // canonical_exports_digest of what this host will serve
+  core::Catalog catalog;  // the document itself (empty while absent): the applier's base
 };
 
 // Reads the store's catalog and turns it into this host's export list: parse, the

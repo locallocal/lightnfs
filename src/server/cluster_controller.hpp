@@ -70,6 +70,9 @@ class ClusterController {
     std::function<Result<void>(const TakeoverContext&)> backend_takeover;
     // stop()+start() of every backend after draining (design 09 §9.7); optional.
     std::function<void()> backend_reset;
+    // Run at the end of every tick on the tick thread, whatever the tick did: the
+    // catalog poll (plan 12 C2) — store reads and posts only, no data-plane work.
+    std::function<void()> after_tick;
   };
 
   struct Snapshot {
@@ -110,6 +113,7 @@ class ClusterController {
   Result<std::vector<std::string>> peers() const;
 
  private:
+  void tick_once();  // tick() without Hooks::after_tick
   bool auto_takeover_allowed() const;
   // Standby → Activating: fence + epoch, then post the data-plane work.
   Result<void> begin_activation(bool force);
@@ -180,6 +184,9 @@ class FsClusterController {
     // Storage-side eviction scoped to one export (that export's Backend::takeover()
     // and the external hook).  Optional; a failure is logged, the activation goes on.
     std::function<Result<void>(uint32_t fsid, const TakeoverContext&)> backend_takeover;
+    // Run at the end of every tick on the tick thread, whatever the tick did: the
+    // catalog poll (plan 12 C2) — store reads and posts only, no data-plane work.
+    std::function<void()> after_tick;
   };
 
   struct FsState {
@@ -319,6 +326,7 @@ class FsClusterController {
   // predecessor with no record at all is "not heard from yet" for our first ttl after
   // start (gateways starting together must not race each other's exports away) and
   // dead after that.
+  void tick_once();  // tick() without Hooks::after_tick
   bool our_turn(const core::ExportEntry& exp, const StoreView& sv, bool stuck) const;
   // Hands an export we serve but are no longer listed for to the first node of
   // `nodes` that request_migrate accepts (registered, heartbeat live).  False when

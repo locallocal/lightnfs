@@ -28,6 +28,7 @@ class StateMgr;
 
 namespace lnfs::server {
 
+class CatalogApplier;
 class ClusterController;
 class FsClusterController;
 
@@ -104,6 +105,9 @@ struct CtlDeps {
   // `cluster takeover <fsid> [--force]`, `cluster standby <fsid>`.  Exclusive with
   // `cluster`; null with it = single gateway.
   FsClusterController* fs_cluster = nullptr;
+  // The catalog applier (plan 12 C2): `cluster catalog apply`.  Null = exports_source
+  // = "local".
+  CatalogApplier* catalog = nullptr;
 
   // Deps over a plane that stays attached for the deps' lifetime (single gateway,
   // tests).  `plane` must outlive the deps.

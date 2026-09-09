@@ -100,9 +100,9 @@ Result<CatalogBoot> load_catalog_exports(ClusterStore& store, core::Config& loca
                             blamed.empty() ? std::string(errno_name(ok.error())) : blamed),
                 ok.error());
   }
-  CatalogBoot boot{true, version, core::canonical_exports_digest(local)};
+  CatalogBoot boot{true, version, core::canonical_exports_digest(local), std::move(*catalog)};
   LNFS_INFO("catalog v{}: {} export(s) for this host ({} in the catalog), digest {}", version,
-            local.exports.size(), catalog->exports.size(), boot.digest);
+            local.exports.size(), boot.catalog.exports.size(), boot.digest);
   return boot;
 }
 

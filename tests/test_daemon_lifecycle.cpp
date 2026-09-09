@@ -28,6 +28,7 @@
 #include "runtime/runtime.hpp"
 #include "server/catalog_boot.hpp"
 #include "server/data_plane.hpp"
+#include "server/main_loop.hpp"
 #include "transport/connection.hpp"
 
 using namespace lnfs;
@@ -388,4 +389,53 @@ TEST(DaemonLifecycle, CatalogBootLocalMergeFails) {
   ASSERT_TRUE(!boot.has_value());
   EXPECT_EQ(static_cast<int>(boot.error()), EIO);
   EXPECT_TRUE(why.find("cannot read the catalog") != std::string::npos);
+}
+
+// plan 12 C2: MainLoop::call runs the closure on the loop thread and hands the result
+// back (the ctl `reload` path); a loop that is not running answers nullopt within the
+// timeout, and the loop thread itself runs the closure inline.
+TEST(DaemonLifecycle, MainLoopCallRunsOnTheLoopThread) {
+  server::MainLoop loop;
+  std::atomic<bool> stop{false};
+  std::atomic<int> reloads{0};
+  std::atomic<bool> reload_request{false};
+  std::thread::id loop_thread;
+  std::thread runner([&] {
+    loop_thread = std::this_thread::get_id();
+    loop.run([&] { return stop.load(); }, [&] { return reload_request.exchange(false); },
+             [&] { ++reloads; });
+  });
+  std::thread::id ran_on{};
+  auto answer = loop.call(
+      [&] {
+        ran_on = std::this_thread::get_id();
+        // From the loop thread a nested call runs inline (no self-wait).
+        auto nested = loop.call([] { return std::string("nested"); }, 10ms);
+        return std::string("ran:") + (nested ? *nested : "timeout");
+      },
+      2s);
+  ASSERT_TRUE(answer.has_value());
+  EXPECT_STREQ(*answer, "ran:nested");
+  EXPECT_TRUE(ran_on == loop_thread);
+  EXPECT_TRUE(loop.on_loop_thread() == false);
+  // A SIGHUP-style request is served on the loop thread between items.
+  reload_request = true;
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (reloads.load() == 0 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(1ms);
+  EXPECT_EQ(reloads.load(), 1);
+  stop = true;
+  runner.join();
+  // Not running any more: the call times out; drain() runs what was queued.
+  int ran_later = 0;
+  auto late = loop.call(
+      [&] {
+        ++ran_later;
+        return std::string("late");
+      },
+      50ms);
+  EXPECT_FALSE(late.has_value());
+  EXPECT_EQ(ran_later, 0);
+  loop.drain();
+  EXPECT_EQ(ran_later, 1);
 }

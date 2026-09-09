@@ -12,12 +12,17 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "mem_cluster_store.hpp"
 #include "obs/metrics.hpp"
+#include "server/catalog_applier.hpp"
+#include "server/catalog_boot.hpp"
 #include "server/cluster_controller.hpp"
 #include "server/cluster_store.hpp"
 #include "server/takeover_hook.hpp"
@@ -1445,4 +1450,321 @@ TEST(FsClusterController, SyncExportsNodesChangeNoCandidateKeeps) {
   EXPECT_STREQ(joined(rec.calls), "takeover:1 activate:1");
   EXPECT_EQ(ctl.migrations(), 1u);
   EXPECT_STREQ(store.owners[1].node, "gw1");
+}
+
+// ---- plan 12 C2: polling the catalog and applying it ----------------------------
+
+namespace {
+
+std::string catalog_doc(uint64_t version, const std::string& exports) {
+  return "[catalog]\nversion = " + std::to_string(version) + "\n" + exports;
+}
+
+std::string export_block(uint32_t fsid, const std::string& path,
+                         const std::string& nodes = "[\"gw1\"]", const std::string& extra = "") {
+  return "[[export]]\npath = \"" + path + "\"\nfsid = " + std::to_string(fsid) +
+         "\nbackend = \"local\"\nclients = [\"127.0.0.0/8\"]\nnodes = " + nodes + "\n" + extra;
+}
+
+// A catalog-mode gateway in a box: the memory store, this host's config, the table
+// booted from the store, an active-active controller polling the catalog after every
+// tick, and the applier with inline posts and counted backend starts / stops.
+struct CatalogGateway {
+  MemStore store;
+  std::string dir;
+  core::Config local;
+  std::unique_ptr<core::ExportTable> table;
+  core::FsOwnerView view;
+  FsRecorder rec;
+  std::optional<server::FsClusterController> ctl;
+  std::optional<server::CatalogApplier> applier;
+  size_t posts = 0, starts = 0, stops = 0;
+  std::vector<uint32_t> started, stopped;
+  uint32_t fail_start_fsid = 0;  // start_backend fails for this fsid
+
+  // `first` builds v1's [[export]] blocks from the box's directory.
+  CatalogGateway(const std::string& refresh,
+                 const std::function<std::string(const std::string&)>& first) {
+    char tmpl[] = "/tmp/lnfs-cat-XXXXXX";
+    dir = mkdtemp(tmpl);
+    for (const char* sub : {"a", "b", "c"}) std::filesystem::create_directories(dir + "/" + sub);
+    store.catalog_docs[1] = catalog_doc(1, first(dir));
+    (void)store.put_node_address("gw1", "10.0.0.1:2049");
+    auto parsed = core::parse_config(
+        "[cluster]\nenabled = true\nid = \"cluster-ctrl-test\"\nshared_dir = \"/srv/shared\"\n"
+        "mode = \"active-active\"\nnode = \"gw1\"\nnode_address = \"10.0.0.1:2049\"\n"
+        "exports_source = \"catalog\"\ncatalog_refresh = \"" +
+        refresh + "\"\n");
+    ASSERT_TRUE(parsed.has_value());
+    local = *parsed;
+    auto boot = server::load_catalog_exports(store, local);
+    ASSERT_TRUE(boot.has_value());
+    auto built = core::ExportTable::build(local);
+    ASSERT_TRUE(built.has_value());
+    table = std::move(*built);
+    local.exports.clear();  // CoreState::local_config: the host's side only
+    local.exports_from_catalog = false;
+    auto hooks = rec.hooks();
+    hooks.after_tick = [this] {
+      if (applier) applier->poll();
+    };
+    core::ClusterConfig cfg = local.cluster;
+    cfg.fence_lease_ms = 1000;
+    ctl.emplace(cfg, *table, store, view, std::move(hooks));
+    applier.emplace(
+        server::CatalogApplier::Deps{.store = store,
+                                     .exports = *table,
+                                     .local = local,
+                                     .node = "gw1",
+                                     .fs_cluster = &*ctl,
+                                     .post =
+                                         [this](std::function<void()> fn) {
+                                           ++posts;
+                                           fn();
+                                         },
+                                     .start_backend = [this](backend::Backend& b) -> Result<void> {
+                                       ++starts;
+                                       if (b.fsid() == fail_start_fsid) return Err(errno_from(EIO));
+                                       started.push_back(static_cast<uint32_t>(b.fsid()));
+                                       return {};
+                                     },
+                                     .stop_backend =
+                                         [this](backend::Backend& b) {
+                                           ++stops;
+                                           stopped.push_back(static_cast<uint32_t>(b.fsid()));
+                                         },
+                                     .retire_overdue = std::chrono::milliseconds(1)},
+        boot->version, boot->catalog, boot->digest);
+  }
+  ~CatalogGateway() {
+    applier.reset();
+    ctl.reset();
+    std::filesystem::remove_all(dir);
+  }
+  void publish(uint64_t expected, const std::string& exports) {
+    auto wrote = store.write_catalog(expected, catalog_doc(expected + 1, exports));
+    ASSERT_TRUE(wrote.has_value());
+  }
+};
+
+}  // namespace
+
+// A newer catalog on a tick: one apply is posted (never two), the new export joins
+// the table and the controller and is taken on the next tick; a removal drains the
+// export and the retirement sweep, posted by a later tick, stops its backend.
+TEST(FsClusterController, CatalogAutoApplyOnTick) {
+  CatalogGateway gw("auto", [](const std::string& d) { return export_block(1, d + "/a"); });
+  EXPECT_EQ(gw.applier->applied(), 1u);
+  EXPECT_EQ(gw.table->size(), 1u);
+  gw.ctl->tick();
+  ASSERT_TRUE(fs_role(*gw.ctl, 1) == server::Role::kActive);
+  EXPECT_EQ(gw.posts, 0u);  // v1 is current: nothing to post
+  EXPECT_EQ(gw.applier->pending(), 0u);
+
+  // v2 adds fsid 2.
+  gw.publish(1, export_block(1, gw.dir + "/a") + export_block(2, gw.dir + "/b"));
+  gw.ctl->tick();
+  EXPECT_EQ(gw.posts, 1u);
+  EXPECT_EQ(gw.applier->applied(), 2u);
+  EXPECT_EQ(gw.applier->pending(), 0u);
+  EXPECT_FALSE(gw.applier->applying());
+  EXPECT_EQ(gw.applier->failures(), 0u);
+  EXPECT_STREQ(gw.applier->last_error(), "");
+  EXPECT_EQ(gw.table->size(), 2u);
+  ASSERT_TRUE(gw.table->by_fsid(2) != nullptr);
+  EXPECT_STREQ(gw.table->by_fsid(2)->path, gw.dir + "/b");
+  EXPECT_EQ(gw.starts, 1u);
+  EXPECT_TRUE(gw.started == std::vector<uint32_t>{2});
+  // Recorded, and the controller knows the export (Standby until the next tick).
+  ASSERT_TRUE(gw.store.catalog_applied.contains("gw1"));
+  EXPECT_EQ(gw.store.catalog_applied["gw1"].version, 2u);
+  EXPECT_STREQ(gw.store.catalog_applied["gw1"].status, "ok");
+  EXPECT_STREQ(gw.store.catalog_applied["gw1"].digest, gw.applier->digest());
+  EXPECT_TRUE(gw.ctl->snapshot().size() == 2u);
+  EXPECT_TRUE(fs_role(*gw.ctl, 2) == server::Role::kStandby);
+  gw.ctl->tick();
+  EXPECT_TRUE(fs_role(*gw.ctl, 2) == server::Role::kActive);
+  EXPECT_EQ(gw.posts, 1u);  // nothing new: no second post
+  EXPECT_EQ(count(gw.rec.calls, "activate:2"), 1u);
+
+  // v3 drops fsid 1: drained on the apply, its backend stopped by the sweep the next
+  // tick posts (the controller's drain released the last reference).
+  gw.publish(2, export_block(2, gw.dir + "/b"));
+  gw.ctl->tick();
+  EXPECT_EQ(gw.applier->applied(), 3u);
+  EXPECT_EQ(gw.posts, 2u);
+  EXPECT_EQ(gw.table->size(), 1u);
+  EXPECT_TRUE(gw.table->by_fsid(1) == nullptr);
+  EXPECT_EQ(count(gw.rec.calls, "deactivate:1"), 1u);
+  EXPECT_TRUE(gw.ctl->snapshot().size() == 1u);
+  EXPECT_TRUE(gw.store.fences["gw1"].holds.size() == 1u);
+  EXPECT_EQ(gw.table->retired_pending(), 1u);
+  EXPECT_EQ(gw.stops, 0u);
+  gw.ctl->tick();
+  EXPECT_EQ(gw.posts, 3u);  // the retirement sweep
+  EXPECT_EQ(gw.stops, 1u);
+  EXPECT_TRUE(gw.stopped == std::vector<uint32_t>{1});
+  EXPECT_EQ(gw.table->retired_pending(), 0u);
+  gw.ctl->tick();
+  EXPECT_EQ(gw.posts, 3u);
+  EXPECT_TRUE(fs_role(*gw.ctl, 2) == server::Role::kActive);
+
+  // v4 changes fsid 2 in place (readonly + nodes): no backend churn, the same entry.
+  const auto* two = gw.table->by_fsid(2);
+  gw.publish(3, export_block(2, gw.dir + "/b", "[\"gw1\", \"gw2\"]", "readonly = true\n"));
+  gw.ctl->tick();
+  EXPECT_EQ(gw.applier->applied(), 4u);
+  EXPECT_TRUE(gw.table->by_fsid(2) == two);
+  EXPECT_TRUE(two->readonly.load());
+  EXPECT_STREQ(joined(gw.ctl->snapshot()[0].nodes), "gw1 gw2");
+  EXPECT_EQ(gw.starts, 1u);
+  EXPECT_EQ(gw.stops, 1u);
+  EXPECT_TRUE(fs_role(*gw.ctl, 2) == server::Role::kActive);
+}
+
+// catalog_refresh = "manual": the tick only records the newer version; apply_latest
+// (ctl / reload / SIGHUP) applies it and clears the pending mark.
+TEST(FsClusterController, CatalogManualLeavesPending) {
+  CatalogGateway gw("manual", [](const std::string& d) { return export_block(1, d + "/a"); });
+  gw.ctl->tick();
+  gw.publish(1, export_block(1, gw.dir + "/a") + export_block(2, gw.dir + "/b"));
+  gw.ctl->tick();
+  gw.ctl->tick();
+  EXPECT_EQ(gw.posts, 0u);
+  EXPECT_EQ(gw.applier->applied(), 1u);
+  EXPECT_EQ(gw.applier->pending(), 2u);
+  EXPECT_EQ(gw.table->size(), 1u);
+  EXPECT_TRUE(gw.store.catalog_applied.empty());
+
+  auto applied = gw.applier->apply_latest();
+  ASSERT_TRUE(applied.has_value());
+  EXPECT_EQ(*applied, 2u);
+  EXPECT_EQ(gw.applier->applied(), 2u);
+  EXPECT_EQ(gw.applier->pending(), 0u);
+  EXPECT_EQ(gw.table->size(), 2u);
+  EXPECT_EQ(gw.store.catalog_applied["gw1"].version, 2u);
+  // Nothing newer: apply_latest is a no-op that reports the current version.
+  applied = gw.applier->apply_latest();
+  ASSERT_TRUE(applied.has_value());
+  EXPECT_EQ(*applied, 2u);
+  EXPECT_EQ(gw.starts, 1u);
+  // apply_now goes through the post hook (the main loop in the daemon).
+  gw.publish(2, export_block(1, gw.dir + "/a") + export_block(2, gw.dir + "/b") +
+                    export_block(3, gw.dir + "/c"));
+  auto now = gw.applier->apply_now();
+  ASSERT_TRUE(now.has_value());
+  EXPECT_EQ(*now, 3u);
+  EXPECT_EQ(gw.posts, 1u);
+  EXPECT_EQ(gw.table->size(), 3u);
+  // Flipping the key to auto (a reload) makes the next tick apply by itself.
+  gw.local.cluster.catalog_refresh = "auto";
+  gw.publish(3, export_block(1, gw.dir + "/a") + export_block(2, gw.dir + "/b"));
+  gw.ctl->tick();
+  EXPECT_EQ(gw.applier->applied(), 4u);
+  EXPECT_EQ(gw.table->size(), 2u);
+}
+
+// A version this host cannot apply leaves the running set untouched, records
+// catalog.<node> = <old> error:<why>, and is retried once fixed.
+TEST(FsClusterController, CatalogApplyFailureKeepsOld) {
+  CatalogGateway gw("auto", [](const std::string& d) { return export_block(1, d + "/a"); });
+  gw.ctl->tick();
+  auto before = gw.table->snapshot();
+
+  // fsid 2 at a path this host does not have.
+  gw.publish(1, export_block(1, gw.dir + "/a") + export_block(2, "/nonexistent/lnfs-c2"));
+  gw.ctl->tick();
+  EXPECT_EQ(gw.posts, 1u);
+  EXPECT_EQ(gw.applier->applied(), 1u);
+  EXPECT_EQ(gw.applier->pending(), 2u);
+  EXPECT_EQ(gw.applier->failures(), 1u);
+  EXPECT_TRUE(gw.applier->last_error().find("catalog v2") != std::string::npos);
+  EXPECT_TRUE(gw.applier->last_error().find("fsid=2") != std::string::npos);
+  EXPECT_TRUE(gw.table->snapshot() == before);  // nothing published
+  EXPECT_EQ(gw.starts, 0u);
+  EXPECT_EQ(gw.store.catalog_applied["gw1"].version, 1u);
+  EXPECT_TRUE(gw.store.catalog_applied["gw1"].status.starts_with("error:catalog v2"));
+  EXPECT_STREQ(gw.store.catalog_applied["gw1"].digest, gw.applier->digest());
+  // The failed version is not retried by the next ticks (every kRetryEveryPolls polls
+  // only): no post, the pending mark stays; a manual apply retries at once and fails
+  // the same way.
+  gw.ctl->tick();
+  gw.ctl->tick();
+  EXPECT_EQ(gw.posts, 1u);
+  EXPECT_EQ(gw.applier->failures(), 1u);
+  EXPECT_EQ(gw.applier->pending(), 2u);
+  EXPECT_TRUE(fs_role(*gw.ctl, 1) == server::Role::kActive);
+  auto again = gw.applier->apply_latest();
+  ASSERT_TRUE(!again.has_value());
+  EXPECT_EQ(gw.applier->failures(), 2u);
+  for (int i = 0; i < server::CatalogApplier::kRetryEveryPolls; ++i) gw.ctl->tick();
+  EXPECT_EQ(gw.posts, 2u);  // the automatic retry came around once
+  EXPECT_EQ(gw.applier->failures(), 3u);
+
+  // A rejected change: fsid 1's path moved.
+  gw.publish(2, export_block(1, gw.dir + "/c"));
+  auto rejected = gw.applier->apply_latest();
+  ASSERT_TRUE(!rejected.has_value());
+  EXPECT_EQ(static_cast<int>(rejected.error()), EINVAL);
+  EXPECT_TRUE(gw.applier->last_error().find("remove and re-add") != std::string::npos);
+  EXPECT_TRUE(gw.applier->last_error().find("fsid 1") != std::string::npos);
+  EXPECT_TRUE(gw.table->snapshot() == before);
+  EXPECT_EQ(gw.applier->applied(), 1u);
+
+  // Two additions, the second fails to start: the first, already started, is stopped
+  // again and nothing is published.
+  gw.publish(3, export_block(1, gw.dir + "/a") + export_block(2, gw.dir + "/b") +
+                    export_block(3, gw.dir + "/c"));
+  gw.fail_start_fsid = 3;
+  auto failed = gw.applier->apply_latest();
+  ASSERT_TRUE(!failed.has_value());
+  EXPECT_EQ(static_cast<int>(failed.error()), EIO);
+  EXPECT_TRUE(gw.applier->last_error().find("fsid=3") != std::string::npos);
+  EXPECT_TRUE(gw.applier->last_error().find("failed to start") != std::string::npos);
+  EXPECT_EQ(gw.starts, 2u);
+  EXPECT_TRUE(gw.started == std::vector<uint32_t>{2});
+  EXPECT_EQ(gw.stops, 1u);
+  EXPECT_TRUE(gw.stopped == std::vector<uint32_t>{2});
+  EXPECT_TRUE(gw.table->snapshot() == before);
+  EXPECT_EQ(gw.table->size(), 1u);
+  gw.fail_start_fsid = 0;
+
+  // Fixed (v5): applied, the failure record replaced.
+  gw.publish(4, export_block(1, gw.dir + "/a") + export_block(2, gw.dir + "/b"));
+  before.reset();
+  gw.ctl->tick();
+  EXPECT_EQ(gw.applier->applied(), 5u);
+  EXPECT_EQ(gw.applier->pending(), 0u);
+  EXPECT_STREQ(gw.applier->last_error(), "");
+  EXPECT_EQ(gw.table->size(), 2u);
+  EXPECT_EQ(gw.store.catalog_applied["gw1"].version, 5u);
+  EXPECT_STREQ(gw.store.catalog_applied["gw1"].status, "ok");
+  EXPECT_EQ(gw.starts, 3u);
+  gw.ctl->tick();
+  EXPECT_TRUE(fs_role(*gw.ctl, 2) == server::Role::kActive);
+
+  // The catalog disappearing from the store is not an error: nothing to apply.
+  gw.store.catalog_docs.clear();
+  gw.ctl->tick();
+  EXPECT_EQ(gw.applier->applied(), 5u);
+  EXPECT_EQ(gw.applier->pending(), 0u);
+  EXPECT_EQ(gw.applier->failures(), 5u);  // v2 three times, the rejected v3, the failed start
+}
+
+// The failover controller polls the same way: a standby applies too, so the table
+// its next activation rebuilds the stack from is current.
+TEST(ClusterController, CatalogPollAfterTick) {
+  MemStore store;
+  size_t polls = 0;
+  Recorder rec;
+  auto hooks = rec.hooks();
+  hooks.after_tick = [&] { ++polls; };
+  server::ClusterController ctl(config("gw1", "standby"), store, std::move(hooks));
+  ctl.tick();
+  ctl.tick();
+  EXPECT_EQ(polls, 2u);
+  EXPECT_TRUE(ctl.role() == server::Role::kStandby);
+  store.fail_read = errno_from(EIO);  // an unreadable store still polls
+  ctl.tick();
+  EXPECT_EQ(polls, 3u);
 }

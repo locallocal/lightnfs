@@ -41,7 +41,8 @@ struct Management {
                           std::function<std::string()> reload,
                           std::function<std::string()> role = {},
                           ClusterController* cluster = nullptr,
-                          FsClusterController* fs_cluster = nullptr);
+                          FsClusterController* fs_cluster = nullptr,
+                          CatalogApplier* catalog = nullptr);
   // `plane` must stay valid until detach() returns: detach waits for every command
   // still using the plane (bounded; a warning names the stragglers).
   void attach(const DataPlane* plane) { this->plane->store(plane); }

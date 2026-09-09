@@ -62,6 +62,11 @@ bool ClusterController::auto_takeover_allowed() const {
 }
 
 void ClusterController::tick() {
+  tick_once();
+  if (hooks_.after_tick) hooks_.after_tick();
+}
+
+void ClusterController::tick_once() {
   Role role;
   {
     std::lock_guard lock(mu_);
@@ -464,6 +469,11 @@ bool FsClusterController::renew() {
 }
 
 void FsClusterController::tick() {
+  tick_once();
+  if (hooks_.after_tick) hooks_.after_tick();
+}
+
+void FsClusterController::tick_once() {
   // No takeover while we cannot renew: a fence we cannot keep is not worth taking, and
   // an export just drained for that reason must not bounce straight back.
   if (!renew()) {
