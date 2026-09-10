@@ -9,6 +9,8 @@
 //   [<fsid>]|migrate <fsid> <node>|catalog <show|status|history|diff [v1] [v2]|
 //   import <file> [--dry-run] [--comment=TEXT]|rollback <version>|apply>>
 //                [--socket=PATH]
+//   lightnfs-ctl cluster export <list|add …|set <fsid> …|remove <fsid> [--force]> [--socket=PATH]
+//                (forwarded verbatim: the server parses the export flags, plan 12 D2)
 //   lightnfs-ctl bench <echo|nullrpc|fullpath> [args...]
 //
 // Socket resolution: --socket, else $LIGHTNFS_CTL, else /tmp/lightnfs-state/ctl.sock.
@@ -150,9 +152,18 @@ Cmd make_cluster_leaf() {
         "per-node keys stripped; --dry-run only reports the diff; --comment=TEXT goes into "
         "the audit trail); `catalog rollback <version>` commits a kept version as a new "
         "one; `catalog apply` applies the latest version now (catalog_refresh = manual). "
-        "Answers `cluster: not enabled` on a single gateway.",
+        "`export list` prints the catalog's exports; `export add --path P --fsid N "
+        "[--backend B] [--nodes a,b] [--clients c1,c2] [--readonly] [--squash root|all|none] "
+        "[--anon-uid N] [--anon-gid N] [--read-bps N] [--write-bps N] [--iops N] [--opt k=v …] "
+        "[--disabled] [--force] [--dry-run] [--comment T]` adds one export (--opt sets a "
+        "backend cluster key; --force reuses an fsid a kept version used differently); "
+        "`export set <fsid> …` changes the on-line fields of one export (the same flags "
+        "minus --path/--backend/--opt; --readonly=false / --disabled=false to clear); "
+        "`export remove <fsid> [--force]` removes one (refused while a gateway serves it, "
+        "unless --force). Answers `cluster: not enabled` on a single gateway.",
         "cluster role: status / exports [node] / takeover [fsid] / standby [fsid] / migrate "
-        "fsid node / catalog show|status|history|diff|import|rollback|apply",
+        "fsid node / catalog show|status|history|diff|import|rollback|apply / export "
+        "list|add|set|remove",
         run_cluster_cmd);
     add_socket_flag(cmd);
     cmd->varp<bool>("force", "f", false, "takeover: overwrite a live fence held by another node");
@@ -230,9 +241,33 @@ std::vector<std::string> normalize_argv(int argc, char** argv) {
     return out;
 }
 
+// `cluster export …` (plan 12 D2) has too many per-export flags — and "was --readonly
+// given at all" matters for `set` — to route through cflag: the line goes to the server
+// verbatim (each argument quoted as needed), which parses and validates the flags and
+// answers the usage line for a bad one.  --socket/-s and --json are still ours.
+int run_cluster_export_raw(const std::vector<std::string>& argv) {
+    std::string socket = default_socket(), line = "cluster export";
+    bool json = false;
+    for (size_t i = 3; i < argv.size(); ++i) {
+        const std::string& a = argv[i];
+        if (a.rfind("--socket=", 0) == 0)
+            socket = a.substr(9);
+        else if (a == "--json" || a == "-j")
+            json = true;
+        else
+            line += " " + wire_arg(a);
+    }
+    if (json) line += " --json";
+    return send_ctl(socket, line + "\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    {
+        auto args = normalize_argv(argc, argv);
+        if (args.size() >= 3 && args[1] == "cluster" && args[2] == "export") return run_cluster_export_raw(args);
+    }
     auto root = std::make_shared<ccmd::c_command>(
         "lightnfs-ctl", "lightnfs-ctl --socket=/var/lib/lightnfs/ctl.sock state",
         "lightnfs-ctl <command> [--socket=PATH] | lightnfs-ctl bench <name> [args...]",

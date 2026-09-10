@@ -1577,3 +1577,226 @@ TEST(Ctl, ClusterCatalogCommands) {
     }
     runtime.stop_and_join();
 }
+
+// plan 12 D2: `cluster export list|add|set|remove` over the memory store, with an
+// active-active controller for the owner guard and the nodes rule.
+TEST(Ctl, ClusterExportCommands) {
+    rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+    runtime.start();
+    {
+        test::MemClusterStore store;
+        (void)store.put_node_address("gw1", "10.0.0.1:2049");
+        (void)store.put_node_address("gw2", "10.0.0.2:2049");
+        (void)store.renew_fences("gw2", std::chrono::seconds(60));
+        // The table this gateway serves (fsid 1 ours, 2 gw2's) — the controller's view.
+        core::ExportTable exports;
+        for (uint32_t fsid = 1; fsid <= 2; ++fsid) {
+            core::ExportConfig ec;
+            ec.path = "/export/" + std::to_string(fsid);
+            ec.fsid = fsid;
+            ec.clients = {"127.0.0.0/8"};
+            ec.nodes = fsid == 1 ? std::vector<std::string>{"gw1"} : std::vector<std::string>{"gw2"};
+            ASSERT_TRUE(exports.add(ec, std::make_unique<backend::MemoryBackend>(fsid)).has_value());
+        }
+        core::ClusterConfig cfg;
+        cfg.enabled = true;
+        cfg.mode = "active-active";
+        cfg.id = "cluster-ctl-test";
+        cfg.shared_dir = "/srv/shared";
+        cfg.node = "gw1";
+        cfg.node_address = "10.0.0.1:2049";
+        cfg.fence_lease_ms = 1000;
+        core::FsOwnerView view;
+        server::FsClusterController fc(cfg, exports, store, view, {}, 1);
+        store.fs_taken_by(2, "gw2", 3);
+        (void)store.put_owner(2, {"gw2", "10.0.0.2:2049", 3});
+        fc.tick();
+        ASSERT_TRUE(fc.role_of(1) == server::Role::kActive);
+        server::CtlDeps deps{};
+        deps.fs_cluster = &fc;
+        auto ask = [&](const std::string& line) {
+            return run_task(runtime, server::CtlServer::answer_async(deps, line, 7));
+        };
+        EXPECT_STREQ(ask("cluster export list"), "cluster: not enabled\n");
+        deps.store = &store;
+        EXPECT_STREQ(ask("cluster export list"), "catalog: none\n");
+        EXPECT_STREQ(ask("cluster export list --json"), "{\"catalog\":null}\n");
+        EXPECT_TRUE(ask("cluster export bogus").starts_with("cluster export: expected list|add"));
+        EXPECT_STREQ(ask("cluster export bogus --json"), "{\"error\":\"bad subcommand\"}\n");
+
+        // add: flags in both spellings, the audit trail, v1 visible through show / list.
+        EXPECT_STREQ(ask("cluster export add --fsid 1"), "cluster: add: --path and --fsid are required\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/1 --fsid x"),
+                     "cluster: --fsid \"x\": expected a non-zero number\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/1 --fsid 1 --bogus 3"), "cluster: unknown flag --bogus\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/1 --fsid 1 --nodes"), "cluster: --nodes needs a value\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/1 --fsid 1 --readonly=maybe"),
+                     "cluster: --readonly takes true or false\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/1 --fsid 1 --squash=sometimes --nodes gw1"),
+                     "cluster: --squash \"sometimes\": expected root, all or none\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/1 --fsid 1 --opt handles"),
+                     "cluster: --opt \"handles\": expected key=value\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/1 --fsid 1 --nodes gw1 --dry-run"),
+                     "catalog v1 committed (was none): export fsid=1 would be added: added=1 removed=- disabled=- "
+                     "enabled=- nodes_changed=- dynamic_changed=- rejected=-\n");
+        EXPECT_TRUE(store.catalog_docs.empty());
+        // active-active: nodes required (the cluster-level validation)
+        EXPECT_TRUE(
+            ask("cluster export add --path /export/1 --fsid 1").starts_with("cluster: add failed: invalid catalog: "));
+        EXPECT_STREQ(
+            ask("cluster export add --path=/export/1 --fsid=1 --nodes=gw1,gw2 --clients 10.0.0.0/8,10.1.0.0/16 "
+                "--readonly --squash none --anon-uid 1 --anon-gid 2 --read-bps 300 --write-bps 400 --iops 5 "
+                "--opt handles=auto --comment \"add one\""),
+            "catalog v1 committed (was none): export fsid=1 added: added=1 removed=- disabled=- enabled=- "
+            "nodes_changed=- dynamic_changed=- rejected=-\n");
+        auto v1 = core::parse_catalog(store.catalog_docs[1]);
+        ASSERT_TRUE(v1.has_value());
+        EXPECT_STREQ(v1->meta.updated_by, "gw1 uid=7");
+        EXPECT_STREQ(v1->meta.comment, "add one");
+        EXPECT_STREQ(ask("cluster export list"),
+                     "fsid=1 path=/export/1 backend=local nodes=gw1,gw2 disabled=no clients=10.0.0.0/8,10.1.0.0/16 "
+                     "readonly=yes squash=none anon_uid=1 anon_gid=2 read_bps=300 write_bps=400 iops=5 "
+                     "keys=handles=auto\n");
+        EXPECT_STREQ(ask("cluster export list --json"),
+                     "{\"version\":1,\"exports_list\":[{\"fsid\":1,\"path\":\"/export/1\",\"backend\":\"local\","
+                     "\"nodes\":[\"gw1\",\"gw2\"],\"disabled\":false,\"clients\":[\"10.0.0.0/8\",\"10.1.0.0/16\"],"
+                     "\"readonly\":true,\"squash\":\"none\",\"anon_uid\":1,\"anon_gid\":2,\"read_bps\":300,"
+                     "\"write_bps\":400,\"iops\":5,\"backend_keys\":{\"handles\":\"auto\"}}]}\n");
+        EXPECT_TRUE(ask("cluster catalog show").find("\nfsid=1 path=/export/1 ") != std::string::npos);
+        // Refused: a duplicate fsid, a nested path, a per-node key, an unknown backend,
+        // an unparseable client; v1 stands.
+        EXPECT_STREQ(
+            ask("cluster export add --path /export/x --fsid 1 --nodes gw1"),
+            "cluster: add failed: fsid 1 is already in the catalog (/export/1): use set, or remove it first\n");
+        EXPECT_TRUE(ask("cluster export add --path /export/1/sub --fsid 5 --nodes gw1")
+                        .starts_with("cluster: add failed: invalid catalog: "));
+        EXPECT_TRUE(ask("cluster export add --path /export/5 --fsid 5 --nodes gw1 --backend cephfs --opt conf=/x")
+                        .starts_with("cluster: add failed: invalid catalog: "));
+        EXPECT_TRUE(ask("cluster export add --path /export/5 --fsid 5 --nodes gw1 --backend nope --json")
+                        .starts_with("{\"error\":\"add failed: invalid catalog: "));
+        EXPECT_TRUE(ask("cluster export add --path /export/5 --fsid 5 --nodes gw1 --clients bogus")
+                        .starts_with("cluster: add failed: invalid catalog: "));
+        EXPECT_EQ(store.catalog_version(), 1u);
+        // A second export, JSON answer.
+        EXPECT_STREQ(ask("cluster export add --path /export/2 --fsid 2 --nodes gw2 --json"),
+                     "{\"version\":2,\"was\":1,\"fsid\":2,\"action\":\"added\",\"added\":[2],\"removed\":[],"
+                     "\"disabled\":[],\"enabled\":[],\"nodes_changed\":[],\"dynamic_changed\":[],"
+                     "\"rejected\":[]}\n");
+
+        // set: nodes reordered, readonly cleared, disabled; identity fields refused;
+        // nothing to change / unknown fsid refused.
+        EXPECT_STREQ(ask("cluster export set"), "cluster: set: an fsid is required\n");
+        EXPECT_STREQ(ask("cluster export set 1"), "cluster: set: nothing to change\n");
+        EXPECT_STREQ(ask("cluster export set 9 --nodes gw1"), "cluster: set failed: fsid 9 is not in the catalog\n");
+        EXPECT_STREQ(ask("cluster export set 1 --path /elsewhere"),
+                     "cluster: fsid 1: path, backend and backend keys cannot change: remove and re-add, or use a "
+                     "new fsid\n");
+        EXPECT_STREQ(ask("cluster export set 1 --opt handles=path --json"),
+                     "{\"error\":\"fsid 1: path, backend and backend keys cannot change: remove and re-add, or use "
+                     "a new fsid\"}\n");
+        EXPECT_STREQ(ask("cluster export set 1 --nodes gw2,gw1 --readonly=false --comment reorder"),
+                     "catalog v3 committed (was v2): export fsid=1 updated: added=- removed=- disabled=- enabled=- "
+                     "nodes_changed=1 dynamic_changed=1 rejected=-\n");
+        auto v3 = core::parse_catalog(store.catalog_docs[3]);
+        ASSERT_TRUE(v3.has_value());
+        EXPECT_STREQ(joined_calls(v3->by_fsid(1)->cfg.nodes), "gw2 gw1");
+        EXPECT_FALSE(v3->by_fsid(1)->cfg.readonly);
+        EXPECT_STREQ(v3->meta.comment, "reorder");
+        EXPECT_STREQ(ask("cluster export set 2 --disabled --json"),
+                     "{\"version\":4,\"was\":3,\"fsid\":2,\"action\":\"updated\",\"added\":[],\"removed\":[],"
+                     "\"disabled\":[2],\"enabled\":[],\"nodes_changed\":[],\"dynamic_changed\":[],"
+                     "\"rejected\":[]}\n");
+        EXPECT_TRUE(ask("cluster export list").find("fsid=2 path=/export/2 backend=local nodes=gw2 disabled=yes ") !=
+                    std::string::npos);
+        EXPECT_STREQ(ask("cluster export set 2 --disabled=false --dry-run"),
+                     "catalog v5 committed (was v4): export fsid=2 would be updated: added=- removed=- disabled=- "
+                     "enabled=2 nodes_changed=- dynamic_changed=- rejected=-\n");
+        EXPECT_EQ(store.catalog_version(), 4u);
+
+        // remove: the owner guard — fsid 1 is served here, 2 by gw2 (the view) — then
+        // --force; an fsid nobody serves goes without it.
+        EXPECT_STREQ(ask("cluster export remove"), "cluster: remove: an fsid is required\n");
+        EXPECT_STREQ(ask("cluster export remove 1 --nodes gw1"), "cluster: remove takes no --nodes\n");
+        EXPECT_STREQ(ask("cluster export remove 1"),
+                     "cluster: fsid 1 is served by gw1 (disable it first, or --force)\n");
+        EXPECT_STREQ(ask("cluster export remove 2 --json"),
+                     "{\"error\":\"fsid 2 is served by gw2 (disable it first, or --force)\"}\n");
+        EXPECT_STREQ(ask("cluster export remove 9"), "cluster: remove failed: fsid 9 is not in the catalog\n");
+        EXPECT_EQ(store.catalog_version(), 4u);
+        EXPECT_STREQ(ask("cluster export remove 2 --force --comment \"bye 2\""),
+                     "catalog v5 committed (was v4): export fsid=2 removed: added=- removed=2 disabled=- enabled=- "
+                     "nodes_changed=- dynamic_changed=- rejected=-\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/3 --fsid 3 --nodes gw1"),
+                     "catalog v6 committed (was v5): export fsid=3 added: added=3 removed=- disabled=- enabled=- "
+                     "nodes_changed=- dynamic_changed=- rejected=-\n");
+        EXPECT_STREQ(ask("cluster export remove 3 --json"),
+                     "{\"version\":7,\"was\":6,\"fsid\":3,\"action\":\"removed\",\"added\":[],\"removed\":[3],"
+                     "\"disabled\":[],\"enabled\":[],\"nodes_changed\":[],\"dynamic_changed\":[],"
+                     "\"rejected\":[]}\n");
+
+        // The fsid reuse rule: 2 was /export/2 (v4 in the history); the same identity
+        // comes back freely, a different one needs --force.
+        EXPECT_STREQ(ask("cluster export add --path /export/2b --fsid 2 --nodes gw2"),
+                     "cluster: fsid 2 was /export/2 (local) in v4: a reused fsid must keep its path, backend and "
+                     "cluster keys, or use a new fsid (--force to reuse it anyway)\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/2 --fsid 2 --nodes gw2"),
+                     "catalog v8 committed (was v7): export fsid=2 added: added=2 removed=- disabled=- enabled=- "
+                     "nodes_changed=- dynamic_changed=- rejected=-\n");
+        EXPECT_STREQ(ask("cluster export remove 2 --force"),
+                     "catalog v9 committed (was v8): export fsid=2 removed: added=- removed=2 disabled=- enabled=- "
+                     "nodes_changed=- dynamic_changed=- rejected=-\n");
+        EXPECT_STREQ(ask("cluster export add --path /export/2b --fsid 2 --nodes gw2 --force"),
+                     "catalog v10 committed (was v9): export fsid=2 added: added=2 removed=- disabled=- enabled=- "
+                     "nodes_changed=- dynamic_changed=- rejected=-\n");
+
+        // A concurrent commit between our read and write is not lost: the edit is
+        // re-applied on the other writer's version.
+        bool bumped = false;
+        store.before_write_catalog = [&] {
+            if (bumped) return;
+            bumped = true;
+            auto cur = core::parse_catalog(store.catalog_docs[store.catalog_version()]);
+            core::CatalogExport other;
+            other.cfg.path = "/export/9";
+            other.cfg.fsid = 9;
+            other.cfg.nodes = {"gw2"};
+            cur->exports.push_back(other);
+            cur->meta = core::CatalogMeta{.version = 11, .updated_at = "-", .updated_by = "gw2", .comment = ""};
+            store.catalog_docs[11] = core::serialize_catalog(*cur);
+        };
+        EXPECT_STREQ(ask("cluster export add --path /export/4 --fsid 4 --nodes gw1"),
+                     "catalog v12 committed (was v11): export fsid=4 added: added=4 removed=- disabled=- enabled=- "
+                     "nodes_changed=- dynamic_changed=- rejected=-\n");
+        store.before_write_catalog = {};
+        auto v12 = core::parse_catalog(store.catalog_docs[12]);
+        ASSERT_TRUE(v12.has_value());
+        EXPECT_TRUE(v12->by_fsid(9) != nullptr);
+        EXPECT_TRUE(v12->by_fsid(4) != nullptr);
+
+        // failover: while this gateway is Active it serves every export — remove needs
+        // --force; a standby gateway may remove freely.
+        deps.fs_cluster = nullptr;
+        core::ClusterConfig fcfg;
+        fcfg.enabled = true;
+        fcfg.id = "cluster-ctl-test";
+        fcfg.shared_dir = "/srv/shared";
+        fcfg.node = "gw1";
+        fcfg.takeover = "manual";
+        fcfg.fence_lease_ms = 1000;
+        server::ClusterController::Hooks hooks;
+        hooks.activate = [](uint64_t) -> Result<void> { return {}; };
+        hooks.deactivate = [] {};
+        server::ClusterController cc(fcfg, store, std::move(hooks));
+        deps.cluster = &cc;
+        EXPECT_STREQ(ask("cluster export remove 4 --dry-run"),
+                     "catalog v13 committed (was v12): export fsid=4 would be removed: added=- removed=4 disabled=- "
+                     "enabled=- nodes_changed=- dynamic_changed=- rejected=-\n");
+        ASSERT_TRUE(cc.request_takeover(true).has_value());
+        EXPECT_STREQ(ask("cluster export remove 4"),
+                     "cluster: fsid 4 is served by gw1 (disable it first, or --force)\n");
+        EXPECT_STREQ(ask("cluster export remove 4 --force"),
+                     "catalog v13 committed (was v12): export fsid=4 removed: added=- removed=4 disabled=- enabled=- "
+                     "nodes_changed=- dynamic_changed=- rejected=-\n");
+    }
+    runtime.stop_and_join();
+}

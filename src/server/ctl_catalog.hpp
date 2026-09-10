@@ -1,5 +1,6 @@
 #pragma once
-// `lightnfs-ctl cluster catalog …` (design 11 §11.10, plan 12 D1): the read commands
+// `lightnfs-ctl cluster catalog …` / `cluster export …` (design 11 §11.10, plan 12
+// D1 / D2): the read commands
 // over the shared catalog (show / status / history / diff), the two writers (import /
 // rollback: CAS commits through ClusterStore::write_catalog, retried on EAGAIN) and
 // `apply` (the C2 applier).  Everything here is blocking store / file IO, run by the
@@ -20,6 +21,11 @@ namespace lnfs::server {
 // trail: updated_by = "<node> uid=<uid>".  Answers "cluster: not enabled" without a
 // store.  Blocking; never call on a reactor.
 std::string cluster_catalog_answer(const CtlDeps& deps, const CtlCommand& cmd, std::optional<uint32_t> peer_uid);
+
+// `cluster export <list|add|set|remove> …` (plan 12 D2): single-export edits of the
+// catalog, committed the same way; `remove` is guarded by the owner view (design 11
+// §11.5) unless --force.  Same threading rules as above.
+std::string cluster_export_answer(const CtlDeps& deps, const CtlCommand& cmd, std::optional<uint32_t> peer_uid);
 
 // The JSON string escaper the ctl answers share.
 std::string ctl_json_escape(std::string_view s);
