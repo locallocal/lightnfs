@@ -322,11 +322,15 @@ nodes = ["gw2", "gw3", "gw1"]         # b 的属主优先 gw2 → 负载分摊
 **观测**：`lightnfs-ctl cluster status`（多活下先一行网关总览：`mode node node_epoch
 node_address shared_dir peers peers_alive takeover migrations exports`，再每导出一行
 `fsid role nodes owner address fs_epoch fence_age_ms fence_expires_in_ms grace_remaining_s
-takeovers fence_lost activation_failures`；`--json` 时 `exports` 为数组）与指标
+takeovers fence_lost activation_failures`；`--json` 时 `exports` 为数组；`exports_source = "catalog"`
+时网关行尾多 `catalog catalog_latest catalog_refresh catalog_error`——已应用 / 最近看到的清单版本、刷新
+策略、上次应用失败原因，主备形态同）与指标
 `lightnfs_cluster_fs_role{fsid,role}`（one-hot：active/activating/draining/remote/unowned）、
 `lightnfs_cluster_fs_owner{fsid,node}`、`lightnfs_cluster_fs_epoch{fsid}`、
 `lightnfs_cluster_fs_{takeovers,fence_lost,activation_failures}_total{fsid}`、
-`lightnfs_cluster_node_epoch`、`lightnfs_cluster_migrations_total`、`lightnfs_v4_moved_total{fsid}`。
+`lightnfs_cluster_node_epoch`、`lightnfs_cluster_migrations_total`、`lightnfs_v4_moved_total{fsid}`；
+清单模式再加 `lightnfs_cluster_catalog_{version,latest_version,pending}` 与
+`lightnfs_cluster_catalog_{applies,apply_failures}_total`（主备同）。
 告警建议：某 fsid 的 `fs_role{role="active"}` 在集群内之和 ≠ 1、`fs_owner` 长时间无样本、
 `fs_fence_lost_total` 增长（脑裂 / 围栏被改写）、`v4_moved_total` 持续增长（客户端没有跟随
 `fs_locations`：老客户端或 `node_address` 不可达）。

@@ -3,15 +3,21 @@
 // span overload of append_histogram.  Metrics::instance() is process-global, so every
 // assertion is delta-based or presence-based rather than assuming pristine counters.
 
+#include <stdlib.h>
+
+#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "backend/memory/memory.hpp"
+#include "core/config.hpp"
 #include "core/fs_owner_view.hpp"
 #include "mem_cluster_store.hpp"
 #include "mini_test.hpp"
 #include "obs/metrics.hpp"
+#include "server/catalog_applier.hpp"
+#include "server/catalog_boot.hpp"
 #include "server/cluster_controller.hpp"
 
 using namespace lnfs;
@@ -213,6 +219,90 @@ TEST(Metrics, ClusterFsSeries) {
     }
     EXPECT_EQ(obs::text_provider_count(), providers_before);
     EXPECT_EQ(sample_value(obs::prometheus_text(), "lightnfs_cluster_node_epoch"), -1);
+}
+
+// plan 12 C3: the catalog follower's series, registered for the applier's lifetime
+// (the same set under failover and active-active): the applied and the latest seen
+// version, the pending flag, and the apply / failure counters.
+TEST(Metrics, CatalogSeries) {
+    const size_t providers_before = obs::text_provider_count();
+    char tmpl[] = "/tmp/lnfs-metcat-XXXXXX";
+    std::string dir = mkdtemp(tmpl);
+    std::filesystem::create_directories(dir + "/a");
+    std::filesystem::create_directories(dir + "/b");
+    auto doc = [&](uint64_t v, const std::string& extra) {
+        return "[catalog]\nversion = " + std::to_string(v) + "\n[[export]]\npath = \"" + dir +
+               "/a\"\nfsid = 1\nbackend = \"local\"\nclients = [\"127.0.0.0/8\"]\n" + extra;
+    };
+    auto block = [&](uint32_t fsid, const std::string& path) {
+        return "[[export]]\npath = \"" + path + "\"\nfsid = " + std::to_string(fsid) +
+               "\nbackend = \"local\"\nclients = [\"127.0.0.0/8\"]\n";
+    };
+    {
+        test::MemClusterStore store;
+        store.catalog_docs[1] = doc(1, "");
+        auto local = core::parse_config(
+            "[cluster]\nenabled = true\nid = \"cluster-metrics-test\"\nshared_dir = \"/srv/shared\"\n"
+            "node = \"gw1\"\nexports_source = \"catalog\"\ncatalog_refresh = \"manual\"\n");
+        ASSERT_TRUE(local.has_value());
+        auto boot = server::load_catalog_exports(store, *local);
+        ASSERT_TRUE(boot.has_value());
+        auto table = core::ExportTable::build(*local);
+        ASSERT_TRUE(table.has_value());
+        local->exports.clear();
+        local->exports_from_catalog = false;
+        server::CatalogApplier applier({.store = store, .exports = **table, .local = *local, .node = "gw1"},
+                                       boot->version, boot->catalog, boot->digest);
+        EXPECT_EQ(obs::text_provider_count(), providers_before + 1);
+
+        // Booted from v1: applied = latest = 1, nothing pending, no applies yet.
+        auto text = obs::prometheus_text();
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_version"), 1);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_latest_version"), 1);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_pending"), 0);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_applies_total"), 0);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_apply_failures_total"), 0);
+
+        // v2 published, seen by a manual-mode poll: latest 2, pending, still serving v1.
+        ASSERT_TRUE(store.write_catalog(1, doc(2, block(2, dir + "/b"))).has_value());
+        applier.poll();
+        text = obs::prometheus_text();
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_version"), 1);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_latest_version"), 2);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_pending"), 1);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_applies_total"), 0);
+
+        // Applied: version 2, one apply, pending cleared.
+        ASSERT_TRUE(applier.apply_latest().has_value());
+        text = obs::prometheus_text();
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_version"), 2);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_latest_version"), 2);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_pending"), 0);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_applies_total"), 1);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_apply_failures_total"), 0);
+
+        // v3 this host cannot serve: a failure counted, v3 seen and pending, v2 served.
+        ASSERT_TRUE(store.write_catalog(2, doc(3, block(9, "/nonexistent/x"))).has_value());
+        EXPECT_FALSE(applier.apply_latest().has_value());
+        text = obs::prometheus_text();
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_version"), 2);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_latest_version"), 3);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_pending"), 1);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_applies_total"), 1);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_apply_failures_total"), 1);
+
+        // The catalog gone from the store: latest 0, nothing pending, v2 still served.
+        store.catalog_docs.clear();
+        applier.poll();
+        text = obs::prometheus_text();
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_version"), 2);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_latest_version"), 0);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_pending"), 0);
+        EXPECT_EQ(sample_value(text, "lightnfs_cluster_catalog_apply_failures_total"), 1);
+    }
+    EXPECT_EQ(obs::text_provider_count(), providers_before);
+    EXPECT_EQ(sample_value(obs::prometheus_text(), "lightnfs_cluster_catalog_version"), -1);
+    std::filesystem::remove_all(dir);
 }
 
 TEST(Metrics, ClusterSeriesRenderWithControllerLifetime) {

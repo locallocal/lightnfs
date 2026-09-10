@@ -12,8 +12,19 @@
 namespace lnfs::server {
 
 CatalogApplier::CatalogApplier(Deps deps, uint64_t applied, core::Catalog catalog, std::string digest)
-    : deps_(std::move(deps)), applied_(applied), digest_(std::move(digest)), current_(std::move(catalog)) {
+    : deps_(std::move(deps)),
+      applied_(applied),
+      latest_(applied),
+      digest_(std::move(digest)),
+      current_(std::move(catalog)) {
     if (!deps_.post) deps_.post = [](const std::function<void()>& fn) { fn(); };
+    metrics_ = obs::register_text_provider([this](std::string& out) { append_metrics(out); });
+}
+
+CatalogApplier::~CatalogApplier() {
+    // The scrape runs providers under the registry lock: after this returns no scrape
+    // is inside append_metrics().
+    obs::unregister_text_provider(metrics_);
 }
 
 void CatalogApplier::poll() {
@@ -28,6 +39,7 @@ void CatalogApplier::poll() {
     {
         std::lock_guard lock(mu_);
         poll_failures_ = 0;
+        latest_ = latest;
         pending_ = latest > applied_ ? latest : 0;
         // a failed version: retried on the kRetryEveryPolls-th poll
         bool held_back = false;
@@ -99,20 +111,15 @@ Result<uint64_t> CatalogApplier::apply_locked_pipeline(std::string& why) {
     // 1. the latest document
     auto doc = deps_.store.read_catalog();
     if (!doc) return fail("cannot read the catalog: " + errno_name(doc.error()), doc.error());
-    uint64_t applied_now;
+    const uint64_t version = *doc ? (*doc)->version : 0;
     {
         std::lock_guard lock(mu_);
-        applied_now = applied_;
-    }
-    if (!*doc || (*doc)->version <= applied_now) {
-        std::lock_guard lock(mu_);
-        pending_ = 0;
-        // nothing newer: idempotent
-        return applied_now;
-    }
-    const uint64_t version = (*doc)->version;
-    {
-        std::lock_guard lock(mu_);
+        latest_ = version;
+        if (version <= applied_) {
+            pending_ = 0;
+            // nothing newer: idempotent
+            return applied_;
+        }
         // what a failure below is about
         pending_ = version;
     }
@@ -249,6 +256,7 @@ Result<uint64_t> CatalogApplier::apply_locked_pipeline(std::string& why) {
     {
         std::lock_guard lock(mu_);
         applied_ = version;
+        ++applies_;
         if (pending_ <= version) pending_ = 0;
         current_ = std::move(*next);
         digest_ = digest;
@@ -292,9 +300,33 @@ size_t CatalogApplier::retire_exports() {
     return stopped;
 }
 
+CatalogApplier::Status CatalogApplier::status() const {
+    std::lock_guard lock(mu_);
+    return Status{.applied = applied_,
+                  .latest = latest_,
+                  .pending = pending_,
+                  .applies = applies_,
+                  .failures = failures_,
+                  .last_error = last_error_,
+                  .refresh = deps_.local.cluster.catalog_refresh};
+}
+
+void CatalogApplier::append_metrics(std::string& out) const {
+    const Status s = status();
+    out += std::format(
+        "lightnfs_cluster_catalog_version {}\nlightnfs_cluster_catalog_latest_version {}\n"
+        "lightnfs_cluster_catalog_pending {}\nlightnfs_cluster_catalog_applies_total {}\n"
+        "lightnfs_cluster_catalog_apply_failures_total {}\n",
+        s.applied, s.latest, s.pending ? 1 : 0, s.applies, s.failures);
+}
+
 uint64_t CatalogApplier::applied() const {
     std::lock_guard lock(mu_);
     return applied_;
+}
+uint64_t CatalogApplier::latest() const {
+    std::lock_guard lock(mu_);
+    return latest_;
 }
 uint64_t CatalogApplier::pending() const {
     std::lock_guard lock(mu_);
@@ -303,6 +335,10 @@ uint64_t CatalogApplier::pending() const {
 std::string CatalogApplier::last_error() const {
     std::lock_guard lock(mu_);
     return last_error_;
+}
+uint64_t CatalogApplier::applies() const {
+    std::lock_guard lock(mu_);
+    return applies_;
 }
 uint64_t CatalogApplier::failures() const {
     std::lock_guard lock(mu_);

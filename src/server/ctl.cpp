@@ -176,11 +176,33 @@ std::string cluster_error(bool json, std::string_view text) {
     return json ? std::format("{{\"error\":\"{}\"}}\n", json_escape(text)) : std::format("cluster: {}\n", text);
 }
 
+// The catalog fields of the gateway line (plan 12 C3), appended only under
+// exports_source = "catalog" so the local-mode line stays as it was: the applied
+// version (none = no catalog yet), the newest version seen in the store, the refresh
+// policy, and why the last apply failed (last on the line: free text).
+std::string catalog_status_text(const CatalogApplier* applier) {
+    if (!applier) return "";
+    const auto s = applier->status();
+    return std::format(" catalog={} catalog_latest={} catalog_refresh={} catalog_error={}",
+                       s.applied ? std::to_string(s.applied) : "none", s.latest ? std::to_string(s.latest) : "none",
+                       s.refresh, s.last_error.empty() ? "-" : s.last_error);
+}
+// The JSON twin, with a leading comma: catalog / catalog_latest are null when none.
+std::string catalog_status_json(const CatalogApplier* applier) {
+    if (!applier) return "";
+    const auto s = applier->status();
+    return std::format(",\"catalog\":{},\"catalog_latest\":{},\"catalog_refresh\":\"{}\",\"catalog_error\":{}",
+                       s.applied ? std::to_string(s.applied) : "null", s.latest ? std::to_string(s.latest) : "null",
+                       json_escape(s.refresh),
+                       s.last_error.empty() ? "null" : std::format("\"{}\"", json_escape(s.last_error)));
+}
+
 // `cluster status` (plan 10 C3): the controller's snapshot plus the store's peer list
 // (read off the reactor by the caller).  The fence fields describe the record last
 // seen: our own while we hold it (age = time since the last renew), someone else's
 // while we stand by (age = time since we read it).
-std::string cluster_status(const ClusterController& cc, const Result<std::vector<std::string>>& peers, bool json) {
+std::string cluster_status(const ClusterController& cc, const Result<std::vector<std::string>>& peers,
+                           const CatalogApplier* catalog, bool json) {
     const auto snap = cc.snapshot();
     const auto& cfg = cc.config();
     const auto now = std::chrono::steady_clock::now();
@@ -208,10 +230,10 @@ std::string cluster_status(const ClusterController& cc, const Result<std::vector
             "{{\"role\":\"{}\",\"node\":\"{}\",\"epoch\":{},\"fence_owner\":{},"
             "\"fence_epoch\":{},\"fence_age_ms\":{},\"fence_expires_in_ms\":{},"
             "\"shared_dir\":\"{}\",\"peers\":{},\"takeover\":\"{}\",\"takeovers\":{},"
-            "\"fence_lost\":{},\"activation_failures\":{},\"last_activation_ms\":{}}}\n",
+            "\"fence_lost\":{},\"activation_failures\":{},\"last_activation_ms\":{}{}}}\n",
             role_name(snap.role), json_escape(snap.node), snap.epoch, fence_owner, fence_epoch_s, fence_age, fence_left,
             json_escape(cfg.shared_dir), peer_list, json_escape(cfg.takeover), snap.takeovers, snap.fence_lost,
-            snap.activation_failures, snap.last_activation.count());
+            snap.activation_failures, snap.last_activation.count(), catalog_status_json(catalog));
     }
     std::string peer_list = "?";
     if (peers) {
@@ -221,20 +243,21 @@ std::string cluster_status(const ClusterController& cc, const Result<std::vector
     return std::format(
         "role={} node={} epoch={} fence_owner={} fence_epoch={} fence_age_ms={} "
         "fence_expires_in_ms={} shared_dir={} peers={} takeover={} takeovers={} "
-        "fence_lost={} activation_failures={} last_activation_ms={}\n",
+        "fence_lost={} activation_failures={} last_activation_ms={}{}\n",
         role_name(snap.role), snap.node, snap.epoch, snap.fence ? owner : "none",
         snap.fence ? std::to_string(fence_epoch) : "-", snap.fence ? std::to_string(age_ms) : "-",
         snap.fence ? std::to_string(expires_in_ms) : "-", cfg.shared_dir, peer_list, cfg.takeover, snap.takeovers,
-        snap.fence_lost, snap.activation_failures, snap.last_activation.count());
+        snap.fence_lost, snap.activation_failures, snap.last_activation.count(), catalog_status_text(catalog));
 }
 
 // `cluster status` under active-active (plan 12 C4): the gateway line, then one line
 // per export as this gateway sees it.  Fence age = time since the record naming the
 // export was last renewed (ours or theirs), from its expiry and the ttl; grace = the
-// export's own reclaim window on this gateway (0 when not served here).
+// export's own reclaim window on this gateway (0 when not served here).  The catalog
+// fields (plan 12 C3) close the gateway line in catalog mode.
 std::string cluster_fs_status(const FsClusterController& fc, const DataPlane* dp,
                               const Result<std::vector<std::string>>& peers,
-                              const Result<std::vector<std::string>>& alive, bool json) {
+                              const Result<std::vector<std::string>>& alive, const CatalogApplier* catalog, bool json) {
     const auto snap = fc.snapshot();
     const auto& cfg = fc.config();
     const int64_t wall_ms =
@@ -277,15 +300,16 @@ std::string cluster_fs_status(const FsClusterController& fc, const DataPlane* dp
         return std::format(
             "{{\"mode\":\"active-active\",\"node\":\"{}\",\"node_epoch\":{},\"node_address\":\"{}\","
             "\"shared_dir\":\"{}\",\"peers\":{},\"peers_alive\":{},\"takeover\":\"{}\","
-            "\"migrations\":{},\"exports\":[{}]}}\n",
+            "\"migrations\":{}{},\"exports\":[{}]}}\n",
             json_escape(fc.node()), fc.node_epoch(), json_escape(cfg.node_address), json_escape(cfg.shared_dir),
-            json_list(peers), json_list(alive), json_escape(cfg.takeover), fc.migrations(), rows);
+            json_list(peers), json_list(alive), json_escape(cfg.takeover), fc.migrations(),
+            catalog_status_json(catalog), rows);
     }
     std::string out = std::format(
         "mode=active-active node={} node_epoch={} node_address={} shared_dir={} peers={} "
-        "peers_alive={} takeover={} migrations={} exports={}\n",
+        "peers_alive={} takeover={} migrations={} exports={}{}\n",
         fc.node(), fc.node_epoch(), cfg.node_address, cfg.shared_dir, peers ? text_list(*peers) : "?",
-        alive ? text_list(*alive) : "?", cfg.takeover, fc.migrations(), snap.size());
+        alive ? text_list(*alive) : "?", cfg.takeover, fc.migrations(), snap.size(), catalog_status_text(catalog));
     for (const auto& fs : snap) {
         const bool owned = fs.view.role != core::FsRole::kUnowned && !fs.view.node.empty();
         out += std::format(
@@ -689,7 +713,7 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
         const auto sub = cmd.arg(1);
         if (sub == "status") {
             auto peers = co_await rt::offload([&cc] { return cc.peers(); });
-            co_return cluster_status(cc, peers, json);
+            co_return cluster_status(cc, peers, deps.catalog, json);
         }
         if (sub == "takeover") {
             bool force = false;
@@ -728,7 +752,7 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
         if (sub == "status") {
             auto peers = co_await rt::offload([&fc] { return fc.peers(); });
             auto alive = co_await rt::offload([&fc] { return fc.alive_peers(); });
-            co_return cluster_fs_status(fc, dp, peers, alive, json);
+            co_return cluster_fs_status(fc, dp, peers, alive, deps.catalog, json);
         }
         if (sub == "exports") {
             // `[<node>]`: the first positional after the subcommand, default this gateway.

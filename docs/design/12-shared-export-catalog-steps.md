@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A、B 已完成；C1、C2 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A、B、C 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -502,7 +502,7 @@ stopped"；`reload` 报 "catalog: v3 is current"；v4 含本机不存在的路�
 模式下写 v6 不动，`kill -HUP` 后 `exports=2`，日志 "reload (SIGHUP): …;catalog: v6 applied (was v5)"。
 `fence_lease = "300ms"` 这类毫秒写法解析器不收（与本步无关，记在这里）。
 
-### C3 状态与指标
+### C3 状态与指标 ✅ 2026-09-10
 
 - `cluster_fs_status`（`ctl.cpp:235`）网关行加 `catalog=<applied|none> catalog_latest=<seen|none>
   catalog_refresh=auto|manual catalog_error=-|<text>`；JSON 同名字段；failover 的 `cluster_status`
@@ -513,6 +513,25 @@ stopped"；`reload` 报 "catalog: v3 is current"；v4 含本机不存在的路�
   `lightnfs_cluster_catalog_apply_failures_total`；failover 控制器同一组。
 - 测试：`tests/test_ctl.cpp` `ClusterFsCommands`（`:685`）与 `tests/test_metrics.cpp`
   `ClusterFsSeries`（`:124`）各加断言。
+
+**实现注**（2026-09-10）：指标没放进两个控制器的 `append_metrics`——控制器不认识应用器，应用器又在
+控制器之后才构造——而是 `CatalogApplier` 构造时自己 `obs::register_text_provider`、析构时注销（与控制器
+同一套注册表纪律：注销返回后不会再有 scrape 停在 provider 里），主备与多活自然是同一组：
+`lightnfs_cluster_catalog_version`（已应用，无清单为 0）、`_latest_version`（store 里最近一次看到的
+版本：启动、poll 或 apply 读到的；清单从 store 消失为 0）、`_pending`（0/1）、`_applies_total`
+（换版成功次数）、`_apply_failures_total`。应用器为此新增 `latest_` / `applies_` 和一把锁下的
+`status()` 快照（`Status{applied, latest, pending, applies, failures, last_error, refresh}`，`refresh`
+即 poll 读到的 `catalog_refresh` 热值），ctl 与指标都只取它。`cluster status`：两种控制器的网关行
+末尾（主备在 `last_activation_ms=` 之后，多活在 `exports=` 之后）追加 `catalog=<v|none>
+catalog_latest=<v|none> catalog_refresh=auto|manual catalog_error=-|<text>`，`catalog_error` 放最后
+因为是自由文本（含空格与冒号，解析器取 `catalog_error=` 之后整段）；JSON 同名字段，无版本 / 无错误为
+`null`。**本地模式（`deps.catalog` 为空）一个字节不变**——四个字段只在清单模式出现，既有的精确断言原样
+通过。测试：`Ctl.ClusterFsCommands` / `Ctl.ClusterCommands` 末尾各加一段（无清单启动 → poll 看到新版
+只动 `catalog_latest` → 应用失败文案上行 → 清单消失回 `none` 而错误仍在；主备用一份解析不了的 v4）；
+`Metrics.CatalogSeries` 单独一例而不是塞进 `ClusterFsSeries`（后者的导出是内存后端加假路径，跑不了真实
+apply），钉住五个系列在启动 / 待应用 / 应用 / 失败 / 清单消失五个时刻的值，以及 provider 随应用器注销；
+控制器三例补 `latest()` / `applies()` / `status()` 断言。08 册 §8.6 与指标表、deployment.md §6 的观测段
+同步加了这四个字段与五个系列。
 
 ---
 

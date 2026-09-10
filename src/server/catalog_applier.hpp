@@ -16,6 +16,7 @@
 #include "backend/api.hpp"
 #include "core/catalog.hpp"
 #include "core/config.hpp"
+#include "obs/metrics.hpp"
 #include "server/cluster_store.hpp"
 #include "util/result.hpp"
 
@@ -44,8 +45,12 @@ class CatalogApplier {
         std::chrono::milliseconds retire_overdue{std::chrono::seconds(900)};
     };
 
-    // `applied` / `catalog` / `digest`: what the boot loaded (CatalogBoot).
+    // `applied` / `catalog` / `digest`: what the boot loaded (CatalogBoot).  Registers
+    // the lightnfs_cluster_catalog_* text provider for its lifetime (plan 12 C3).
     CatalogApplier(Deps deps, uint64_t applied, core::Catalog catalog, std::string digest);
+    ~CatalogApplier();
+    CatalogApplier(const CatalogApplier&) = delete;
+    CatalogApplier& operator=(const CatalogApplier&) = delete;
 
     // Tick thread.  Reads the catalog's version: newer than what is applied → under
     // catalog_refresh = "auto" posts one apply (never two at once), under "manual" only
@@ -74,14 +79,40 @@ class CatalogApplier {
     // were stopped.
     size_t retire_exports();
 
+    // One consistent reading for `cluster status` and the metrics (plan 12 C3).
+    struct Status {
+        // the version the table serves (0 = none: no catalog at boot, none applied since)
+        uint64_t applied = 0;
+        // the newest version seen in the store by the boot, a poll or an apply (0 = none)
+        uint64_t latest = 0;
+        // a newer version seen but not applied (0 = none)
+        uint64_t pending = 0;
+        // applies that changed the served version
+        uint64_t applies = 0;
+        uint64_t failures = 0;
+        // why the last apply failed; empty once one succeeds
+        std::string last_error;
+        // [cluster] catalog_refresh as the poll reads it: "auto" / "manual"
+        std::string refresh;
+    };
+    Status status() const;
+
     uint64_t applied() const;
+    // the newest version seen in the store (0 = none)
+    uint64_t latest() const;
     // a newer version seen but not applied (0 = none)
     uint64_t pending() const;
     std::string last_error() const;
+    uint64_t applies() const;
     uint64_t failures() const;
     // of what the table serves
     std::string digest() const;
     bool applying() const;
+
+    // Prometheus text (plan 12 C3): lightnfs_cluster_catalog_{version,latest_version,
+    // pending,applies_total,apply_failures_total}; the same series under failover and
+    // active-active.
+    void append_metrics(std::string& out) const;
 
  private:
     Result<uint64_t> apply_locked_pipeline(std::string& why);
@@ -89,7 +120,9 @@ class CatalogApplier {
     Deps deps_;
     mutable std::mutex mu_;
     uint64_t applied_ = 0;
+    uint64_t latest_ = 0;
     uint64_t pending_ = 0;
+    uint64_t applies_ = 0;
     uint64_t failures_ = 0;
     // an apply is posted or running
     bool applying_ = false;
@@ -105,6 +138,7 @@ class CatalogApplier {
     core::Catalog current_;
     int poll_failures_ = 0;
     std::chrono::steady_clock::time_point last_overdue_warning_{};
+    obs::ProviderHandle metrics_ = 0;
 };
 
 }  // namespace lnfs::server
