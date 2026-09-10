@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A、B、C 已完成；D1 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A、B、C 已完成；D1、D2 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -600,7 +600,7 @@ current catalog"），默认 comment "rollback to vN"，也收 `--comment`。测
 "retired: backend stopped"；`rollback 1` → v3 内容 = v1、`exports=2`；`diff 1 3` 全空；`apply` 答 "v3 already
 applied"。
 
-### D2 `cluster export list/add/set/remove`
+### D2 `cluster export list/add/set/remove` ✅ 2026-09-11
 
 **改动点**
 
@@ -619,6 +619,38 @@ applied"。
 **测试**：`Ctl.ClusterExportCommands`：`add` 后 v+1 且 `show` 可见；重复 fsid / path 前缀 / 本机键
 `--opt conf=…` / 未知后端各被拒；`set --nodes` 改顺位；`set --path` 被拒；`remove` 被属主护栏
 拒、`--force` 通过；fsid 复用规则。
+
+**实现注**（2026-09-11）：命令与 D1 同在 `src/server/ctl_catalog.cpp`（`cluster_export_answer`，`answer_async`
+同样整体 `rt::offload`）。**提交路径改成"变更函数"**：D1 的 `commit(next)` 在 CAS 重试时会把基于旧版算出的
+整份文档写上去、覆盖掉抢先者的改动（对 `import` / `rollback` 这种整份替换无所谓，对单导出增删改是丢更新），
+现在 `commit(mutate)` 每次尝试都重读当前版再施加变更（`Mutation = f(current) → next`），`import` / `rollback`
+用 `replace_with(doc)`；`validate_catalog` 与 §11.5 的 `rejected` 检查也搬进循环、对每次的 `next` 做。测试
+用 `before_write_catalog` 钩子让别人先提交 fsid 9，我们的 `add fsid 4` 重试后 v12 里两者都在。标志解析
+`parse_export_flags`：`--k=v` 与 `--k v` 都收；`--readonly` / `--disabled` / `--force` / `--dry-run` 裸写为 true、
+`=true|false` 明示（`set` 靠这个清除）；`--opt k=v` 可重复；未知标志、多余位置参数、缺值都是明确文案。
+`add`：`--path` / `--fsid` 必填，其余默认同 `ExportConfig`（`clients` 默认全开，`backend` 默认 local）；同
+fsid 已在清单 → "already in the catalog (…): use set, or remove it first"；集群级规则（重复 / 嵌套 path、本机键、
+未知后端、坏 clients、多活缺 `nodes`）全由 `validate_catalog` 报 "add failed: invalid catalog: <why>"；**fsid
+复用规则**（`check_fsid_reuse`）：从新到旧扫历史，最近一个含该 fsid 的版本若 path / backend / 集群键不同
+（用 `diff_catalog` 的 `rejected` 判定）→ EEXIST "fsid N was <path> (<backend>) in vK: … (--force to reuse it
+anyway)"，同身份放行。`set <fsid>`：`--path` / `--backend` / `--opt` → "path, backend and backend keys cannot
+change: remove and re-add, or use a new fsid"；没给任何可变标志 → "nothing to change"；fsid 不在清单 → ENOENT。
+`remove <fsid>`：护栏 `served_by`——多活看控制器快照（view 的属主，或本机 activating / active），主备看本机
+`role() == Active`（活动网关服务清单里的一切）——非空且无 `--force` → "fsid N is served by gw2 (disable it
+first, or --force)"；`remove` 只收 `--force` / `--dry-run` / `--comment`。`list` = `show` 的导出行（无清单
+"catalog: none"，空清单 "no exports (catalog vN)"），JSON `{"version", "exports_list"}`。三个写命令的回答统一
+`catalog vN committed (was vM): export fsid=X added|updated|removed: <diff 摘要>`，`--dry-run` 为 "would be
+…" 且不写；JSON `{"version","was","fsid","action",<diff 七类>}`。**客户端**：`cluster export …` 的每导出标志
+太多、且 `set` 需要区分"没给"与 `=false`，不走 ccmd——`main` 里 `normalize_argv` 后发现 `cluster export` 就
+`run_cluster_export_raw`：除 `--socket` / `-s` / `--json` 外逐个 `wire_arg` 原样转发，服务端解析并回 usage。
+测试 `Ctl.ClusterExportCommands`（多活控制器 + 内存 store：无 store / 无清单 / usage → 各种坏标志文案 →
+dry-run 不写 → 多活缺 nodes 被拒 → 全标志 `add` 与 `list` 文本 / JSON → 重复 fsid / 嵌套 path / 本机键 / 未知
+后端 / 坏 clients 被拒 → `set` 改顺位 + 清 readonly、`--disabled`、身份字段被拒、无变化、未知 fsid → 护栏（本机
+与对端属主）、`--force`、无人服务的直接删 → fsid 复用同身份放行 / 异身份拒 / `--force` → 并发提交不丢 →
+主备控制器 Active 时护栏、`--force`）。真机冒烟（单网关多活清单模式）：`lightnfs-ctl cluster export add --path
+"…/my dir" --fsid 1 --nodes gw1 --readonly --comment "first export, spaced"`、`add --path=… --opt handles=auto`
+→ 2.5 s 内 `exports=2`；`set 1 --readonly=false --iops 50` 就地生效（日志 "1 updated"）；`set 1 --path` 被拒；
+`remove 2` 被护栏拒、`--force` 后 `exports=1`；同 fsid 换路径被 fsid 复用规则拒；`--bogus` 与无子命令各回文案。
 
 ### D3 离线 `lightnfs-ctl catalog … --shared-dir <dir>`
 

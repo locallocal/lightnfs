@@ -111,7 +111,8 @@ const char* kHelp =
     "fdcache [flush]|clear-poison|state|expire-client <clientid>|conns|kill-conn <id>|"
     "loglevel <debug|info|warn|error>|reload|drain|grace-end|"
     "cluster <status|exports [<node>]|takeover [<fsid>] [--force]|standby [<fsid>]|"
-    "migrate <fsid> <node>|catalog <show|status|history|diff|import|rollback|apply> …>"
+    "migrate <fsid> <node>|catalog <show|status|history|diff|import|rollback|apply> …|"
+    "export <list|add|set|remove> …>"
     "  (append --json for JSON output)\n";
 
 }  // namespace
@@ -698,6 +699,10 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
         // The shared export catalog (plan 12 D1): store and file IO, and `apply`'s wait
         // for the main loop, all off this reactor.
         co_return co_await rt::offload([&deps, &cmd, peer_uid] { return cluster_catalog_answer(deps, cmd, peer_uid); });
+    }
+    if (cmd.name() == "cluster" && cmd.arg(1) == "export") {
+        // Single-export catalog edits (plan 12 D2): the same commit path, off this reactor.
+        co_return co_await rt::offload([&deps, &cmd, peer_uid] { return cluster_export_answer(deps, cmd, peer_uid); });
     }
     if (cmd.name() == "cluster" && deps.cluster) {
         // The controller's store calls block on the shared filesystem (plan 10 A2): run
