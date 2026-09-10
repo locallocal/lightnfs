@@ -13,10 +13,13 @@
 
 #include <chrono>
 #include <filesystem>
+#include <format>
+#include <fstream>
 #include <thread>
 
 #include "backend/local/local.hpp"
 #include "backend/memory/memory.hpp"
+#include "core/catalog.hpp"
 #include "core/config.hpp"
 #include "core/fs_owner_view.hpp"
 #include "mem_cluster_store.hpp"
@@ -971,8 +974,15 @@ TEST(Ctl, ClusterFsCommands) {
                 "exports_source = \"catalog\"\ncatalog_refresh = \"manual\"\n");
             ASSERT_TRUE(local.has_value());
             // booted without a catalog
-            server::CatalogApplier applier({.store = store, .exports = exports, .local = *local, .node = "gw1"}, 0, {},
-                                           "");
+            server::CatalogApplier applier({.store = store,
+                                            .exports = exports,
+                                            .local = *local,
+                                            .node = "gw1",
+                                            .fs_cluster = nullptr,
+                                            .post = {},
+                                            .start_backend = {},
+                                            .stop_backend = {}},
+                                           0, {}, "");
             deps.catalog = &applier;
             EXPECT_TRUE(ask("cluster status")
                             .find(" migrations=1 exports=3 catalog=none catalog_latest=none "
@@ -1300,11 +1310,15 @@ TEST(Ctl, ClusterCatalogApply) {
                                        boot->version, boot->catalog, boot->digest);
         server::CtlDeps deps{};
         auto ask = [&](const char* line) { return run_task(runtime, server::CtlServer::answer_async(deps, line)); };
-        // Not enabled (exports_source = local): no applier behind the deps.
-        EXPECT_STREQ(ask("cluster catalog apply"), "catalog: not enabled (exports_source = \"local\")\n");
-        EXPECT_STREQ(ask("cluster catalog apply --json"), "{\"error\":\"catalog not enabled\"}\n");
+        // No store (single gateway): not enabled; a store without an applier
+        // (exports_source = local): the read / write commands work, apply says so.
+        EXPECT_STREQ(ask("cluster catalog apply"), "cluster: not enabled\n");
+        EXPECT_STREQ(ask("cluster catalog apply --json"), "{\"error\":\"not enabled\"}\n");
+        deps.store = &store;
+        EXPECT_STREQ(ask("cluster catalog apply"), "catalog apply: not enabled (exports_source = \"local\")\n");
+        EXPECT_STREQ(ask("cluster catalog apply --json"), "{\"error\":\"catalog apply: not enabled\"}\n");
         deps.catalog = &applier;
-        EXPECT_STREQ(ask("cluster catalog"), "cluster catalog: expected apply\n");
+        EXPECT_TRUE(ask("cluster catalog").starts_with("cluster catalog: expected show|status|history|diff"));
         EXPECT_STREQ(ask("cluster catalog apply"), "catalog v1 already applied\n");
         ASSERT_TRUE(store.write_catalog(1, doc(2, "ab")).has_value());
         EXPECT_STREQ(ask("cluster catalog apply"), "catalog v2 applied (was v1)\n");
@@ -1322,6 +1336,243 @@ TEST(Ctl, ClusterCatalogApply) {
         EXPECT_TRUE(failed.find("fsid=9") != std::string::npos);
         EXPECT_TRUE(ask("cluster catalog apply --json").find("\"error\":\"catalog apply failed") != std::string::npos);
         EXPECT_EQ((*table)->size(), 2u);
+        std::filesystem::remove_all(dir);
+    }
+    runtime.stop_and_join();
+}
+
+// plan 12 D1: the wire line splits on whitespace outside double quotes; `\"` and `\\`
+// escape inside them; a bare --json is the rendering flag, a quoted one an argument.
+TEST(Ctl, ParseCommandQuotes) {
+    auto c = server::parse_ctl_command(
+        "cluster catalog import \"/tmp/my dir/x.toml\" --comment \"say \\\"hi\\\" \\\\ there\" --json");
+    ASSERT_TRUE(c.error.empty());
+    EXPECT_TRUE(c.json);
+    ASSERT_TRUE(c.args.size() == 6u);
+    EXPECT_STREQ(c.args[0], "cluster");
+    EXPECT_STREQ(c.args[3], "/tmp/my dir/x.toml");
+    EXPECT_STREQ(c.args[4], "--comment");
+    EXPECT_STREQ(c.args[5], "say \"hi\" \\ there");
+    // A quoted --json is an argument; whitespace runs and tabs split; an empty quoted
+    // token survives; a quote inside a word joins.
+    c = server::parse_ctl_command("a \"--json\"");
+    EXPECT_FALSE(c.json);
+    ASSERT_TRUE(c.args.size() == 2u);
+    EXPECT_STREQ(c.args[1], "--json");
+    c = server::parse_ctl_command("  a\tb  \"\" x\"y z\"w --json ");
+    EXPECT_TRUE(c.json);
+    ASSERT_TRUE(c.args.size() == 4u);
+    EXPECT_STREQ(c.args[0], "a");
+    EXPECT_STREQ(c.args[1], "b");
+    EXPECT_STREQ(c.args[2], "");
+    EXPECT_STREQ(c.args[3], "xy zw");
+    // Unterminated: the error is set, and the server answers with it in both renderings.
+    c = server::parse_ctl_command("a \"unterminated");
+    EXPECT_STREQ(c.error, "unterminated quote");
+    ASSERT_TRUE(c.args.size() == 2u);
+    EXPECT_STREQ(c.args[1], "unterminated");
+    server::CtlDeps deps{};
+    EXPECT_STREQ(server::CtlServer::answer(deps, "ping \"x"), "unterminated quote\n");
+    EXPECT_STREQ(server::CtlServer::answer(deps, "ping \"x --json"), "unterminated quote\n");
+    EXPECT_STREQ(server::CtlServer::answer(deps, "ping --json \"x"), "{\"error\":\"unterminated quote\"}\n");
+    // Nothing else changed: the unquoted forms parse as before.
+    EXPECT_STREQ(server::CtlServer::answer(deps, "ping --json"), "{\"ok\":true}\n");
+    EXPECT_STREQ(server::CtlServer::answer(deps, "\"ping\""), "pong\n");
+}
+
+// plan 12 D1: `cluster catalog show|status|history|diff|import|rollback` over the memory
+// store, without an applier (exports_source = local, design 11 §11.9 step 1).
+TEST(Ctl, ClusterCatalogCommands) {
+    rt::Runtime runtime({.reactors = 1, .offload_threads = 2});
+    runtime.start();
+    {
+        char tmpl[] = "/tmp/lnfs-ctlcatcmd-XXXXXX";
+        std::string dir = mkdtemp(tmpl);
+        auto write_file = [&](const char* name, const std::string& text) {
+            std::string path = dir + "/" + name;
+            std::ofstream(path) << text;
+            return path;
+        };
+        auto block = [&](uint32_t fsid, const std::string& sub, const std::string& extra = "") {
+            return "[[export]]\npath = \"" + dir + "/" + sub + "\"\nfsid = " + std::to_string(fsid) +
+                   "\nbackend = \"local\"\nclients = [\"10.0.0.0/8\"]\n" + extra;
+        };
+        // a local configuration file (import strips it to its exports)
+        const std::string file_a = write_file("a.toml", "[server]\nport = 2049\n" + block(1, "a") + block(2, "b"));
+        const std::string file_b = write_file("b.toml", block(1, "a", "readonly = true\n") + block(3, "c"));
+        const std::string file_moved = write_file("moved.toml", block(1, "elsewhere") + block(3, "c"));
+        const std::string file_dup = write_file("dup.toml", block(1, "a") + block(1, "b"));
+
+        test::MemClusterStore store;
+        server::CtlDeps deps{};
+        auto ask = [&](const std::string& line) {
+            return run_task(runtime, server::CtlServer::answer_async(deps, line, 42));
+        };
+        // No store: not enabled.
+        EXPECT_STREQ(ask("cluster catalog show"), "cluster: not enabled\n");
+        deps.store = &store;
+        // Nothing published yet.
+        EXPECT_STREQ(ask("cluster catalog show"), "catalog: none\n");
+        EXPECT_STREQ(ask("cluster catalog show --json"), "{\"catalog\":null}\n");
+        EXPECT_STREQ(ask("cluster catalog status"), "latest=none\n");
+        EXPECT_STREQ(ask("cluster catalog status --json"), "{\"latest\":null,\"nodes\":[]}\n");
+        EXPECT_STREQ(ask("cluster catalog history"), "catalog history: none\n");
+        EXPECT_STREQ(ask("cluster catalog history --json"), "{\"current\":null,\"versions\":[]}\n");
+        EXPECT_TRUE(ask("cluster catalog diff").find("no applied version here") != std::string::npos);
+        EXPECT_TRUE(ask("cluster catalog bogus").starts_with("cluster catalog: expected show|status|history|diff"));
+        EXPECT_STREQ(ask("cluster catalog bogus --json"), "{\"error\":\"bad subcommand\"}\n");
+        EXPECT_STREQ(ask("cluster catalog import"), "cluster: import: a gateway-side file is required\n");
+        EXPECT_TRUE(ask("cluster catalog import " + dir + "/missing.toml").find("cannot read") != std::string::npos);
+        EXPECT_STREQ(ask("cluster catalog rollback"), "cluster: rollback: a history version is required\n");
+
+        // import --dry-run: the diff, no write.
+        EXPECT_STREQ(ask("cluster catalog import " + file_a + " --dry-run"),
+                     "catalog import dry-run: would commit v1 (current none): added=1,2 removed=- disabled=- "
+                     "enabled=- nodes_changed=- dynamic_changed=- rejected=-\n");
+        EXPECT_TRUE(store.catalog_docs.empty());
+        EXPECT_STREQ(ask("cluster catalog import " + file_a + " --dry-run --json"),
+                     "{\"dry_run\":true,\"version\":1,\"was\":0,\"added\":[1,2],\"removed\":[],"
+                     "\"disabled\":[],\"enabled\":[],\"nodes_changed\":[],\"dynamic_changed\":[],"
+                     "\"rejected\":[]}\n");
+        // import: v1, with the audit trail (node unknown here: no controller; uid from
+        // the connection), the comment quoted on the wire.
+        EXPECT_STREQ(ask("cluster catalog import " + file_a + " --comment \"first one\""),
+                     "catalog v1 imported (was none): added=1,2 removed=- disabled=- enabled=- nodes_changed=- "
+                     "dynamic_changed=- rejected=-\n");
+        ASSERT_TRUE(store.catalog_version() == 1u);
+        auto v1 = core::parse_catalog(store.catalog_docs[1]);
+        ASSERT_TRUE(v1.has_value());
+        EXPECT_EQ(v1->meta.version, 1u);
+        EXPECT_STREQ(v1->meta.updated_by, "? uid=42");
+        EXPECT_STREQ(v1->meta.comment, "first one");
+        EXPECT_TRUE(v1->meta.updated_at.ends_with("Z"));
+        ASSERT_TRUE(v1->exports.size() == 2u);
+        EXPECT_STREQ(v1->exports[1].cfg.path, dir + "/b");
+        auto shown = ask("cluster catalog show");
+        EXPECT_TRUE(shown.starts_with("version=1 exports=2 updated_at=" + v1->meta.updated_at +
+                                      " updated_by=? uid=42 comment=first one\n"));
+        EXPECT_TRUE(shown.find("\nfsid=1 path=" + dir +
+                               "/a backend=local nodes=- disabled=no clients=10.0.0.0/8 "
+                               "readonly=no squash=root anon_uid=65534 anon_gid=65534 read_bps=0 write_bps=0 "
+                               "iops=0 keys=-\nfsid=2 path=" +
+                               dir + "/b ") != std::string::npos);
+        auto shown_json = ask("cluster catalog show --json");
+        EXPECT_TRUE(shown_json.starts_with("{\"version\":1,\"exports\":2,\"updated_at\":\""));
+        EXPECT_TRUE(shown_json.find("\"comment\":\"first one\",\"exports_list\":[{\"fsid\":1,\"path\":\"" + dir +
+                                    "/a\",\"backend\":\"local\",\"nodes\":[],\"disabled\":false,"
+                                    "\"clients\":[\"10.0.0.0/8\"],\"readonly\":false,\"squash\":\"root\","
+                                    "\"anon_uid\":65534,\"anon_gid\":65534,\"read_bps\":0,\"write_bps\":0,"
+                                    "\"iops\":0,\"backend_keys\":{}},{\"fsid\":2,") != std::string::npos);
+
+        // status: the gateways' catalog.<node> records, alive unknown without a
+        // controller, the free-text status last on the line, then the latest version.
+        store.catalog_applied["gw2"] = {"gw2", 0, "-", 1700000000000, "error:boom here"};
+        store.catalog_applied["gw1"] = {"gw1", 1, "sha256:aa", 1700000000000, "ok"};
+        EXPECT_STREQ(ask("cluster catalog status"),
+                     "node=gw1 applied=1 alive=? applied_at=2023-11-14T22:13:20Z digest=sha256:aa status=ok\n"
+                     "node=gw2 applied=0 alive=? applied_at=2023-11-14T22:13:20Z digest=- status=error:boom here\n"
+                     "latest=1\n");
+        EXPECT_STREQ(ask("cluster catalog status --json"),
+                     "{\"latest\":1,\"nodes\":[{\"node\":\"gw1\",\"applied\":1,\"alive\":null,"
+                     "\"applied_at_ms\":1700000000000,\"digest\":\"sha256:aa\",\"status\":\"ok\"},"
+                     "{\"node\":\"gw2\",\"applied\":0,\"alive\":null,\"applied_at_ms\":1700000000000,"
+                     "\"digest\":\"-\",\"status\":\"error:boom here\"}]}\n");
+
+        // v2: fsid 1 readonly, 2 gone, 3 new; v1 goes to the history.
+        EXPECT_STREQ(ask("cluster catalog import " + file_b),
+                     "catalog v2 imported (was v1): added=3 removed=2 disabled=- enabled=- nodes_changed=- "
+                     "dynamic_changed=1 rejected=-\n");
+        EXPECT_EQ(store.catalog_version(), 2u);
+        auto hist = ask("cluster catalog history");
+        EXPECT_TRUE(hist.starts_with("version=1 exports=2 updated_at="));
+        EXPECT_TRUE(hist.find(" comment=first one current=no\nversion=2 exports=2 updated_at=") != std::string::npos);
+        EXPECT_TRUE(hist.ends_with(" comment=- current=yes\n"));
+        auto hist_json = ask("cluster catalog history --json");
+        EXPECT_TRUE(hist_json.starts_with("{\"current\":2,\"versions\":[{\"version\":1,\"exports\":2,"));
+        EXPECT_TRUE(hist_json.find("\"comment\":\"first one\",\"current\":false},{\"version\":2,") !=
+                    std::string::npos);
+        EXPECT_TRUE(hist_json.ends_with("\"current\":true}]}\n"));
+        // diff: explicit versions (0 / none = before the first publish), one line per class.
+        EXPECT_STREQ(ask("cluster catalog diff 1 2"),
+                     "from=1 to=2\nadded=3\nremoved=2\ndisabled=-\nenabled=-\nnodes_changed=-\n"
+                     "dynamic_changed=1\nrejected=-\n");
+        EXPECT_STREQ(ask("cluster catalog diff 1 2 --json"),
+                     "{\"from\":1,\"to\":2,\"added\":[3],\"removed\":[2],\"disabled\":[],\"enabled\":[],"
+                     "\"nodes_changed\":[],\"dynamic_changed\":[1],\"rejected\":[]}\n");
+        EXPECT_TRUE(ask("cluster catalog diff none 2").starts_with("from=0 to=2\nadded=1,3\n"));
+        EXPECT_STREQ(ask("cluster catalog diff 1 9"),
+                     "cluster: version 9 is neither current (2) nor in the history (kept: 1)\n");
+        EXPECT_STREQ(ask("cluster catalog diff x 2"), "cluster: bad version \"x\": a number or none\n");
+        EXPECT_STREQ(ask("cluster catalog diff 1 2 3"), "cluster: diff takes at most two versions\n");
+        // Refused: an fsid whose path moved (§11.5), a duplicate fsid; v2 stands.
+        EXPECT_STREQ(ask("cluster catalog import " + file_moved),
+                     "cluster: import failed: fsid 1 changed path / backend / cluster keys: remove and re-add, "
+                     "or use a new fsid\n");
+        auto dup = ask("cluster catalog import " + file_dup + " --json");
+        EXPECT_TRUE(dup.starts_with("{\"error\":\"import failed: invalid catalog: "));
+        EXPECT_EQ(store.catalog_version(), 2u);
+        // A catalog document (with its [catalog] header) imports as is: the header is
+        // replaced by the commit's own.
+        auto v2 = core::parse_catalog(store.catalog_docs[2]);
+        ASSERT_TRUE(v2.has_value());
+        core::Catalog doc = *v2;
+        doc.meta = core::CatalogMeta{.version = 77, .updated_at = "x", .updated_by = "y", .comment = "z"};
+        const std::string file_doc = write_file("doc.toml", core::serialize_catalog(doc));
+        EXPECT_STREQ(ask("cluster catalog import " + file_doc + " --comment=\"as doc\""),
+                     "catalog v3 imported (was v2): added=- removed=- disabled=- enabled=- nodes_changed=- "
+                     "dynamic_changed=- rejected=-\n");
+        auto v3 = core::parse_catalog(store.catalog_docs[3]);
+        ASSERT_TRUE(v3.has_value());
+        EXPECT_EQ(v3->meta.version, 3u);
+        EXPECT_STREQ(v3->meta.comment, "as doc");
+        EXPECT_TRUE(v3->exports == v2->exports);
+
+        // Someone else commits between our read and our write: EAGAIN once, the retry
+        // re-reads and lands on v5.
+        bool bumped = false;
+        store.before_write_catalog = [&] {
+            if (bumped) return;
+            bumped = true;
+            core::Catalog other = *v3;
+            other.meta = core::CatalogMeta{.version = 4, .updated_at = "-", .updated_by = "gw2", .comment = ""};
+            store.catalog_docs[4] = core::serialize_catalog(other);
+        };
+        store.log.clear();
+        EXPECT_STREQ(ask("cluster catalog import " + file_a + " --json"),
+                     "{\"dry_run\":false,\"version\":5,\"was\":4,\"added\":[2],\"removed\":[3],"
+                     "\"disabled\":[],\"enabled\":[],\"nodes_changed\":[],\"dynamic_changed\":[1],"
+                     "\"rejected\":[]}\n");
+        EXPECT_STREQ(joined_calls(store.log), "write_catalog:3 write_catalog:4");
+        EXPECT_EQ(store.catalog_version(), 5u);
+        // A writer that never stops: three attempts, then the error.
+        store.before_write_catalog = [&] {
+            core::Catalog other = *v3;
+            other.meta = core::CatalogMeta{
+                .version = store.catalog_version() + 1, .updated_at = "-", .updated_by = "gw2", .comment = ""};
+            store.catalog_docs[other.meta.version] = core::serialize_catalog(other);
+        };
+        EXPECT_STREQ(ask("cluster catalog import " + file_a),
+                     "cluster: import failed: another writer keeps changing the catalog (3 attempts): retry\n");
+        store.before_write_catalog = {};
+        const uint64_t after_race = store.catalog_version();
+
+        // rollback: v1's exports come back as a new version; the current and unknown
+        // versions are refused.
+        auto rolled = ask("cluster catalog rollback 1");
+        EXPECT_TRUE(rolled.starts_with(
+            std::format("catalog v{} committed: rollback to v1 (was v{}): ", after_race + 1, after_race)));
+        auto latest = core::parse_catalog(store.catalog_docs[after_race + 1]);
+        ASSERT_TRUE(latest.has_value());
+        EXPECT_TRUE(latest->exports == v1->exports);
+        EXPECT_STREQ(latest->meta.comment, "rollback to v1");
+        EXPECT_STREQ(ask(std::format("cluster catalog rollback {}", after_race + 1)),
+                     std::format("cluster: version {} is the current catalog\n", after_race + 1));
+        EXPECT_TRUE(ask("cluster catalog rollback 99 --json").starts_with("{\"error\":\"version 99 is neither"));
+        EXPECT_TRUE(ask("cluster catalog rollback 1 --json")
+                        .starts_with(std::format("{{\"version\":{},\"rollback_to\":1,\"was\":{},", after_race + 2,
+                                                 after_race + 1)));
+        // apply without an applier
+        EXPECT_STREQ(ask("cluster catalog apply"), "catalog apply: not enabled (exports_source = \"local\")\n");
         std::filesystem::remove_all(dir);
     }
     runtime.stop_and_join();
