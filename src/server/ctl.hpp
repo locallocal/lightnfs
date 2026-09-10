@@ -12,7 +12,9 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/config.hpp"
@@ -30,7 +32,25 @@ namespace lnfs::server {
 
 class CatalogApplier;
 class ClusterController;
+class ClusterStore;
 class FsClusterController;
+
+// One ctl command line as tokens (plan 12 D1): whitespace-separated outside double
+// quotes; inside `"…"` whitespace is literal and `\"` / `\\` stand for the two
+// characters.  A bare (unquoted) `--json` anywhere selects the JSON rendering and is
+// not a token; a quoted one is an ordinary argument.  An unterminated quote sets
+// `error`.
+struct CtlCommand {
+    std::vector<std::string> args;
+    bool json = false;
+    std::string error;
+    const std::string& name() const {
+        static const std::string empty;
+        return args.empty() ? empty : args[0];
+    }
+    std::string_view arg(size_t i) const { return i < args.size() ? std::string_view(args[i]) : std::string_view(); }
+};
+CtlCommand parse_ctl_command(std::string_view line);
 
 // The data plane the ctl commands address (plan 10 A4): what exists only while the
 // gateway serves — the export table, the DRC, the v4 state manager and the drain
@@ -111,6 +131,10 @@ struct CtlDeps {
     // The catalog applier (plan 12 C2): `cluster catalog apply`.  Null = exports_source
     // = "local".
     CatalogApplier* catalog = nullptr;
+    // The cluster store (plan 12 D1): `cluster catalog show|status|history|diff|import|
+    // rollback` read and write the shared catalog through it, in either exports_source.
+    // Null = single gateway.  Must outlive the ctl server.
+    ClusterStore* store = nullptr;
 
     // Deps over a plane that stays attached for the deps' lifetime (single gateway,
     // tests).  `plane` must outlive the deps.
@@ -135,7 +159,9 @@ class CtlServer {
     // Shared with MetricsHttp: text answer for one admin command.
     static std::string answer(const CtlDeps& deps, std::string_view command);
     // Commands that must run as coroutines (state table locks): falls back to answer().
-    static rt::Task<std::string> answer_async(const CtlDeps& deps, std::string command);
+    // `peer_uid`: SO_PEERCRED of the connection, for the catalog's audit trail.
+    static rt::Task<std::string> answer_async(const CtlDeps& deps, std::string command,
+                                              std::optional<uint32_t> peer_uid = std::nullopt);
 
  private:
     CtlServer(int fd, std::string path, CtlDeps deps) : fd_(fd), path_(std::move(path)), deps_(deps) {}

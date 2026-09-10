@@ -644,8 +644,8 @@ int run_server(const std::string& config_path) {
                 .retire_overdue = std::chrono::seconds(10 * server_cfg.lease_seconds)},
             catalog.version, std::move(catalog.catalog), exports_digest);
     }
-    mgmt.emplace(
-        Management::start(server_cfg, runtime, do_reload, {}, controller.get(), fs_controller.get(), applier.get()));
+    mgmt.emplace(Management::start(server_cfg, runtime, do_reload, {}, controller.get(), fs_controller.get(),
+                                   applier.get(), cluster_store.get()));
     apply_observability(server_cfg);
 
     if (!cluster_store || active_active) {

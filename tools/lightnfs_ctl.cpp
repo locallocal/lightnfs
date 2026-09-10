@@ -6,7 +6,8 @@
 //   lightnfs-ctl <ping|metrics|dump-errors|drc|fdcache|clear-poison|state> [--socket=PATH]
 //   lightnfs-ctl expire-client <clientid> [--socket=PATH]
 //   lightnfs-ctl cluster <status|exports [<node>]|takeover [<fsid>] [--force]|standby
-//   [<fsid>]|migrate <fsid> <node>>
+//   [<fsid>]|migrate <fsid> <node>|catalog <show|status|history|diff [v1] [v2]|
+//   import <file> [--dry-run] [--comment=TEXT]|rollback <version>|apply>>
 //                [--socket=PATH]
 //   lightnfs-ctl bench <echo|nullrpc|fullpath> [args...]
 //
@@ -94,12 +95,30 @@ Cmd make_socket_leaf(const char* name, const char* example, const char* usage, c
     return cmd;
 }
 
-// `cluster <status|takeover|standby>` (plan 10 C3): a socket leaf with a subcommand
-// positional, like `drc [flush]`, plus the --force flag that `takeover` forwards.
+// The wire protocol splits on whitespace outside double quotes (plan 12 D1): an
+// argument with whitespace, a quote or a backslash goes quoted, `"` and `\` escaped.
+std::string wire_arg(const std::string& a) {
+    bool plain = !a.empty();
+    for (char c : a)
+        if (c == ' ' || c == '\t' || c == '"' || c == '\\') plain = false;
+    if (plain) return a;
+    std::string out = "\"";
+    for (char c : a) {
+        if (c == '"' || c == '\\') out += '\\';
+        out += c;
+    }
+    return out + '"';
+}
+
+// `cluster <status|takeover|standby|…>` (plan 10 C3): a socket leaf with a subcommand
+// positional, like `drc [flush]`, plus the flags `takeover` (--force) and `catalog
+// import` (--dry-run, --comment) forward.
 void run_cluster_cmd(const Cmd& c) {
     std::string line = c->name();
-    for (const auto& a : c->args()) line += " " + a;
+    for (const auto& a : c->args()) line += " " + wire_arg(a);
     if (c->var<bool>("force")) line += " --force";
+    if (c->var<bool>("dry-run")) line += " --dry-run";
+    if (auto comment = c->var<std::string>("comment"); !comment.empty()) line += " --comment " + wire_arg(comment);
     if (c->var<bool>("json")) line += " --json";
     line += '\n';
     g_exit = send_ctl(c->var<std::string>("socket"), line);
@@ -107,9 +126,10 @@ void run_cluster_cmd(const Cmd& c) {
 
 Cmd make_cluster_leaf() {
     auto cmd = std::make_shared<ccmd::c_command>(
-        "cluster", "lightnfs-ctl cluster takeover 3 --force",
+        "cluster", "lightnfs-ctl cluster catalog import /etc/lightnfs/lightnfs.toml --comment=\"first catalog\"",
         "lightnfs-ctl cluster <status|exports [<node>]|takeover [<fsid>] [--force]|standby "
-        "[<fsid>]|migrate <fsid> <node>>",
+        "[<fsid>]|migrate <fsid> <node>|catalog <show|status|history|diff [<v1>] [<v2>]|"
+        "import <file> [--dry-run] [--comment=TEXT]|rollback <version>|apply>>",
         "Multi-gateway failover (design 09): `status` shows this gateway's role, node, "
         "epoch, fence owner/age, shared_dir and the peer list; `takeover` asks a standby "
         "gateway to take the fence and start serving (--force takes a live fence held by "
@@ -120,12 +140,24 @@ Cmd make_cluster_leaf() {
         "serves right now — fsid, path, role, fs epoch — the export → owner map v3 clients "
         "mount by; `takeover <fsid>` and `standby <fsid>` move one export; `migrate "
         "<fsid> <node>` (on the owner) hands one export to a live peer without a client "
-        "outage. Answers `cluster: not enabled` on a single gateway.",
+        "outage. Shared export catalog (design 11): `catalog show` prints the current "
+        "catalog (header, one line per export); `catalog status` every gateway's applied "
+        "version, heartbeat and last apply result, then the latest version; `catalog "
+        "history` the versions kept; `catalog diff [<v1>] [<v2>]` the export-level "
+        "changes between two versions (default: this gateway's applied version vs the "
+        "current catalog); `catalog import <file>` replaces the catalog with the exports "
+        "of a gateway-side TOML file (a local configuration or a catalog document; "
+        "per-node keys stripped; --dry-run only reports the diff; --comment=TEXT goes into "
+        "the audit trail); `catalog rollback <version>` commits a kept version as a new "
+        "one; `catalog apply` applies the latest version now (catalog_refresh = manual). "
+        "Answers `cluster: not enabled` on a single gateway.",
         "cluster role: status / exports [node] / takeover [fsid] / standby [fsid] / migrate "
-        "fsid node",
+        "fsid node / catalog show|status|history|diff|import|rollback|apply",
         run_cluster_cmd);
     add_socket_flag(cmd);
     cmd->varp<bool>("force", "f", false, "takeover: overwrite a live fence held by another node");
+    cmd->varp<bool>("dry-run", "n", false, "catalog import: report the changes without committing");
+    cmd->varp<std::string>("comment", "c", "", "catalog import / rollback: audit-trail comment for the new version");
     return cmd;
 }
 
@@ -174,7 +206,8 @@ Cmd make_bench() {
     return cmd;
 }
 
-// Folds `--socket PATH`/`-s PATH` into --socket=PATH (the only form cflag takes) and
+// Folds `--socket PATH`/`-s PATH` (and `--comment TEXT`) into --socket=PATH (the only
+// form cflag takes) and
 // moves a pre-subcommand --socket/--json to the end so the leaf that owns the flag
 // sees it.
 std::vector<std::string> normalize_argv(int argc, char** argv) {
@@ -185,6 +218,7 @@ std::vector<std::string> normalize_argv(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if ((a == "--socket" || a == "-s") && i + 1 < argc) a = "--socket=" + std::string(argv[++i]);
+        if ((a == "--comment" || a == "-c") && i + 1 < argc) a = "--comment=" + std::string(argv[++i]);
         if (!seen_cmd && (a.rfind("--socket=", 0) == 0 || a == "--json" || a == "-j")) {
             deferred.push_back(std::move(a));
             continue;

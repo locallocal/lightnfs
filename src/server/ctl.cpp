@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <format>
 #include <memory>
@@ -27,6 +28,7 @@
 #include "runtime/offload_pool.hpp"
 #include "server/catalog_applier.hpp"
 #include "server/cluster_controller.hpp"
+#include "server/ctl_catalog.hpp"
 #include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
 #include "util/log.hpp"
@@ -51,53 +53,57 @@ Task<void> send_all(int fd, std::string_view text) {
     }
 }
 
-// Command line -> tokens; a `--json` token anywhere selects the JSON rendering
-// (plan doc 10 §4.2 — scripts stop grepping free text).
-struct Cmd {
-    std::vector<std::string> args;
-    bool json = false;
-    const std::string& name() const {
-        static const std::string empty;
-        return args.empty() ? empty : args[0];
-    }
-    std::string_view arg(size_t i) const { return i < args.size() ? std::string_view(args[i]) : std::string_view(); }
-};
+using Cmd = CtlCommand;
 
-Cmd parse_command(std::string_view line) {
-    Cmd out;
-    std::istringstream in{std::string(line)};
+}  // namespace
+
+CtlCommand parse_ctl_command(std::string_view line) {
+    CtlCommand out;
     std::string tok;
-    while (in >> tok) {
-        if (tok == "--json")
+    bool in_tok = false, quoted = false, in_quote = false;
+    auto flush = [&] {
+        if (!in_tok) return;
+        if (!quoted && tok == "--json")
             out.json = true;
         else
-            out.args.push_back(std::move(tok));
+            out.args.push_back(tok);
+        tok.clear();
+        in_tok = quoted = false;
+    };
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (in_quote) {
+            if (c == '\\' && i + 1 < line.size() && (line[i + 1] == '"' || line[i + 1] == '\\'))
+                tok += line[++i];
+            else if (c == '"')
+                in_quote = false;
+            else
+                tok += c;
+            continue;
+        }
+        if (c == '"') {
+            in_quote = true;
+            in_tok = quoted = true;
+        } else if (std::isspace(static_cast<unsigned char>(c))) {
+            flush();
+        } else {
+            in_tok = true;
+            tok += c;
+        }
     }
+    if (in_quote) out.error = "unterminated quote";
+    flush();
     return out;
 }
 
+namespace {
+
+Cmd parse_command(std::string_view line) {
+    return parse_ctl_command(line);
+}
+
 std::string json_escape(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-            case '"':
-                out += "\\\"";
-                break;
-            case '\\':
-                out += "\\\\";
-                break;
-            case '\n':
-                out += "\\n";
-                break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20)
-                    out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
-                else
-                    out += c;
-        }
-    }
-    return out;
+    return ctl_json_escape(s);
 }
 
 const char* kHelp =
@@ -105,7 +111,8 @@ const char* kHelp =
     "fdcache [flush]|clear-poison|state|expire-client <clientid>|conns|kill-conn <id>|"
     "loglevel <debug|info|warn|error>|reload|drain|grace-end|"
     "cluster <status|exports [<node>]|takeover [<fsid>] [--force]|standby [<fsid>]|"
-    "migrate <fsid> <node>>  (append --json for JSON output)\n";
+    "migrate <fsid> <node>|catalog <show|status|history|diff|import|rollback|apply> …>"
+    "  (append --json for JSON output)\n";
 
 }  // namespace
 
@@ -389,6 +396,8 @@ std::string fs_role_of(const FsClusterController& fc, uint32_t fsid) {
 std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     const Cmd cmd = parse_command(command);
     const bool json = cmd.json;
+    if (!cmd.error.empty())
+        return json ? std::format("{{\"error\":\"{}\"}}\n", json_escape(cmd.error)) : cmd.error + "\n";
     PlaneRef pin = deps.acquire_plane();
     const DataPlane* dp = pin.get();
     if (cmd.name() == "ping") return json ? "{\"ok\":true}\n" : "pong\n";
@@ -626,9 +635,11 @@ std::string CtlServer::answer(const CtlDeps& deps, std::string_view command) {
     return json ? "{\"error\":\"unknown command\"}\n" : kHelp;
 }
 
-rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string command) {
+rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string command,
+                                              std::optional<uint32_t> peer_uid) {
     const Cmd cmd = parse_command(command);
     const bool json = cmd.json;
+    if (!cmd.error.empty()) co_return answer(deps, command);
     // The pin keeps the plane alive across the awaits below: a detach in progress waits
     // for it to drop before the data plane is torn down (plan 10 C1).
     PlaneRef pin = deps.acquire_plane();
@@ -684,27 +695,9 @@ rt::Task<std::string> CtlServer::answer_async(const CtlDeps& deps, std::string c
         co_return std::format("flushed {} drc entries\n", dropped);
     }
     if (cmd.name() == "cluster" && cmd.arg(1) == "catalog") {
-        // The shared export catalog (plan 12 C2): `apply` runs the pipeline on the main
-        // loop and waits for it off this reactor.  The read commands arrive with D1.
-        if (!deps.catalog)
-            co_return json ? "{\"error\":\"catalog not enabled\"}\n"
-                           : "catalog: not enabled (exports_source = \"local\")\n";
-        if (cmd.arg(2) == "apply") {
-            CatalogApplier& applier = *deps.catalog;
-            const uint64_t before = applier.applied();
-            auto applied = co_await rt::offload([&applier] { return applier.apply_now(); });
-            if (applied) {
-                if (json)
-                    co_return std::format("{{\"applied\":{},\"changed\":{},\"pending\":{}}}\n", *applied,
-                                          *applied != before, applier.pending());
-                co_return *applied == before ? std::format("catalog v{} already applied\n", *applied)
-                                             : std::format("catalog v{} applied (was v{})\n", *applied, before);
-            }
-            std::string why = applier.last_error();
-            if (applied.error() == errno_from(ETIMEDOUT)) why = "timed out waiting for the main loop";
-            co_return cluster_error(json, std::format("catalog apply failed (still v{}): {}", applier.applied(), why));
-        }
-        co_return json ? "{\"error\":\"bad subcommand\"}\n" : "cluster catalog: expected apply\n";
+        // The shared export catalog (plan 12 D1): store and file IO, and `apply`'s wait
+        // for the main loop, all off this reactor.
+        co_return co_await rt::offload([&deps, &cmd, peer_uid] { return cluster_catalog_answer(deps, cmd, peer_uid); });
     }
     if (cmd.name() == "cluster" && deps.cluster) {
         // The controller's store calls block on the shared filesystem (plan 10 A2): run
@@ -912,7 +905,7 @@ rt::Task<void> CtlServer::serve(int cfd) {
     if (received > 0) {
         if (auto nl = line.find('\n'); nl != std::string::npos) line.resize(nl);
         while (!line.empty() && line.back() == '\r') line.pop_back();
-        co_await send_all(cfd, co_await answer_async(deps_, std::move(line)));
+        co_await send_all(cfd, co_await answer_async(deps_, std::move(line), peer.uid));
     }
     co_await uring_close(cfd);
 }

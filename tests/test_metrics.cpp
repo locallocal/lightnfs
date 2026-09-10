@@ -251,7 +251,14 @@ TEST(Metrics, CatalogSeries) {
         ASSERT_TRUE(table.has_value());
         local->exports.clear();
         local->exports_from_catalog = false;
-        server::CatalogApplier applier({.store = store, .exports = **table, .local = *local, .node = "gw1"},
+        server::CatalogApplier applier({.store = store,
+                                        .exports = **table,
+                                        .local = *local,
+                                        .node = "gw1",
+                                        .fs_cluster = nullptr,
+                                        .post = {},
+                                        .start_backend = {},
+                                        .stop_backend = {}},
                                        boot->version, boot->catalog, boot->digest);
         EXPECT_EQ(obs::text_provider_count(), providers_before + 1);
 

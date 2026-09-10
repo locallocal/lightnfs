@@ -98,6 +98,7 @@ add_library(lnfs_core STATIC
   src/server/cluster_controller.cpp
   src/server/cluster_store.cpp
   src/server/ctl.cpp
+  src/server/ctl_catalog.cpp
   src/server/data_plane.cpp
   src/server/daemon.cpp
   src/server/frontend.cpp

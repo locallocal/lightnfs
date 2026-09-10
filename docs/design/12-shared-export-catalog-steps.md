@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A、B、C 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A、B、C 已完成；D1 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -537,7 +537,7 @@ apply），钉住五个系列在启动 / 待应用 / 应用 / 失败 / 清单消
 
 ## 阶段 D：管理命令
 
-### D1 ctl 引号与 `cluster catalog …`
+### D1 ctl 引号与 `cluster catalog …` ✅ 2026-09-10
 
 **改动点**
 
@@ -565,6 +565,40 @@ apply），钉住五个系列在启动 / 待应用 / 应用 / 失败 / 清单消
 **测试**：`tests/test_ctl.cpp` 加 `Ctl.ParseCommandQuotes`、`Ctl.ClusterCatalogCommands`（内存
 store：无清单时 `show` 答 `catalog: none`；`import` 建 v1 并写 history；`status` 列出 applied；
 并发写模拟：store 版本被改 → EAGAIN 重试成功；`rollback` 产生 v3 内容 = v1；`--json` 同形）。
+
+**实现注**（2026-09-10）：线协议的解析器抽成公开的 `parse_ctl_command` → `CtlCommand{args, json, error}`
+（`ctl.hpp`，单元测试直接打）：引号外按空白切分，引号内 `\"` / `\\` 还原为字符，其余反斜杠原样；**裸**
+`--json` 才是渲染开关，`"--json"` 是普通参数；引号在词中间也接（`x"y z"w` → `xy zw`）；未闭合引号置
+`error`，`answer` / `answer_async` 两种渲染都答 "unterminated quote"。客户端 `wire_arg`：含空白 / 引号 /
+反斜杠或为空的参数加引号并转义；`normalize_argv` 顺手把 `--comment TEXT` 折成 `--comment=TEXT`（ccmd 只收
+等号形）。命令本体在新文件 `src/server/ctl_catalog.hpp/.cpp`（`cluster_catalog_answer(deps, cmd, peer_uid)`，
+全部同步阻塞），`answer_async` 把整个命令丢进一次 `rt::offload`——store / 文件 IO 与 `apply` 等主循环都不在
+reactor 上；原来 ctl.cpp 里的 `apply` 分支搬了过去，文案不变。清单命令只依赖 `CtlDeps::store`（新增
+`ClusterStore*`，`Management::start` 多一个参数，daemon 传 `cluster_store.get()`），所以**本地模式也能用**
+（§11.9 第 1 步：先 `import` 再切换）；无 store（单网关）答 `cluster: not enabled`；有 store 无应用器时只有
+`apply` 答 "catalog apply: not enabled (exports_source = \"local\")"。`updated_by` = `<node> uid=<SO_PEERCRED>`
+（`serve()` 已取的 ucred 经 `answer_async` 新的可选参数传入；node 取自任一控制器，测试里无控制器为 `?`）；
+`updated_at` 为 UTC ISO-8601 秒。与草案的差异：(1) `status` 行的字段序是 `node= applied= alive= applied_at=
+digest= status=`——`status` 是自由文本（`error:<why>` 含空格）所以放行尾；`alive` 多活取 `alive_peers()`，主备
+只知道围栏持有者（其余 `?`）；末行 `latest=`。(2) `show` 头行 `version= exports= updated_at= updated_by=
+comment=`，每导出一行按草案字段外加 `keys=`（集群级后端键 `k=v,…`），JSON 里导出数组叫 `exports_list`
+（`exports` 是计数）。(3) `history` 把当前版也列出来并标 `current=yes|no`，解析不了的版本标 `unparseable`。
+(4) `diff` 的版本可写 `0` / `none`（首发前的空清单）；没给两个版本时 `from` = 本网关已应用版（无应用器则报
+"give the two versions to compare"）。(5) `import` 按 §11.5 拒绝 `rejected` 非空（同 fsid 改 path / backend /
+集群键），文案与应用器一致；文件是清单文档（有 `[catalog]` 头）就直接 `parse_catalog`（头由本次提交重填），
+否则 `parse_config` → `catalog_from_config`；`validate_catalog` 的 `active_active` 取 `deps.fs_cluster != null`；
+CAS 失败（EAGAIN）重读重试，最多 `kCatalogCommitRetries` = 3 次后报 "another writer keeps changing the
+catalog"；`--comment` 既收 `--comment <text>` 也收 `--comment=<text>`。(6) `rollback` 拒绝当前版（"is the
+current catalog"），默认 comment "rollback to vN"，也收 `--comment`。测试：`Ctl.ParseCommandQuotes`、
+`Ctl.ClusterCatalogCommands`（无 store / 无清单的每个命令 → dry-run 不写 → v1 含审计头 → `show` 文本与 JSON →
+`status` 两台记录 → v2 → `history` / `diff 1 2` / `diff none 2` / 版本不存在 → 改 path 与重复 fsid 被拒 → 清单文档
+导入 → 并发一次 EAGAIN 后 v5（`MemClusterStore` 新增 `before_write_catalog` 钩子）→ 永远有人抢先 3 次后报错 →
+`rollback 1` 内容 = v1、拒绝当前版与未知版 → `apply` 无应用器文案），`Ctl.ClusterCatalogApply` 改为先无 store
+再有 store。真机冒烟（单网关清单模式、`fence_lease = "1s"` auto）：`lightnfs-ctl cluster catalog import <file>
+--comment "hello world, first"`，导出路径含空格，`catalog.toml` 的 `updated_by = "gw1 uid=1000"`、comment 完整；
+`show` / `status` / `history` / `diff` / `cluster exports` 看到带空格的路径；v2 删导出 → 2.5 s 内 `exports=1`、
+"retired: backend stopped"；`rollback 1` → v3 内容 = v1、`exports=2`；`diff 1 3` 全空；`apply` 答 "v3 already
+applied"。
 
 ### D2 `cluster export list/add/set/remove`
 

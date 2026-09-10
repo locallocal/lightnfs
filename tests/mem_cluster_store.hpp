@@ -212,6 +212,8 @@ struct MemClusterStore final : server::ClusterStore {
     std::map<uint64_t, std::string> catalog_docs;
     std::map<std::string, server::CatalogApplied> catalog_applied;
     Errno fail_write_catalog = Errno::kOk;
+    // Runs at the top of write_catalog: a test's "someone else committed first".
+    std::function<void()> before_write_catalog;
 
     uint64_t catalog_version() const { return catalog_docs.empty() ? 0 : catalog_docs.rbegin()->first; }
     Result<std::optional<server::CatalogDoc>> read_catalog() override {
@@ -221,6 +223,7 @@ struct MemClusterStore final : server::ClusterStore {
     }
     Result<uint64_t> write_catalog(uint64_t expected, std::string_view text) override {
         log.push_back("write_catalog:" + std::to_string(expected));
+        if (before_write_catalog) before_write_catalog();
         if (fail_write_catalog != Errno::kOk) return Err(fail_write_catalog);
         uint64_t version = LNFS_TRY(core::peek_catalog_version(text));
         if (version != expected + 1) return Err(errno_from(EINVAL));
