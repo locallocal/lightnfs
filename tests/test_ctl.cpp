@@ -961,6 +961,53 @@ TEST(Ctl, ClusterFsCommands) {
         store.fail_list = errno_from(EIO);
         EXPECT_TRUE(ask("cluster status").find(" peers=? ") != std::string::npos);
         EXPECT_TRUE(ask("cluster status --json").find("\"peers\":null") != std::string::npos);
+
+        // plan 12 C3: in catalog mode the gateway line closes with the catalog fields
+        // (the lines above, without an applier, are the local-mode line unchanged).
+        {
+            auto local = core::parse_config(
+                "[cluster]\nenabled = true\nid = \"cluster-ctl-test\"\nshared_dir = \"/srv/shared\"\n"
+                "mode = \"active-active\"\nnode = \"gw1\"\nnode_address = \"10.0.0.1:2049\"\n"
+                "exports_source = \"catalog\"\ncatalog_refresh = \"manual\"\n");
+            ASSERT_TRUE(local.has_value());
+            // booted without a catalog
+            server::CatalogApplier applier({.store = store, .exports = exports, .local = *local, .node = "gw1"}, 0, {},
+                                           "");
+            deps.catalog = &applier;
+            EXPECT_TRUE(ask("cluster status")
+                            .find(" migrations=1 exports=3 catalog=none catalog_latest=none "
+                                  "catalog_refresh=manual catalog_error=-\nfsid=1 ") != std::string::npos);
+            EXPECT_TRUE(ask("cluster status --json")
+                            .find("\"migrations\":1,\"catalog\":null,\"catalog_latest\":null,"
+                                  "\"catalog_refresh\":\"manual\",\"catalog_error\":null,\"exports\":[") !=
+                        std::string::npos);
+            // A v1 the poll sees under manual: latest moves, applied does not.
+            store.catalog_docs[1] =
+                "[catalog]\nversion = 1\n[[export]]\npath = \"/nonexistent/x\"\nfsid = 9\n"
+                "backend = \"local\"\nclients = [\"127.0.0.0/8\"]\nnodes = [\"gw1\"]\n";
+            applier.poll();
+            EXPECT_TRUE(
+                ask("cluster status").find(" catalog=none catalog_latest=1 catalog_refresh=manual catalog_error=-\n") !=
+                std::string::npos);
+            EXPECT_TRUE(ask("cluster status --json")
+                            .find("\"catalog\":null,\"catalog_latest\":1,\"catalog_refresh\":\"manual\","
+                                  "\"catalog_error\":null,") != std::string::npos);
+            // The apply fails (a path this host lacks): the reason rides last on the line.
+            EXPECT_FALSE(applier.apply_latest().has_value());
+            EXPECT_TRUE(ask("cluster status")
+                            .find(" catalog=none catalog_latest=1 catalog_refresh=manual catalog_error=catalog v1: "
+                                  "this host cannot serve it: export fsid=9 (/nonexistent/x): ") != std::string::npos);
+            EXPECT_TRUE(ask("cluster status --json")
+                            .find("\"catalog_refresh\":\"manual\",\"catalog_error\":\"catalog v1: this host "
+                                  "cannot serve it: export fsid=9 (/nonexistent/x): ") != std::string::npos);
+            // The catalog gone from the store: nothing seen, the old error stands.
+            store.catalog_docs.clear();
+            applier.poll();
+            EXPECT_TRUE(ask("cluster status")
+                            .find(" catalog=none catalog_latest=none catalog_refresh=manual catalog_error=catalog "
+                                  "v1: ") != std::string::npos);
+            deps.catalog = nullptr;
+        }
     }
     runtime.stop_and_join();
 }
@@ -1051,6 +1098,38 @@ TEST(Ctl, ClusterCommands) {
         store.fail_list = errno_from(EIO);
         EXPECT_TRUE(ask("cluster status").find(" peers=? ") != std::string::npos);
         EXPECT_TRUE(ask("cluster status --json").find("\"peers\":null") != std::string::npos);
+
+        // plan 12 C3: the failover line carries the same catalog fields, after
+        // last_activation_ms; booted from v3 here, v4 seen by a poll, an apply failure.
+        {
+            auto local = core::parse_config(
+                "[cluster]\nenabled = true\nid = \"cluster-ctl-test\"\nshared_dir = \"/srv/shared\"\n"
+                "node = \"gw1\"\nexports_source = \"catalog\"\ncatalog_refresh = \"auto\"\n");
+            ASSERT_TRUE(local.has_value());
+            core::ExportTable exports;
+            server::CatalogApplier applier({.store = store, .exports = exports, .local = *local, .node = "gw1"}, 3, {},
+                                           "sha256:c");
+            deps.catalog = &applier;
+            auto text = ask("cluster status");
+            EXPECT_TRUE(text.find(" last_activation_ms=") != std::string::npos);
+            EXPECT_TRUE(text.find(" catalog=3 catalog_latest=3 catalog_refresh=auto catalog_error=-\n") !=
+                        std::string::npos);
+            EXPECT_TRUE(ask("cluster status --json")
+                            .find(",\"catalog\":3,\"catalog_latest\":3,\"catalog_refresh\":\"auto\","
+                                  "\"catalog_error\":null}\n") != std::string::npos);
+            // A v4 that does not parse: seen by the poll (auto posts the apply inline
+            // here), the apply fails and says so.
+            store.catalog_docs[4] = "[catalog]\nversion = 4\n[[export]]\npath = \"/x\"\n";
+            applier.poll();
+            EXPECT_EQ(applier.failures(), 1u);
+            text = ask("cluster status");
+            EXPECT_TRUE(text.find(" catalog=3 catalog_latest=4 catalog_refresh=auto catalog_error=catalog v4") !=
+                        std::string::npos);
+            EXPECT_TRUE(ask("cluster status --json")
+                            .find(",\"catalog\":3,\"catalog_latest\":4,\"catalog_refresh\":\"auto\","
+                                  "\"catalog_error\":\"catalog v4") != std::string::npos);
+            deps.catalog = nullptr;
+        }
     }
     runtime.stop_and_join();
 }

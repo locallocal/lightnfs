@@ -1601,10 +1601,19 @@ TEST(FsClusterController, CatalogAutoApplyOnTick) {
     gw.ctl->tick();
     EXPECT_EQ(gw.posts, 1u);
     EXPECT_EQ(gw.applier->applied(), 2u);
+    EXPECT_EQ(gw.applier->latest(), 2u);
     EXPECT_EQ(gw.applier->pending(), 0u);
     EXPECT_FALSE(gw.applier->applying());
+    EXPECT_EQ(gw.applier->applies(), 1u);
     EXPECT_EQ(gw.applier->failures(), 0u);
     EXPECT_STREQ(gw.applier->last_error(), "");
+    // one consistent reading for status / metrics (plan 12 C3)
+    const auto status = gw.applier->status();
+    EXPECT_EQ(status.applied, 2u);
+    EXPECT_EQ(status.latest, 2u);
+    EXPECT_EQ(status.pending, 0u);
+    EXPECT_EQ(status.applies, 1u);
+    EXPECT_STREQ(status.refresh, "auto");
     EXPECT_EQ(gw.table->size(), 2u);
     ASSERT_TRUE(gw.table->by_fsid(2) != nullptr);
     EXPECT_STREQ(gw.table->by_fsid(2)->path, gw.dir + "/b");
@@ -1669,7 +1678,9 @@ TEST(FsClusterController, CatalogManualLeavesPending) {
     gw.ctl->tick();
     EXPECT_EQ(gw.posts, 0u);
     EXPECT_EQ(gw.applier->applied(), 1u);
+    EXPECT_EQ(gw.applier->latest(), 2u);
     EXPECT_EQ(gw.applier->pending(), 2u);
+    EXPECT_STREQ(gw.applier->status().refresh, "manual");
     EXPECT_EQ(gw.table->size(), 1u);
     EXPECT_TRUE(gw.store.catalog_applied.empty());
 
@@ -1712,7 +1723,9 @@ TEST(FsClusterController, CatalogApplyFailureKeepsOld) {
     gw.ctl->tick();
     EXPECT_EQ(gw.posts, 1u);
     EXPECT_EQ(gw.applier->applied(), 1u);
+    EXPECT_EQ(gw.applier->latest(), 2u);
     EXPECT_EQ(gw.applier->pending(), 2u);
+    EXPECT_EQ(gw.applier->applies(), 0u);
     EXPECT_EQ(gw.applier->failures(), 1u);
     EXPECT_TRUE(gw.applier->last_error().find("catalog v2") != std::string::npos);
     EXPECT_TRUE(gw.applier->last_error().find("fsid=2") != std::string::npos);
@@ -1787,6 +1800,9 @@ TEST(FsClusterController, CatalogApplyFailureKeepsOld) {
     EXPECT_EQ(gw.applier->pending(), 0u);
     // v2 three times, the rejected v3, the failed start
     EXPECT_EQ(gw.applier->failures(), 5u);
+    // only v5 went through; nothing in the store means nothing seen
+    EXPECT_EQ(gw.applier->applies(), 1u);
+    EXPECT_EQ(gw.applier->latest(), 0u);
 }
 
 // The failover controller polls the same way: a standby applies too, so the table
