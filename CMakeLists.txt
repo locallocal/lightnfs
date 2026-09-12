@@ -138,13 +138,10 @@ if(OpenSSL_FOUND)
   target_link_libraries(lnfs_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
-# ccmd: command-line framework for the lightnfsd entry point (git submodule,
-# header-only + static cflag; needs `git submodule update --init --recursive`)
+# ccmd v0.0.2: command-line framework for the lightnfsd / lightnfs-ctl / lightnfs-fh
+# entry points (git submodule, header-only ccmd + header-only cflag; needs
+# `git submodule update --init --recursive`)
 add_subdirectory(third_party/ccmd EXCLUDE_FROM_ALL)
-# vendored code compiles under this project's -Wall -Wextra; silence cflag's own
-# warnings without touching the submodule
-target_compile_options(ccmd_cflag PRIVATE -Wno-sign-compare
-  $<$<CXX_COMPILER_ID:Clang>:-Wno-delete-non-abstract-non-virtual-dtor>)
 
 add_executable(lightnfsd src/main.cpp)
 target_link_libraries(lightnfsd PRIVATE lnfs_core ccmd::ccmd)
