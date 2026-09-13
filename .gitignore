@@ -5,3 +5,5 @@ compile_commands.json
 fuzz/corpus/
 packaging/dist/
 build-pkg/
+docker/export/
+docker/.env

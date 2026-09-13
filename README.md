@@ -334,6 +334,9 @@ version:
 - **Least privilege.** `packaging/systemd/lightnfs.service` runs as a dedicated user
   with `CAP_DAC_READ_SEARCH` + `CAP_NET_BIND_SERVICE`, `ProtectSystem=strict`, and a
   seccomp allowlist generated from a real workload (`scripts/gen_seccomp_allowlist.sh`).
+- **Containers.** [docker/](docker/README.md) ships a multi-stage `Dockerfile` and a
+  `docker-compose.yml` with the same posture: state volume, export bind mount,
+  unprivileged user holding only the two capabilities, read-only root filesystem.
 - **Handles.** File handles are HMAC-authenticated; kernel handles are stable across
   restarts, the fallback mode is documented with its limits.
 - **Restart behaviour.** Crash or restart → new write verifier (clients resend

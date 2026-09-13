@@ -62,6 +62,9 @@ sudo systemctl enable --now lightnfs
 （`setcap 'cap_dac_read_search,cap_net_bind_service=ep' lightnfsd`，或用高位端口免去
 `CAP_NET_BIND_SERVICE`），并用容器/`bwrap` 限制可见文件系统。
 
+容器部署：`docker/` 提供多阶段 `Dockerfile`、`docker-compose.yml` 与降权入口脚本（状态卷、
+导出目录绑定挂载、仅保留上述两个 capability、只读根文件系统），见 `docker/README.md`。
+
 ## 3. 关键配置
 
 见 `config/lightnfs.toml.example`（每键有注释）。发布前必查：

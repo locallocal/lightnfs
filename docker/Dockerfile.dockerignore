@@ -1,0 +1,23 @@
+# Build-context filter for docker/Dockerfile (BuildKit reads <Dockerfile>.dockerignore
+# next to the Dockerfile; the context itself is the repository root).
+.git
+.gitignore
+.gitmodules
+.cache
+.clang-format
+.clang-tidy
+compile_commands.json
+build
+build-*
+packaging/dist
+fuzz/corpus
+third_party/liburing/src/*.o
+third_party/liburing/src/*.a
+third_party/liburing/src/*.so*
+third_party/liburing/config-host.*
+third_party/liburing/liburing.pc
+third_party/liburing/liburing-ffi.pc
+docker/export
+docker/.env
+**/*.log
+**/*.swp
