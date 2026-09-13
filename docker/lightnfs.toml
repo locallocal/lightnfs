@@ -1,0 +1,56 @@
+# lightnfs configuration for the container image (docker/Dockerfile).  Baked in at
+# /etc/lightnfs/lightnfs.toml; docker-compose.yml bind-mounts this file over it so edits
+# take effect with `docker compose restart` (hot-reloadable keys: `docker compose exec
+# lightnfs lightnfs-ctl reload`).  Every key is documented in config/lightnfs.toml.example.
+
+[server]
+reactors = 0            # one reactor per core visible to the container
+offload_threads = 16
+# ring = "auto"         # docker's default seccomp profile blocks io_uring_*: "auto" falls
+                        # back to the epoll ring.  For io_uring inside the container run
+                        # with a seccomp profile that allows io_uring_setup/enter/register
+                        # (or `security_opt: [seccomp=unconfined]` on a trusted host).
+port = 2049
+mount_port = 20048
+rpcbind = false         # no rpcbind in the container: v3 clients mount with
+                        # `-o vers=3,port=2049,mountport=20048`; v4.1/4.2 needs only 2049
+builtin_portmap = false
+state_dir = "/var/lib/lightnfs"   # volume: boot epoch, HMAC key, reclaim list — keep it
+max_connections = 4096
+per_peer_limit = 128
+max_request_size = "2MiB"
+metrics_port = 9100     # Prometheus text endpoint; published to 127.0.0.1:9100 by compose
+metrics_bind = "0.0.0.0"          # the container's interfaces (the host reaches it via NAT)
+log_level = "info"      # debug | info | warn | error — logs go to stderr (`docker logs`)
+
+[protocol]
+v3 = true
+v4 = true
+lease = "90s"
+courtesy_multiplier = 24
+drc_ttl = "120s"
+drc_mem = "64MiB"
+
+[limits]
+inflight_per_conn = 64
+
+# The export: bind-mount the tree to serve at /export (compose: LNFS_EXPORT).  A
+# read-write export needs the tree writable by the server uid (LNFS_UID in the
+# entrypoint), which is uid 2049 unless overridden.
+[[export]]
+path = "/export"
+backend = "local"
+fsid = 1
+# Trusted networks only (AUTH_SYS trusts the uid/gid the client presents): the private
+# ranges cover docker bridge networks (172.16/12) and typical LANs.  Narrow to your
+# client subnet before exposing the port.
+clients = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]
+squash = "root"
+readonly = false
+
+[export.local]
+handles = "auto"        # kernel handles with CAP_DAC_READ_SEARCH (compose adds it), path
+                        # fallback otherwise
+fd_cache = 4096
+readdir_enrich = true
+# identity = "check"    # "setfsuid" needs the server as root: LNFS_UID=0
