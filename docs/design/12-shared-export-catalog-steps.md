@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A、B、C 已完成；阶段 D 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A、B、C、D 已完成；E1 已完成，余 E2 文档）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -696,7 +696,7 @@ v1 时"每个导出必须有 `nodes`"这条规则真的生效）；位置参数�
 
 ## 阶段 E：验收与文档
 
-### E1 三实例脚本"清单"段 + `v4catalog` 验收模式
+### E1 三实例脚本"清单"段 + `v4catalog` 验收模式 ✅ 2026-09-14
 
 **改动点**
 
@@ -715,6 +715,53 @@ v1 时"每个导出必须有 `nodes`"这条规则真的生效）；位置参数�
   6. `catalog rollback 1` 后全部回到 v1 的导出集。
   Release 与 ASAN 各一轮；`level=error` 为零。
 - `tests/accept_client.cpp` 加 `v4catalog` 模式（伪根 READDIR 断言 + change 单调 + STALE）。
+
+**实现注**（2026-09-14）：导出模式变成脚本的**外层循环**而不是只给清单段：
+`LNFS_EXPORTS`（默认 `"local catalog"`）× `LNFS_BUILD_DIRS`，每个组合跑一遍 run_phase，段标签成
+`rel-local` / `rel-catalog` / `asan-local` / `asan-catalog`，`single` 段只跑 local（`nodes=["gw1"]`
+的退化门与清单无关）。这样"既有四段原样通过"是**跑出来的**而不是读出来的：两种模式下 status /
+v4moved / roll / crash 一字不改地各过一遍。两个 `[[export]]` 块抽成 `export_blocks()`，本地模式写进
+每台的 toml、清单模式写进引导用的 seed 文件，两边的导出集逐字节相同；清单模式的 toml 只多
+`exports_source = "catalog"` 与 `catalog_refresh = "auto"`，一个 `[[export]]` 都没有。引导
+（`seed_catalog`）在**任何守护进程启动前**跑 D3 的离线 `catalog import --from-local`，seed 文件带
+`[cluster] mode = "active-active"`，所以 D3 的模式推断真的在这里生效——少写一个 `nodes` 会在引导这一步
+就被拒；答案钉死为 `catalog v1 imported (was none): added=1,2`。
+
+`catalog` 段放在 roll 与 crash **之间**（crash 会 kill 掉 gw1，清单段需要三台都在），顺序：三台
+`catalog status` 都在 v1 → `lnfs_accept_client v4catalog` 跑完 add / move(nodes) / disable 三次编辑 →
+三台都没有 fsid 3 的 `role=` 行 → 版本恰好是 v4 → `export remove 3` 通过（禁用的导出没人服务）→
+以 `--nodes gw1` 重新加入（**不带** `--force`：同 path / backend / 集群键，fsid 复用规则本来就该放行）
+→ `remove 3` 被属主护栏拒、`--force` 通过 → 再加一次作为后两步的对象 → gw3 改 `catalog_refresh =
+"manual"` 后 `reload`（答 `catalog_refresh -> manual`），改一次 `set 3 --iops 100`：gw1/gw2 追上而
+gw3 停在旧版（`cluster status` 里 `catalog=<旧> catalog_latest=<新> catalog_refresh=manual`），
+`cluster catalog apply` 答 `catalog vN applied (was vM)` 后追平，再 `reload` 回 auto →
+`catalog rollback 1`，三台回到两个导出、fsid 3 处处消失。段末 `exports=2`。
+
+客户端模式 `v4catalog HOST PORT_A PORT_C PARENT EXPORT ADD_CMD MOVE_CMD DISABLE_CMD`：与 `v4moved`
+一样由客户端自己在正确的时刻跑 ctl 命令——三次编辑的"前"和"后"都要在同一个会话里看，脚本先发命令
+就没有"前"了。PORT_A 是**不**拥有新导出的网关，PORT_C 是拥有它的那台，`PARENT` 是挂着各导出的伪目录。
+断言：加之前伪目录里没有该名字 → 加之后 READDIR 多出一项、伪目录的 change 属性严格变大（B2 的
+`epoch << 32 | generation`）→ 新节点 READ 答 MOVED、`fs_locations` 非空（**要轮询**：没人拿到围栏之前
+所有权门答的是 DELAY 不是 MOVED，第一版直接读一次因此失败）→ 在属主上 OPEN 一个文件留下状态 →
+`set --nodes` 把属主踢出名单后，属主的 SEQUENCE 置 `SEQ4_STATUS_LEASE_MOVED` → `--disabled=true` 后，
+加导出时留下的那个伪句柄答 NFS4ERR_STALE（伪节点 id 是路径哈希，导出走了就 resolve 不到），
+READDIR 里名字消失，change 再次变大。新辅助函数 `v4_lookup_status`（不 fatal 的 LOOKUP 链，
+导出集在脚下变）、`v4_change`（GETATTR(change)，状态外带，好盯着句柄从 MOVED 变 STALE）、
+`v4_readdir_names`（只要名字，伪目录没有本地树可比）。
+
+**本步抓到的一个真 bug**（已修，`server/cluster_controller.cpp` `migration_target`）：
+`fs/<fsid>/owner` 比导出本身活得久——导出退出清单时没有任何一方清理共享状态。于是"先 `set 3
+--nodes gw2,gw1`（属主变 gw2）→ disable → remove → 以 `--nodes gw1` 重新加入"之后，gw2 读到的
+owner 记录仍写着自己，`migration_target` 把它当成一次待完成的迁移，于是 **gw2 立刻把这个不含它的
+导出抢回去**（`take` 走的是 "migrate" 分支，绕开了唯一检查 `nodes` 的 `our_turn`）；唯一被列名的
+gw1 看到一份活着的外来围栏，就永远停在 Standby。修法是在 `migration_target` 里加一条：owner 记录
+指向的节点若已不在该导出的 `nodes` 里，就不算迁移目标，退回按节点顺位的普通规则（`cluster status`
+的属主视图同时不再把客户端指向一个不会接手的网关）。回归测试
+`FsClusterController.StaleOwnerRecordDoesNotResurrectAnUnlistedNode`（去掉修改后 9 条断言全红）。
+**留给 E2 的收尾项**：修的是消费侧，`fs/<fsid>/owner`（连同 `fs/<fsid>/epoch`、
+`fs/<fsid>/clients/`）本身仍然在导出被移出清单后长期留在共享目录里——每个曾经存在过的 fsid 一份，
+没人回收。清理要决定"谁清、何时清"（最后一个排空的网关？还是按 fsid 不在任何历史版本里判定），
+与本册其余部分无关，收进 `docs/toto/shared-export-catalog-followups.md`。
 
 ### E2 文档
 

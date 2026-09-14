@@ -226,11 +226,15 @@ ctl 命令 `lightnfs-ctl cluster migrate <fsid> <node>`，**在当前属主上�
    结束 F 的 grace、给持有过 F 状态的客户端置 LEASE_MOVED）→ `release_fs_fence(F)`；角色回
    Remote。**命令到此立即返回**（`migrate started: fsid= from= to=`）。没有在途请求静默期，
    状态即时丢弃——与"迁移 = 该 fs 重启"的语义一致。
-5. **T 在下一个 tick 接管**：`migration_target()` 看到 owner 指向一个存活且 ≠ 上一持有者的节点、
-   且无人持围栏 → **无视顺位、无视 `takeover = manual`** 接管，`reason = "migrate"`：读
+5. **T 在下一个 tick 接管**：`migration_target()` 看到 owner 指向一个存活、≠ 上一持有者、
+   **且仍在该导出 `nodes` 里**的节点、且无人持围栏 → **无视顺位、无视 `takeover = manual`**
+   接管，`reason = "migrate"`：读
    `fs/<F>/epoch`、`acquire_fs_fence(F, epoch+1)`、`bump_fs_epoch`、跑 F 的后端 `takeover()` +
    `takeover_hook`（`LNFS_PREV_NODE = S`）、`load_grace_list(F)`（arm F 的 grace）、写自己的
-   owner 记录、开始对 F 服务。
+   owner 记录、开始对 F 服务。其中 `nodes` 那一条是必需的：`fs/<F>/owner` 比导出本身活得久
+   （导出退出清单时无人清理共享状态），少了它，一个已被移出 `nodes` 的旧属主会在导出重新加入时
+   凭陈旧的 owner 记录把它抢回去——而顺位规则 `our_turn()` 是唯一拦住未列名网关的地方
+   （11 册 §11.5，12 册 E1）。
 6. **窗口内**：T 处于 Activating，对引擎发布为 unowned → 对 F 回 `DELAY`；其他网关的视图 Remote
    指向 T → 回 MOVED 指 T；除 T 以外的顺位网关看到 owner 指向存活的 T 时**主动让位**。因此
    **任何编排都必须轮询目标到 `role=active`**，而不是源端变 remote（收尾项 §3）。
