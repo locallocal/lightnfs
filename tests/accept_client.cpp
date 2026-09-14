@@ -2665,6 +2665,248 @@ int cmd_v4moved(const char* host, uint16_t port_a, uint16_t port_b, uint16_t por
     return 0;
 }
 
+namespace v4 {
+constexpr uint32_t kAttrChange = 3;
+// NFS4ERR_STALE
+constexpr uint32_t kStale = 70;
+
+// LOOKUP chain from the pseudo root, without lookup_path's fatal on a non-OK status:
+// the export set moves under the caller here, so a missing component is an answer.
+uint32_t v4_lookup_status(V4Client& c, const std::vector<std::string>& components, std::vector<std::byte>* out) {
+    XdrEnc ops(c.rpc.pool);
+    c.seq_header(ops, 2 + (uint32_t)components.size());
+    ops.u32(kOpPutrootfh);
+    for (const auto& comp : components) {
+        ops.u32(kOpLookup);
+        ops.string(comp);
+    }
+    ops.u32(kOpGetfh);
+    auto r = c.run(ops.take().to_bytes(), 0, false);
+    if (r.status != 0) return r.status;
+    V4Client::skip_sequence_res(r.dec);
+    V4Client::expect_op(r.dec, kOpPutrootfh);
+    for (size_t i = 0; i < components.size(); ++i) V4Client::expect_op(r.dec, kOpLookup);
+    V4Client::expect_op(r.dec, kOpGetfh);
+    auto fh = r.dec.opaque(128);
+    if (!fh) fatal("v4: bad path fh");
+    if (out) out->assign(fh->begin(), fh->end());
+    return 0;
+}
+
+// GETATTR(change) on `fh`.  `status` (when given) receives the compound status, so a
+// caller can watch a kept handle answer MOVED and then go STALE; the change value is
+// meaningful only on 0.
+uint64_t v4_change(V4Client& c, const std::vector<std::byte>& fh, uint32_t* status = nullptr) {
+    XdrEnc ops(c.rpc.pool);
+    c.seq_header(ops, 2);
+    ops.u32(kOpPutfh);
+    ops.opaque(fh);
+    ops.u32(kOpGetattr);
+    // bitmap: one word
+    ops.u32(1);
+    ops.u32(1u << kAttrChange);
+    auto r = c.run(ops.take().to_bytes(), 0, false);
+    if (status) *status = r.status;
+    if (r.status != 0) {
+        if (!status) fatal("v4: GETATTR(change): status %u", r.status);
+        return 0;
+    }
+    V4Client::skip_sequence_res(r.dec);
+    V4Client::expect_op(r.dec, kOpPutfh);
+    V4Client::expect_op(r.dec, kOpGetattr);
+    uint32_t words = ru32(r.dec);
+    uint32_t w0 = words > 0 ? ru32(r.dec) : 0;
+    for (uint32_t i = 1; i < words; ++i) (void)ru32(r.dec);
+    // attrlist4 length
+    (void)ru32(r.dec);
+    if (!(w0 & (1u << kAttrChange))) fatal("v4: GETATTR did not answer the change attribute");
+    return ru64(r.dec);
+}
+
+// READDIR of `fh`, entry names only: used on the pseudo directory that holds the
+// exports, where there is no backing tree to compare against.
+std::vector<std::string> v4_readdir_names(V4Client& c, const std::vector<std::byte>& fh) {
+    std::vector<std::string> names;
+    uint64_t cookie = 0;
+    bool eof = false;
+    while (!eof) {
+        XdrEnc ops(c.rpc.pool);
+        c.seq_header(ops, 2);
+        ops.u32(kOpPutfh);
+        ops.opaque(fh);
+        ops.u32(kOpReaddir);
+        ops.u64(cookie);
+        std::array<std::byte, 8> verf{};
+        ops.opaque_fixed(verf);
+        ops.u32(1u << 16);
+        ops.u32(1u << 17);
+        // bitmap: one word, type only (skipped through the value length)
+        ops.u32(1);
+        ops.u32(1u << kAttrType);
+        auto r = c.run(ops.take().to_bytes());
+        V4Client::skip_sequence_res(r.dec);
+        V4Client::expect_op(r.dec, kOpPutfh);
+        V4Client::expect_op(r.dec, kOpReaddir);
+        (void)r.dec.opaque_fixed(8);
+        size_t page = 0;
+        while (rbool(r.dec)) {
+            cookie = ru64(r.dec);
+            auto name = r.dec.string(255);
+            if (!name) fatal("v4: bad readdir name");
+            names.emplace_back(*name);
+            uint32_t words = ru32(r.dec);
+            for (uint32_t i = 0; i < words; ++i) (void)ru32(r.dec);
+            uint32_t vals_len = ru32(r.dec);
+            (void)r.dec.skip(vals_len);
+            ++page;
+        }
+        eof = rbool(r.dec);
+        if (!eof && page == 0) fatal("v4: empty readdir page without eof");
+    }
+    return names;
+}
+
+bool has_name(const std::vector<std::string>& names, const std::string& name) {
+    return std::find(names.begin(), names.end(), name) != names.end();
+}
+}  // namespace v4
+
+// v4catalog (plan 12 E1): what a catalog edit looks like to a v4.1 client on a live
+// active-active cluster.  A is a gateway that will not own the new export, C is the one
+// that will; `parent_path` is the pseudo directory the exports hang under.
+//   add      — `add_cmd` publishes a new export.  On A its entry appears in the pseudo
+//              directory, the directory's change attribute moves (plan 12 B2:
+//              epoch << 32 | generation), and the new node answers MOVED with
+//              fs_locations naming its owner.
+//   move     — `move_cmd` rewrites the export's `nodes` so C has to give it up; the
+//              client holding an open there is told LEASE_MOVED.
+//   disable  — `disable_cmd` disables the export.  The pseudo handle the client kept
+//              from the add goes STALE, the entry is gone and change moved again.
+int cmd_v4catalog(const char* host, uint16_t port_a, uint16_t port_c, const std::string& parent_path,
+                  const std::string& new_export, const std::string& add_cmd, const std::string& move_cmd,
+                  const std::string& disable_cmd) {
+    using namespace v4;
+    const auto parent_comps = split_path(parent_path);
+    const auto new_comps = split_path(new_export);
+    if (new_comps.empty()) fatal("v4catalog: an export path is required");
+    const std::string leaf = new_comps.back();
+    const auto step = std::chrono::milliseconds(50);
+
+    V4Client a(host, port_a, "lightnfs-catalog-a");
+    a.establish();
+    auto parent_fh = lookup_path(a, parent_comps);
+    const uint64_t change_before = v4_change(a, parent_fh);
+    const auto names_before = v4_readdir_names(a, parent_fh);
+    if (has_name(names_before, leaf)) fatal("v4catalog: '%s' is in the pseudo directory before the add", leaf.c_str());
+
+    // ---- add: the export set grows under a live session ---------------------------------
+    std::printf("v4catalog: adding the export: %s\n", add_cmd.c_str());
+    if (std::system(add_cmd.c_str()) != 0) fatal("v4catalog: add command failed");
+    std::vector<std::string> names_after;
+    uint64_t change_after = 0;
+    for (unsigned waited = 0;; ++waited) {
+        // The pseudo node ids are path hashes, so the parent survives the change; it is
+        // looked up again anyway, the way a client that dropped its cache would.
+        parent_fh = lookup_path(a, parent_comps);
+        names_after = v4_readdir_names(a, parent_fh);
+        change_after = v4_change(a, parent_fh);
+        if (has_name(names_after, leaf)) break;
+        if (waited > 400) fatal("v4catalog: '%s' never appeared in the pseudo directory of A", leaf.c_str());
+        std::this_thread::sleep_for(step);
+    }
+    if (names_after.size() != names_before.size() + 1)
+        fatal("v4catalog: pseudo directory has %zu entries after the add, %zu before", names_after.size(),
+              names_before.size());
+    if (change_after <= change_before)
+        fatal("v4catalog: pseudo change attribute did not move on the add (%llu -> %llu)",
+              (unsigned long long)change_before, (unsigned long long)change_after);
+
+    // The new export is served elsewhere: MOVED with fs_locations naming its owner.
+    // Until some gateway takes the fence the export is Unowned and the gate answers
+    // DELAY, so this settles rather than reads once.
+    std::vector<std::byte> kept_fh;
+    std::vector<std::string> locs;
+    uint32_t st = 0;
+    for (unsigned waited = 0;; ++waited) {
+        if (uint32_t lk = v4_lookup_status(a, new_comps, &kept_fh); lk != 0)
+            fatal("v4catalog: LOOKUP of the new export on A: status %u", lk);
+        (void)v4_read(a, kept_fh, Stateid4{}, 4, &st);
+        if (st == kMoved) {
+            locs = v4_fs_locations(a, kept_fh);
+            if (!locs.empty()) break;
+        } else if (st != kDelay) {
+            fatal("v4catalog: READ of the new export on A: expected MOVED, got %u", st);
+        }
+        if (waited > 400) fatal("v4catalog: A never settled on MOVED with fs_locations (last status %u)", st);
+        std::this_thread::sleep_for(step);
+    }
+    std::printf(
+        "v4catalog: A lists the new export ('%s', %zu entries), change %llu -> %llu, MOVED "
+        "with fs_locations=%s\n",
+        leaf.c_str(), names_after.size(), (unsigned long long)change_before, (unsigned long long)change_after,
+        locs.front().c_str());
+
+    // ---- the owner serves it: an open there is state the next edit has to move -----------
+    V4Client c(host, port_c, "lightnfs-catalog-fs");
+    c.establish();
+    {
+        OpenOut o;
+        std::vector<std::byte> root;
+        for (unsigned waited = 0;; ++waited) {
+            o.status = v4_lookup_status(c, new_comps, &root);
+            if (o.status == 0) {
+                o = v4_open(c, root, "catalog.bin", 3, 0, "catalog-owner", true, 0, 0);
+                if (o.status == 0) break;
+            }
+            // MOVED = the owner has not taken it over yet, DELAY = activating,
+            // GRACE = its reclaim window, ENOENT = the set has not reached it at all.
+            if (o.status != kMoved && o.status != kDelay && o.status != kGrace && o.status != 2)
+                fatal("v4catalog: OPEN(CREATE) on the owner: status %u", o.status);
+            if (waited > 400) fatal("v4catalog: the owner never served the new export (last status %u)", o.status);
+            std::this_thread::sleep_for(step);
+        }
+        std::printf("v4catalog: the owner serves the new export and holds an open on it\n");
+    }
+
+    // ---- move: `nodes` no longer lists the owner, so the export is handed on -------------
+    std::printf("v4catalog: moving the export: %s\n", move_cmd.c_str());
+    if (std::system(move_cmd.c_str()) != 0) fatal("v4catalog: move command failed");
+    for (unsigned tries = 0; !(v4_sequence_flags(c) & 0x80u); ++tries) {
+        if (tries > 400) fatal("v4catalog: the old owner never set LEASE_MOVED after the nodes change");
+        std::this_thread::sleep_for(step);
+    }
+    std::printf("v4catalog: the old owner reports LEASE_MOVED\n");
+
+    // ---- disable: the export leaves every gateway's set ----------------------------------
+    std::printf("v4catalog: disabling the export: %s\n", disable_cmd.c_str());
+    if (std::system(disable_cmd.c_str()) != 0) fatal("v4catalog: disable command failed");
+    uint32_t kept_status = 0;
+    for (unsigned tries = 0;; ++tries) {
+        (void)v4_change(a, kept_fh, &kept_status);
+        if (kept_status == kStale) break;
+        if (kept_status != 0 && kept_status != kMoved && kept_status != kDelay)
+            fatal("v4catalog: the kept handle answered %u, expected MOVED then STALE", kept_status);
+        if (tries > 400) fatal("v4catalog: the kept handle never went stale (last status %u)", kept_status);
+        std::this_thread::sleep_for(step);
+    }
+    parent_fh = lookup_path(a, parent_comps);
+    const auto names_end = v4_readdir_names(a, parent_fh);
+    if (has_name(names_end, leaf)) fatal("v4catalog: '%s' still listed after the disable", leaf.c_str());
+    const uint64_t change_end = v4_change(a, parent_fh);
+    if (change_end <= change_after)
+        fatal("v4catalog: pseudo change attribute did not move on the disable (%llu -> %llu)",
+              (unsigned long long)change_after, (unsigned long long)change_end);
+
+    c.destroy();
+    a.destroy();
+    std::printf(
+        "accept_client v4catalog OK: add seen in the pseudo directory (MOVED + fs_locations "
+        "to the owner), LEASE_MOVED on the nodes change, kept handle STALE after the "
+        "disable, change attribute strictly monotonic %llu -> %llu -> %llu\n",
+        (unsigned long long)change_before, (unsigned long long)change_after, (unsigned long long)change_end);
+    return 0;
+}
+
 // Lease-expiry scenario (development plan §6.3 / design 07 §7.4): a client holding a
 // deny-WRITE open vanishes (connection dropped, no CLOSE).  Inside the lease a second
 // client is SHARE_DENIED; once the lease lapses the holder is a courtesy client and the
@@ -3017,6 +3259,8 @@ int main(int argc, char** argv) {
                      "TAKEOVER_CMD\n"
                      "       accept_client v4moved HOST PORT_A PORT_B PORT_C EXPORT BACKING "
                      "MIGRATE_CMD\n"
+                     "       accept_client v4catalog HOST PORT_A PORT_C PARENT EXPORT "
+                     "ADD_CMD MOVE_CMD DISABLE_CMD\n"
                      "       accept_client v4lock HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
                      "       accept_client v42    HOST NFS_PORT MOUNT_PORT EXPORT BACKING\n"
                      "       accept_client fsync-eio HOST NFS_PORT MOUNT_PORT EXPORT\n");
@@ -3050,6 +3294,9 @@ int main(int argc, char** argv) {
     // PORT_A PORT_B PORT_C EXPORT BACKING MIGRATE_CMD
     if (cmd == "v4moved" && argc == 9)
         return cmd_v4moved(host, nfs_port, mount_port, (uint16_t)atoi(argv[5]), argv[6], argv[7], argv[8]);
+    // PORT_A PORT_C PARENT EXPORT ADD_CMD MOVE_CMD DISABLE_CMD
+    if (cmd == "v4catalog" && argc == 10)
+        return cmd_v4catalog(host, nfs_port, mount_port, export_path, argv[6], argv[7], argv[8], argv[9]);
     if (cmd == "v4lock" && argc == 7) return cmd_v4lock(host, nfs_port, export_path, argv[6]);
     if (cmd == "v42" && argc == 7) return cmd_v42(host, nfs_port, export_path, argv[6]);
     if (cmd == "fsync-eio" && argc == 6) return cmd_fsync_eio(host, nfs_port, mount_port, export_path);

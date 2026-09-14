@@ -1418,6 +1418,67 @@ TEST(FsClusterController, SyncExportsRemovalDrainsOwner) {
     EXPECT_TRUE(store.fences["gw1"].holds.size() == 1u);
 }
 
+// fs/<fsid>/owner outlives the export leaving the export set — nothing clears shared
+// state on a catalog removal (design 11 §11.5).  Re-added with a `nodes` list that no
+// longer names the old owner, the stale record must not read as a pending migration:
+// before this was caught (plan 12 E1) the old owner took the export straight back,
+// ahead of the node order and outside its own `nodes`, and the listed gateway then saw
+// a live foreign fence and stayed Standby for good.
+TEST(FsClusterController, StaleOwnerRecordDoesNotResurrectAnUnlistedNode) {
+    MemStore store;
+    Exports exports({{"gw1", "gw2"}, {"gw1"}, {"gw1"}});
+    (void)store.put_node_address("gw1", "10.0.0.1:2049");
+    (void)store.put_node_address("gw2", "10.0.0.2:2049");
+    core::FsOwnerView view1, view2;
+    FsRecorder rec1, rec2;
+    server::FsClusterController gw1(aa_config("gw1"), exports.table, store, view1, rec1.hooks());
+    server::FsClusterController gw2(aa_config("gw2"), exports.table, store, view2, rec2.hooks());
+    gw1.tick();
+    gw2.tick();
+    ASSERT_TRUE(fs_role(gw1, 1) == server::Role::kActive);
+
+    // gw1 hands fsid 1 to gw2: the owner record names gw2 and gw2 takes it.
+    ASSERT_TRUE(gw1.request_migrate(1, "gw2").has_value());
+    gw2.tick();
+    ASSERT_TRUE(fs_role(gw2, 1) == server::Role::kActive);
+    EXPECT_STREQ(store.owners[1].node, "gw2");
+
+    // The export leaves the catalog: gw2 drains it, both controllers forget it — and
+    // fs/1/owner still says gw2.
+    core::ExportSetPlan drop;
+    drop.remove.push_back(1);
+    auto set = apply_plan(exports.table, std::move(drop));
+    ASSERT_TRUE(set != nullptr);
+    gw1.sync_exports(set);
+    gw2.sync_exports(set);
+    ASSERT_TRUE(gw2.snapshot().size() == 2u);
+    EXPECT_STREQ(store.owners[1].node, "gw2");
+
+    // Re-added listing gw1 only.  gw2 must leave it alone however many ticks pass.
+    core::ExportSetPlan back;
+    back.add.push_back(export_cfg(1, {"gw1"}));
+    set = apply_plan(exports.table, std::move(back), {1});
+    ASSERT_TRUE(set != nullptr);
+    rec1.calls.clear();
+    rec2.calls.clear();
+    gw1.sync_exports(set);
+    gw2.sync_exports(set);
+    for (int i = 0; i < 3; ++i) {
+        gw2.tick();
+        EXPECT_TRUE(fs_role(gw2, 1) == server::Role::kStandby);
+    }
+    EXPECT_TRUE(rec2.calls.empty());
+    // The owner view refers nobody to the stale owner either.
+    EXPECT_TRUE(view_of(view2, 1).role == core::FsRole::kUnowned);
+    // The one listed gateway takes it.
+    gw1.tick();
+    EXPECT_TRUE(fs_role(gw1, 1) == server::Role::kActive);
+    EXPECT_STREQ(joined(rec1.calls), "takeover:1 activate:1");
+    gw2.tick();
+    EXPECT_TRUE(view_of(view2, 1).role == core::FsRole::kRemote);
+    EXPECT_STREQ(view_of(view2, 1).node, "gw1");
+}
+
 // The owner is dropped from `nodes` but no listed node is alive: it keeps serving
 // (warning each tick) and hands over as soon as one appears.
 TEST(FsClusterController, SyncExportsNodesChangeNoCandidateKeeps) {

@@ -409,6 +409,15 @@ bool FsClusterController::alive(const StoreView& sv, std::string_view node) {
 std::string FsClusterController::migration_target(const Fs& fs, const StoreView& sv) {
     if (!fs.owner || fs.owner->node.empty() || fs.owner->node == fs.last_holder) return {};
     if (!alive(sv, fs.owner->node)) return {};
+    // fs/<fsid>/owner outlives the export leaving the export set (nothing clears shared
+    // state on a catalog removal), so after a re-add — or after a `nodes` change while
+    // the export was gone — it can still name a node the export no longer lists.  Only a
+    // listed node is a migration target; otherwise the ordinary node-order rule decides,
+    // which is the one place that keeps an unlisted gateway from serving the export at
+    // all (plan 12 E1).
+    if (const auto& nodes = fs.exp->node_list();
+        !nodes.empty() && std::find(nodes.begin(), nodes.end(), fs.owner->node) == nodes.end())
+        return {};
     return fs.owner->node;
 }
 
