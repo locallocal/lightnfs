@@ -11,14 +11,17 @@
 //                        [--comment=TEXT]|rollback <version> [--comment=TEXT]|apply> [--socket=PATH]
 //   lightnfs-ctl cluster export <list|add …|set <fsid> …|remove <fsid> [--force]> [--socket=PATH]
 //                (forwarded verbatim: the server parses the export flags, plan 12 D2)
+//   lightnfs-ctl catalog <show|status|history|diff|import|rollback> --shared-dir=DIR
+//                (offline: straight at the shared directory, no gateway, plan 12 D3)
 //   lightnfs-ctl bench <echo|nullrpc|fullpath> [args...]
 //
 // Socket resolution: --socket, else $LIGHTNFS_CTL, else /tmp/lightnfs-state/ctl.sock.
 // Root options do not propagate to subcommands in ccmd, so normalize_argv moves
-// --socket/--json (wherever they were given) behind the positionals, where the leaf
-// that owns the flag sees them.
+// --socket/--shared-dir/--json (wherever they were given) behind the positionals,
+// where the leaf that owns the flag sees them.
 
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -31,7 +34,12 @@
 #include <string>
 #include <vector>
 
+#include "core/config.hpp"
+#include "server/cluster_store.hpp"
+#include "server/ctl.hpp"
+#include "server/ctl_catalog.hpp"
 #include "tools/bench/bench_main.hpp"
+#include "util/log.hpp"
 
 namespace {
 
@@ -112,8 +120,8 @@ std::string wire_arg(const std::string& a) {
     return out + '"';
 }
 
-// Which of the server-side flags a `cluster …` leaf forwards.
-enum ClusterFlags : unsigned { kForce = 1, kDryRun = 2, kComment = 4 };
+// Which of the server-side flags a `cluster …` / offline `catalog …` leaf forwards.
+enum ClusterFlags : unsigned { kForce = 1, kDryRun = 2, kComment = 4, kFromLocal = 8, kActiveActive = 16 };
 
 // A leaf below `cluster` (plan 10 C3 / plan 11 / plan 12): the wire line is the path
 // from `cluster` down (`wire`), the positionals, and the flags the leaf registered.
@@ -127,6 +135,8 @@ Cmd make_cluster_leaf(std::string wire, const char* name, const char* example, c
         if (flags & kComment)
             if (auto comment = c->var<std::string>("comment"); !comment.empty())
                 line += " --comment " + wire_arg(comment);
+        if (flags & kFromLocal)
+            if (auto file = c->var<std::string>("from-local"); !file.empty()) line += " --from-local " + wire_arg(file);
         if (c->var<bool>("json")) line += " --json";
         line += '\n';
         g_exit = send_ctl(c->var<std::string>("socket"), line);
@@ -136,6 +146,8 @@ Cmd make_cluster_leaf(std::string wire, const char* name, const char* example, c
     if (flags & kForce) cmd->varp<bool>("force", "f", false, "take a live fence held by another node");
     if (flags & kDryRun) cmd->varp<bool>("dry-run", "n", false, "report the changes without committing");
     if (flags & kComment) cmd->varp<std::string>("comment", "c", "", "audit-trail comment for the new version");
+    if (flags & kFromLocal)
+        cmd->var<std::string>("from-local", "", "import a gateway configuration file (not a catalog document)");
     return cmd;
 }
 
@@ -174,10 +186,11 @@ Cmd make_cluster_catalog() {
                           "export-level changes between two versions"));
     cmd->add_subcommand(make_cluster_leaf(
         "cluster catalog import", "import", "lightnfs-ctl cluster catalog import /etc/lightnfs/lightnfs.toml --dry-run",
-        "lightnfs-ctl cluster catalog import <file> [--dry-run] [--comment=TEXT]",
+        "lightnfs-ctl cluster catalog import <file>|--from-local=FILE [--dry-run] [--comment=TEXT]",
         "Replace the catalog with the exports of a gateway-side TOML file (a local configuration or a "
-        "catalog document; per-node keys are stripped). --dry-run only reports the diff.",
-        "replace the catalog with the exports of a TOML file", kDryRun | kComment));
+        "catalog document; per-node keys are stripped). --from-local=FILE names a local configuration "
+        "and refuses a catalog document. --dry-run only reports the diff.",
+        "replace the catalog with the exports of a TOML file", kDryRun | kComment | kFromLocal));
     cmd->add_subcommand(
         make_cluster_leaf("cluster catalog rollback", "rollback", "lightnfs-ctl cluster catalog rollback 3",
                           "lightnfs-ctl cluster catalog rollback <version> [--comment=TEXT]",
@@ -284,6 +297,129 @@ Cmd make_cluster() {
     return cmd;
 }
 
+// ---- offline catalog (plan 12 D3) -----------------------------------------------------
+// `lightnfs-ctl catalog <sub> --shared-dir DIR` runs the same commands `cluster catalog
+// <sub>` runs on a gateway, but in this process and straight against the shared
+// directory: first bootstrap (no gateway configured for the catalog yet) and rescue
+// (no gateway is up to take the socket).  The command bodies are the server's
+// (cluster_catalog_answer over a PosixClusterStore in deps with nothing but a store),
+// so the wording, the CAS retries and the §11.5 rules are one implementation.
+// `apply` is not offered: applying a version is a running gateway's job.
+
+// Whether the configuration a --from-local import reads puts its cluster in
+// active-active, which decides one catalog rule (`nodes` required on every export).
+// A file that does not parse is left to the import itself to report.
+bool local_config_active_active(const std::string& path) {
+    auto config = lnfs::core::load_config(path);
+    return config && lnfs::core::cluster_active_active(config->cluster);
+}
+
+// Runs one assembled command against `dir` and prints the answer.  Exit 1 on an error
+// answer: text errors open with `cluster` (`cluster: <why>`, or the usage line), JSON
+// ones with `{"error"`; no successful answer of these commands starts either way.
+int run_offline(const std::string& dir, const lnfs::server::CtlCommand& cmd, bool active_active) {
+    struct stat st{};
+    if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        std::fprintf(stderr, "catalog: %s is not a directory\n", dir.c_str());
+        return 2;
+    }
+    // The commit path logs its INFO line; on a CLI the answer on stdout says it already.
+    lnfs::set_log_level(lnfs::LogLevel::kWarn);
+    auto store = lnfs::server::make_posix_cluster_store(dir);
+    lnfs::server::CtlDeps deps;
+    deps.store = store.get();
+    deps.audit_node = "offline";
+    deps.active_active = active_active;
+    const std::string out = lnfs::server::cluster_catalog_answer(deps, cmd, static_cast<uint32_t>(::getuid()));
+    std::fwrite(out.data(), 1, out.size(), stdout);
+    return out.rfind("cluster", 0) == 0 || out.rfind("{\"error\"", 0) == 0 ? 1 : 0;
+}
+
+Cmd make_offline_leaf(const char* sub, const char* example, const char* usage, const char* help_long,
+                      const char* help_short, unsigned flags = 0) {
+    auto run = [sub, flags](const Cmd& c) {
+        const std::string dir = c->var<std::string>("shared-dir");
+        if (dir.empty()) {
+            std::fprintf(stderr, "catalog: --shared-dir <dir> is required (the cluster's [cluster] shared_dir)\n");
+            g_exit = 2;
+            return;
+        }
+        lnfs::server::CtlCommand cmd;
+        cmd.args = {"cluster", "catalog", sub};
+        bool active_active = (flags & kActiveActive) && c->var<bool>("active-active");
+        if (flags & kFromLocal)
+            if (auto file = c->var<std::string>("from-local"); !file.empty()) {
+                cmd.args.emplace_back("--from-local");
+                cmd.args.push_back(file);
+                active_active = active_active || local_config_active_active(file);
+            }
+        for (const auto& a : c->args()) cmd.args.push_back(a);
+        if ((flags & kDryRun) && c->var<bool>("dry-run")) cmd.args.emplace_back("--dry-run");
+        if (flags & kComment)
+            if (auto comment = c->var<std::string>("comment"); !comment.empty()) {
+                cmd.args.emplace_back("--comment");
+                cmd.args.push_back(comment);
+            }
+        cmd.json = c->var<bool>("json");
+        g_exit = run_offline(dir, cmd, active_active);
+    };
+    auto cmd = std::make_shared<ccmd::command>(sub, example, usage, help_long, help_short, run);
+    cmd->varp<std::string>("shared-dir", "d", "", "the cluster's shared directory ([cluster] shared_dir)");
+    cmd->varp<bool>("json", "j", false, "machine-readable JSON output");
+    if (flags & kDryRun) cmd->varp<bool>("dry-run", "n", false, "report the changes without committing");
+    if (flags & kComment) cmd->varp<std::string>("comment", "c", "", "audit-trail comment for the new version");
+    if (flags & kFromLocal)
+        cmd->var<std::string>("from-local", "", "import a gateway configuration file (not a catalog document)");
+    if (flags & kActiveActive)
+        cmd->var<bool>("active-active", false,
+                       "validate under active-active rules (nodes required on every export); implied by "
+                       "a --from-local file whose [cluster] mode is active-active");
+    return cmd;
+}
+
+Cmd make_offline_catalog() {
+    auto cmd = make_node("catalog",
+                         "lightnfs-ctl catalog import --from-local /etc/lightnfs/lightnfs.toml "
+                         "--shared-dir /mnt/shared/lightnfs",
+                         "lightnfs-ctl catalog <show|status|history|diff|import|rollback> --shared-dir=DIR",
+                         "Shared export catalog (design 11) edited offline: the commands of `lightnfs-ctl "
+                         "cluster catalog …` run in this process against the shared directory, contacting no "
+                         "gateway — first bootstrap, and rescue when no gateway is up. The audit trail records "
+                         "`offline uid=<your uid>`. Run `lightnfs-ctl help catalog <command>` for details.",
+                         "offline shared export catalog administration");
+    cmd->add_subcommand(make_offline_leaf("show", "lightnfs-ctl catalog show --shared-dir /mnt/shared/lightnfs",
+                                          "lightnfs-ctl catalog show --shared-dir=DIR",
+                                          "Print the current catalog: a header line, then one line per export.",
+                                          "print the current catalog"));
+    cmd->add_subcommand(make_offline_leaf("status", "lightnfs-ctl catalog status --shared-dir /mnt/shared/lightnfs",
+                                          "lightnfs-ctl catalog status --shared-dir=DIR",
+                                          "What each gateway last applied, then the latest version. Liveness reads "
+                                          "`?` offline: no controller is here to tell.",
+                                          "applied version per gateway"));
+    cmd->add_subcommand(make_offline_leaf("history", "lightnfs-ctl catalog history --shared-dir /mnt/shared/lightnfs",
+                                          "lightnfs-ctl catalog history --shared-dir=DIR", "The catalog versions kept.",
+                                          "list the versions kept"));
+    cmd->add_subcommand(make_offline_leaf("diff", "lightnfs-ctl catalog diff 3 4 --shared-dir /mnt/shared/lightnfs",
+                                          "lightnfs-ctl catalog diff <v1> <v2> --shared-dir=DIR",
+                                          "Export-level changes between two kept versions (`0` or `none` is the "
+                                          "empty catalog before the first one). Both are required offline: no "
+                                          "gateway is here to say which version it applied.",
+                                          "export-level changes between two versions"));
+    cmd->add_subcommand(make_offline_leaf(
+        "import",
+        "lightnfs-ctl catalog import --from-local /etc/lightnfs/lightnfs.toml --shared-dir /mnt/shared/lightnfs",
+        "lightnfs-ctl catalog import <file>|--from-local=FILE [--dry-run] [--comment=TEXT] --shared-dir=DIR",
+        "Replace the catalog with the exports of a TOML file (a gateway configuration or a catalog "
+        "document; per-node keys are stripped) — how the first version is published. --from-local=FILE "
+        "names a configuration and refuses a catalog document. --dry-run only reports the diff.",
+        "replace the catalog with the exports of a TOML file", kDryRun | kComment | kFromLocal | kActiveActive));
+    cmd->add_subcommand(make_offline_leaf(
+        "rollback", "lightnfs-ctl catalog rollback 3 --shared-dir /mnt/shared/lightnfs",
+        "lightnfs-ctl catalog rollback <version> [--comment=TEXT] --shared-dir=DIR",
+        "Commit a kept version as a new one.", "commit a kept version as a new one", kComment | kActiveActive));
+    return cmd;
+}
+
 // Bench leaves rebuild the positional argv the bench entries have always parsed
 // (argv[0] = the bench name); each entry _exit()s when its run completes.
 void run_bench(const Cmd& c, int (*entry)(int, char**)) {
@@ -326,9 +462,10 @@ Cmd make_bench() {
     return cmd;
 }
 
-// Moves --socket/--json (folding `--socket PATH`/`-s PATH` into --socket=PATH) behind
-// every positional so the leaf that owns the flag sees them wherever they were given
-// (`lightnfs-ctl -s PATH cluster status` as well as `… cluster status -s PATH`).
+// Moves --socket/--shared-dir/--json (folding a `--socket PATH` / `-s PATH` /
+// `--shared-dir DIR` / `-d DIR` pair into the `=` form) behind every positional so the
+// leaf that owns the flag sees them wherever they were given (`lightnfs-ctl -s PATH
+// cluster status` as well as `… cluster status -s PATH`).
 std::vector<std::string> normalize_argv(int argc, char** argv) {
     std::vector<std::string> out, deferred;
     out.reserve(static_cast<size_t>(argc));
@@ -336,7 +473,8 @@ std::vector<std::string> normalize_argv(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if ((a == "--socket" || a == "-s") && i + 1 < argc) a = "--socket=" + std::string(argv[++i]);
-        if (a.rfind("--socket=", 0) == 0 || a == "--json" || a == "-j")
+        if ((a == "--shared-dir" || a == "-d") && i + 1 < argc) a = "--shared-dir=" + std::string(argv[++i]);
+        if (a.rfind("--socket=", 0) == 0 || a.rfind("--shared-dir=", 0) == 0 || a == "--json" || a == "-j")
             deferred.push_back(std::move(a));
         else
             out.push_back(std::move(a));
@@ -439,6 +577,7 @@ int main(int argc, char** argv) {
                                           "reclaimed yet lose their claim window).",
                                           "end grace early"));
     root->add_subcommand(make_cluster());
+    root->add_subcommand(make_offline_catalog());
     root->add_subcommand(make_bench());
 
     try {

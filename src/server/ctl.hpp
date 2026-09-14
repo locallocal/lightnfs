@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "core/config.hpp"
@@ -135,6 +136,13 @@ struct CtlDeps {
     // rollback` read and write the shared catalog through it, in either exports_source.
     // Null = single gateway.  Must outlive the ctl server.
     ClusterStore* store = nullptr;
+    // Offline catalog administration (`lightnfs-ctl catalog … --shared-dir <dir>`, plan
+    // 12 D3): deps with a store and nothing else.  `audit_node` replaces the node name
+    // the audit trail would take from a controller (the offline tool writes "offline"),
+    // and `active_active` supplies the catalog validation mode a controller would
+    // otherwise decide.  Both are ignored while a controller is attached.
+    std::string audit_node = {};
+    bool active_active = false;
 
     // Deps over a plane that stays attached for the deps' lifetime (single gateway,
     // tests).  `plane` must outlive the deps.
@@ -164,7 +172,7 @@ class CtlServer {
                                               std::optional<uint32_t> peer_uid = std::nullopt);
 
  private:
-    CtlServer(int fd, std::string path, CtlDeps deps) : fd_(fd), path_(std::move(path)), deps_(deps) {}
+    CtlServer(int fd, std::string path, CtlDeps deps) : fd_(fd), path_(std::move(path)), deps_(std::move(deps)) {}
     rt::Task<void> serve(int cfd);
 
     int fd_;

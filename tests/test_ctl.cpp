@@ -29,7 +29,9 @@
 #include "server/catalog_applier.hpp"
 #include "server/catalog_boot.hpp"
 #include "server/cluster_controller.hpp"
+#include "server/cluster_store.hpp"
 #include "server/ctl.hpp"
+#include "server/ctl_catalog.hpp"
 #include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
 #include "util/log.hpp"
@@ -1799,4 +1801,114 @@ TEST(Ctl, ClusterExportCommands) {
                      "nodes_changed=- dynamic_changed=- rejected=-\n");
     }
     runtime.stop_and_join();
+}
+
+// Offline catalog administration (plan 12 D3): the same command bodies over deps that
+// carry nothing but a real PosixClusterStore — what `lightnfs-ctl catalog … --shared-dir`
+// builds.  The audit trail takes its node name from `audit_node` and the catalog rules
+// their mode from `active_active`, both of which a controller would otherwise supply.
+TEST(Ctl, OfflineCatalog) {
+    char tmpl[] = "/tmp/lnfs-ctloffline-XXXXXX";
+    const std::string dir = mkdtemp(tmpl);
+    {
+        auto write_file = [&](const char* name, const std::string& text) {
+            std::string path = dir + "/" + name;
+            std::ofstream(path) << text;
+            return path;
+        };
+        auto block = [&](uint32_t fsid, const std::string& sub, const std::string& extra = "") {
+            return "[[export]]\npath = \"" + dir + "/" + sub + "\"\nfsid = " + std::to_string(fsid) +
+                   "\nbackend = \"local\"\nclients = [\"10.0.0.0/8\"]\n" + extra;
+        };
+        const std::string local =
+            write_file("local.toml", "[server]\nport = 2049\n" + block(1, "a", "nodes = [\"gw1\", \"gw2\"]\n") +
+                                         block(2, "b", "nodes = [\"gw2\", \"gw1\"]\n"));
+        // fsid 2 without `nodes`: legal under failover, refused under active-active.
+        const std::string loose = write_file("loose.toml", block(1, "a", "nodes = [\"gw1\"]\n") + block(2, "b"));
+
+        const std::string shared = dir + "/shared";
+        std::filesystem::create_directory(shared);
+        auto store = server::make_posix_cluster_store(shared);
+        server::CtlDeps deps{};
+        deps.store = store.get();
+        deps.audit_node = "offline";
+        auto ask = [&](std::vector<std::string> args, bool json = false) {
+            server::CtlCommand cmd;
+            cmd.args = std::move(args);
+            cmd.json = json;
+            return server::cluster_catalog_answer(deps, cmd, 1000);
+        };
+
+        // Nothing published yet; `diff` says why it cannot default the versions here
+        // (no gateway in this process, rather than the on-gateway "exports_source").
+        EXPECT_STREQ(ask({"cluster", "catalog", "show"}), "catalog: none\n");
+        EXPECT_STREQ(ask({"cluster", "catalog", "diff"}),
+                     "cluster: no applied version here (no gateway runs in this process): give the two versions "
+                     "to compare\n");
+
+        // --from-local names a gateway configuration: a catalog document is refused
+        // instead of silently taken as one.
+        const std::string doc = write_file("doc.toml", "[catalog]\nversion = 7\n" + block(1, "a"));
+        EXPECT_STREQ(ask({"cluster", "catalog", "import", "--from-local", doc}),
+                     "cluster: " + doc +
+                         " is a catalog document, not a gateway configuration: import it "
+                         "without --from-local\n");
+        EXPECT_STREQ(ask({"cluster", "catalog", "import", "--from-local"}), "cluster: --from-local needs a value\n");
+
+        // Bootstrap: v1 from the local file, audited as the offline tool.
+        EXPECT_STREQ(ask({"cluster", "catalog", "import", "--from-local=" + local, "--comment", "first, offline"}),
+                     "catalog v1 imported (was none): added=1,2 removed=- disabled=- enabled=- nodes_changed=- "
+                     "dynamic_changed=- rejected=-\n");
+        EXPECT_TRUE(ask({"cluster", "catalog", "show"}).starts_with("version=1 exports=2 updated_at="));
+        EXPECT_TRUE(ask({"cluster", "catalog", "show"}).find("updated_by=offline uid=1000 comment=first, offline") !=
+                    std::string::npos);
+
+        // The validation mode comes from `active_active`, nothing else being attached.
+        EXPECT_STREQ(ask({"cluster", "catalog", "import", "--from-local", loose, "--dry-run"}),
+                     "catalog import dry-run: would commit v2 (current v1): added=- removed=- disabled=- enabled=- "
+                     "nodes_changed=1,2 dynamic_changed=- rejected=-\n");
+        deps.active_active = true;
+        EXPECT_STREQ(ask({"cluster", "catalog", "import", "--from-local", loose}),
+                     "cluster: import failed: invalid catalog: export fsid=2: nodes is required under "
+                     "active-active\n");
+        deps.active_active = false;
+
+        // A second version, then the offline rollback; history and diff read the same
+        // documents a gateway would.
+        EXPECT_STREQ(ask({"cluster", "catalog", "import", loose, "--comment=v2"}),
+                     "catalog v2 imported (was v1): added=- removed=- disabled=- enabled=- nodes_changed=1,2 "
+                     "dynamic_changed=- rejected=-\n");
+        EXPECT_STREQ(ask({"cluster", "catalog", "diff", "1", "2"}),
+                     "from=1 to=2\nadded=-\nremoved=-\ndisabled=-\nenabled=-\nnodes_changed=1,2\n"
+                     "dynamic_changed=-\nrejected=-\n");
+        EXPECT_STREQ(ask({"cluster", "catalog", "rollback", "2"}), "cluster: version 2 is the current catalog\n");
+        EXPECT_STREQ(ask({"cluster", "catalog", "rollback", "1"}),
+                     "catalog v3 committed: rollback to v1 (was v2): added=- removed=- disabled=- enabled=- "
+                     "nodes_changed=1,2 dynamic_changed=- rejected=-\n");
+        auto v3 = store->read_catalog();
+        ASSERT_TRUE(v3.has_value() && v3->has_value());
+        auto parsed = core::parse_catalog((*v3)->text);
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_STREQ(parsed->meta.updated_by, "offline uid=1000");
+        EXPECT_EQ(parsed->exports.size(), size_t(2));
+
+        // No gateway has reported an applied version; `status` still answers.  With a
+        // record it reads it back, and liveness is "?": no controller is here to tell.
+        EXPECT_STREQ(ask({"cluster", "catalog", "status"}), "latest=3\n");
+        ASSERT_TRUE(
+            store
+                ->put_catalog_applied(
+                    {.node = "gw1", .version = 2, .digest = "d00d", .applied_at_ms = 1757000000000, .status = "ok"})
+                .has_value());
+        EXPECT_STREQ(ask({"cluster", "catalog", "status"}),
+                     "node=gw1 applied=2 alive=? applied_at=2025-09-04T15:33:20Z digest=d00d status=ok\n"
+                     "latest=3\n");
+        EXPECT_STREQ(ask({"cluster", "catalog", "status"}, true),
+                     "{\"latest\":3,\"nodes\":[{\"node\":\"gw1\",\"applied\":2,\"alive\":null,"
+                     "\"applied_at_ms\":1757000000000,\"digest\":\"d00d\",\"status\":\"ok\"}]}\n");
+        // `apply` is a running gateway's job and has no applier here.
+        EXPECT_STREQ(ask({"cluster", "catalog", "apply"}), "catalog apply: not enabled (exports_source = \"local\")\n");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
