@@ -204,6 +204,11 @@ if(OpenSSL_FOUND)
 endif()
 add_test(NAME lnfs_tests COMMAND lnfs_tests)
 
+# Offline catalog CLI (plan 12 D3): drives the built lightnfs-ctl against a throwaway
+# shared directory — the flag plumbing and exit codes only the binary can show.
+add_test(NAME ctl_offline_catalog
+         COMMAND ${CMAKE_SOURCE_DIR}/scripts/test_ctl_offline.sh $<TARGET_FILE:lightnfs-ctl>)
+
 # Acceptance client: userspace NFSv3/v4.1 client that drives a running lightnfsd over
 # TCP. Invoked by scripts/accept_m2_local.sh and accept_m6_local.sh, not by ctest.
 add_executable(lnfs_accept_client tests/accept_client.cpp)

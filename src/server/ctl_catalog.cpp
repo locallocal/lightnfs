@@ -57,8 +57,9 @@ std::string error_answer(bool json, std::string_view text) {
 
 const char* usage(bool json) {
     return json ? "{\"error\":\"bad subcommand\"}\n"
-                : "cluster catalog: expected show|status|history|diff [<v1>] [<v2>]|import <file> "
-                  "[--dry-run] [--comment <text>]|rollback <version>|apply\n";
+                : "cluster catalog: expected show|status|history|diff [<v1>] [<v2>]|import "
+                  "<file>|--from-local <file> [--dry-run] [--comment <text>]|rollback "
+                  "<version>|apply\n";
 }
 
 // "2026-09-10T08:00:00Z"
@@ -81,11 +82,18 @@ std::string iso_of_ms(int64_t ms) {
     return buf;
 }
 
-// This gateway's name for the audit trail: from whichever controller runs.
+// This gateway's name for the audit trail: from whichever controller runs, or the
+// override the offline tool sets (plan 12 D3).
 std::string node_name(const CtlDeps& deps) {
     if (deps.fs_cluster) return deps.fs_cluster->node();
     if (deps.cluster) return core::cluster_node_name(deps.cluster->config());
-    return "?";
+    return deps.audit_node.empty() ? "?" : deps.audit_node;
+}
+
+// Which rules validate_catalog enforces: a controller knows the mode, offline deps
+// (plan 12 D3) say so themselves.
+bool catalog_active_active(const CtlDeps& deps) {
+    return deps.fs_cluster != nullptr || (deps.cluster == nullptr && deps.active_active);
 }
 
 std::string json_string(std::string_view s) {
@@ -404,9 +412,9 @@ std::string diff(const CtlDeps& deps, const CtlCommand& cmd, bool json) {
         to = given[1];
     } else {
         if (!deps.catalog)
-            return error_answer(json,
-                                "no applied version here (exports_source = \"local\"): give the two versions "
-                                "to compare");
+            return error_answer(json, std::format("no applied version here ({}): give the two versions to compare",
+                                                  deps.audit_node.empty() ? "exports_source = \"local\""
+                                                                          : "no gateway runs in this process"));
         from = deps.catalog->applied();
         to = given.empty() ? current_v : given[0];
     }
@@ -424,7 +432,9 @@ std::string diff(const CtlDeps& deps, const CtlCommand& cmd, bool json) {
 
 // The file as a catalog: a catalog document (with its [catalog] header) is taken as is,
 // a local configuration file is stripped to its exports (catalog_from_config).
-Result<Catalog> catalog_from_file(const std::string& path, std::string& why) {
+// `from_local`: the caller said the file is a gateway configuration (`--from-local`,
+// plan 12 D3), so a catalog document is refused instead of silently taken as one.
+Result<Catalog> catalog_from_file(const std::string& path, std::string& why, bool from_local = false) {
     std::ifstream input(path);
     if (!input) {
         const int e = errno ? errno : ENOENT;
@@ -434,7 +444,12 @@ Result<Catalog> catalog_from_file(const std::string& path, std::string& why) {
     std::ostringstream contents;
     contents << input.rdbuf();
     const std::string text = contents.str();
-    if (core::peek_catalog_version(text)) {
+    if (from_local && core::peek_catalog_version(text)) {
+        why =
+            std::format("{} is a catalog document, not a gateway configuration: import it without --from-local", path);
+        return Err(errno_from(EINVAL));
+    }
+    if (!from_local && core::peek_catalog_version(text)) {
         auto cat = core::parse_catalog(text);
         if (!cat) {
             why = std::format("{} is not a valid catalog document: {}", path, errno_name(cat.error()));
@@ -469,7 +484,7 @@ using Mutation = std::function<Result<Catalog>(const std::optional<Catalog>& cur
 Result<Commit> commit(const CtlDeps& deps, const Mutation& mutate, std::optional<uint32_t> peer_uid,
                       const std::string& comment, bool dry_run, std::string& why) {
     ClusterStore& store = *deps.store;
-    const bool active_active = deps.fs_cluster != nullptr;
+    const bool active_active = catalog_active_active(deps);
     std::string by = node_name(deps);
     if (peer_uid) by += std::format(" uid={}", *peer_uid);
     for (int attempt = 0;; ++attempt) {
@@ -515,16 +530,20 @@ Mutation replace_with(Catalog next) {
 
 std::string import_cmd(const CtlDeps& deps, const CtlCommand& cmd, std::optional<uint32_t> peer_uid, bool json) {
     std::string file, comment;
-    bool dry_run = false;
+    bool dry_run = false, from_local = false;
     for (size_t i = 3; i < cmd.args.size(); ++i) {
         const auto& a = cmd.args[i];
         if (a == "--dry-run") {
             dry_run = true;
-        } else if (a == "--comment") {
-            if (i + 1 >= cmd.args.size()) return error_answer(json, "--comment needs a text");
-            comment = cmd.args[++i];
+        } else if (a == "--comment" || a == "--from-local") {
+            if (i + 1 >= cmd.args.size()) return error_answer(json, std::format("{} needs a value", a));
+            (a == "--comment" ? comment : file) = cmd.args[++i];
+            from_local |= a == "--from-local";
         } else if (a.starts_with("--comment=")) {
             comment = a.substr(std::string_view("--comment=").size());
+        } else if (a.starts_with("--from-local=")) {
+            file = a.substr(std::string_view("--from-local=").size());
+            from_local = true;
         } else if (file.empty()) {
             file = a;
         } else {
@@ -533,7 +552,7 @@ std::string import_cmd(const CtlDeps& deps, const CtlCommand& cmd, std::optional
     }
     if (file.empty()) return error_answer(json, "import: a gateway-side file is required");
     std::string why;
-    auto next = catalog_from_file(file, why);
+    auto next = catalog_from_file(file, why, from_local);
     if (!next) return error_answer(json, why);
     auto done = commit(deps, replace_with(std::move(*next)), peer_uid, comment, dry_run, why);
     if (!done) return error_answer(json, "import failed: " + why);

@@ -1,6 +1,6 @@
 # 12. 共享导出清单——实现步骤拆分
 
-> 状态：**实施中**（阶段 A、B、C 已完成；D1、D2 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
+> 状态：**实施中**（阶段 A、B、C 已完成；阶段 D 已完成）。本册把 [11 册](11-shared-export-catalog.md) 的方案拆成可独立合并、
 > 可独立验证的步骤；每步给出改动点（带现有代码锚点）、接口形态、测试与验收标准。11 册回答
 > "做什么、为什么"，本册只回答"按什么顺序、改哪里、怎么证明做对了"。体例沿用 09 / 10 册的
 > 实施计划（原 10、12 册，完成后撤下，见 git 历史）；本册完成后同样撤下，未闭环项收进
@@ -652,7 +652,7 @@ dry-run 不写 → 多活缺 nodes 被拒 → 全标志 `add` 与 `list` 文本 
 → 2.5 s 内 `exports=2`；`set 1 --readonly=false --iops 50` 就地生效（日志 "1 updated"）；`set 1 --path` 被拒；
 `remove 2` 被护栏拒、`--force` 后 `exports=1`；同 fsid 换路径被 fsid 复用规则拒；`--bogus` 与无子命令各回文案。
 
-### D3 离线 `lightnfs-ctl catalog … --shared-dir <dir>`
+### D3 离线 `lightnfs-ctl catalog … --shared-dir <dir>` ✅ 2026-09-14
 
 **目标**：不经网关直接操作共享目录（首次引导、所有网关都起不来时的救援）。
 
@@ -662,6 +662,35 @@ dry-run 不写 → 多活缺 nodes 被拒 → 全标志 `add` 与 `list` 文本 
 （`catalog_from_config`）。
 
 **测试**：`tests/test_ctl.cpp` 里对纯函数的覆盖已足够；离线路径在 E1 脚本里用于引导。
+
+**实现注**（2026-09-14）：离线命令**不是**第二套实现——`lightnfs-ctl` 已经链接 `lnfs_core`（里面就有
+`ctl_catalog.cpp` 与 `cluster_store.cpp`），所以叶子只是搭一个"除 store 外全空"的 `CtlDeps`（store =
+`make_posix_cluster_store(dir)`）、把 argv 拼成 `CtlCommand{args = {"cluster","catalog",<sub>,…}}`、直接调
+`cluster_catalog_answer(deps, cmd, getuid())`，文案、CAS 重试、§11.5 规则、`--json` 与网关上逐字一致。
+`CtlDeps` 为此加两个字段（有控制器时一律忽略）：`audit_node`（离线填 `"offline"`，`node_name()` 的兜底从
+`"?"` 变成它，于是 `updated_by = "offline uid=<getuid>"`）与 `active_active`（`commit()` 原来只认
+`fs_cluster != nullptr`，离线没有控制器，改成 `fs_cluster || (!cluster && deps.active_active)`）。
+子命令给了 `show|status|history|diff|import|rollback` ——比草案多 `status` / `diff` 两个只读的（同一个
+dispatcher，零成本）；`apply` 不给：应用一版是运行中的网关的事，离线无应用器只会答 "not enabled"。
+`diff` 不给版本时的文案按 deps 分流：括号里在网关上是 `exports_source = "local"`，离线换成
+`no gateway runs in this process`。`import --from-local <file>`（D1 的 `import` 顺带也收了，
+`ctl_catalog.cpp` 的 `catalog_from_file` 加 `from_local` 参数）明确"这是网关配置文件"：清单文档被拒
+（"is a catalog document, not a gateway configuration: import it without --from-local"），而位置参数形式仍
+按 D1 自动识别两种文档。**active-active 校验模式的来源**：`--from-local` 的文件自己带 `[cluster] mode`，
+工具先 `load_config` 读一次，`cluster_active_active()` 为真就把 `deps.active_active` 打开（于是 E1 引导
+v1 时"每个导出必须有 `nodes`"这条规则真的生效）；位置参数形式与需要覆盖时用显式 `--active-active`。
+其余工具侧细节：`--shared-dir` / `-d` 必填，目录不存在直接报错而不是让 `PosixClusterStore` 建一个空的；
+`normalize_argv` 像 `--socket` 一样把它折成等号形并后移，所以写在子命令前面也行；提交路径的 `LNFS_INFO`
+会重复 stdout 上的回答，离线把日志级别压到 warn；退出码 0 / 1（错误回答：文本以 `cluster` 开头、JSON 以
+`{"error"` 开头）/ 2（用法）。测试两层：`Ctl.OfflineCatalog`（真 `PosixClusterStore` + 只有 store 的 deps：
+`diff` 的离线文案 → `--from-local` 拒清单文档 / 缺值 → 引导 v1 并钉住 `updated_by=offline uid=1000` →
+同一份导出在 `active_active` 开关两侧一拒一过 → v2 / `diff 1 2` / `rollback` 拒当前版与成功 → 无网关时
+`status` 仍答 → `apply` 无应用器）；`scripts/test_ctl_offline.sh`（注册成 ctest 的 `ctl_offline_catalog`，
+驱动真二进制：缺 `--shared-dir`、目录不存在、裸 `catalog` 打帮助、空目录的 `show` / `show --json`、
+`--dry-run` 不落盘、引导 v1 与审计行、`--shared-dir` / `-d` 写在子命令前、AA 文件缺 `nodes` 被拒而同样的
+导出在 failover 文件里通过、`--active-active` 强制、`--from-local` 拒清单文档、`history` / `diff 1 2` /
+`diff none 1` / 未知版本、`rollback` 拒当前版与成功后 `diff 1 3` 全空、`status` 与 `--json`、`apply` 不在
+离线子命令树里）。
 
 ---
 
