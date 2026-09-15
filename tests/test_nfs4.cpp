@@ -2389,6 +2389,78 @@ CopyRes do_copy(V4Fixture& f, const std::vector<std::byte>& src, const nfsv4::St
 // followups/protocol-gaps.md A5: FREE_STATEID took no clientid, so any session could
 // free any other client's lock stateid -- and `other` is a bare counter (B1), so they are
 // walkable.  The victim's next LOCK/LOCKU then fails with BAD_STATEID.
+// followups/protocol-gaps.md B1: the sessionid used to be
+// clientid(8) | counter(4) | boot_epoch(4) -- derivable from two small counters, so one
+// client could guess another's sessionid and drive its session (ctx.clientid comes back
+// out of the id, so the stateid ownership checks pass too).  The last four bytes are now
+// per-session randomness.  This test spells the old construction out: if anyone makes the
+// id predictable again, the forged ids below start working.
+TEST(Nfs4, SessionIdIsNotPredictable) {
+    V4Fixture f;
+    f.establish_session(true, "client-a");
+    // The engine recovers ctx.clientid from the first eight bytes -- that half of the
+    // layout is load-bearing and must not drift.
+    uint64_t from_id = 0;
+    std::memcpy(&from_id, f.sessionid.data(), 8);
+    EXPECT_EQ(from_id, f.clientid);
+
+    const auto real = f.sessionid;
+    // A forged id names a session that does not exist, so the server never advances the
+    // real session's slot.  Those attempts must not consume the fixture's sequence
+    // counter either (force_seq keeps it where it is), or every later real call comes
+    // back SEQ_MISORDERED and the test measures its own bookkeeping instead of the id.
+    auto sequence_status = [&](const state::SessionId& id, bool own_session) {
+        f.sessionid = id;
+        xdr::XdrEnc ops(f.pool);
+        ops.u32(static_cast<uint32_t>(Op::kPutrootfh));
+        auto body =
+            own_session ? f.session_body(1, ops.take()) : f.session_body(1, ops.take(), 0, false, f.slot_seq[0]);
+        uint32_t status = f.parse(f.compound_raw(std::move(body))).status;
+        f.sessionid = real;
+        return status;
+    };
+    // Sanity: the real id works, so a BADSESSION below means the id was wrong and not
+    // that the compound was malformed.
+    EXPECT_EQ(sequence_status(real, true), 0u);
+
+    // Rebuild every sessionid the old scheme could have produced for this client: the
+    // boot epoch is the fixture's 7 and the session counter is small.
+    for (uint32_t counter = 0; counter < 8; ++counter) {
+        state::SessionId forged{};
+        std::memcpy(forged.data(), &f.clientid, 8);
+        std::memcpy(forged.data() + 8, &counter, 4);
+        uint32_t epoch32 = 7;
+        std::memcpy(forged.data() + 12, &epoch32, 4);
+        // The property under test: no id the old scheme could have produced is the live
+        // one.  Skipping the collision case (a 1-in-2^32 nonce equal to the epoch) would
+        // skip exactly the guess that used to succeed, so assert it instead.
+        EXPECT_TRUE(forged != real);
+        EXPECT_EQ(sequence_status(forged, false), stv(Status::kBadsession));
+    }
+    // A zero tail and an all-ones tail are not it either.
+    for (uint32_t tail : {0u, 0xffffffffu}) {
+        state::SessionId forged = real;
+        std::memcpy(forged.data() + 12, &tail, 4);
+        EXPECT_TRUE(forged != real);
+        EXPECT_EQ(sequence_status(forged, false), stv(Status::kBadsession));
+    }
+    // The real session is untouched by all that guessing.
+    EXPECT_EQ(sequence_status(real, true), 0u);
+
+    // A second session carries a different nonce, not just a bumped counter: one
+    // process-wide random value would leave these equal and buy nothing.
+    const auto a_slot_seq = f.slot_seq;
+    f.establish_session(true, "client-b");
+    EXPECT_TRUE(f.sessionid != real);
+    EXPECT_FALSE(std::equal(real.begin() + 12, real.end(), f.sessionid.begin() + 12));
+    // Counters still advance, so uniqueness stays a construction guarantee.
+    EXPECT_FALSE(std::equal(real.begin() + 8, real.begin() + 12, f.sessionid.begin() + 8));
+    // And A's session still works alongside B's.
+    f.sessionid = real;
+    f.slot_seq = a_slot_seq;
+    EXPECT_EQ(sequence_status(real, true), 0u);
+}
+
 TEST(Nfs4, FreeStateidRejectsForeignStateids) {
     V4Fixture f;
     f.establish_session(true, "client-a");

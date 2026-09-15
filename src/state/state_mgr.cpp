@@ -1,6 +1,7 @@
 #include "state/state_mgr.hpp"
 
 #include <fcntl.h>
+#include <sys/random.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -17,6 +18,19 @@ namespace lnfs::state {
 using nfsv4::Status;
 
 namespace {
+
+// Unguessable tail for a sessionid (followups/protocol-gaps.md B1).  getrandom() on a
+// seeded pool does not block and CREATE_SESSION is a once-per-mount operation, so the
+// syscall is affordable here; a failure degrades to the monotonic counter rather than to
+// a predictable constant, and says so.
+uint32_t random_u32() {
+    uint32_t value = 0;
+    if (getrandom(&value, sizeof(value), 0) != static_cast<ssize_t>(sizeof(value))) {
+        LNFS_WARN("getrandom failed ({}): session ids fall back to the counter alone", errno);
+        return 0;
+    }
+    return value;
+}
 
 uint64_t fnv64(std::string_view bytes) {
     uint64_t h = 1469598103934665603ull;
@@ -545,11 +559,27 @@ rt::Task<StateMgr::CreateSessionResult> StateMgr::create_session(uint64_t client
         }
 
         auto session = std::make_shared<SessionRec>();
+        // sessionid = clientid(8) | counter(4) | random(4).
+        //
+        // The first eight bytes must stay the clientid: the engine recovers ctx.clientid
+        // from them (nfsv4/engine.cpp, the SEQUENCE path) and every stateid check keys off
+        // it.  The counter keeps uniqueness a construction guarantee rather than a
+        // probability.  The last four bytes were a copy of the boot epoch — which nothing
+        // reads, and which made the whole id derivable from two small counters: a client
+        // could guess another client's sessionid in a handful of tries and then drive that
+        // session (its clientid comes back out of the id, so the stateid ownership checks
+        // pass too).  Fresh randomness per session closes that; it must be per session,
+        // since one process-wide value would be identical across sessions and buy nothing.
+        //
+        // 32 bits is ~2^31 failed COMPOUNDs for an online guess, each answered
+        // BADSESSION and visible in the logs — impractical rather than impossible.  A
+        // hostile network is still the SP4_MACH_CRED / TLS problem that
+        // reference/nfsv4/09-security.md §9.5 describes; this only removes the free win.
         uint32_t counter = next_session_.fetch_add(1, std::memory_order_relaxed);
+        uint32_t nonce = random_u32();
         std::memcpy(session->id.data(), &client->clientid, 8);
         std::memcpy(session->id.data() + 8, &counter, 4);
-        uint32_t epoch32 = static_cast<uint32_t>(cfg_.boot_epoch);
-        std::memcpy(session->id.data() + 12, &epoch32, 4);
+        std::memcpy(session->id.data() + 12, &nonce, 4);
         session->client = client;
         session->fore = fore_req;
         session->fore.headerpad = 0;
