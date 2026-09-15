@@ -243,6 +243,61 @@ TEST(Nfs3, ReaddirRejectsMismatchedCookieVerifier) {
 // NFS3ERR_NAMETOOLONG (the client's ENAMETOOLONG), not as an RPC-level GARBAGE_ARGS that
 // the client can only turn into EIO.  C5 rides along: an unusable component in LOOKUP is
 // answered too, not rejected at the RPC layer.
+// followups/protocol-gaps.md B6: FSINFO's `properties` never carried FSF3_CANSETTIME,
+// although v3 SETATTR does accept SET_TO_CLIENT_TIME and the v4 cansettime attribute
+// already said so.  Clients that read the bit (BSD / Solaris / macOS) fall back to
+// SET_TO_SERVER_TIME without it and lose the timestamps utimes() / tar -p are restoring.
+TEST(Nfs3, FsinfoAdvertisesCanSetTime) {
+    NfsFixture f;
+    xdr::XdrEnc args(f.pool);
+    f.root_fh.encode(args);
+    auto reply = f.request((uint32_t)nfsv3::Proc::kFsinfo, args.take());
+    ASSERT_TRUE(reply_status(f, reply) == (uint32_t)nfsv3::Status::kOk);
+    auto dec = f.result(reply);
+    (void)dec.u32();
+    // post_op_attr
+    ASSERT_TRUE(*dec.boolean());
+    for (int i = 0; i < 21; ++i) (void)dec.u32();
+    // rtmax, rtpref, rtmult, wtmax, wtpref, wtmult, dtpref
+    for (int i = 0; i < 7; ++i) ASSERT_TRUE(dec.u32().has_value());
+    // maxfilesize
+    ASSERT_TRUE(dec.u64().has_value());
+    // time_delta: seconds + nseconds
+    ASSERT_TRUE(dec.u32().has_value());
+    ASSERT_TRUE(dec.u32().has_value());
+    auto props = dec.u32();
+    ASSERT_TRUE(props.has_value());
+    EXPECT_TRUE((*props & nfsv3::kFsfCanSetTime) != 0);
+    // The memory backend has both, and the server is homogeneous by construction: the new
+    // bit must be added to those, not replace them.
+    EXPECT_TRUE((*props & nfsv3::kFsfLink) != 0);
+    EXPECT_TRUE((*props & nfsv3::kFsfSymlink) != 0);
+    EXPECT_TRUE((*props & nfsv3::kFsfHomogeneous) != 0);
+    // Nothing outside the four bits RFC 1813 §3.3.19 defines.
+    EXPECT_EQ(*props & ~(nfsv3::kFsfLink | nfsv3::kFsfSymlink | nfsv3::kFsfHomogeneous | nfsv3::kFsfCanSetTime), 0u);
+
+    // The bit is honest: sattr3 carrying SET_TO_CLIENT_TIME really does decode into a
+    // client-time SetAttr for the engine to hand down.  Asserted at the decoder rather
+    // than over the wire on purpose -- a real SETATTR here answers PERM, because the
+    // fixture's anonymous credential does not own the file and POSIX utimes() with
+    // explicit times needs ownership.  That it reaches the backend when the caller is
+    // entitled to is covered by WriteTypes.SattrAndCreateRoundTrip and
+    // Nfs4.SetattrSizeModeOwner.
+    nfsv3::SetattrArgs sa;
+    sa.object = f.root_fh;
+    sa.attrs.mtime_how = backend::SetAttr::TimeHow::kClient;
+    sa.attrs.mtime = {1234567, 89};
+    xdr::XdrEnc sargs(f.pool);
+    sa.encode(sargs);
+    auto flat = sargs.take().to_bytes();
+    xdr::XdrDec sdec(std::span<const std::byte>(flat.data(), flat.size()));
+    auto parsed = nfsv3::SetattrArgs::decode(sdec);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(parsed->attrs.mtime_how == backend::SetAttr::TimeHow::kClient);
+    EXPECT_EQ(parsed->attrs.mtime.sec, 1234567);
+    EXPECT_EQ(parsed->attrs.mtime.nsec, 89u);
+}
+
 TEST(Nfs3, OverlongNamesAnswerNametoolong) {
     NfsFixture f;
     const auto kNametoolong = (uint32_t)nfsv3::Status::kNametoolong;
