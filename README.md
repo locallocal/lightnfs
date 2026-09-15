@@ -425,6 +425,9 @@ pending a target cluster and v4 open/deny state stays per gateway.
 - **Guide** — [docs/guide/deployment.md](docs/guide/deployment.md): trust boundary,
   least-privilege systemd unit, key configuration, operations, multi-gateway failover
   and active-active deployment, the shared export catalog, known limitations.
+  [docs/guide/scripts.md](docs/guide/scripts.md) is the `scripts/` reference — source
+  gates, acceptance runners (loopback / root VM / real cluster backend), external test
+  suite fetchers, benchmark and fuzz drivers, and the two operations scripts.
 - **Reference** — protocol research: [docs/reference/nfsv3/](docs/reference/nfsv3/README.md),
   [docs/reference/nfsv4/](docs/reference/nfsv4/README.md).
 - **Testing** — [test report](docs/testing/test-report.md) (conformance runs via
