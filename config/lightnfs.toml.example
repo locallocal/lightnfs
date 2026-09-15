@@ -123,7 +123,13 @@ clients = ["192.168.0.0/24", "127.0.0.0/8"]
 # nodes = ["gw1", "gw2"]   # active-active only: owner priority for this export, identical
 #                          # cluster-wide; exports on one Gluster volume / Lustre mount
 #                          # must list the same nodes
+# squash: "root" maps uid 0, gid 0 and any supplementary group 0 to anon_uid/anon_gid
+# independently (as exports(5) root_squash does), so a caller claiming gid 0 with a
+# non-zero uid is squashed too; "all" maps every identity to anon and drops the
+# supplementary groups; "none" passes the client's identity through untouched.
 squash = "root"
+# anon_uid = 65534   # identity root_squash / all_squash map to; default nobody/nogroup
+# anon_gid = 65534
 readonly = true     # phase 2: set false for read-write exports
 # Per-export token buckets (READ/WRITE data path); 0 / omitted = unlimited.
 # Hot-reloadable via SIGHUP / `lightnfs-ctl reload`.

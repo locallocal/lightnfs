@@ -26,7 +26,7 @@
 | A4 | A | `nfsv4/engine.cpp:789` 等 | v4 名字 256B → BADNAME，≥257B → BADXDR | 应为 NFS4ERR_NAMETOOLONG；`errmap` 白名单里的 NAMETOOLONG 无路径可达**——已修复** |
 | A5 | A | `state/state_mgr.cpp:1595`、`nfsv4/engine.cpp:2765` | FREE_STATEID 不校验 stateid 属主 | 叠加 B1 的可推 stateid → 可释放别人的 lock stateid**——已修复** |
 | B1 | B | `state/state_mgr.cpp:549` | sessionid 全无随机分量，网段内可枚举并冒用别人的会话**——已修复**；同条目下的 stateid 可推（A5 覆盖）与 SEQUENCE 隐式绑定连接（与 knfsd 在 SP4_NONE 下一致）**原判定过重，已更正** | 见 B1 正文 |
-| B2 | B | `core/config.cpp:1089` | `squash = root` 只压 uid，不压 gid 0 与附加组 0 | 组 root 可写的文件仍可被写 |
+| B2 | B | `core/config.cpp:1089` | `squash = root` 只压 uid，不压 gid 0 与附加组 0 | 组 root 可写的文件仍可被写**——已修复** |
 | B3 | B | 全路径缺失 | 无特权源端口（"secure"）检查 | 受信主机上的**普通用户**即可声称任意 uid |
 | B4 | B | `rpc/drc.hpp:39` | DRC 键含源端口 | 跨重连的重传 miss → 非幂等过程重放（REMOVE 回 NOENT 等） |
 | B5 | B | `nfsv4/attrs.cpp:133` | `fh_expire_type` 恒为 FH4_PERSISTENT，无视 `kStableHandles` | fallback 句柄模式下向客户端谎报句柄永久有效 |
@@ -320,7 +320,7 @@ DESTROY_SESSION 用到。初版据此说它违反 RFC 的「bind before use」�
 被误伤。sessionid 变成不可推之后，这条通路上剩下的风险就是「能嗅到线上流量的攻击者」——而那种
 攻击者在明文 AUTH_SYS 下本来就能直接伪造身份，属于 09-security §9.5 已记录的边界。
 
-### B2 `squash = root` 只压 uid
+### B2 `squash = root` 只压 uid（已修复）
 
 ```
 // core/config.cpp:1087-1095
@@ -340,6 +340,25 @@ uid 0 → anonuid、gid 0 → anongid、附加组里的 0 → anongid。
 
 **修法**：`kRoot` 分支拆成三个独立判断，与 knfsd 对齐；`config/lightnfs.toml.example` 与
 deployment.md §3 的 squash 说明同步。
+
+**已修复**（本轮）：
+- `kRoot` 分支拆成三个独立判断，与 exports(5) / knfsd 的 `nfsd_setuser` 对齐：`uid == 0` →
+  `anon_uid`，`gid == 0` → `anon_gid`，附加组里每个 0 → `anon_gid`。`kAll` 原样不动（压一切 +
+  清空附加组）。
+- 附加组里的 0 是**替换**而不是删除，和 knfsd 一致：调用方保留它声称的组数量，只是 0 变成
+  anon，其余不动。
+- 回归测例 `ExportSet.RootSquashMapsGroupRootToo`：uid 0（原本就能过的情况）、**uid=1000 +
+  gid=0**（B2 的那种）、附加组 `{0, 42, 0}`（断言变成 `{anon, 42, anon}`、长度不变）、
+  完全无 root 的普通调用方原样通过、`squash = all` 仍然压平一切、`squash = none` 连 root 都不动。
+  撤掉修复后失败 3 处，正是 `group_root.gid`、`supp.groups[0]`、`supp.groups[2]`。
+- 文档与样例同步：`config/lightnfs.toml.example` 的 `squash` 键上写清三种模式各映射什么、并
+  露出 `anon_uid`/`anon_gid` 两个注释键；[deployment.md](../../guide/deployment.md) §1 与 §3
+  的口径都改成「`root` 压的是三样」。
+
+**顺带记一条没做的**：knfsd 在**任何** squash 模式下还会把 `INVALID_UID`/`INVALID_GID`
+（即 `(uint32_t)-1`）映射成 anon。lightnfs 目前原样透传，`squash = none` 下会把 0xFFFFFFFF
+交给后端（`local` 的 setfsuid 会失败，`kNativeAccess` 后端由存储侧判定）。这会改变
+`squash = none` 的行为，不在 B2 条目内，**留作独立项**。
 
 ### B3 不检查特权源端口
 
@@ -551,7 +570,7 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 3. ~~**A3**、**C5**、**A4**~~（均已修复，见上）、**B6**、**B5** —— 错误码与属性宣告的一致性。
    `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
    剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
-4. **B2、B3** —— 身份压缩与源端口，动的是安全默认值，需要同步文档与配置样例。
+4. ~~**B2**~~（已修复，见上）、**B3** —— 身份压缩与源端口，动的是安全默认值，需要同步文档与配置样例。
 5. **B4、B7** —— DRC 键与委托一致性。B4 是删一个字段；B7 建议先上"有 v3 导出则不授委托"的
    一行版本，再决定要不要做完整的 v3 召回。
 6. **B8 / C 类** —— 按需。B8.5（errmap 白名单）与 C4（过期注释）属于"改一行防将来踩"。
