@@ -17,11 +17,20 @@ inline constexpr uint32_t kProgram = 100003;
 inline constexpr uint32_t kVersion = 4;
 // NFS4_FHSIZE
 inline constexpr uint32_t kMaxFileHandle = 128;
-inline constexpr uint32_t kMaxName = 255;
 inline constexpr uint32_t kMaxTag = 1024;
 // EXCHANGE_ID co_ownerid
 inline constexpr uint32_t kMaxOwnerId = 1024;
 inline constexpr uint32_t kLeaseSeconds = 90;
+// component4 and linktext4 are utf8str_cs — `string<>` on the wire (RFC 8881 §3.2):
+// their length limits are the filesystem's (the maxname attribute, PATH_MAX), not XDR.
+// An over-long component therefore has to decode and answer NFS4ERR_NAMETOOLONG rather
+// than NFS4ERR_BADXDR (followups/protocol-gaps.md A4).  These two are pure DoS ceilings:
+// inside them a request is decoded and answered, beyond them it does not name anything a
+// filesystem could hold.  The component limit itself is per export — the backend's
+// limits().max_name, which is what the maxname attribute advertises.
+inline constexpr uint32_t kNameWireMax = 4096;
+inline constexpr uint32_t kSymlinkWireMax = 16384;
+// The semantic symlink-target limit (POSIX PATH_MAX).
 inline constexpr uint32_t kMaxSymlink = 4096;
 
 // ---- operation codes (nfsv4 research 02 §2.4) ----

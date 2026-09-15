@@ -1727,6 +1727,146 @@ TEST(Nfs4, NamespaceOpsCreateRemoveRenameLink) {
     EXPECT_EQ(dir_op(f, root_fh, Op::kRemove, [&](xdr::XdrEnc& e) { e.string("export"); }).status, stv(Status::kRofs));
 }
 
+// followups/protocol-gaps.md A4: component4 is utf8str_cs, `string<>` on the wire, so a
+// component longer than the filesystem's maxname has to come back as
+// NFS4ERR_NAMETOOLONG -- not BADNAME (which is "this name is not acceptable") and not
+// BADXDR (which blames the encoding).
+TEST(Nfs4, OverlongComponentsAnswerNametoolong) {
+    V4Fixture f;
+    f.establish_session();
+    auto dir_fh = f.path_fh({"export", "data"});
+    ASSERT_TRUE(!dir_fh.empty());
+    const auto kNametoolong = stv(Status::kNametoolong);
+    // The memory backend reports the default max_name of 255.
+    const std::string long_name(256, 'x');
+    const std::string ok_name(255, 'y');
+    const std::string huge_name(nfsv4::kNameWireMax + 1, 'z');
+
+    auto lookup = [&](const std::string& name) {
+        return dir_op(f, dir_fh, Op::kLookup, [&](xdr::XdrEnc& e) { e.string(name); }).status;
+    };
+    EXPECT_EQ(lookup(long_name), kNametoolong);
+    // 255 is acceptable as a name; it simply is not there.
+    EXPECT_EQ(lookup(ok_name), stv(Status::kNoent));
+    // The other component verdicts must not have been folded into the length one.
+    EXPECT_EQ(lookup(""), stv(Status::kInval));
+    EXPECT_EQ(lookup("."), stv(Status::kBadname));
+    EXPECT_EQ(lookup(".."), stv(Status::kBadname));
+    EXPECT_EQ(lookup("a/b"), stv(Status::kBadname));
+    // Past the decode ceiling it is no longer a plausible name: BADXDR is right there.
+    EXPECT_EQ(lookup(huge_name), stv(Status::kBadxdr));
+
+    // SECINFO checks its own name the same way.
+    EXPECT_EQ(dir_op(f, dir_fh, Op::kSecinfo, [&](xdr::XdrEnc& e) { e.string(long_name); }).status, kNametoolong);
+    EXPECT_EQ(dir_op(f, dir_fh, Op::kSecinfo, [&](xdr::XdrEnc& e) { e.string("."); }).status, stv(Status::kBadname));
+
+    // OPEN CLAIM_NULL, both with and without create.
+    for (uint32_t opentype : {0u, 1u}) {
+        auto open = dir_op(f, dir_fh, Op::kOpen, [&](xdr::XdrEnc& e) {
+            // seqid
+            e.u32(0);
+            // OPEN4_SHARE_ACCESS_READ
+            e.u32(1);
+            // deny none
+            e.u32(0);
+            // open_owner4
+            e.u64(0);
+            e.string("owner-a4");
+            e.u32(opentype);
+            if (opentype == 1) {
+                // UNCHECKED4
+                e.u32(0);
+                encode_empty_fattr(e);
+            }
+            // CLAIM_NULL
+            e.u32(0);
+            e.string(long_name);
+        });
+        EXPECT_EQ(open.status, kNametoolong);
+    }
+
+    // CREATE / REMOVE go through MutateGuard::precheck.
+    auto create = dir_op(f, dir_fh, Op::kCreate, [&](xdr::XdrEnc& e) {
+        // NF4DIR
+        e.u32(2);
+        e.string(long_name);
+        encode_empty_fattr(e);
+    });
+    EXPECT_EQ(create.status, kNametoolong);
+    EXPECT_EQ(dir_op(f, dir_fh, Op::kRemove, [&](xdr::XdrEnc& e) { e.string(long_name); }).status, kNametoolong);
+
+    // RENAME and LINK check the name they are given against the same limit.
+    auto hello_fh = f.path_fh({"export", "data", "hello"});
+    ASSERT_TRUE(!hello_fh.empty());
+    auto link = dir_op(
+        f, dir_fh, Op::kLink, [&](xdr::XdrEnc& e) { e.string(long_name); }, 2,
+        [&](xdr::XdrEnc& e) {
+            e.u32(static_cast<uint32_t>(Op::kPutfh));
+            e.opaque(hello_fh);
+            e.u32(static_cast<uint32_t>(Op::kSavefh));
+        });
+    EXPECT_EQ(link.status, kNametoolong);
+    auto ren = dir_op(
+        f, dir_fh, Op::kRename,
+        [&](xdr::XdrEnc& e) {
+            e.string("hello");
+            e.string(long_name);
+        },
+        2,
+        [&](xdr::XdrEnc& e) {
+            e.u32(static_cast<uint32_t>(Op::kPutfh));
+            e.opaque(dir_fh);
+            e.u32(static_cast<uint32_t>(Op::kSavefh));
+        });
+    EXPECT_EQ(ren.status, kNametoolong);
+}
+
+// The same treatment for linktext4, so v3 SYMLINK and v4 CREATE(NF4LNK) agree on the
+// exact same target (A3/A4): PATH_MAX is the limit, and it is a status, not an XDR error.
+TEST(Nfs4, LongSymlinkTargetIsAccepted) {
+    V4Fixture f;
+    f.establish_session();
+    auto dir_fh = f.path_fh({"export", "data"});
+    const std::string target(2000, 't');
+    auto create = dir_op(f, dir_fh, Op::kCreate, [&](xdr::XdrEnc& e) {
+        // NF4LNK
+        e.u32(5);
+        e.string(target);
+        e.string("long-link");
+        encode_empty_fattr(e);
+    });
+    EXPECT_EQ(create.status, 0u);
+
+    auto link_fh = f.path_fh({"export", "data", "long-link"});
+    ASSERT_TRUE(!link_fh.empty());
+    auto readlink = dir_op(f, link_fh, Op::kReadlink, [](xdr::XdrEnc&) {});
+    ASSERT_TRUE(readlink.status == 0u);
+    V4Fixture::expect_op(readlink.reply.dec, Op::kSequence, 0);
+    (void)readlink.reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(readlink.reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(readlink.reply.dec, Op::kReadlink, 0);
+    auto got = readlink.reply.dec.string(nfsv4::kSymlinkWireMax);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(std::string(*got), target);
+
+    // Beyond PATH_MAX: NAMETOOLONG, not BADXDR.
+    auto too_long = dir_op(f, dir_fh, Op::kCreate, [&](xdr::XdrEnc& e) {
+        e.u32(5);
+        e.string(std::string(nfsv4::kMaxSymlink + 1, 't'));
+        e.string("too-long");
+        encode_empty_fattr(e);
+    });
+    EXPECT_EQ(too_long.status, stv(Status::kNametoolong));
+    // And past the decode ceiling, BADXDR is right.
+    auto huge = dir_op(f, dir_fh, Op::kCreate, [&](xdr::XdrEnc& e) {
+        e.u32(5);
+        e.string(std::string(nfsv4::kSymlinkWireMax + 1, 't'));
+        e.string("huge");
+        encode_empty_fattr(e);
+    });
+    EXPECT_EQ(huge.status, stv(Status::kBadxdr));
+}
+
 TEST(Nfs4, RestartReclaimWithinGrace) {
     V4Fixture f;
     f.establish_session();

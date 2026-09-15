@@ -59,14 +59,38 @@ bool utf8_component(std::string_view name) {
     return core::valid_utf8(name);
 }
 
+// One verdict for a name component, shared by the MutateGuard path and the ops that
+// check a name themselves (LOOKUP / OPEN / SECINFO): over the filesystem's maxname is
+// NAMETOOLONG so the client's application sees ENAMETOOLONG (followups/protocol-gaps.md
+// A4), zero-length is INVAL (RFC 8881 §18.10), and everything else — "." / ".." or a
+// component carrying '/' or NUL — is BADNAME.
+uint32_t name_status4(core::NameCheck check) {
+    switch (check) {
+        case core::NameCheck::kOk:
+            return st(Status::kOk);
+        case core::NameCheck::kEmpty:
+            return st(Status::kInval);
+        case core::NameCheck::kTooLong:
+            return st(Status::kNametoolong);
+        default:
+            return st(Status::kBadname);
+    }
+}
+
+// The component-length limit this filesystem advertises through the maxname attribute.
+// The synthesized tree has no backend of its own and keeps the shared default.
+size_t max_name_of(const core::ExportEntry* exp) {
+    return exp ? exp->backend->limits().max_name : core::kMaxNameLen;
+}
+
 // v4 mapping of a failed MutateGuard verdict (plan doc 10 §6.1): readonly exports are
-// ROFS, empty components INVAL (RFC 8881 §18.10), every other component failure BADNAME.
+// ROFS, every component failure the verdict above.
 uint32_t verdict_status4(const MutateGuard::Verdict& verdict) {
     switch (verdict.kind) {
         case MutateGuard::Verdict::kReadonly:
             return st(Status::kRofs);
         case MutateGuard::Verdict::kBadName:
-            return verdict.name == core::NameCheck::kEmpty ? st(Status::kInval) : st(Status::kBadname);
+            return name_status4(verdict.name);
         default:
             return st(Status::kOk);
     }
@@ -771,7 +795,7 @@ uint32_t Engine::op_getfh(Ctx& ctx, xdr::XdrEnc& enc) {
 }
 
 rt::Task<uint32_t> Engine::op_lookup(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
-    auto name = dec.string(kMaxName + 1);
+    auto name = dec.string(kNameWireMax);
     if (!name) {
         enc.u32(st(Status::kBadxdr));
         co_return st(Status::kBadxdr);
@@ -780,18 +804,21 @@ rt::Task<uint32_t> Engine::op_lookup(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
         enc.u32(st(Status::kNofilehandle));
         co_return st(Status::kNofilehandle);
     }
-    if (name->empty() || !utf8_component(*name)) {
-        // zero-length or malformed UTF-8 component: INVAL, not BADNAME (RFC 8881 §18.10)
+    if (!utf8_component(*name)) {
+        // malformed UTF-8 component: INVAL, not BADNAME (RFC 8881 §14.1 / §18.10)
         enc.u32(st(Status::kInval));
         co_return st(Status::kInval);
     }
-    if (!core::valid_component(*name)) {
-        enc.u32(st(Status::kBadname));
-        co_return st(Status::kBadname);
-    }
+    // The handle resolves first: the length verdict needs this filesystem's maxname, and
+    // a stale handle outranks a name the filesystem could not have held anyway.
     auto resolved = co_await resolve(ctx, ctx.cfh);
     if (!resolved) {
         uint32_t code = st(core::to_v4(resolved.error(), Op::kLookup));
+        enc.u32(code);
+        co_return code;
+    }
+    if (uint32_t code = name_status4(core::check_component(*name, max_name_of(resolved->exp)));
+        code != st(Status::kOk)) {
         enc.u32(code);
         co_return code;
     }
@@ -1733,7 +1760,7 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     Stateid deleg_claim_sid{};
     switch (*claim) {
         case kClaimNull: {
-            auto n = dec.string(kMaxName + 1);
+            auto n = dec.string(kNameWireMax);
             if (!n) {
                 enc.u32(st(Status::kBadxdr));
                 co_return st(Status::kBadxdr);
@@ -1815,17 +1842,13 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     core::ExportEntry* exp = dir->exp;
 
     if (*claim == kClaimNull) {
-        if (name.empty()) {
-            enc.u32(st(Status::kInval));
-            co_return st(Status::kInval);
-        }
         if (!utf8_component(name)) {
             enc.u32(st(Status::kInval));
             co_return st(Status::kInval);
         }
-        if (!core::valid_component(name)) {
-            enc.u32(st(Status::kBadname));
-            co_return st(Status::kBadname);
+        if (uint32_t code = name_status4(core::check_component(name, max_name_of(dir->exp))); code != st(Status::kOk)) {
+            enc.u32(code);
+            co_return code;
         }
         // the synthesized tree holds only directories
         if (dir->pseudo()) {
@@ -2414,7 +2437,7 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     std::string linkdata;
     backend::DevT rdev{};
     if (*type == kNf4Lnk) {
-        auto target = dec.string(kMaxSymlink);
+        auto target = dec.string(kSymlinkWireMax);
         if (!target) {
             enc.u32(st(Status::kBadxdr));
             co_return st(Status::kBadxdr);
@@ -2429,7 +2452,7 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
         }
         rdev = {*major, *minor};
     }
-    auto name = dec.string(kMaxName + 1);
+    auto name = dec.string(kNameWireMax);
     if (!name) {
         enc.u32(st(Status::kBadxdr));
         co_return st(Status::kBadxdr);
@@ -2455,6 +2478,12 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     if (*type == kNf4Lnk && linkdata.empty()) {
         enc.u32(st(Status::kInval));
         co_return st(Status::kInval);
+    }
+    // linktext4 is unbounded on the wire; PATH_MAX is what the storage will take, and the
+    // v3 SYMLINK path answers the same way (followups/protocol-gaps.md A3/A4).
+    if (*type == kNf4Lnk && linkdata.size() > kMaxSymlink) {
+        enc.u32(st(Status::kNametoolong));
+        co_return st(Status::kNametoolong);
     }
     auto dir = co_await resolve(ctx, ctx.cfh);
     if (!dir) {
@@ -2529,7 +2558,7 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
 }
 
 rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
-    auto name = dec.string(kMaxName + 1);
+    auto name = dec.string(kNameWireMax);
     if (!name) {
         enc.u32(st(Status::kBadxdr));
         co_return st(Status::kBadxdr);
@@ -2589,8 +2618,8 @@ rt::Task<uint32_t> Engine::op_remove(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
 }
 
 rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
-    auto oldname = dec.string(kMaxName + 1);
-    auto newname = dec.string(kMaxName + 1);
+    auto oldname = dec.string(kNameWireMax);
+    auto newname = dec.string(kNameWireMax);
     if (!oldname || !newname) {
         enc.u32(st(Status::kBadxdr));
         co_return st(Status::kBadxdr);
@@ -2664,7 +2693,7 @@ rt::Task<uint32_t> Engine::op_rename(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
 }
 
 rt::Task<uint32_t> Engine::op_link(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
-    auto newname = dec.string(kMaxName + 1);
+    auto newname = dec.string(kNameWireMax);
     if (!newname) {
         enc.u32(st(Status::kBadxdr));
         co_return st(Status::kBadxdr);
@@ -3013,7 +3042,7 @@ rt::Task<uint32_t> Engine::op_locku(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
 // SECINFO (RFC 8881 §18.29): AUTH_SYS-only server — the answer is always [AUTH_SYS]
 // once the name resolves; the current filehandle is consumed (§2.6.3.1.1.8).
 rt::Task<uint32_t> Engine::op_secinfo(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc) {
-    auto name = dec.string(kMaxName + 1);
+    auto name = dec.string(kNameWireMax);
     if (!name) {
         enc.u32(st(Status::kBadxdr));
         co_return st(Status::kBadxdr);
@@ -3022,17 +3051,18 @@ rt::Task<uint32_t> Engine::op_secinfo(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
         enc.u32(st(Status::kNofilehandle));
         co_return st(Status::kNofilehandle);
     }
-    if (name->empty() || !utf8_component(*name)) {
+    if (!utf8_component(*name)) {
         enc.u32(st(Status::kInval));
         co_return st(Status::kInval);
-    }
-    if (!core::valid_component(*name)) {
-        enc.u32(st(Status::kBadname));
-        co_return st(Status::kBadname);
     }
     auto resolved = co_await resolve(ctx, ctx.cfh);
     if (!resolved) {
         uint32_t code = st(core::to_v4(resolved.error(), Op::kSecinfo));
+        enc.u32(code);
+        co_return code;
+    }
+    if (uint32_t code = name_status4(core::check_component(*name, max_name_of(resolved->exp)));
+        code != st(Status::kOk)) {
         enc.u32(code);
         co_return code;
     }
