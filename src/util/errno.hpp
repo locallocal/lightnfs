@@ -22,6 +22,8 @@ enum class Errno : int32_t {
     kBadHandle = 3003,
     // export served by another gateway -> v4 MOVED (plan 12 B3)
     kMoved = 3004,
+    // RPC verifier malformed for the credential's flavor -> AUTH_BADVERF
+    kBadVerf = 3005,
 };
 
 constexpr Errno errno_from(int e) {

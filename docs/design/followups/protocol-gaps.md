@@ -725,12 +725,37 @@ feature 表现在写明 DUMP/UMNTALL 会应答但服务器不维护权威 rmtab�
   断言**伪根仍然回 NOT_SAME**）。
   把行为回退成"恒严格、不计数"后两条分别失败 4 / 3 处。
 
-### C3 AUTH 层的两个记录项
+### C3 AUTH 层的两个记录项（已修复）
 
-`AuthSys::authenticate` 不校验 verifier（RFC 5531 要求 AUTH_SYS 的 verifier 是
-AUTH_NONE/零长）；`AuthNone` 直接给 `uid/gid = 65534`（`rpc/auth.cpp:11-17`）而不走导出的
-`anon_uid/anon_gid`。按现有信任边界两者都可接受，备案；`AuthNone` 那条若要统一，改成走
-`squash_cred` 的 anon 更自洽。
+初版把两条都记为"按现有信任边界可接受，备案"。实际都改了——两条都很小，而且改完比留着更自洽。
+
+**(a) AUTH_SYS 的 verifier 现在校验了。**
+RFC 5531 §8.2 规定 AUTH_SYS 凭证配一个 AUTH_NONE、零长度的 verifier。此前 verifier 被完全忽略，
+所以 flavor 对不上也照样通过。现在不符即回 **AUTH_BADVERF**（`AuthStat` 里本来就有
+`kAuthBadverf = 3`，只是没人用）。新增 `Errno::kBadVerf` 让分发器能把它和"未知 flavor"
+（AUTH_REJECTEDCRED）、"凭证体坏"（AUTH_BADCRED）区分开。
+风险可忽略：没有客户端会发别的东西；而默默接受一个从不查看的 verifier，正是 flavor 混淆能长期
+不被发现的原因。
+
+**(b) AUTH_NONE 现在走导出的 `anon_uid` / `anon_gid`。**
+AUTH_NONE 表示"我不声明任何身份"，所以导出的匿名身份应当适用——**包括 `squash = none`**：
+`none` 的含义是"把客户端**声明的**身份原样透传"，而这里根本没有声明。此前认证器里硬编码的
+65534 会胜出，导出配的 `anon_uid` 对这类调用方被静默忽略。
+
+实现上**没有用 `flavor == kNone` 判定**，而是给 `Cred` 加了一个显式的 `anonymous` 位：
+`flavor` 的默认值就是 `kNone`，拿它当判据会让**每一个默认构造的 `Cred`**（测试夹具、以后任何
+内部调用方）都悄悄变成匿名——`V4Fixture` 就是构造一个 `Cred` 然后只设 `uid = 0`，那会被压成
+anon，几十条 v4 测例当场改变语义。只有认证器会设这个位。
+
+- 行为变更范围：接受 AUTH_NONE 请求**且**把 `anon_uid`/`anon_gid` 设成非 65534 的部署。此前
+  拿到 65534，现在拿到配置值——本来就是运维配了却没生效的那个值。
+- 回归测例两条：`Nfs3.AuthSysVerifierMustBeNull`（手工拼 RPC 调用以便独立控制 verifier：合规的
+  verifier 通过、flavor 不对与零 flavor 带 body 都回 AUTH_BADVERF、未知 flavor 仍回
+  AUTH_REJECTEDCRED 不被混淆、AUTH_NONE 不受影响）与
+  `Nfs3.AuthNoneUsesTheExportsAnonIdentity`（AUTH_NONE 在 `squash = none` 的导出上映射到
+  1000/1001 且附加组清空；同一导出上 AUTH_SYS 的 500/600 原样透传；**默认构造的 `Cred` 不是
+  匿名**，uid 0 保持 0）。
+  回退两处行为后分别失败 2 / 3 处：坏 verifier 被放行，AUTH_NONE 回 65534 而不是 1000/1001。
 
 ### C4 `pseudofs.cpp` 的注释已过期
 

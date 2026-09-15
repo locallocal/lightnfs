@@ -298,6 +298,139 @@ TEST(Nfs3, FsinfoAdvertisesCanSetTime) {
     EXPECT_EQ(parsed->attrs.mtime.nsec, 89u);
 }
 
+// followups/protocol-gaps.md C3, first item: RFC 5531 §8.2 pairs an AUTH_SYS credential
+// with an AUTH_NONE verifier of zero length.  The verifier used to be ignored entirely,
+// so a mismatched flavor rode through unnoticed.
+TEST(Nfs3, AuthSysVerifierMustBeNull) {
+    NfsFixture f;
+    // A GETATTR call built by hand so the verifier can be set independently of the
+    // credential; NfsFixture::call always sends AUTH_NONE for both.
+    auto call_with = [&](uint32_t cred_flavor, uint32_t verf_flavor, uint32_t verf_len) {
+        xdr::XdrEnc enc(f.pool);
+        enc.u32(0x9001);
+        enc.u32(rpc::kCall);
+        enc.u32(2);
+        enc.u32(nfsv3::kProgram);
+        enc.u32(nfsv3::kVersion);
+        enc.u32(static_cast<uint32_t>(nfsv3::Proc::kGetattr));
+        enc.u32(cred_flavor);
+        if (cred_flavor == 1) {
+            // authsys_parms: stamp, machinename, uid, gid, gids<>
+            xdr::XdrEnc body(f.pool);
+            body.u32(0);
+            body.string("host");
+            body.u32(0);
+            body.u32(0);
+            body.u32(0);
+            auto bytes = body.take().to_bytes();
+            enc.opaque(bytes);
+        } else {
+            enc.u32(0);
+        }
+        enc.u32(verf_flavor);
+        if (verf_len) {
+            std::vector<std::byte> junk(verf_len, std::byte{0x5A});
+            enc.opaque(junk);
+        } else {
+            enc.u32(0);
+        }
+        xdr::XdrEnc args(f.pool);
+        f.root_fh.encode(args);
+        enc.opaque_fixed(args.take().to_bytes());
+
+        rt::spawn(f.dispatcher.handle_request(f.ctx, enc.take()), f.reactor);
+        while (!f.ring.has_pending(rt::testing::FakeRing::Kind::kSendv)) f.reactor.poll_once();
+        auto op = f.ring.take(rt::testing::FakeRing::Kind::kSendv, 5);
+        std::vector<std::byte> wire;
+        for (int i = 0; i < op.iovcnt; ++i) {
+            auto* p = static_cast<std::byte*>(op.iov[i].iov_base);
+            wire.insert(wire.end(), p, p + op.iov[i].iov_len);
+        }
+        f.ring.complete(op, static_cast<int32_t>(wire.size()));
+        while (f.reactor.poll_once()) {
+        }
+        return std::vector<std::byte>(wire.begin() + 4, wire.end());
+    };
+    // The auth_stat of a MSG_DENIED/AUTH_ERROR reply, or ~0 when the reply was accepted.
+    auto auth_stat = [](std::vector<std::byte>& bytes) -> uint32_t {
+        xdr::XdrDec dec(std::span<const std::byte>(bytes.data(), bytes.size()));
+        // xid
+        (void)dec.u32();
+        auto mtype = dec.u32();
+        auto reply_stat = dec.u32();
+        if (!mtype || !reply_stat || *reply_stat != rpc::kMsgDenied) return ~0u;
+        auto reject = dec.u32();
+        if (!reject || *reject != rpc::kAuthError) return ~0u;
+        auto st = dec.u32();
+        return st ? *st : ~0u;
+    };
+
+    // AUTH_SYS with the verifier the RFC specifies: accepted.
+    auto ok = call_with(1, 0, 0);
+    EXPECT_EQ(auth_stat(ok), ~0u);
+    // A non-zero verifier flavor, and a zero flavor with a body: both AUTH_BADVERF.
+    auto bad_flavor = call_with(1, 1, 0);
+    EXPECT_EQ(auth_stat(bad_flavor), (uint32_t)rpc::kAuthBadverf);
+    auto bad_len = call_with(1, 0, 8);
+    EXPECT_EQ(auth_stat(bad_len), (uint32_t)rpc::kAuthBadverf);
+    // An unknown flavor is still AUTH_REJECTEDCRED, not conflated with the new code.
+    auto unknown = call_with(42, 0, 0);
+    EXPECT_EQ(auth_stat(unknown), (uint32_t)rpc::kAuthRejectedcred);
+    // AUTH_NONE is untouched by the AUTH_SYS check.
+    auto none = call_with(0, 0, 0);
+    EXPECT_EQ(auth_stat(none), ~0u);
+}
+
+// C3, second item: AUTH_NONE claims no identity, so the export's anon_uid/anon_gid apply
+// whatever the squash mode is.  The authenticator's hardcoded nobody/nogroup used to win
+// and an export's configured anon was quietly ignored for those callers.
+TEST(Nfs3, AuthNoneUsesTheExportsAnonIdentity) {
+    core::ExportTable table;
+    core::ExportConfig cfg;
+    cfg.path = "/export";
+    cfg.fsid = 7;
+    cfg.clients = {"127.0.0.0/8"};
+    // `none` is the interesting case: it passes a *claimed* identity through, and an
+    // AUTH_NONE caller has not claimed one.
+    cfg.squash = core::Squash::kNone;
+    cfg.anon_uid = 1000;
+    cfg.anon_gid = 1001;
+    ASSERT_TRUE(table.add(cfg, std::make_unique<backend::MemoryBackend>(7)).has_value());
+    auto set = table.snapshot();
+    core::ExportEntry* entry = set->by_fsid(7);
+    ASSERT_TRUE(entry != nullptr);
+
+    // What the AUTH_NONE authenticator actually produces.
+    auto anon = rpc::AuthRegistry::default_registry().authenticate([] {
+        rpc::RpcCall c{.args = xdr::XdrDec(std::span<const std::byte>{})};
+        c.cred.flavor = 0;
+        c.verf.flavor = 0;
+        return c;
+    }());
+    ASSERT_TRUE(anon.has_value());
+    EXPECT_TRUE(anon->anonymous);
+    auto mapped = core::ExportTable::squash_cred(*anon, *entry);
+    EXPECT_EQ(mapped.uid, 1000u);
+    EXPECT_EQ(mapped.gid, 1001u);
+    EXPECT_TRUE(mapped.groups.empty());
+
+    // An AUTH_SYS caller on the same export is still passed through untouched: the new
+    // rule is about claiming no identity, not about squashing everyone.
+    rpc::Cred sys;
+    sys.flavor = rpc::AuthFlavor::kSys;
+    sys.uid = 500;
+    sys.gid = 600;
+    auto through = core::ExportTable::squash_cred(sys, *entry);
+    EXPECT_EQ(through.uid, 500u);
+    EXPECT_EQ(through.gid, 600u);
+    // And a default-constructed Cred is NOT anonymous, so internal callers and fixtures
+    // keep the identity they set.
+    rpc::Cred plain;
+    plain.uid = 0;
+    EXPECT_FALSE(plain.anonymous);
+    EXPECT_EQ(core::ExportTable::squash_cred(plain, *entry).uid, 0u);
+}
+
 TEST(Nfs3, OverlongNamesAnswerNametoolong) {
     NfsFixture f;
     const auto kNametoolong = (uint32_t)nfsv3::Status::kNametoolong;

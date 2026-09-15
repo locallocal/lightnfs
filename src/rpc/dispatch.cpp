@@ -73,7 +73,13 @@ Task<void> Dispatcher::handle_request(transport::ConnCtx& ctx, rt::BufferChain r
 
     auto cred = auth_.authenticate(*call);
     if (!cred) {
-        encode_reply_auth_error(enc, call->xid, cred.error() == errno_from(EPERM) ? kAuthRejectedcred : kAuthBadcred);
+        AuthStat stat = kAuthBadcred;
+        // EPERM: unknown flavor.  kBadVerf: the verifier does not match the flavor (C3).
+        if (cred.error() == errno_from(EPERM))
+            stat = kAuthRejectedcred;
+        else if (cred.error() == Errno::kBadVerf)
+            stat = kAuthBadverf;
+        encode_reply_auth_error(enc, call->xid, stat);
         co_await send_enc(ctx, enc);
         co_return;
     }
