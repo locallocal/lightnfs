@@ -136,6 +136,24 @@ struct NfsFixture {
     }
 };
 
+// The RPC accept_stat, so a GARBAGE_ARGS reply is distinguishable from a real one.
+uint32_t accept_stat(const std::vector<std::byte>& bytes) {
+    xdr::XdrDec dec(std::span<const std::byte>(bytes.data(), bytes.size()));
+    for (int i = 0; i < 5; ++i) (void)dec.u32();
+    auto v = dec.u32();
+    return v ? *v : ~0u;
+}
+
+// The NFS/MOUNT status word, or ~0 when the reply carries no body at all (an accept-error
+// reply such as GARBAGE_ARGS has none).  Reading it blindly aborts in Result::value(),
+// which turns a test failure into a crash -- and these tests exist precisely to check
+// what happens on the inputs that used to produce a bodyless reply.
+uint32_t reply_status(NfsFixture& f, std::vector<std::byte>& bytes) {
+    auto dec = f.result(bytes);
+    auto v = dec.u32();
+    return v ? *v : ~0u;
+}
+
 }  // namespace
 
 TEST(Nfs3Types, ReadAndReaddirArgsRoundTrip) {
@@ -218,6 +236,135 @@ TEST(Nfs3, ReaddirRejectsMismatchedCookieVerifier) {
     auto reply = f.request((uint32_t)nfsv3::Proc::kReaddir, args.take());
     auto result = f.result(reply);
     EXPECT_EQ(*result.u32(), (uint32_t)nfsv3::Status::kBadCookie);
+}
+
+// followups/protocol-gaps.md A3: filename3 / nfspath3 are string<> on the wire, so a
+// name or path longer than the filesystem will take has to come back as
+// NFS3ERR_NAMETOOLONG (the client's ENAMETOOLONG), not as an RPC-level GARBAGE_ARGS that
+// the client can only turn into EIO.  C5 rides along: an unusable component in LOOKUP is
+// answered too, not rejected at the RPC layer.
+TEST(Nfs3, OverlongNamesAnswerNametoolong) {
+    NfsFixture f;
+    const auto kNametoolong = (uint32_t)nfsv3::Status::kNametoolong;
+    const std::string long_name(256, 'x');
+    const std::string ok_name(255, 'y');
+
+    auto dirop = [&](nfsv3::Proc proc, const std::string& name) {
+        xdr::XdrEnc args(f.pool);
+        nfsv3::Diropargs{f.root_fh, name}.encode(args);
+        return f.request(static_cast<uint32_t>(proc), args.take());
+    };
+    // LOOKUP: was GARBAGE_ARGS, now a real reply carrying NAMETOOLONG.
+    auto reply = dirop(nfsv3::Proc::kLookup, long_name);
+    EXPECT_EQ(accept_stat(reply), rpc::kSuccess);
+    EXPECT_EQ(reply_status(f, reply), kNametoolong);
+    // 255 is the memory backend's max_name: accepted as a name, simply not present.
+    reply = dirop(nfsv3::Proc::kLookup, ok_name);
+    EXPECT_EQ(reply_status(f, reply), (uint32_t)nfsv3::Status::kNoent);
+    // C5: a component that can never exist is a lookup miss, not an RPC error.
+    for (const std::string& bad : {std::string("a/b"), std::string("")}) {
+        reply = dirop(nfsv3::Proc::kLookup, bad);
+        EXPECT_EQ(accept_stat(reply), rpc::kSuccess);
+        EXPECT_EQ(reply_status(f, reply), (uint32_t)nfsv3::Status::kNoent);
+    }
+    // REMOVE / RMDIR take the same path through MutateGuard::precheck.
+    for (nfsv3::Proc proc : {nfsv3::Proc::kRemove, nfsv3::Proc::kRmdir}) {
+        reply = dirop(proc, long_name);
+        EXPECT_EQ(accept_stat(reply), rpc::kSuccess);
+        EXPECT_EQ(reply_status(f, reply), kNametoolong);
+    }
+    // RMDIR still distinguishes "." and ".." (RFC 1813 §3.3.13) -- the length arm must
+    // not have swallowed the dot arm.
+    reply = dirop(nfsv3::Proc::kRmdir, ".");
+    EXPECT_EQ(reply_status(f, reply), (uint32_t)nfsv3::Status::kInval);
+    reply = dirop(nfsv3::Proc::kRmdir, "..");
+    EXPECT_EQ(reply_status(f, reply), (uint32_t)nfsv3::Status::kExist);
+
+    // The creation family: CREATE / MKDIR / SYMLINK.
+    xdr::XdrEnc create(f.pool);
+    nfsv3::CreateArgs cargs;
+    cargs.where = {f.root_fh, long_name};
+    cargs.mode = nfsv3::kCreateUnchecked;
+    cargs.encode(create);
+    reply = f.request((uint32_t)nfsv3::Proc::kCreate, create.take());
+    EXPECT_EQ(reply_status(f, reply), kNametoolong);
+
+    xdr::XdrEnc mkdir(f.pool);
+    nfsv3::MkdirArgs{{f.root_fh, long_name}, {}}.encode(mkdir);
+    reply = f.request((uint32_t)nfsv3::Proc::kMkdir, mkdir.take());
+    EXPECT_EQ(reply_status(f, reply), kNametoolong);
+
+    xdr::XdrEnc symlink(f.pool);
+    nfsv3::SymlinkArgs{{f.root_fh, long_name}, {}, "target"}.encode(symlink);
+    reply = f.request((uint32_t)nfsv3::Proc::kSymlink, symlink.take());
+    EXPECT_EQ(reply_status(f, reply), kNametoolong);
+
+    // RENAME / LINK check both names through the same guard.
+    xdr::XdrEnc rename(f.pool);
+    nfsv3::RenameArgs{{f.root_fh, "hello"}, {f.root_fh, long_name}}.encode(rename);
+    reply = f.request((uint32_t)nfsv3::Proc::kRename, rename.take());
+    EXPECT_EQ(reply_status(f, reply), kNametoolong);
+
+    xdr::XdrEnc link(f.pool);
+    nfsv3::LinkArgs{f.root_fh, {f.root_fh, long_name}}.encode(link);
+    reply = f.request((uint32_t)nfsv3::Proc::kLink, link.take());
+    EXPECT_EQ(reply_status(f, reply), kNametoolong);
+
+    // Past the decode ceiling a request no longer names anything a filesystem could
+    // hold: GARBAGE_ARGS stays the answer there.
+    reply = dirop(nfsv3::Proc::kLookup, std::string(nfsv3::kNameWireMax + 1, 'z'));
+    EXPECT_EQ(accept_stat(reply), rpc::kGarbageArgs);
+}
+
+// A3, the functional half: a symlink target between MNTPATHLEN(1024) and PATH_MAX(4096)
+// is a perfectly legal POSIX target and used to be rejected at the decoder.
+TEST(Nfs3, LongSymlinkTargetIsAccepted) {
+    NfsFixture f;
+    const std::string target(2000, 't');
+    xdr::XdrEnc args(f.pool);
+    nfsv3::SymlinkArgs{{f.root_fh, "long-link"}, {}, target}.encode(args);
+    auto reply = f.request((uint32_t)nfsv3::Proc::kSymlink, args.take());
+    ASSERT_TRUE(reply_status(f, reply) == (uint32_t)nfsv3::Status::kOk);
+    auto result = f.result(reply);
+    (void)result.u32();
+    // post_op_fh3, then READLINK it back.
+    ASSERT_TRUE(*result.boolean());
+    auto fh_bytes = *result.opaque(64);
+    nfsv3::FileHandle link{{fh_bytes.begin(), fh_bytes.end()}};
+    xdr::XdrEnc rl(f.pool);
+    link.encode(rl);
+    reply = f.request((uint32_t)nfsv3::Proc::kReadlink, rl.take());
+    ASSERT_TRUE(reply_status(f, reply) == (uint32_t)nfsv3::Status::kOk);
+    result = f.result(reply);
+    (void)result.u32();
+    // post-op attrs
+    ASSERT_TRUE(*result.boolean());
+    for (int i = 0; i < 21; ++i) (void)result.u32();
+    auto got = result.string(nfsv3::kPathWireMax);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_STREQ(std::string(*got), target);
+
+    // Beyond PATH_MAX the storage would refuse it anyway: NAMETOOLONG, not GARBAGE_ARGS.
+    xdr::XdrEnc too_long(f.pool);
+    nfsv3::SymlinkArgs{{f.root_fh, "too-long"}, {}, std::string(nfsv3::kMaxPath + 1, 't')}.encode(too_long);
+    reply = f.request((uint32_t)nfsv3::Proc::kSymlink, too_long.take());
+    EXPECT_EQ(accept_stat(reply), rpc::kSuccess);
+    EXPECT_EQ(reply_status(f, reply), (uint32_t)nfsv3::Status::kNametoolong);
+}
+
+// A3, MOUNT side: MNT3ERR_NAMETOOLONG exists for exactly this.
+TEST(Mount3, OverlongPathAnswersNametoolong) {
+    NfsFixture f;
+    xdr::XdrEnc args(f.pool);
+    args.string(std::string(mountd::kMaxMountPath + 1, '/'));
+    auto reply = f.mount_request(1, args.take());
+    EXPECT_EQ(accept_stat(reply), rpc::kSuccess);
+    EXPECT_EQ(reply_status(f, reply), 63u);
+    // An over-long component inside an existing export answers the same way.
+    xdr::XdrEnc deep(f.pool);
+    deep.string("/export/" + std::string(256, 'x'));
+    reply = f.mount_request(1, deep.take());
+    EXPECT_EQ(reply_status(f, reply), 63u);
 }
 
 TEST(Mount3, MountAndExportWireFlow) {

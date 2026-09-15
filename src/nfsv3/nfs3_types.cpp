@@ -17,7 +17,7 @@ void Diropargs::encode(xdr::XdrEnc& enc) const {
 }
 Result<Diropargs> Diropargs::decode(xdr::XdrDec& dec) {
     auto dir = LNFS_TRY(FileHandle::decode(dec));
-    auto name = LNFS_TRY(dec.string(kMaxName));
+    auto name = LNFS_TRY(dec.string(kNameWireMax));
     return Diropargs{std::move(dir), std::string(name)};
 }
 
@@ -197,7 +197,7 @@ Result<SymlinkArgs> SymlinkArgs::decode(xdr::XdrDec& dec) {
     SymlinkArgs out;
     out.where = LNFS_TRY(Diropargs::decode(dec));
     out.attrs = LNFS_TRY(decode_sattr(dec));
-    out.target = std::string(LNFS_TRY(dec.string(kMaxPath)));
+    out.target = std::string(LNFS_TRY(dec.string(kPathWireMax)));
     return out;
 }
 

@@ -22,7 +22,7 @@
 |---|----|------|------|----------------|
 | A1 | A | `nfsv4/attrs.cpp:57,102` | GETATTR 请求只写属性 `time_access_set`/`time_modify_set` 时，attrmask 置位但 attrlist 不带值 | fattr4 自相矛盾，客户端 XDR 解析失败（Linux → EIO）**——已修复** |
 | A2 | A | `nfsv4/attrs.cpp:196` | `fs_locations_info`(67) 编码在 `mounted_on_fileid`(55) 之前，违反属性升序 | referral 探测时属性错位解析（仅 active-active）**——已修复** |
-| A3 | A | `nfsv3/nfs3_types.cpp:20,200`、`mountd/mount3.cpp:114` | v3 名字 >255B、symlink 目标 >1024B、MNT 路径 >1024B 一律 RPC GARBAGE_ARGS | 应为 NFS3ERR_NAMETOOLONG；`ln -s <1KB+ 目标>` 在 v3 上直接 EIO |
+| A3 | A | `nfsv3/nfs3_types.cpp:20,200`、`mountd/mount3.cpp:114` | v3 名字 >255B、symlink 目标 >1024B、MNT 路径 >1024B 一律 RPC GARBAGE_ARGS | 应为 NFS3ERR_NAMETOOLONG；`ln -s <1KB+ 目标>` 在 v3 上直接 EIO**——已修复（连带 C5）** |
 | A4 | A | `nfsv4/engine.cpp:789` 等 | v4 名字 256B → BADNAME，≥257B → BADXDR | 应为 NFS4ERR_NAMETOOLONG；`errmap` 白名单里的 NAMETOOLONG 无路径可达 |
 | A5 | A | `state/state_mgr.cpp:1595`、`nfsv4/engine.cpp:2765` | FREE_STATEID 不校验 stateid 属主 | 叠加 B1 的可推 stateid → 可释放别人的 lock stateid |
 | B1 | B | `state/state_mgr.cpp:141,549,734` | sessionid / clientid / stateid 全无随机分量；SEQUENCE 接受任意连接 | 网段内可枚举并冒用别人的会话与状态 |
@@ -115,7 +115,7 @@ fattr4 的 attrlist 必须按属性号升序排列。`encode_fattr` 的编码顺
 - 反向验证：把顺序改回去（并去掉断言）后两条分别失败 12 / 3 处（`referrals = false` 那轮
   不受影响，符合预期）。
 
-### A3 v3 超长名字/路径被降级成 RPC GARBAGE_ARGS
+### A3 v3 超长名字/路径被降级成 RPC GARBAGE_ARGS（已修复）
 
 解码层就把长度当成 XDR 上界：
 
@@ -142,6 +142,33 @@ fattr4 的 attrlist 必须按属性号升序排列。`encode_fattr` 的编码顺
 把长度判定交给已有的 `core::check_component()`（它已经有 `NameCheck::kTooLong`，只是
 `valid_component()` 把它和其他失败一起折成 bool 丢掉了），让 v3 把 `kTooLong` 映射成
 NFS3ERR_NAMETOOLONG、mountd 映射成 MNT3ERR_NAMETOOLONG（`map_error` 已有这一支）。
+
+**已修复**（本轮，连带 C5）：
+- 解码上界与语义上界分开：`nfs3_types.hpp` 新增 `kNameWireMax = 4096` / `kPathWireMax = 16384`
+  作为**纯 DoS 天花板**（`filename3`/`nfspath3` 在 RFC 1813 §2.5 里本就是 `string<>`），
+  `kMaxPath` 从 1024 改成 POSIX 的 4096 当语义上界，原来那个 `kMaxName = 255` 删掉——
+  名字的语义上界不再是硬编码，而是**该导出后端的 `limits().max_name`**，也就是 PATHCONF /
+  v4 `maxname` 宣告的那个数（`local` 后端从 `fpathconf(_PC_NAME_MAX)` 探出来，见
+  `local.cpp:435`，此前与硬编码的 255 可能不一致）；
+- `MutateGuard::precheck` 改用 `check_component(name, exp.backend->limits().max_name)`，
+  v3 的 `verdict_status()` 为 `NameCheck::kTooLong` 单独返回 NFS3ERR_NAMETOOLONG（其余名字
+  失败仍是 ACCES，RMDIR 的 "." / ".." 分支不动）；
+- v3 SYMLINK 目标 >`kMaxPath` 回 NAMETOOLONG；1025..4096 字节的目标现在正常创建；
+- LOOKUP 的名字检查从"与 XDR 失败合并成 GARBAGE_ARGS"改成解出句柄后再判：`kTooLong` →
+  NAMETOOLONG，空名字/含 `/` 或 NUL → NOENT（这就是 C5）。顺带把 STALE 的优先级摆正了——
+  坏名字不再抢在句柄校验之前。
+- mountd：`dirpath` 解码放宽到 `kMountPathWireMax = 8192`，超过 `kMaxMountPath = 1024`
+  （RFC 1813 §5.1.1 的 MNTPATHLEN）回 MNT3ERR_NAMETOOLONG；路径里某个分量超长同样回
+  NAMETOOLONG 而不是原来的 MNT3ERR_INVAL。
+- 回归测例三条：`Nfs3.OverlongNamesAnswerNametoolong`（LOOKUP / REMOVE / RMDIR / CREATE /
+  MKDIR / SYMLINK / RENAME / LINK 各一条超长名字，外加 255 字节名字仍是 NOENT、`a/b` 与
+  空名字是 NOENT、RMDIR 的 "." / ".." 仍是 INVAL / EXIST、超过解码天花板仍是
+  GARBAGE_ARGS）、`Nfs3.LongSymlinkTargetIsAccepted`（2000 字节目标创建成功并 READLINK
+  读回，>PATH_MAX 回 NAMETOOLONG）、`Mount3.OverlongPathAnswersNametoolong`。
+  三条都不裸解引用回复里的字段：**GARBAGE_ARGS 回复根本没有 body**，直接读会崩在
+  `Result::value()` 的断言里而不是给出失败——这正是这几条测例要检查的那种输入。
+- 反向验证（保留新常量、只回退行为）：三条分别失败 15 / 1 / 3 处，失败值恰是修复前的行为
+  （accept_stat = 4 即 GARBAGE_ARGS、status 读不出来、MOUNT 分量超长回 22 即 MNT3ERR_INVAL）。
 
 ### A4 v4 超长名字回 BADNAME / BADXDR
 
@@ -444,7 +471,7 @@ AUTH_NONE/零长）；`AuthNone` 直接给 `uid/gid = 65534`（`rpc/auth.cpp:11-
 （共享导出清单热更新后，v4 客户端的伪根 READDIR 会因 verifier 变化而重列，位置型 cookie 不会
 错位）。注释该改，免得后人按注释去"修"。
 
-### C5 v3 LOOKUP 的非法分量也回 GARBAGE_ARGS
+### C5 v3 LOOKUP 的非法分量也回 GARBAGE_ARGS（已随 A3 修复）
 
 `nfsv3/engine.cpp:287` 把 `!core::valid_component(args->name, true)` 与 XDR 解码失败合并成
 一条 `reply_garbage_args`。"." / ".." 是放行的，但含 `/` 或 NUL 的分量会变成 RPC 层错误而不是
@@ -456,8 +483,9 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 
 1. ~~**A1**、**A2**~~ —— 均已修复（见上）。畸形回复这一类目前已清空。
 2. **A5、B1** —— 跨客户端的状态隔离。B1 的两个子项独立，可分别落。
-3. **A3、A4、C5、B6、B5** —— 错误码与属性宣告的一致性，一次改动可以一起收
-   （`check_component` 的 `kTooLong` 打通到两个引擎 + 两个属性位）。
+3. ~~**A3**、**C5**~~（已修复，见上）、**A4**、**B6**、**B5** —— 错误码与属性宣告的一致性。
+   A3 已经把 `check_component` 的 `kTooLong` 打通到 v3 与 mountd；A4 只剩
+   `verdict_status4()` 与 v4 的解码上界两处。
 4. **B2、B3** —— 身份压缩与源端口，动的是安全默认值，需要同步文档与配置样例。
 5. **B4、B7** —— DRC 键与委托一致性。B4 是删一个字段；B7 建议先上"有 v3 导出则不授委托"的
    一行版本，再决定要不要做完整的 v3 召回。
