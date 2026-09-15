@@ -25,7 +25,7 @@
 | A3 | A | `nfsv3/nfs3_types.cpp:20,200`、`mountd/mount3.cpp:114` | v3 名字 >255B、symlink 目标 >1024B、MNT 路径 >1024B 一律 RPC GARBAGE_ARGS | 应为 NFS3ERR_NAMETOOLONG；`ln -s <1KB+ 目标>` 在 v3 上直接 EIO**——已修复（连带 C5）** |
 | A4 | A | `nfsv4/engine.cpp:789` 等 | v4 名字 256B → BADNAME，≥257B → BADXDR | 应为 NFS4ERR_NAMETOOLONG；`errmap` 白名单里的 NAMETOOLONG 无路径可达**——已修复** |
 | A5 | A | `state/state_mgr.cpp:1595`、`nfsv4/engine.cpp:2765` | FREE_STATEID 不校验 stateid 属主 | 叠加 B1 的可推 stateid → 可释放别人的 lock stateid**——已修复** |
-| B1 | B | `state/state_mgr.cpp:141,549,734` | sessionid / clientid / stateid 全无随机分量；SEQUENCE 接受任意连接 | 网段内可枚举并冒用别人的会话与状态 |
+| B1 | B | `state/state_mgr.cpp:549` | sessionid 全无随机分量，网段内可枚举并冒用别人的会话**——已修复**；同条目下的 stateid 可推（A5 覆盖）与 SEQUENCE 隐式绑定连接（与 knfsd 在 SP4_NONE 下一致）**原判定过重，已更正** | 见 B1 正文 |
 | B2 | B | `core/config.cpp:1089` | `squash = root` 只压 uid，不压 gid 0 与附加组 0 | 组 root 可写的文件仍可被写 |
 | B3 | B | 全路径缺失 | 无特权源端口（"secure"）检查 | 受信主机上的**普通用户**即可声称任意 uid |
 | B4 | B | `rpc/drc.hpp:39` | DRC 键含源端口 | 跨重连的重传 miss → 非幂等过程重放（REMOVE 回 NOENT 等） |
@@ -250,52 +250,75 @@ RFC 8881 §18.38.3：不属于本客户端的 stateid → NFS4ERR_BAD_STATEID。
 
 ## B. 语义偏差与安全边界偏差
 
-### B1 会话与状态标识全可推，且 SEQUENCE 不做连接绑定
+### B1 会话标识可推（已修复）；连接绑定与 stateid 可推（原判定过重，已更正）
 
-两件事叠在一起才构成风险，所以合成一条。
+> **更正**：本条初版把两件事合成一条，并断言都是对 RFC / 参考实现的偏离。复核后
+> **(b) 连接绑定、以及 (a) 里 stateid 那半都站不住**——它们与 knfsd 在 SP4_NONE 下的行为一致，
+> 而且本仓库的调研分册早就记过结论。真正成立的只有 **sessionid 可推**这一条，已修。
+> 下面按「成立 / 不成立」重写，保留原始论据以便复核。
 
-**(a) 标识没有随机分量。**
+**(a1) sessionid 可推 —— 成立，已修复。**
 
 ```
-// state_mgr.cpp:549-553
+// state_mgr.cpp:549-553（修复前）
 std::memcpy(session->id.data(),      &client->clientid, 8);   // = epoch32 | client counter32
 std::memcpy(session->id.data() + 8,  &counter,          4);   // 全局 session counter
-std::memcpy(session->id.data() + 12, &epoch32,          4);
+std::memcpy(session->id.data() + 12, &epoch32,          4);   // boot epoch 的副本
 ```
 
-clientid 自身是 `{boot_epoch(32) | counter(32)}`，stateid.other 是
-`{boot_epoch(4B) | type(1B) | counter(7B)}`（`:141-150`）。**三者都不含 `getrandom` 的
-随机量**，搜索空间只有"boot epoch + 两个小计数器"。
+整个 16 字节由「boot epoch + 两个小计数器」决定，**没有任何随机分量**。后果：白名单网段内任一
+主机能在个位数次尝试内猜出别人的 sessionid，并在自己的连接上发 SEQUENCE 冒用该会话——
+`ctx.clientid` 是从 sessionid 前 8 字节直接取的（`nfsv4/engine.cpp` 的 SEQUENCE 路径），所以
+`check_io` 里 `rec->client->clientid != clientid` 那道校验也一并通过：受害者的 open/lock
+stateid 可以拿来做 IO，DESTROY_SESSION 也能无声打断它的会话。
 
-**(b) SEQUENCE 无条件接受任意连接。**
+**已修复**（本轮）：末 4 字节从「boot epoch 的副本」（无人解析）换成**每会话**的 `getrandom`
+随机量，布局变成 `clientid(8) | counter(4) | random(4)`。
+- 前 8 字节必须留成 clientid（引擎依赖，见上）；counter 留着，让**唯一性仍是构造保证**而不是
+  概率。
+- 随机量必须**每会话一份**：一个进程级常量在所有会话间相同，等于没加。
+- 32 位意味着在线猜测约 2^31 次失败 COMPOUND，每次都回 BADSESSION 且留日志——从「随手可猜」
+  变成「不实际」。**不是**密码学强度：真正敌对的网络仍然是
+  [09-security](../../reference/nfsv4/09-security.md) §9.5 说的 SP4_MACH_CRED / TLS 问题，这里
+  只是把白送的那一步收掉。
+- `getrandom` 失败时退回「只有 counter」并打 warn，而不是退回一个可预测的常量。
+- 回归测例 `Nfs4.SessionIdIsNotPredictable`：把旧构造**写进测例**——用
+  `clientid | counter(0..7) | epoch` 以及全 0 / 全 1 尾巴重建 10 个候选 id，断言没有一个等于
+  活着的会话、且都回 BADSESSION；再断言两个会话的尾 4 字节不同（进程级随机量会让它们相同）、
+  counter 仍在递增（唯一性）、前 8 字节仍等于 clientid（引擎依赖）。
+  把尾巴改回 boot epoch 后该测例失败 4 处，关键一条是 `sequence_status(forged) == 0`——
+  **伪造的 sessionid 被接受了**。
 
-```
-// state_mgr.cpp:734
-session.bound_conns.insert(conn_id);      // 注释：implicit bind (trunking-lenient)
-```
+**(a2) stateid 可推 —— 不成立（作为「偏离」）。**
 
-`NFS4ERR_CONN_NOT_BOUND_TO_SESSION` 在代码里定义了，但只有 DESTROY_SESSION 用到
-（`:649`）。RFC 8881 的"bind before use"要求：除了发 CREATE_SESSION 的那条连接自动绑定，
-其他连接必须先 BIND_CONN_TO_SESSION，否则 SEQUENCE 应回 CONN_NOT_BOUND_TO_SESSION。
+knfsd 的 stateid 是 `{si_generation, {so_clid, so_id}}`，`so_id` 是每客户端计数器——**同样可
+推**；它靠 `nfsd4_lookup_stateid` 校验 `cl_clientid`，也就是属主检查。lightnfs 的
+`other = {epoch(4B) | type(1B) | counter(7B)}` 与之同构，缺的正是那道属主检查——那是 **A5**，
+已经修了。所以这半条的正确结论是「A5 覆盖」，而不是「给 stateid 加随机量」。
 
-**合起来的后果**：`clients` 白名单网段内的任一主机，可以枚举出一个有效 sessionid，在**自己
-的连接上**发 SEQUENCE 冒用别人的会话。因为 `ctx.clientid` 是从 sessionid 前 8 字节直接取
-的（`src/nfsv4/engine.cpp:361`），`check_io` 里 `rec->client->clientid != clientid` 这道校验
-也一并被绕过——于是同样可推的 open/lock stateid 可以拿来做 IO；DESTROY_SESSION 可以无声打断
-别人的会话。文件句柄有 SipHash HMAC，伪造不了，但攻击者可以自己 PUTROOTFH/LOOKUP 走一遍
-命名空间拿到合法句柄；导出的 CIDR 白名单仍然生效。
+补一句为什么不顺手加随机量：要有意义就得**每 stateid 一份**。共享一个进程级掩码是可逆的
+（攻击者拿自己的两个 stateid 就能解出掩码，因为 counter 近乎连续），而每 stateid 独立随机又
+丢掉唯一性保证，得改成「counter 的带密钥置换」（如 SipHash 截断 56 位 + 建表查重）。这是参考
+实现都没有的复杂度，收益在 A5 之后也很薄。**决定：不做**，属主检查就是防线。
 
-**这不等价于 AUTH_SYS 本来就有的风险**。deployment.md §1 的信任边界说的是"网络内任意主机可
-声称任意用户身份"——那是身份层面的。抢占别人的**打开状态与字节锁**、无声中断别人的**会话**，
-不在那条边界覆盖范围内：即使两个客户端用的是同一个 uid，NFS 的状态模型也承诺它们的 open/lock
-互不干扰。
+**(b) SEQUENCE 隐式绑定连接 —— 不成立（作为「偏离」）。**
 
-**修法**（两处都很便宜）：
-1. sessionid 的后 8 字节、stateid.other 的 counter 段混入一个每进程的 `getrandom` 随机量。
-   **保留** `epoch32` 前缀——`epoch_of(sid.other)` 的重启判定（`state_mgr.cpp:1445` 等多处）
-   依赖它，且 clientid 高 32 位的 epoch 语义也要留。
-2. SEQUENCE 对未绑定连接回 CONN_NOT_BOUND_TO_SESSION；若要保留 trunking 的宽松度，
-   至少要求新连接的对端地址与建会话时一致（`ConnCtx::peer` 已有）。
+`sequence_begin` 无条件 `bound_conns.insert(conn_id)`（`state_mgr.cpp:734`，注释写着
+"implicit bind (trunking-lenient)"），`NFS4ERR_CONN_NOT_BOUND_TO_SESSION` 只在
+DESTROY_SESSION 用到。初版据此说它违反 RFC 的「bind before use」。复核结论：
+
+- knfsd 的 `nfsd4_sequence_check_conn()` 对未绑定连接的处理是——**只有 `cl_mach_cred`
+  （SP4_MACH_CRED）在生效时才回 CONN_NOT_BOUND_TO_SESSION，否则直接把新连接哈希进会话**。
+  lightnfs 的 EXCHANGE_ID 只接受 SP4_NONE，所以当前行为与 knfsd 在同等配置下一致。
+- 本仓库的 [06-sessions-v41](../../reference/nfsv4/06-sessions-v41.md) §6.3 也早写了：
+  「重连 + BIND_CONN_TO_SESSION（**或直接在新连接上发 SEQUENCE，若服务器允许**）即恢复」——
+  这是当初就知道的服务器可选项。
+
+改成严格拒绝会比参考实现更严，而且会打断「重连后不发 BIND_CONN_TO_SESSION 就续用会话」的
+客户端（Linux 会发，别的实现不保证）。**决定：不改。** 初版提的折中（要求新连接对端地址与
+建会话时一致）也不采纳：RFC 8881 §2.10.5 的 session trunking 本就允许多地址，多宿主客户端会
+被误伤。sessionid 变成不可推之后，这条通路上剩下的风险就是「能嗅到线上流量的攻击者」——而那种
+攻击者在明文 AUTH_SYS 下本来就能直接伪造身份，属于 09-security §9.5 已记录的边界。
 
 ### B2 `squash = root` 只压 uid
 
@@ -522,9 +545,9 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 ## 建议的修复顺序
 
 1. ~~**A1**、**A2**~~ —— 均已修复（见上）。畸形回复这一类目前已清空。
-2. ~~**A5**~~（已修复，见上）、**B1** —— 跨客户端的状态隔离。A5 落地后，B1 的
-   「stateid 可推」不再能直接释放别人的锁状态，但会话冒用这条仍然开着；B1 的两个子项
-   （标识加随机量、SEQUENCE 连接绑定）独立，可分别落。
+2. ~~**A5**、**B1**~~ —— 跨客户端的状态隔离，两条都收口了：A5 补上 stateid 属主检查，
+   B1 让 sessionid 不可推。B1 里「stateid 加随机量」与「SEQUENCE 严格连接绑定」两项复核后
+   **判定为不做**（理由见 B1 正文）。
 3. ~~**A3**、**C5**、**A4**~~（均已修复，见上）、**B6**、**B5** —— 错误码与属性宣告的一致性。
    `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
    剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
@@ -545,9 +568,11 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 - **A3**：v3 侧补两条裸 RPC 用例——256 字节分量的 LOOKUP（期望 NAMETOOLONG）与 2000 字节
   symlink 目标的 SYMLINK（期望成功）。注意**不能**用 Linux 客户端挂载来测：客户端按
   PATHCONF 的 `name_max` 在本地就挡了，测不到线上行为，这也是这条一直没被发现的原因。
-- **B1**（A5 已由 `Nfs4.FreeStateidRejectsForeignStateids` 与
-  `StateMgr.ByteRangeLocksLifecycle` 覆盖）：把跨客户端隔离用例组补齐——A5 已经建好了
-  「两个会话共用一条连接」的夹具写法，READ 与 DESTROY_SESSION 两条照抄即可。
+- 跨客户端隔离目前三条：`Nfs4.FreeStateidRejectsForeignStateids`、
+  `StateMgr.ByteRangeLocksLifecycle`（A5）、`Nfs4.SessionIdIsNotPredictable`（B1）。若要再补
+  「B 用 A 的 stateid 做 READ / DESTROY_SESSION」，A5 建好的「两个会话共用一条连接」夹具写法
+  可直接照抄；注意伪造 sessionid 的 SEQUENCE **不能**让夹具的 slot 计数器前进（用
+  `session_body` 的 `force_seq`），否则后续真实调用全部 SEQ_MISORDERED，测的就成了自己的簿记。
 - **B4**：DRC 用例里换一个源端口重发同一 xid，断言命中缓存（`tests/test_rpc.cpp` 已有 DRC
   测例可扩展）。
 - **B7**：在 `tests/` 里搭一个 v3 引擎 + v4 引擎共享同一 `MemoryBackend` 与 `StateMgr` 的
