@@ -98,10 +98,10 @@ ConnRegistry& ConnRegistry::instance() {
     return r;
 }
 
-uint64_t ConnRegistry::add(int fd, const Peer& peer) {
+uint64_t ConnRegistry::add(int fd, const Peer& peer, const std::atomic<int64_t>* last_rx) {
     std::lock_guard lock(mu_);
     uint64_t id = next_id_++;
-    conns_.emplace(id, Ent{fd, peer, std::chrono::steady_clock::now()});
+    conns_.emplace(id, Ent{fd, peer, std::chrono::steady_clock::now(), last_rx});
     return id;
 }
 
@@ -133,6 +133,28 @@ bool ConnRegistry::kill(uint64_t id) {
     if (it == conns_.end()) return false;
     ::shutdown(it->second.fd, SHUT_RDWR);
     return true;
+}
+
+size_t ConnRegistry::kill_idle(std::chrono::seconds idle) {
+    if (idle.count() <= 0) return 0;
+    int64_t now =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    size_t killed = 0;
+    std::lock_guard lock(mu_);
+    for (const auto& [id, ent] : conns_) {
+        if (!ent.last_rx) continue;
+        int64_t last = ent.last_rx->load(std::memory_order_relaxed);
+        if (last == 0 || now - last < idle.count()) continue;
+        // shutdown() under the registry mutex, exactly like kill(): the entry's presence
+        // proves the fd still belongs to this connection, and the read loop then runs the
+        // normal drain-and-close path.  No coroutine is left parked on a dead buffer,
+        // which is why this is a sweeper and not a timeout around the recv.
+        ::shutdown(ent.fd, SHUT_RDWR);
+        ++killed;
+        LNFS_INFO("conn {}: idle {}s with no complete record, shutting down", ent.peer.to_string(), now - last);
+    }
+    if (killed) obs::Metrics::instance().conns_idle_reaped.fetch_add(killed, std::memory_order_relaxed);
+    return killed;
 }
 
 size_t ConnRegistry::close_all() {
@@ -260,7 +282,10 @@ Task<void> handle_one(ConnCtx* c, rpc::Dispatcher* d, BufferChain rec) {
 
 Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp, ConnTracker* tracker) {
     ConnCtx* c = ctx.get();
-    uint64_t conn_id = ConnRegistry::instance().add(c->fd, c->peer);
+    c->last_rx.store(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+        std::memory_order_relaxed);
+    uint64_t conn_id = ConnRegistry::instance().add(c->fd, c->peer, &c->last_rx);
     // RFC 9289: the AUTH_TLS probe is the first RPC or never
     bool tls_probe_seen = false;
     for (;;) {
@@ -271,6 +296,12 @@ Task<void> connection_main(std::unique_ptr<ConnCtx> ctx, rpc::Dispatcher& disp, 
             }
             break;
         }
+        // A complete record arrived: the idle reaper measures from here, so a connection
+        // stalled mid-record counts as idle (C1).
+        c->last_rx.store(
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count(),
+            std::memory_order_relaxed);
         // empty record: ignore
         if (rec->empty()) continue;
         if (c->cancel.cancel_requested()) break;

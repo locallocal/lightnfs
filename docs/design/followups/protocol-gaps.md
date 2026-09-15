@@ -660,16 +660,41 @@ feature 表现在写明 DUMP/UMNTALL 会应答但服务器不维护权威 rmtab�
 
 ## C. 加固项与已知取舍
 
-### C1 记录标记无片数上限、连接无空闲超时
+### C1 记录标记无片数上限、连接无空闲超时（已修复）
 
-`RecordStream::read_record()`（`transport/record_stream.cpp:56-86`）只有两道闸：单片
-`max_fragment_` 与整记录 `max_record_`。**长度为 0 的非末片不计入 `rec.size()`**，于是片数无上界：
-一条连接可以无限发 4 字节的 `0x00000000` 片头把协程挂在那里。`ConnRegistry` 只有
-`max_connections = 4096`（`transport/connection.hpp:35`），**没有任何 idle / recv 超时**
-（`connection.cpp` 里的 `wait_idle` 是关服时用的）。knfsd 有 `svc_age_temp_xprts` 定期回收
-空闲连接。
+**两半的性质不同，处理方式也不同。**
 
-**建议**：单记录片数上限（例如 1024 片）+ 每连接接收超时（无完整记录到达即断，按 lease 量级）。
+**(a) 分片数上限 —— 恒开，无配置。**
+`RecordStream::kMaxFragments = 1024`，每条记录超过就回 EMSGSIZE。这一半才是真正堵住"一条连接
+无限占用一个读协程"的那条路：零长度非末片对两个 size 上限都不计数，所以此前片数确实无界。
+1024 对真实客户端宽松三个数量级（本服务器自己永远只发一片），只会打到"不是客户端"的东西。
+
+**(b) 空闲连接回收 —— 新增 `[server] conn_idle_timeout`，默认 0（关）。**
+
+实现上**故意不用 `with_timeout` 包住 recv**。`with_timeout` 超时后内层任务是**分离**继续跑的
+（`runtime/io.hpp` 的注释写明了），而 `fill()` 会往 `rbuf_.data() + rend_` 写——连接拆完之后那块
+内存属于已销毁的 `RecordStream`，就是一个 use-after-free。`ctl.cpp` 那处用 `with_timeout` 之后
+紧跟 `uring_cancel_fd` 才安全，而连接读循环没有对应的时机。
+改成**扫描器**：`ConnCtx` 上加一个 `last_rx`（粗粒度秒，读循环每收完一条完整记录就写），
+`ConnRegistry::kill_idle()` 在注册表锁下对超时的连接 `shutdown(SHUT_RDWR)`——这正是既有 `kill()`
+的做法，读循环随后走**正常的 drain-and-close 路径**，没有任何协程被留在失效缓冲区上。
+和 knfsd 的 `svc_age_temp_xprts` 是同一个形状。
+计时从"收到完整记录"算起，所以卡在半条记录中间的连接也算空闲，一套机制覆盖两种情形。
+
+**为什么默认关（自行判断，需要复核）**：关掉连接本身是无害的——v3 无状态，v4 会话也不随连接
+消失（隐式重新绑定，见 B1(b)）。但**v4 的回传通道就搭在某条连接上**：回收一个持有读委托的空闲
+客户端，CB_RECALL 就得等它回来，期间只能走吊销期限。这个代价取决于部署形态（有没有开委托、
+客户端空闲多久），不该由服务器替运维决定。本条真正的 DoS 面由 (a) 恒开地堵住，(b) 是给
+"连接被囤积"这种场景的开关。文档里写明了这个取舍。
+
+- 指标 `lightnfs_conns_idle_reaped_total`；每次回收打一条带空闲秒数的 info。
+- 回归测例四条：`RecordStream.EndlessEmptyFragmentsAreCapped`（喂 `kMaxFragments` 个零长片仍在
+  界内、第 1025 个才 EMSGSIZE——边界钉死）、`RecordStream.FragmentsBelowTheCapStillReassemble`
+  （9 片的正常记录照样重组，上限没挡住合法用法）、`Ctl.ConnRegistryReapsIdleConnections`
+  （0 = 关、超时长于空闲则不动、到期恰好回收 1 条且对端见 EOF、没登记时钟的条目永不回收）、
+  `Ctl.ConnIdleTimeoutConfigKey`（解析、显式 0、荒谬值被拒、默认 0）。
+- 反向验证：去掉分片上限后第一条测例**永远不 done**——正是"无限占用"本身；让回收器忽略截止
+  时间后第三条回收了 2 条而不是 0/1 条，把"截止时间真的在起作用"也钉住了。
 
 ### C2 v3 cookieverf 严格化的运营边界（已记为取舍）
 

@@ -58,6 +58,17 @@ struct ServerConfig {
     uint32_t max_request_size = (1u << 20) + (64u << 10);
     int inflight_per_conn = 64;
     int per_peer_limit = 128;
+    // Idle-connection reaper (followups/protocol-gaps.md C1): shut down a connection that
+    // has not delivered a complete record for this many seconds, the way knfsd's
+    // svc_age_temp_xprts does.  0 (the default) leaves it off.
+    //
+    // Off by default on purpose.  Closing the connection itself is harmless — v3 is
+    // stateless and a v4 session survives it — but a v4 client's *backchannel* rides one
+    // of these connections, so reaping an idle client that holds a read delegation delays
+    // CB_RECALL until it reconnects (the recall then waits out its revocation deadline).
+    // Operators exposed to connection-hoarding turn it on; the fragment-count cap in
+    // RecordStream, which is always on, is what closes the unbounded-hold DoS.
+    uint32_t conn_idle_timeout_s = 0;
     uint64_t drc_ttl_ms = 120000;
     uint64_t drc_mem = 64u << 20;
     bool enable_v4 = true;

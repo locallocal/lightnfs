@@ -9,6 +9,7 @@
 
 #include "core/boot_epoch.hpp"
 #include "server/cluster_store.hpp"
+#include "transport/connection.hpp"
 #include "util/log.hpp"
 
 namespace lnfs::server {
@@ -133,6 +134,24 @@ void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::Cluster
             done.set_value();
         }(&state, &lease_stop, std::move(exited)),
         runtime.reactor(runtime.reactor_count() - 1));
+    // Idle-connection reaper (followups/protocol-gaps.md C1), on the same auxiliary
+    // reactor.  Transport housekeeping, so it lives here rather than inside the lease
+    // scanner: ConnRegistry::kill_idle() only shuts the socket down, and the connection's
+    // own read loop then runs the normal drain-and-close path.  Shares lease_stop, so
+    // stop_lease_scanner() ends both; it is not joined because it holds no state anything
+    // else can outlive.
+    if (cfg.conn_idle_timeout_s != 0) {
+        rt::spawn(
+            [](std::atomic<bool>* stop, uint32_t idle) -> rt::Task<void> {
+                while (!stop->load(std::memory_order_relaxed)) {
+                    for (int slice = 0; slice < 10 && !stop->load(std::memory_order_relaxed); ++slice)
+                        co_await rt::sleep_for(std::chrono::milliseconds(100));
+                    if (stop->load(std::memory_order_relaxed)) break;
+                    transport::ConnRegistry::instance().kill_idle(std::chrono::seconds(idle));
+                }
+            }(&lease_stop, cfg.conn_idle_timeout_s),
+            runtime.reactor(runtime.reactor_count() - 1));
+    }
 }
 
 void ProtocolStack::stop_lease_scanner() {

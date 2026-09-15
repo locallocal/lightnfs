@@ -144,6 +144,40 @@ TEST(RecordStream, OversizeFragmentRejected) {
     EXPECT_EQ((int)res.error(), EMSGSIZE);
 }
 
+// followups/protocol-gaps.md C1: neither size cap bounds the *number* of fragments, and a
+// zero-length non-last fragment costs nothing against either -- so a client could park a
+// read coroutine indefinitely on 4-byte fragment headers.
+TEST(RecordStream, EndlessEmptyFragmentsAreCapped) {
+    Fixture f;
+    f.start_read();
+    // Feed zero-length non-last fragment headers one at a time, as the attack would.
+    auto empty_header = frag("", /*last=*/false);
+    for (uint32_t i = 0; i < RecordStream::kMaxFragments; ++i) {
+        ASSERT_TRUE(!f.done);
+        f.feed(empty_header);
+    }
+    // kMaxFragments empty fragments are (absurdly) still inside the cap; the next one is
+    // not -- the boundary is pinned here on purpose.
+    ASSERT_TRUE(!f.done);
+    f.feed(empty_header);
+    ASSERT_TRUE(f.done);
+    EXPECT_FALSE(f.result.has_value());
+    EXPECT_EQ((int)f.result.error(), EMSGSIZE);
+}
+
+// The cap must not get in the way of a record that legitimately spans a few fragments.
+TEST(RecordStream, FragmentsBelowTheCapStillReassemble) {
+    Fixture f;
+    f.start_read();
+    for (uint32_t i = 0; i < 8; ++i) f.feed(frag("ab", /*last=*/false));
+    ASSERT_TRUE(!f.done);
+    f.feed(frag("end", /*last=*/true));
+    ASSERT_TRUE(f.done);
+    ASSERT_TRUE(f.result.has_value());
+    auto bytes = f.result->to_bytes();
+    EXPECT_STREQ(std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()), "ababababababababend");
+}
+
 TEST(RecordStream, WritePartialSendContinues) {
     Fixture f;
     xdr::XdrEnc enc(f.pool);

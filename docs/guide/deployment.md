@@ -86,6 +86,7 @@ sudo systemctl enable --now lightnfs
 | 保留端口 | `[[export]] secure_ports` | 默认 `true`（对齐 knfsd `secure`）：要求源端口 < 1024。容器 / `noresvport` / `lnfs_accept_client` 这类拿不到保留端口的客户端需置 `false`，见 §1 |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
 | 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` / `[export.lustre]` / `[export.cephfs]` | `local`（本机目录树）、`gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名）或 `lustre`（Lustre 客户端挂载内的目录：`mount`（默认自动探测）/`hsm`/`native_locks`/`identity`/`fd_cache`；非 Lustre 挂载启动即拒，写明 statfs magic 不符）或 `cephfs`（libcephfs 挂载：`conf`/`id`/`keyring`/`mon_host`/`fs_name`/`subdir`/`options`/`uuid`（多网关接管时回收的会话 uuid，默认 `<cluster id>-<fsid>`）；运行时加载 `libcephfs.so.2`，缺库启动失败并写明；`path` 只是挂载名） |
+| 空闲连接回收 | `[server] conn_idle_timeout` | 秒；**默认 0（关）**。超过该时长没收到完整 RPC 记录的连接会被 shutdown（对齐 knfsd 的 `svc_age_temp_xprts`）。关连接本身无害（v3 无状态、v4 会话不丢），但 v4 回传通道就搭在连接上——回收一个持读委托的空闲客户端会让 CB_RECALL 等到它回来。分片数上限（`RecordStream::kMaxFragments`，恒开、无需配置）才是堵住「无限占用」那条路的 |
 | 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |
 | 传输加密 | `[tls] mode` / `cert` / `key` / `ca` / `client_cert` | RPC-over-TLS（RFC 9289）：off/optional/required + 证书；改动需重启 |
 | 租约 | `[protocol] lease` | v4.1 租约（默认 90s） |
