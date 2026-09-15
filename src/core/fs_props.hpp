@@ -22,6 +22,11 @@ struct FsProps {
     // kNativeAccess: the backend's access()/open() are authoritative (storage-side ACLs
     // under the caller's identity); the engines skip their own pre-flight checks.
     bool native_access = false;
+    // kStableHandles: ObjIds survive a restart, so the filehandles built from them do
+    // too.  Drives the v4 fh_expire_type attribute — a backend without it (the local
+    // backend's path fallback, when name_to_handle_at is unavailable) must be advertised
+    // as volatile rather than persistent (followups/protocol-gaps.md B5).
+    bool stable_handles = false;
     // Fixed for every backend this server fronts (design 05): one root, names kept as
     // given, long names rejected rather than truncated, chown needs privilege, times are
     // settable.

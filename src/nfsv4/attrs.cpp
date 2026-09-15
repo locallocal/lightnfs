@@ -162,8 +162,12 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
 
     if (ok(kSupportedAttrs)) supported_attrs(src.referrals).encode(vals);
     if (ok(kType)) vals.u32(static_cast<uint32_t>(a.type));
-    // FH4_PERSISTENT
-    if (ok(kFhExpireType)) vals.u32(0);
+    // fh_expire_type: FH4_PERSISTENT only when the backend really has persistent handles.
+    // Claiming it for a backend without kStableHandles told the client it need not be
+    // prepared to recover from an expired handle, while a restart invalidated every one of
+    // them (followups/protocol-gaps.md B5).  The synthesized tree (null fs) is persistent:
+    // its node ids are path hashes.
+    if (ok(kFhExpireType)) vals.u32(!src.fs || src.fs->stable_handles ? kFhPersistent : kFhVolatileAny);
     if (ok(kChange)) vals.u64(a.change);
     if (ok(kSize)) vals.u64(a.size);
     if (ok(kLinkSupport)) vals.boolean(fs.link_support);

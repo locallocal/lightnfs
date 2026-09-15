@@ -411,7 +411,9 @@ pending a target cluster and v4 open/deny state stays per gateway.
 - Single gateway: v4 state lives in process memory plus the on-disk reclaim list; no
   state sharing between gateways.
 - Handle stability in `handles = "auto"` fallback mode depends on the filesystem
-  (documented; use kernel handles with `CAP_DAC_READ_SEARCH` in production).
+  (documented; use kernel handles with `CAP_DAC_READ_SEARCH` in production).  In that mode
+  v4 advertises `fh_expire_type = FH4_VOLATILE_ANY` rather than claiming persistence, so
+  clients know to be ready to recover a handle.
 
 ## Documentation index
 

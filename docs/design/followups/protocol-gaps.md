@@ -29,7 +29,7 @@
 | B2 | B | `core/config.cpp:1089` | `squash = root` 只压 uid，不压 gid 0 与附加组 0 | 组 root 可写的文件仍可被写**——已修复** |
 | B3 | B | 全路径缺失 | 无特权源端口（"secure"）检查 | 受信主机上的**普通用户**即可声称任意 uid**——已修复（新增 `secure_ports`，默认 true）** |
 | B4 | B | `rpc/drc.hpp:39` | DRC 键含源端口 | 跨重连的重传 miss → 非幂等过程重放（REMOVE 回 NOENT 等）**——已修复** |
-| B5 | B | `nfsv4/attrs.cpp:133` | `fh_expire_type` 恒为 FH4_PERSISTENT，无视 `kStableHandles` | fallback 句柄模式下向客户端谎报句柄永久有效 |
+| B5 | B | `nfsv4/attrs.cpp:133` | `fh_expire_type` 恒为 FH4_PERSISTENT，无视 `kStableHandles` | fallback 句柄模式下向客户端谎报句柄永久有效**——已修复** |
 | B6 | B | `nfsv3/engine.cpp:584` | v3 FSINFO 不宣告 FSF3_CANSETTIME | 看 properties 的客户端不用 SET_TO_CLIENT_TIME |
 | B7 | B | `nfsv3/engine.hpp`（无 StateMgr） | v3 的写/删/改名不召回 v4 读委托 | v4 客户端**无限期**读到缓存旧内容 |
 | B8 | B | 见正文清单 | 7 条较小的一致性偏差 | 各条见正文 |
@@ -457,7 +457,7 @@ knfsd 的 DRC 用 `rpc_cmp_addr()`，**只比地址不比端口**，就是为了
   把端口加回键里后该测例失败 5 处，关键两条是 `replays: 0 vs 1` 与 `inserts: 2 vs 1`——
   重连的重传 miss 了缓存并重新执行了一次。
 
-### B5 `fh_expire_type` 恒为 FH4_PERSISTENT
+### B5 `fh_expire_type` 恒为 FH4_PERSISTENT（已修复）
 
 ```
 // nfsv4/attrs.cpp:132-133
@@ -480,6 +480,29 @@ FH4_VOLATILE_ANY 正是为这个场景存在的）。
 `stable_handles`（`fs_props()` 里从 `Cap::kStableHandles` 取，与 `native_change` /
 `native_access` 同一写法），`fh_expire_type` 按它选 `0` / `0x2`。伪根恒为
 FH4_PERSISTENT（路径哈希 id，稳定）。
+
+**已修复**（本轮）：
+- `FsProps` 加 `stable_handles`，`fs_props()` 从 `Cap::kStableHandles` 取（与 `native_change` /
+  `native_access` 同一写法）；`attrs.hpp` 加 `kFhPersistent` / `kFhVolatileAny` 两个值。
+- 编码改成 `!src.fs || src.fs->stable_handles ? kFhPersistent : kFhVolatileAny`。**伪根必须
+  显式走 persistent 那一支**——它的 `src.fs` 是空指针、会落到默认构造的 `FsProps`（
+  `stable_handles = false`），但它的节点 id 是路径哈希、本来就稳定。这和相邻的
+  `kChangeAttrType` 用 `!src.fs` 判伪根是同一个写法。
+- **没有**加 `FH4_NOEXPIRE_WITH_OPEN`(0x1)：local 后端的路径回退模式下，文件被改名就会让句柄
+  失效，不管有没有打开——宣告它会是另一个谎。
+- 回归测例两条：`Nfs4.FhExpireTypeFollowsStableHandles`（直接对编码器断言三种情形：
+  `stable_handles = true` → PERSISTENT、`false` → VOLATILE_ANY、`fs == nullptr`（伪根）→
+  PERSISTENT）与 `Nfs4.FhExpireTypeOverTheWire`（走真实 GETATTR，并断言
+  `fs_props(memory backend).stable_handles` 确实为真——memory 后端宣告了该能力位，所以导出侧
+  回 PERSISTENT，把「派生」和「编码」两段都钉住）。
+  改回硬编码 0 之后只有 VOLATILE 那条失败（`0 vs 2`），两条 PERSISTENT 断言仍通过——说明修复
+  只动了该动的那一种情形。
+- README 的「已知限制」里那条句柄稳定性也补了一句：回退模式下 v4 宣告 FH4_VOLATILE_ANY。
+
+**留下的半条（独立项）**：句柄失效时我们回的是 NFS4ERR_STALE，而 RFC 8881 §4.2.3 对 volatile
+句柄期望的是 **NFS4ERR_FHEXPIRED**。要改得让 errmap 知道「这个导出是不是 volatile」，比本条大
+一档；而且 Linux 客户端对 STALE 本来就有恢复路径，所以现状不比之前差——之前是**既谎报
+persistent 又回 STALE**，现在至少宣告是诚实的。**决定：本轮不做，记在此处。**
 
 ### B6 v3 FSINFO 不宣告 FSF3_CANSETTIME
 
@@ -624,7 +647,7 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 2. ~~**A5**、**B1**~~ —— 跨客户端的状态隔离，两条都收口了：A5 补上 stateid 属主检查，
    B1 让 sessionid 不可推。B1 里「stateid 加随机量」与「SEQUENCE 严格连接绑定」两项复核后
    **判定为不做**（理由见 B1 正文）。
-3. ~~**A3**、**C5**、**A4**~~（均已修复，见上）、**B6**、**B5** —— 错误码与属性宣告的一致性。
+3. ~~**A3**、**C5**、**A4**、**B5**~~（均已修复，见上）、**B6** —— 错误码与属性宣告的一致性。
    `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
    剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
 4. ~~**B2**、**B3**~~ —— 身份压缩与源端口，均已修复；两条都动了安全默认值，文档与配置样例已同步。
