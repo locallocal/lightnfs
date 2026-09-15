@@ -20,7 +20,7 @@
 
 | # | 级 | 位置 | 问题 | 客户端可见后果 |
 |---|----|------|------|----------------|
-| A1 | A | `nfsv4/attrs.cpp:57,102` | GETATTR 请求只写属性 `time_access_set`/`time_modify_set` 时，attrmask 置位但 attrlist 不带值 | fattr4 自相矛盾，客户端 XDR 解析失败（Linux → EIO） |
+| A1 | A | `nfsv4/attrs.cpp:57,102` | GETATTR 请求只写属性 `time_access_set`/`time_modify_set` 时，attrmask 置位但 attrlist 不带值 | fattr4 自相矛盾，客户端 XDR 解析失败（Linux → EIO）**——已修复** |
 | A2 | A | `nfsv4/attrs.cpp:196` | `fs_locations_info`(67) 编码在 `mounted_on_fileid`(55) 之前，违反属性升序 | referral 探测时属性错位解析（仅 active-active） |
 | A3 | A | `nfsv3/nfs3_types.cpp:20,200`、`mountd/mount3.cpp:114` | v3 名字 >255B、symlink 目标 >1024B、MNT 路径 >1024B 一律 RPC GARBAGE_ARGS | 应为 NFS3ERR_NAMETOOLONG；`ln -s <1KB+ 目标>` 在 v3 上直接 EIO |
 | A4 | A | `nfsv4/engine.cpp:789` 等 | v4 名字 256B → BADNAME，≥257B → BADXDR | 应为 NFS4ERR_NAMETOOLONG；`errmap` 白名单里的 NAMETOOLONG 无路径可达 |
@@ -39,7 +39,7 @@
 
 ## A. 会产生错误码错误或畸形回复
 
-### A1 GETATTR 拿只写属性 → 畸形 fattr4
+### A1 GETATTR 拿只写属性 → 畸形 fattr4（已修复）
 
 `supported_attrs()` 把 `time_access_set`(48) 与 `time_modify_set`(54) 也放进了集合
 （`src/nfsv4/attrs.cpp:57-58`）。这本身没错——它们对 SETATTR 确实支持。问题是
@@ -63,6 +63,19 @@ RFC 8881 §18.7.3 的口径是：GETATTR 请求只写属性应答 **NFS4ERR_INVA
 **修法**：`op_getattr` / `op_readdir` / `op_verify` 入口判断 `wanted` 是否命中
 {48, 54}，命中回 INVAL；同时在 `encode_fattr` 里把这两位从 `actual` 中剔除做兜底
 （防御纵深，也让未来新增只写属性不再复发）。`supported_attrs()` 不要动。
+
+**已修复**（本轮）：
+- `nfsv4/attrs.cpp` 新增 `write_only_attrs()` / `wants_write_only()`，`encode_fattr` 的
+  `actual` 掩码里再 `& ~write_only`，从编码器层保证 attrmask 与 attrlist 永远一致；
+- `op_getattr`、`op_readdir` 在解出掩码后命中即回 INVAL，`op_verify`/`op_nverify` 的
+  逐位循环里与 `rdattr_error` 同一支处理；
+- `supported_attrs()` 与 `settable_attrs()` **未动**——SETATTR 侧行为不变；
+- 回归测例：`Nfs4.WriteOnlyAttrsAreNotReadable`（GETATTR 单独/混合请求、READDIR、
+  VERIFY/NVERIFY 各一条，另断言 `supported_attrs` 仍宣告这两位、SETATTR 仍能设
+  `time_modify_set`）与 `Nfs4.EncodeFattrNeverEmitsValuelessAttrs`（编码器层不变式：
+  attrmask 不含无值位、attrlist 长度恰等于各值之和且被读尽）。
+  撤掉修复后两条测例分别 7 / 2 处失败——修复前 VERIFY 回 NOT_SAME、NVERIFY 回 OK，
+  即"拿截断的 attrlist 做了一次错误比较"，比单纯解析失败更隐蔽。
 
 ### A2 `fs_locations_info` 破坏属性升序
 
@@ -424,7 +437,7 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 
 ## 建议的修复顺序
 
-1. **A1、A2** —— 畸形回复，各几行，且 A1 是构造请求即可触发的。
+1. ~~**A1**~~（已修复，见上）、**A2** —— 畸形回复，各几行。
 2. **A5、B1** —— 跨客户端的状态隔离。B1 的两个子项独立，可分别落。
 3. **A3、A4、C5、B6、B5** —— 错误码与属性宣告的一致性，一次改动可以一起收
    （`check_component` 的 `kTooLong` 打通到两个引擎 + 两个属性位）。
@@ -435,7 +448,8 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 
 ## 验证建议
 
-- **A1 / A2 / A4**：pynfs 4.1 的 GETATTR / 属性组能覆盖 A1 与 A4；A2 需要一个 referrals
+- **A2 / A4**（A1 已由 `Nfs4.WriteOnlyAttrsAreNotReadable` 与
+  `Nfs4.EncodeFattrNeverEmitsValuelessAttrs` 覆盖）：pynfs 4.1 的 GETATTR / 属性组能覆盖 A4；A2 需要一个 referrals
   开启的用例（`[cluster] mode = active-active`），或者像本次审计一样在
   `tests/test_nfs4.cpp` 里直接对 `encode_fattr` 断言"属性号严格升序 + attrlist 长度等于各
   属性值长度之和"——后者是能一次性守住整类问题的不变式，建议常态化。

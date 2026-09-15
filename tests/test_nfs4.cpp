@@ -1231,6 +1231,148 @@ TEST(Nfs4, SetattrSizeModeOwner) {
     EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
 }
 
+// followups/protocol-gaps.md A1: time_access_set(48) / time_modify_set(54) are settable
+// but have no readable value.  They stay in supported_attrs() — SETATTR does support
+// them — while every read path answers NFS4ERR_INVAL instead of putting a value-less bit
+// into the attrmask (which made attrmask and attrlist disagree: unparsable fattr4).
+TEST(Nfs4, WriteOnlyAttrsAreNotReadable) {
+    using nfsv4::attr::kSize;
+    using nfsv4::attr::kSupportedAttrs;
+    using nfsv4::attr::kTimeAccessSet;
+    using nfsv4::attr::kTimeModifySet;
+    V4Fixture f;
+    f.establish_session();
+    auto dir_fh = f.path_fh({"export", "data"});
+    auto o = do_open(f, dir_fh, "hello", 3, 0, "owner-wo");
+    ASSERT_TRUE(o.status == 0);
+
+    auto getattr = [&](std::initializer_list<uint32_t> bits) {
+        return dir_op(f, o.fh, Op::kGetattr, [&](xdr::XdrEnc& e) {
+            nfsv4::Bitmap want;
+            for (uint32_t b : bits) want.set(b);
+            want.encode(e);
+        });
+    };
+    // Asked for on its own, or alongside a readable attribute: INVAL either way.
+    EXPECT_EQ(getattr({kTimeAccessSet}).status, stv(Status::kInval));
+    EXPECT_EQ(getattr({kTimeModifySet}).status, stv(Status::kInval));
+    EXPECT_EQ(getattr({kSize, kTimeAccessSet}).status, stv(Status::kInval));
+    EXPECT_EQ(getattr({kSize, kTimeModifySet}).status, stv(Status::kInval));
+
+    // The readable neighbour still answers, and attrmask/attrlist agree: one attribute,
+    // one 8-byte value, attrlist fully consumed.
+    auto ok = getattr({kSize});
+    ASSERT_TRUE(ok.status == 0);
+    V4Fixture::expect_op(ok.reply.dec, Op::kSequence, 0);
+    (void)ok.reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(ok.reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(ok.reply.dec, Op::kGetattr, 0);
+    auto mask = nfsv4::Bitmap::decode(ok.reply.dec);
+    ASSERT_TRUE(mask.has_value());
+    EXPECT_TRUE(mask->test(kSize));
+    EXPECT_FALSE(mask->test(kTimeAccessSet));
+    EXPECT_FALSE(mask->test(kTimeModifySet));
+    EXPECT_EQ(*ok.reply.dec.u32(), 8u);
+
+    // READDIR carries the same attribute mask per entry (RFC 8881 §18.23.3).
+    auto readdir = dir_op(f, dir_fh, Op::kReaddir, [&](xdr::XdrEnc& e) {
+        e.u64(0);
+        std::array<std::byte, 8> verf{};
+        e.opaque_fixed(verf);
+        e.u32(4096);
+        e.u32(4096);
+        nfsv4::Bitmap want;
+        want.set(kSize);
+        want.set(kTimeModifySet);
+        want.encode(e);
+    });
+    EXPECT_EQ(readdir.status, stv(Status::kInval));
+
+    // VERIFY / NVERIFY have nothing to compare against (§18.31.3 / §18.15.3).
+    auto verify_op = [&](Op op) {
+        return dir_op(f, o.fh, op, [&](xdr::XdrEnc& e) {
+            nfsv4::Bitmap mask_in;
+            mask_in.set(kTimeModifySet);
+            mask_in.encode(e);
+            xdr::XdrEnc vals(f.pool);
+            // SET_TO_SERVER_TIME4
+            vals.u32(0);
+            auto bytes = vals.take().to_bytes();
+            e.opaque(bytes);
+        });
+    };
+    EXPECT_EQ(verify_op(Op::kVerify).status, stv(Status::kInval));
+    EXPECT_EQ(verify_op(Op::kNverify).status, stv(Status::kInval));
+
+    // Still advertised as supported, and still settable: the fix must not shrink
+    // supported_attrs() or break the SETATTR path.
+    EXPECT_TRUE(nfsv4::supported_attrs().test(kTimeAccessSet));
+    EXPECT_TRUE(nfsv4::supported_attrs().test(kTimeModifySet));
+    auto sup = getattr({kSupportedAttrs});
+    ASSERT_TRUE(sup.status == 0);
+    V4Fixture::expect_op(sup.reply.dec, Op::kSequence, 0);
+    (void)sup.reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(sup.reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(sup.reply.dec, Op::kGetattr, 0);
+    (void)nfsv4::Bitmap::decode(sup.reply.dec);
+    (void)sup.reply.dec.u32();
+    auto advertised = nfsv4::Bitmap::decode(sup.reply.dec);
+    ASSERT_TRUE(advertised.has_value());
+    EXPECT_TRUE(advertised->test(kTimeAccessSet));
+    EXPECT_TRUE(advertised->test(kTimeModifySet));
+
+    auto set = dir_op(f, o.fh, Op::kSetattr, [&](xdr::XdrEnc& e) {
+        o.stateid.encode(e);
+        nfsv4::Bitmap mask_in;
+        mask_in.set(kTimeModifySet);
+        mask_in.encode(e);
+        xdr::XdrEnc vals(f.pool);
+        // SET_TO_CLIENT_TIME4
+        vals.u32(1);
+        vals.u64(1234567);
+        vals.u32(89);
+        auto bytes = vals.take().to_bytes();
+        e.opaque(bytes);
+    });
+    EXPECT_EQ(set.status, 0u);
+    EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+}
+
+// The encoder-level invariant behind A1: whatever a caller asks for, the attrmask the
+// encoder emits and the attrlist behind it must describe the same attributes.
+TEST(Nfs4, EncodeFattrNeverEmitsValuelessAttrs) {
+    rt::BufferPool pool;
+    xdr::XdrEnc enc(pool);
+    backend::Attr a;
+    a.type = backend::FType::kReg;
+    a.size = 42;
+    a.fileid = 7;
+    core::FsProps fs;
+    nfsv4::AttrSource src;
+    src.attr = &a;
+    src.fsid = 23;
+    src.fs = &fs;
+    nfsv4::Bitmap want;
+    want.set(nfsv4::attr::kSize);
+    want.set(nfsv4::attr::kTimeAccessSet);
+    want.set(nfsv4::attr::kTimeModifySet);
+    nfsv4::encode_fattr(enc, want, src);
+
+    auto bytes = enc.take().to_bytes();
+    xdr::XdrDec dec(std::span<const std::byte>(bytes.data(), bytes.size()));
+    auto mask = nfsv4::Bitmap::decode(dec);
+    ASSERT_TRUE(mask.has_value());
+    EXPECT_FALSE(mask->test(nfsv4::attr::kTimeAccessSet));
+    EXPECT_FALSE(mask->test(nfsv4::attr::kTimeModifySet));
+    EXPECT_TRUE(mask->test(nfsv4::attr::kSize));
+    // attrlist holds exactly the one u64 the mask promises.
+    auto len = dec.u32();
+    ASSERT_TRUE(len.has_value());
+    EXPECT_EQ(*len, 8u);
+    EXPECT_EQ(*dec.u64(), 42u);
+    EXPECT_TRUE(dec.at_end());
+}
+
 TEST(Nfs4, NamespaceOpsCreateRemoveRenameLink) {
     V4Fixture f;
     f.establish_session();

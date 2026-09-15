@@ -68,6 +68,14 @@ Status decode_settable_fattr(xdr::XdrDec& dec, backend::SetAttr& out, Bitmap& se
 // The settable subset of supported_attrs() (size/mode/owner/owner_group/time_*_set).
 const Bitmap& settable_attrs();
 
+// The write-only subset of supported_attrs(): time_access_set / time_modify_set exist for
+// SETATTR and have no readable value, so a read of them cannot be answered (RFC 8881
+// §5.1).  They stay in supported_attrs() — the server does support setting them.
+const Bitmap& write_only_attrs();
+// True if the mask asks for any of them: the read paths (GETATTR / READDIR / VERIFY /
+// NVERIFY) answer NFS4ERR_INVAL instead of encoding a value-less attribute.
+bool wants_write_only(const Bitmap& wanted);
+
 // True if the mask requests attrs that need a statfs() prefetch.
 bool wants_stats(const Bitmap& wanted);
 

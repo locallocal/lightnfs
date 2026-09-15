@@ -1088,6 +1088,12 @@ rt::Task<uint32_t> Engine::op_getattr(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
         enc.u32(st(Status::kNofilehandle));
         co_return st(Status::kNofilehandle);
     }
+    // time_access_set / time_modify_set are settable but have no readable value
+    // (RFC 8881 §5.1 / §18.7.3): INVAL, not a value-less attrmask bit.
+    if (wants_write_only(*wanted)) {
+        enc.u32(st(Status::kInval));
+        co_return st(Status::kInval);
+    }
     // an absent export answers its referral attributes (plan 12 B3)
     if (referrals_) {
         auto decoded = handles_.decode_v4(ctx.cfh, ctx.conn.peer.addr, *ctx.set);
@@ -1428,6 +1434,11 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     if (*cookie == 1 || *cookie == 2) {
         enc.u32(st(Status::kBadCookie));
         co_return st(Status::kBadCookie);
+    }
+    // No readable value for the write-only attributes (RFC 8881 §18.23.3).
+    if (wants_write_only(*wanted)) {
+        enc.u32(st(Status::kInval));
+        co_return st(Status::kInval);
     }
     auto resolved = co_await resolve(ctx, ctx.cfh);
     if (!resolved) {
@@ -2354,8 +2365,9 @@ rt::Task<uint32_t> Engine::op_verify(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
     const Bitmap& sup = supported_attrs(referrals_);
     for (uint32_t bit = 0; bit < 96; ++bit) {
         if (!mask->test(bit)) continue;
-        // never meaningful in a VERIFY
-        if (bit == attr::kRdattrError) {
+        // rdattr_error is never meaningful in a VERIFY; the write-only attributes have no
+        // readable value to compare against (RFC 8881 §18.31.3 / §18.15.3).
+        if (bit == attr::kRdattrError || write_only_attrs().test(bit)) {
             enc.u32(st(Status::kInval));
             co_return st(Status::kInval);
         }
