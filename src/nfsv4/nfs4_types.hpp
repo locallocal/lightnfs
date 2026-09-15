@@ -24,7 +24,7 @@ inline constexpr uint32_t kLeaseSeconds = 90;
 // component4 and linktext4 are utf8str_cs — `string<>` on the wire (RFC 8881 §3.2):
 // their length limits are the filesystem's (the maxname attribute, PATH_MAX), not XDR.
 // An over-long component therefore has to decode and answer NFS4ERR_NAMETOOLONG rather
-// than NFS4ERR_BADXDR (followups/protocol-gaps.md A4).  These two are pure DoS ceilings:
+// than NFS4ERR_BADXDR (followups/protocol-conformance-followups.md A4).  These two are pure DoS ceilings:
 // inside them a request is decoded and answered, beyond them it does not name anything a
 // filesystem could hold.  The component limit itself is per export — the backend's
 // limits().max_name, which is what the maxname attribute advertises.
@@ -224,7 +224,7 @@ struct Bitmap {
     // anything this server knows about.  A read (GETATTR / READDIR) simply does not return
     // them, which is what RFC 8881 says to do with unsupported attributes; a write
     // (SETATTR / CREATE / OPEN) must answer ATTRNOTSUPP instead of silently not setting
-    // them (followups/protocol-gaps.md B8).
+    // them (followups/protocol-conformance-followups.md B8).
     bool beyond_known = false;
 
     bool test(uint32_t bit) const {

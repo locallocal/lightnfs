@@ -480,7 +480,7 @@ TEST(WritePath, DrcReplaysIdenticalReply) {
     EXPECT_EQ(*dec4.u32(), 17u);
 }
 
-// followups/protocol-gaps.md B4: the DRC key used to include the source port, so the one
+// followups/protocol-conformance-followups.md B4: the DRC key used to include the source port, so the one
 // case the cache exists for -- a client that lost its connection and resends the same xid
 // -- missed it and re-executed the non-idempotent procedure.  The successful mkdir then
 // came back as EEXIST, the successful remove as NOENT.

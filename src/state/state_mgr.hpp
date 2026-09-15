@@ -385,7 +385,7 @@ class StateMgr {
     // Cheap "is any delegation outstanding at all" probe (one relaxed counter read).
     // The v3 engine checks it before the extra lookup its recall gate needs, so the
     // gate costs nothing in the common case — and nothing at all with delegations
-    // disabled (followups/protocol-gaps.md B7).
+    // disabled (followups/protocol-conformance-followups.md B7).
     bool any_delegations() const { return deleg_count_.load(std::memory_order_relaxed) > 0; }
     // CLAIM_DELEG_CUR_FH: the stateid must be this client's delegation on this file.
     rt::Task<uint32_t> check_deleg_claim(const Stateid& sid, uint64_t clientid, uint32_t fsid,
@@ -424,7 +424,7 @@ class StateMgr {
     // Returns the post-close stateid in `out`.
     // The file a current filehandle names.  CLOSE, OPEN_DOWNGRADE and LOCKU operate on
     // the current filehandle, so a stateid naming a different file is BAD_STATEID rather
-    // than something to act on (followups/protocol-gaps.md B8; knfsd checks the same thing
+    // than something to act on (followups/protocol-conformance-followups.md B8; knfsd checks the same thing
     // in nfs4_preprocess_seqid_op).  Optional so the expiry/reclaim paths, which have no
     // filehandle and mean to drop state wherever it lives, stay as they were.
     struct FileRef {
@@ -439,7 +439,7 @@ class StateMgr {
                                       Stateid* out, const FileRef* expect = nullptr);
     // FREE_STATEID (RFC 8881 §18.38): releases a lock stateid whose ranges are all gone.
     // `clientid` is the caller's own — a stateid belonging to anyone else answers
-    // BAD_STATEID (followups/protocol-gaps.md A5).  There is no owner-less form: an
+    // BAD_STATEID (followups/protocol-conformance-followups.md A5).  There is no owner-less form: an
     // internal caller that means to drop state regardless goes through unlink_state().
     rt::Task<uint32_t> free_stateid(const Stateid& sid, uint64_t clientid);
 

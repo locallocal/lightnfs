@@ -1233,7 +1233,7 @@ TEST(Nfs4, SetattrSizeModeOwner) {
     EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
 }
 
-// followups/protocol-gaps.md A1: time_access_set(48) / time_modify_set(54) are settable
+// followups/protocol-conformance-followups.md A1: time_access_set(48) / time_modify_set(54) are settable
 // but have no readable value.  They stay in supported_attrs() — SETATTR does support
 // them — while every read path answers NFS4ERR_INVAL instead of putting a value-less bit
 // into the attrmask (which made attrmask and attrlist disagree: unparsable fattr4).
@@ -1342,7 +1342,7 @@ TEST(Nfs4, WriteOnlyAttrsAreNotReadable) {
 
 // The encoder-level invariant behind A1: whatever a caller asks for, the attrmask the
 // encoder emits and the attrlist behind it must describe the same attributes.
-// followups/protocol-gaps.md B5: fh_expire_type was hardcoded FH4_PERSISTENT.  A backend
+// followups/protocol-conformance-followups.md B5: fh_expire_type was hardcoded FH4_PERSISTENT.  A backend
 // without kStableHandles -- the local backend's path fallback, taken when
 // name_to_handle_at is unavailable -- hands out handles that do not survive a restart, and
 // claiming persistence told the client it need not be prepared to recover.
@@ -1442,7 +1442,7 @@ TEST(Nfs4, EncodeFattrNeverEmitsValuelessAttrs) {
     EXPECT_TRUE(dec.at_end());
 }
 
-// followups/protocol-gaps.md A2: fattr4 values must follow the attrmask in ascending
+// followups/protocol-conformance-followups.md A2: fattr4 values must follow the attrmask in ascending
 // attribute order.  fs_locations_info(67) used to be encoded ahead of
 // mounted_on_fileid(55), which only misparsed when a client asked for both -- exactly
 // what a Linux referral probe does.
@@ -1796,7 +1796,7 @@ TEST(Nfs4, NamespaceOpsCreateRemoveRenameLink) {
     EXPECT_EQ(dir_op(f, root_fh, Op::kRemove, [&](xdr::XdrEnc& e) { e.string("export"); }).status, stv(Status::kRofs));
 }
 
-// followups/protocol-gaps.md A4: component4 is utf8str_cs, `string<>` on the wire, so a
+// followups/protocol-conformance-followups.md A4: component4 is utf8str_cs, `string<>` on the wire, so a
 // component longer than the filesystem's maxname has to come back as
 // NFS4ERR_NAMETOOLONG -- not BADNAME (which is "this name is not acceptable") and not
 // BADXDR (which blames the encoding).
@@ -1936,7 +1936,7 @@ TEST(Nfs4, LongSymlinkTargetIsAccepted) {
     EXPECT_EQ(huge.status, stv(Status::kBadxdr));
 }
 
-// followups/protocol-gaps.md B8, the state half: CLOSE / OPEN_DOWNGRADE / LOCKU act on
+// followups/protocol-conformance-followups.md B8, the state half: CLOSE / OPEN_DOWNGRADE / LOCKU act on
 // the current filehandle, so a stateid belonging to a different file is BAD_STATEID
 // (knfsd checks the same thing in nfs4_preprocess_seqid_op).  They used to act on
 // whatever the stateid named and ignore the filehandle entirely.
@@ -2650,10 +2650,10 @@ CopyRes do_copy(V4Fixture& f, const std::vector<std::byte>& src, const nfsv4::St
 
 }  // namespace
 
-// followups/protocol-gaps.md A5: FREE_STATEID took no clientid, so any session could
+// followups/protocol-conformance-followups.md A5: FREE_STATEID took no clientid, so any session could
 // free any other client's lock stateid -- and `other` is a bare counter (B1), so they are
 // walkable.  The victim's next LOCK/LOCKU then fails with BAD_STATEID.
-// followups/protocol-gaps.md B1: the sessionid used to be
+// followups/protocol-conformance-followups.md B1: the sessionid used to be
 // clientid(8) | counter(4) | boot_epoch(4) -- derivable from two small counters, so one
 // client could guess another's sessionid and drive its session (ctx.clientid comes back
 // out of the id, so the stateid ownership checks pass too).  The last four bytes are now
@@ -3371,7 +3371,7 @@ uint32_t do_delegreturn(V4Fixture& f, const std::vector<std::byte>& fh, const nf
 
 // CREATE_SESSION with CONN_BACK_CHAN binds the channel; a read-only OPEN then earns a
 // read delegation whose stateid serves READ; DELEGRETURN hands it back.
-// followups/protocol-gaps.md B7: the v3 engine held no StateMgr, so a v3 mutation on a
+// followups/protocol-conformance-followups.md B7: the v3 engine held no StateMgr, so a v3 mutation on a
 // file a v4 client held a read delegation on recalled nothing -- that client kept serving
 // its cached copy indefinitely, with nothing to tell it otherwise.  This is worse than the
 // documented "v3 writes are not constrained by v4 share reservations" boundary: that one

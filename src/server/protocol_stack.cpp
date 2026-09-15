@@ -87,7 +87,7 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
     nfs3.set_write_verifier(core.active_active ? core::verifier_for_node(core.epoch, core.node)
                                                : core::verifier_from_epoch(core.epoch));
     nfs3.set_drc(&drc);
-    // v3 mutations recall v4 read delegations (followups/protocol-gaps.md B7).  Always
+    // v3 mutations recall v4 read delegations (followups/protocol-conformance-followups.md B7).  Always
     // wired: without v4, or with delegations off, no delegation is ever granted and the
     // gate is one relaxed atomic load.
     nfs3.set_state_mgr(&state);
@@ -134,7 +134,7 @@ void ProtocolStack::enable_v4(const core::ServerConfig& cfg, const core::Cluster
             done.set_value();
         }(&state, &lease_stop, std::move(exited)),
         runtime.reactor(runtime.reactor_count() - 1));
-    // Idle-connection reaper (followups/protocol-gaps.md C1), on the same auxiliary
+    // Idle-connection reaper (followups/protocol-conformance-followups.md C1), on the same auxiliary
     // reactor.  Transport housekeeping, so it lives here rather than inside the lease
     // scanner: ConnRegistry::kill_idle() only shuts the socket down, and the connection's
     // own read loop then runs the normal drain-and-close path.  Shares lease_stop, so

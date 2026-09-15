@@ -194,7 +194,7 @@ TEST(Ctl, OpsConfigKeys) {
     ASSERT_TRUE(parsed.has_value());
     EXPECT_STREQ(parsed->server.bind, "127.0.0.1");
     EXPECT_STREQ(parsed->server.log_file, "/var/log/lightnfs.log");
-    // followups/protocol-gaps.md C1: the idle reaper is off unless configured.
+    // followups/protocol-conformance-followups.md C1: the idle reaper is off unless configured.
     EXPECT_EQ(parsed->server.conn_idle_timeout_s, 0u);
     EXPECT_EQ(parsed->server.log_rotate_size, 10u << 20);
     EXPECT_EQ(parsed->server.log_rotate_keep, 3u);
@@ -710,7 +710,7 @@ TEST(Ctl, ConnRegistryListAndKill) {
     close(sv[1]);
 }
 
-// followups/protocol-gaps.md C1: connections had no idle bound at all, so a client could
+// followups/protocol-conformance-followups.md C1: connections had no idle bound at all, so a client could
 // hold one of the 4096 slots forever without ever completing a record.  kill_idle() is a
 // sweeper rather than a timeout around the recv: it only shuts the socket down, and the
 // connection's own read loop then runs the normal drain-and-close path -- a with_timeout
@@ -1884,7 +1884,7 @@ TEST(Ctl, ClusterExportCommands) {
                      "catalog v13 committed (was v12): export fsid=4 removed: added=- removed=4 disabled=- enabled=- "
                      "nodes_changed=- dynamic_changed=- rejected=-\n");
 
-        // followups/protocol-gaps.md B3: secure_ports has to survive the catalog round
+        // followups/protocol-conformance-followups.md B3: secure_ports has to survive the catalog round
         // trip -- ctl flag, emitted TOML, parsed back -- or turning it off for a container
         // export would silently come back on (to the secure default) at the next publish.
         // Last in this test on purpose: a commit here renumbers nothing above.

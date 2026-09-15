@@ -163,7 +163,7 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
     // A mount point is a directory.  Handing back the handle of a regular file let the
     // client mount it and then fail every lookup underneath, with nothing saying why;
     // MNT3ERR_NOTDIR is the answer RFC 1813 §5.2.1 has for it
-    // (followups/protocol-gaps.md B8).
+    // (followups/protocol-conformance-followups.md B8).
     if ((*obj)->type() != backend::FType::kDir) {
         enc.u32(static_cast<uint32_t>(MountStatus::kNotdir));
         co_await send(ctx, enc);

@@ -19,7 +19,7 @@ using nfsv4::Status;
 
 namespace {
 
-// Unguessable tail for a sessionid (followups/protocol-gaps.md B1).  getrandom() on a
+// Unguessable tail for a sessionid (followups/protocol-conformance-followups.md B1).  getrandom() on a
 // seeded pool does not block and CREATE_SESSION is a once-per-mount operation, so the
 // syscall is affordable here; a failure degrades to the monotonic counter rather than to
 // a predictable constant, and says so.

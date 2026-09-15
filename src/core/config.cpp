@@ -1057,7 +1057,7 @@ std::optional<std::chrono::steady_clock::time_point> ExportTable::oldest_retired
 // exports(5) `secure`, on by default: the source port must be a reserved one.  This is
 // what makes the AUTH_SYS trust model hold up — only a privileged process can bind below
 // 1024, so the credential comes from the client's kernel rather than from any user on the
-// host (followups/protocol-gaps.md B3).  A rejection is counted, and warned about once per
+// host (followups/protocol-conformance-followups.md B3).  A rejection is counted, and warned about once per
 // process so the first one names the port and the key to turn off instead of flooding.
 bool ExportTable::port_allowed(const sockaddr_storage& peer, const ExportEntry& entry) {
     if (!entry.secure_ports.load(std::memory_order_relaxed)) return true;
@@ -1148,7 +1148,7 @@ MappedCred ExportTable::squash_cred(const rpc::Cred& cred, const ExportEntry& en
     // nfsd_setuser): uid 0, gid 0, and every supplementary group 0 become anon.  Keying
     // the whole mapping off `uid == 0` left a request with uid=1000 and gid=0 — or with
     // group 0 in its list — holding group-root rights on a "squashed" export
-    // (followups/protocol-gaps.md B2).  Group 0 is replaced rather than dropped, so the
+    // (followups/protocol-conformance-followups.md B2).  Group 0 is replaced rather than dropped, so the
     // caller keeps the same number of groups it claimed.
     if (entry.squash == Squash::kRoot) {
         if (out.uid == 0) out.uid = entry.anon_uid;

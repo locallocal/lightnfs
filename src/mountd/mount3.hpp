@@ -11,7 +11,7 @@ inline constexpr uint32_t kVersion = 3;
 // dirpath is string<MNTPATHLEN> with MNTPATHLEN = 1024 (RFC 1813 §5.1.1).  Decoding
 // stops well past it so an over-long path answers MNT3ERR_NAMETOOLONG — the status the
 // protocol has for exactly this — instead of a bare GARBAGE_ARGS the client can only
-// read as EIO (followups/protocol-gaps.md A3).
+// read as EIO (followups/protocol-conformance-followups.md A3).
 inline constexpr uint32_t kMaxMountPath = 1024;
 inline constexpr uint32_t kMountPathWireMax = 8192;
 

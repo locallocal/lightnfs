@@ -61,7 +61,7 @@ bool utf8_component(std::string_view name) {
 
 // One verdict for a name component, shared by the MutateGuard path and the ops that
 // check a name themselves (LOOKUP / OPEN / SECINFO): over the filesystem's maxname is
-// NAMETOOLONG so the client's application sees ENAMETOOLONG (followups/protocol-gaps.md
+// NAMETOOLONG so the client's application sees ENAMETOOLONG (followups/protocol-conformance-followups.md
 // A4), zero-length is INVAL (RFC 8881 §18.10), and everything else — "." / ".." or a
 // component carrying '/' or NUL — is BADNAME.
 uint32_t name_status4(core::NameCheck check) {
@@ -1827,7 +1827,7 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
     // share_access is the access mode in the low two bits, the delegation-want hint in
     // 0xFF00, and two "signal/push when available" hints at 0x10000 / 0x20000 (RFC 8881
     // §18.16.3).  Anything outside those is undefined: INVAL, rather than silently masked
-    // away as if the client had not asked (followups/protocol-gaps.md B8).
+    // away as if the client had not asked (followups/protocol-conformance-followups.md B8).
     constexpr uint32_t kShareAccessDefined = 0x3 | 0xFF00 | 0x10000 | 0x20000;
     if (*share_access & ~kShareAccessDefined) {
         enc.u32(st(Status::kInval));
@@ -2523,7 +2523,7 @@ rt::Task<uint32_t> Engine::op_create(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& en
         co_return st(Status::kInval);
     }
     // linktext4 is unbounded on the wire; PATH_MAX is what the storage will take, and the
-    // v3 SYMLINK path answers the same way (followups/protocol-gaps.md A3/A4).
+    // v3 SYMLINK path answers the same way (followups/protocol-conformance-followups.md A3/A4).
     if (*type == kNf4Lnk && linkdata.size() > kMaxSymlink) {
         enc.u32(st(Status::kNametoolong));
         co_return st(Status::kNametoolong);
@@ -2887,7 +2887,7 @@ rt::Task<uint32_t> Engine::op_reclaim_complete(Ctx& ctx, xdr::XdrDec& dec, xdr::
     // filehandle, so there has to be one.  Accepted and otherwise ignored — only the
     // per-client flag is tracked, which is what the Linux client's rca_one_fs = FALSE
     // needs; per-fs reclaim tracking is recorded as an open item for the active-active
-    // per-fsid grace work (followups/protocol-gaps.md B8).
+    // per-fsid grace work (followups/protocol-conformance-followups.md B8).
     if (*one_fs) {
         if (ctx.cfh.empty()) {
             enc.u32(st(Status::kNofilehandle));

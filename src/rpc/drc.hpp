@@ -37,7 +37,7 @@ class Drc {
         // port.  Replaces the per-request inet_ntop + string hash/compare (plan doc 10
         // §2.4).
         //
-        // The port is deliberately not part of the identity (followups/protocol-gaps.md
+        // The port is deliberately not part of the identity (followups/protocol-conformance-followups.md
         // B4).  The case the DRC exists for is a client that lost its connection and
         // resends the same xid — and a reconnect means a new source port, so keying on it
         // missed exactly that case and re-executed the non-idempotent procedure: the

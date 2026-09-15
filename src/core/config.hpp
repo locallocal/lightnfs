@@ -58,7 +58,7 @@ struct ServerConfig {
     uint32_t max_request_size = (1u << 20) + (64u << 10);
     int inflight_per_conn = 64;
     int per_peer_limit = 128;
-    // Idle-connection reaper (followups/protocol-gaps.md C1): shut down a connection that
+    // Idle-connection reaper (followups/protocol-conformance-followups.md C1): shut down a connection that
     // has not delivered a complete record for this many seconds, the way knfsd's
     // svc_age_temp_xprts does.  0 (the default) leaves it off.
     //
@@ -137,10 +137,10 @@ struct ExportConfig {
     // (< 1024).  On by default, as in knfsd: AUTH_SYS trusts the client's kernel to put
     // the caller's real uid in the credential, and only a privileged process can bind a
     // reserved port — without this an unprivileged user on an allowed host can speak NFS
-    // directly and claim any uid (followups/protocol-gaps.md B3).  Turn it off per export
+    // directly and claim any uid (followups/protocol-conformance-followups.md B3).  Turn it off per export
     // for client populations that cannot get one (containers, `mount -o noresvport`).
     bool secure_ports = true;
-    // READDIR cookie verifier policy (followups/protocol-gaps.md C2).  Strict (the
+    // READDIR cookie verifier policy (followups/protocol-conformance-followups.md C2).  Strict (the
     // default) derives the verifier from the directory's change attribute, so a directory
     // modified between pages sends the client back to the start — no duplicated and no
     // missing entries, which is the guarantee design 04 §4.2 chose.  The cost is that a

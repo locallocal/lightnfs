@@ -120,7 +120,7 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
     const Bitmap& sup = supported_attrs(src.referrals);
     // Write-only attributes are dropped here as well as rejected by the read paths: an
     // attrmask bit with no value behind it makes attrmask and attrlist disagree, which no
-    // client can parse (followups/protocol-gaps.md A1).  One filter, two places, so a new
+    // client can parse (followups/protocol-conformance-followups.md A1).  One filter, two places, so a new
     // read path cannot reintroduce it.
     const Bitmap& wo = write_only_attrs();
     auto word = [](const Bitmap& b, uint32_t w) { return w < b.words.size() ? b.words[w] : 0u; };
@@ -151,7 +151,7 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
     // bit is set — which makes this the one place that can hold the ascending order
     // fattr4 requires.  A block moved to the wrong place trips the assert on the first
     // encode instead of shipping an attrlist the client parses into the wrong fields
-    // (followups/protocol-gaps.md A2: fs_locations_info(67) sat ahead of
+    // (followups/protocol-conformance-followups.md A2: fs_locations_info(67) sat ahead of
     // mounted_on_fileid(55) and only showed up when a client asked for both).
     int64_t last_id = -1;
     auto ok = [&](uint32_t id) {
@@ -165,7 +165,7 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
     // fh_expire_type: FH4_PERSISTENT only when the backend really has persistent handles.
     // Claiming it for a backend without kStableHandles told the client it need not be
     // prepared to recover from an expired handle, while a restart invalidated every one of
-    // them (followups/protocol-gaps.md B5).  The synthesized tree (null fs) is persistent:
+    // them (followups/protocol-conformance-followups.md B5).  The synthesized tree (null fs) is persistent:
     // its node ids are path hashes.
     if (ok(kFhExpireType)) vals.u32(!src.fs || src.fs->stable_handles ? kFhPersistent : kFhVolatileAny);
     if (ok(kChange)) vals.u64(a.change);

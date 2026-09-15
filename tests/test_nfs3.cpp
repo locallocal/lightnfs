@@ -238,12 +238,12 @@ TEST(Nfs3, ReaddirRejectsMismatchedCookieVerifier) {
     EXPECT_EQ(*result.u32(), (uint32_t)nfsv3::Status::kBadCookie);
 }
 
-// followups/protocol-gaps.md A3: filename3 / nfspath3 are string<> on the wire, so a
+// followups/protocol-conformance-followups.md A3: filename3 / nfspath3 are string<> on the wire, so a
 // name or path longer than the filesystem will take has to come back as
 // NFS3ERR_NAMETOOLONG (the client's ENAMETOOLONG), not as an RPC-level GARBAGE_ARGS that
 // the client can only turn into EIO.  C5 rides along: an unusable component in LOOKUP is
 // answered too, not rejected at the RPC layer.
-// followups/protocol-gaps.md B6: FSINFO's `properties` never carried FSF3_CANSETTIME,
+// followups/protocol-conformance-followups.md B6: FSINFO's `properties` never carried FSF3_CANSETTIME,
 // although v3 SETATTR does accept SET_TO_CLIENT_TIME and the v4 cansettime attribute
 // already said so.  Clients that read the bit (BSD / Solaris / macOS) fall back to
 // SET_TO_SERVER_TIME without it and lose the timestamps utimes() / tar -p are restoring.
@@ -298,7 +298,7 @@ TEST(Nfs3, FsinfoAdvertisesCanSetTime) {
     EXPECT_EQ(parsed->attrs.mtime.nsec, 89u);
 }
 
-// followups/protocol-gaps.md C3, first item: RFC 5531 §8.2 pairs an AUTH_SYS credential
+// followups/protocol-conformance-followups.md C3, first item: RFC 5531 §8.2 pairs an AUTH_SYS credential
 // with an AUTH_NONE verifier of zero length.  The verifier used to be ignored entirely,
 // so a mismatched flavor rode through unnoticed.
 TEST(Nfs3, AuthSysVerifierMustBeNull) {
@@ -541,7 +541,7 @@ TEST(Nfs3, LongSymlinkTargetIsAccepted) {
 }
 
 // A3, MOUNT side: MNT3ERR_NAMETOOLONG exists for exactly this.
-// followups/protocol-gaps.md B8: a mount point is a directory.  MNT used to hand back the
+// followups/protocol-conformance-followups.md B8: a mount point is a directory.  MNT used to hand back the
 // filehandle of whatever the path named, so mounting a path ending at a regular file
 // succeeded and then failed every lookup underneath with nothing saying why.
 TEST(Mount3, MntRefusesANonDirectory) {
@@ -713,7 +713,7 @@ TEST(Nfs3, ReaddirVerifierRoundTripAndChangeDetection) {
 // wire as NFS3ERR_JUKEBOX on READ (one of the two procedures the 08 §8.2 whitelist
 // admits it on; both are idempotent and never DRC-cached, so a retransmission always
 // re-executes) and the retry succeeds once the backend is ready.
-// followups/protocol-gaps.md C2: the strict cookie verifier buys "no duplicated and no
+// followups/protocol-conformance-followups.md C2: the strict cookie verifier buys "no duplicated and no
 // missing entries" at the price of restarting a listing whenever the directory changes.
 // On a directory under continuous churn that restart can keep happening, so an operator
 // needs (a) a way to see it and (b) a way to trade it away per export.

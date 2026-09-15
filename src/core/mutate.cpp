@@ -14,7 +14,7 @@ MutateGuard::Verdict MutateGuard::precheck(std::initializer_list<std::string_vie
     // The length limit is the export's own — the backend's max_name, which is what
     // PATHCONF and the v4 maxname attribute advertise — not a hardcoded 255: a backend
     // is free to report something else, and the enforced limit has to be the advertised
-    // one (followups/protocol-gaps.md A3).
+    // one (followups/protocol-conformance-followups.md A3).
     const size_t max_name = exp_.backend ? exp_.backend->limits().max_name : kMaxNameLen;
     size_t index = 0;
     for (std::string_view name : names) {
