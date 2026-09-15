@@ -345,7 +345,7 @@ takeovers fence_lost activation_failures`；`--json` 时 `exports` 为数组；`
 
 默认每台网关各带一份本地 TOML，其中 `[[export]]` 段**全集群必须逐字相同**（`exports.<node>`
 摘要互校），于是"加一个导出 = 改 N 份文件 + 重启 N 台网关"。`[cluster] exports_source =
-"catalog"`（设计见 [design/11-shared-export-catalog.md](design/11-shared-export-catalog.md)）把
+"catalog"`（设计见 [design/11-shared-export-catalog.md](../design/11-shared-export-catalog.md)）把
 导出表上移到 `shared_dir/catalog.toml`——集群一份、带版本号与历史、只由管理命令写；本地文件只
 留身份与本机键。**主备（§5）与多活（§6）都可用**，与 `mode` 正交。
 

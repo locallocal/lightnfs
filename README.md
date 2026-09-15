@@ -10,8 +10,8 @@ reactor (epoll fallback), with no kernel NFS server involved.
 [中文文档 / Chinese documentation](docs/README.zh.md)
 
 - Design documents: [docs/design/](docs/design/README.md)
-- Protocol research: [docs/nfsv3/](docs/nfsv3/README.md), [docs/nfsv4/](docs/nfsv4/README.md)
-- Deployment guide: [docs/deployment.md](docs/deployment.md)
+- Protocol research: [docs/reference/nfsv3/](docs/reference/nfsv3/README.md), [docs/reference/nfsv4/](docs/reference/nfsv4/README.md)
+- Deployment guide: [docs/guide/deployment.md](docs/guide/deployment.md)
 
 Note: the design and research documents are written in Chinese.
 
@@ -221,7 +221,7 @@ Benchmarks (design 02 §2.8 three layers):
 ./build/lightnfs-ctl bench nullrpc  1 4 20000 32      # L2: null RPC (gate: ≥100k rps single reactor)
 ./build/lightnfs-ctl bench fullpath 1 4 20000 32 read # L4: full NFS path over the memory backend
 scripts/bench_gate.sh                       # all three against tools/bench/baseline.txt
-                                            # (usage guide: docs/performance/benchmarks.md)
+                                            # (usage guide: docs/testing/benchmarks.md)
 ```
 
 ## Configuration
@@ -323,7 +323,7 @@ line available at debug level.
 
 ## Deployment and security
 
-Read [docs/deployment.md](docs/deployment.md) before exposing the server. The short
+Read [docs/guide/deployment.md](docs/guide/deployment.md) before exposing the server. The short
 version:
 
 - **Trust boundary: AUTH_SYS only.** The client's uid/gid are trusted as presented;
@@ -344,7 +344,7 @@ version:
   reclaim their opens/locks.
 
 The release checklist with per-item verification is in
-[docs/security-checklist.md](docs/security-checklist.md).
+[docs/testing/security-checklist.md](docs/testing/security-checklist.md).
 
 ## Testing
 
@@ -415,13 +415,22 @@ pending a target cluster and v4 open/deny state stays per gateway.
 
 ## Documentation index
 
-- Design: [docs/design/](docs/design/README.md) — architecture, runtime/concurrency,
+`docs/` is organised in four parts (see [docs/README.md](docs/README.md)):
+
+- **Design** — [docs/design/](docs/design/README.md): architecture, runtime/concurrency,
   transport/RPC/XDR, NFS core, backend API, backend implementations, state management,
-  configuration/observability, multi-gateway failover design (proposal)
-- Protocol research: [docs/nfsv3/](docs/nfsv3/README.md), [docs/nfsv4/](docs/nfsv4/README.md)
-- Operations: [deployment guide](docs/deployment.md),
-  [security checklist](docs/security-checklist.md)
-- Performance: [benchmark tool guide](docs/performance/benchmarks.md) (`lightnfs-ctl bench`,
-  `scripts/bench_gate.sh`, baseline policy, real-mount fio guidance) and the
-  [test report](docs/performance/test-report.md) — conformance runs (cthon / pynfs / fsx),
-  benchmark numbers against `tools/bench/baseline.txt`, unit/fuzz/backend test coverage
+  configuration/observability, and the three cluster books (multi-gateway failover,
+  active-active per-export ownership, the shared export catalog). Open items per book
+  live in [docs/design/followups/](docs/design/followups/).
+- **Guide** — [docs/guide/deployment.md](docs/guide/deployment.md): trust boundary,
+  least-privilege systemd unit, key configuration, operations, multi-gateway failover
+  and active-active deployment, the shared export catalog, known limitations.
+- **Reference** — protocol research: [docs/reference/nfsv3/](docs/reference/nfsv3/README.md),
+  [docs/reference/nfsv4/](docs/reference/nfsv4/README.md).
+- **Testing** — [test report](docs/testing/test-report.md) (conformance runs via
+  cthon / pynfs / fsx, benchmark numbers against `tools/bench/baseline.txt`,
+  unit/fuzz/backend coverage), [benchmark tool guide](docs/testing/benchmarks.md)
+  (`lightnfs-ctl bench`, `scripts/bench_gate.sh`, baseline policy, real-mount fio
+  guidance), and the [security checklist](docs/testing/security-checklist.md).
+
+The design, reference and testing documents are written in Chinese.

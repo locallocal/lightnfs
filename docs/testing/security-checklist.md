@@ -89,7 +89,7 @@ fuzz：`fuzz/fuzz_handle_request.cpp` 直喂 `Dispatcher::handle_request`，阶�
 
 ## 8. AUTH_SYS 信任边界写入部署文档 ✅（阶段 5）
 
-- `docs/deployment.md` §1 明确：AUTH_SYS 身份不可验证 ⇒ 仅受信网络部署，公网必须加密——
+- `docs/guide/deployment.md` §1 明确：AUTH_SYS 身份不可验证 ⇒ 仅受信网络部署，公网必须加密——
   内置 **RPC-over-TLS**（RFC 9289，`[tls]`，`xprtsec=tls`）或前置 WireGuard/IPsec/stunnel；
   `clients` CIDR 白名单 + `squash` 收敛；句柄 HMAC 防伪造句柄但不防伪造身份。§5 归档全部
   已知限制（无 GSS、无 NLM、v3/v4 混布锁边界、句柄稳定性、单机网关）。

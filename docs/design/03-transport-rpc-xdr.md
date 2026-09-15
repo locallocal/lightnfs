@@ -1,6 +1,6 @@
 # 3. 传输与 RPC/XDR 层
 
-协议格式依据：nfsv3 分册 [02-rpc-xdr.md](../nfsv3/02-rpc-xdr.md)。本文只写实现结构。
+协议格式依据：nfsv3 分册 [02-rpc-xdr.md](../reference/nfsv3/02-rpc-xdr.md)。本文只写实现结构。
 
 ## 3.1 监听与连接
 

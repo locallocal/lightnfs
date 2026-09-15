@@ -238,7 +238,7 @@ foreach(t ${LNFS_FUZZ_TARGETS})
 endforeach()
 
 # Doc/code drift gate (plan doc 10 §7.3): the generated v3 errmap whitelist must match
-# docs/nfsv3/08-errors.md §8.2.
+# docs/reference/nfsv3/08-errors.md §8.2.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
   add_test(NAME errmap_check
@@ -263,5 +263,5 @@ install(FILES config/lightnfs.toml.example
         DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/lightnfs)
 install(FILES packaging/systemd/lightnfs.service
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
-install(FILES README.md docs/deployment.md
+install(FILES README.md docs/guide/deployment.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})

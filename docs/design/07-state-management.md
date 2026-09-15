@@ -1,6 +1,6 @@
 # 7. 状态管理
 
-协议语义依据 nfsv4 分册 [04-state-model.md](../nfsv4/04-state-model.md)、[06-sessions-v41.md](../nfsv4/06-sessions-v41.md)。本文写数据结构与并发实现。范围：v4.1/4.2 状态 + v3 DRC（DRC 结构已在 03 分册 3.7，此处不重复）。v3 锁（NLM）不做（决策 D8/nfsv3 分册 6.6 选项 1）。
+协议语义依据 nfsv4 分册 [04-state-model.md](../reference/nfsv4/04-state-model.md)、[06-sessions-v41.md](../reference/nfsv4/06-sessions-v41.md)。本文写数据结构与并发实现。范围：v4.1/4.2 状态 + v3 DRC（DRC 结构已在 03 分册 3.7，此处不重复）。v3 锁（NLM）不做（决策 D8/nfsv3 分册 6.6 选项 1）。
 
 ## 7.1 数据结构总览（对应 nfsv4/11.3 的建议结构）
 

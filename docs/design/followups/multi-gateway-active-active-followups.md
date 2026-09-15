@@ -3,7 +3,7 @@
 > 多活的实施步骤文档（原 `docs/design/12-multi-gateway-active-active-steps.md`）的 A1–E3 已全部
 > 实现并合并（每步标 ✅ 2026-09-06），随之与 09 的步骤文档（原 10 册）同样撤下，每步实现记录见
 > git 历史。本文件按其 §E3 的约定收口未闭环项，供后续处理。设计与实现见
-> [../design/10-multi-gateway-active-active.md](../design/10-multi-gateway-active-active.md)（原 11 册）。
+> [../design/10-multi-gateway-active-active.md](../10-multi-gateway-active-active.md)（原 11 册）。
 
 ## 1. VM（root）端到端未跑
 
@@ -33,5 +33,5 @@ MOVED（尚未属主）。`scripts/cluster_roll.sh` 的 `migrate()` 因此轮询
 ## 4. 全仓库既有 clang-format/clang-tidy 漂移
 
 沿用 09 实施时的处理：新增代码的 format/tidy 无新增问题，但全仓库既有漂移未在本特性里顺手改
-（见 `docs/toto/multi-gateway-failover-followups.md` §3）。`src/core/boot_epoch.cpp` 的
+（见 `docs/design/followups/multi-gateway-failover-followups.md` §3）。`src/core/boot_epoch.cpp` 的
 `fscanf`（`bugprone-unchecked-string-to-number-conversion`）等既有告警不属于本册改动。

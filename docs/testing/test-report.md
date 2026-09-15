@@ -104,7 +104,7 @@ EXCLUSIVE 重放、匿名/open-state IO、粘性 commit、v4.2、身份透传、
 
 ## 5. 安全清单验收（08 分册 §8.5）
 
-全部 8 项已逐条验收并归档于 [security-checklist.md](../security-checklist.md)：
+全部 8 项已逐条验收并归档于 [security-checklist.md](security-checklist.md)：
 长度上限+fuzz 全入口、句柄 HMAC+每请求导出/IP 校验、名字双层校验、squash 单点、
 grace reclaim 名单强制、资源上限可配、最小特权+seccomp（`packaging/systemd/
 lightnfs.service` + `gen_seccomp_allowlist.sh`）、AUTH_SYS 信任边界入部署文档；
@@ -113,7 +113,7 @@ lightnfs.service` + `gen_seccomp_allowlist.sh`）、AUTH_SYS 信任边界入部�
 ## 6. 已知限制与豁免
 
 - 无特权回退句柄模式在无 STATX_BTIME 的文件系统（如 tmpfs）上句柄不跨重启稳定
-  （生产指引见 [deployment.md](../deployment.md)）。
+  （生产指引见 [deployment.md](../guide/deployment.md)）。
 - pynfs 预期排除：委托组（读委托已实现但排除表未重新收窄，待 root VM 全量重跑）、
   需 root 的块/字符设备树对象、CSID7（pynfs 自身缺陷）。
 - 集群后端只经 fake 验证；真实 GlusterFS 卷 / Lustre 挂载 / CephFS 集群上的验收
