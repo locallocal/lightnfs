@@ -16,7 +16,7 @@ inline constexpr uint32_t kMaxFileHandle = 64;
 // filename3 and nfspath3 are `string<>` on the wire (RFC 1813 §2.5) — deliberately
 // unbounded, because the length limit is filesystem semantics, not XDR.  An over-long
 // name therefore has to decode and come back as NFS3ERR_NAMETOOLONG, never as an
-// RPC-level GARBAGE_ARGS the client can only turn into EIO (followups/protocol-gaps.md
+// RPC-level GARBAGE_ARGS the client can only turn into EIO (followups/protocol-conformance-followups.md
 // A3).  These two are pure DoS ceilings: inside them a request is decoded and answered,
 // beyond them it does not name anything a filesystem could hold.
 inline constexpr uint32_t kNameWireMax = 4096;

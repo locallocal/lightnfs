@@ -66,8 +66,14 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 
 ## 协议一致性缺口
 
-本设计各分册描述的是"打算怎么做"。实现与协议之间还剩下的差距，收在
-[followups/protocol-gaps.md](followups/protocol-gaps.md)：对照 RFC 1813 / 8881 / 7862 / 5531
-与 [../reference/](../reference/) 的调研结论，逐条列出会产生畸形回复的缺陷（A 类）、语义与
-安全边界偏差（B 类）与加固项（C 类），每条带文件行号、影响与修法。改 `src/nfsv3/`、
-`src/nfsv4/`、`src/rpc/`、`src/state/` 之前先扫一眼。
+本设计各分册描述的是"打算怎么做"。2026-09-15 对照 RFC 1813 / 8881 / 7862 / 5531 与
+[../reference/](../reference/) 的调研结论做过一次全面审计，A（畸形回复）、B（语义与安全边界
+偏差）、C（加固项）三级共 18 条，**已全部收口**（逐条对应的提交见收尾文档的索引表；代码注释里
+`protocol-conformance-followups.md A3` 这类引用指的就是那些条目号）。
+
+剩下的未闭环项收在
+[followups/protocol-conformance-followups.md](followups/protocol-conformance-followups.md)：
+volatile 句柄失效该回 FHEXPIRED 而非 STALE、`INVALID_UID` 未映射 anon、RECLAIM_COMPLETE 的
+per-fs 跟踪（归到多活的 per-fsid grace）、`scripts/` 里 29 处 pipefail 下的 `grep -q`、pynfs /
+cthon 与真内核客户端从未跑过。改 `src/nfsv3/`、`src/nfsv4/`、`src/rpc/`、`src/state/` 之前先
+扫一眼。

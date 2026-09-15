@@ -362,11 +362,11 @@ TEST(ExportSet, PseudoChangeMonotonic) {
     EXPECT_EQ(seen.size(), 6u);
 }
 
-// followups/protocol-gaps.md B2: root_squash is three independent substitutions
+// followups/protocol-conformance-followups.md B2: root_squash is three independent substitutions
 // (exports(5) / knfsd's nfsd_setuser) -- uid 0, gid 0 and every supplementary group 0.
 // Keying the whole mapping off uid == 0 let uid=1000,gid=0 keep group-root rights on a
 // squashed export.
-// followups/protocol-gaps.md B3: exports(5) `secure`, on by default as in knfsd.  Only a
+// followups/protocol-conformance-followups.md B3: exports(5) `secure`, on by default as in knfsd.  Only a
 // privileged process can bind a reserved port, which is what lets AUTH_SYS trust that the
 // uid in the credential came from the client's kernel and not from any user on the host.
 TEST(ExportSet, SecurePortsRefusesUnprivilegedSourcePorts) {

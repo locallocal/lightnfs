@@ -36,7 +36,7 @@ class PseudoFs {
     // together with the comment here said the tree only changes across restarts; that
     // reading is wrong, and it is the reading that matters, because a hot export-set
     // change has to flip this or a v4 client would keep serving a stale listing of the
-    // pseudo tree against positional cookies (followups/protocol-gaps.md C4).
+    // pseudo tree against positional cookies (followups/protocol-conformance-followups.md C4).
     explicit PseudoFs(const std::vector<std::shared_ptr<ExportEntry>>& entries, uint64_t change_base = 1);
 
     // Nodes are handed out non-const like find()/for_export(): the tree is frozen with

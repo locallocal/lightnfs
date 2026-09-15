@@ -98,7 +98,7 @@ struct ConnCtx {
     rt::Semaphore inflight;
     rt::CancelSource cancel;
     // Coarse seconds of the last complete record read from this connection, for the idle
-    // reaper (followups/protocol-gaps.md C1).  Written by the read loop, read by the
+    // reaper (followups/protocol-conformance-followups.md C1).  Written by the read loop, read by the
     // sweeper under the registry mutex — relaxed is enough, a second either way does not
     // matter for a minutes-scale timeout.
     std::atomic<int64_t> last_rx{0};
@@ -154,7 +154,7 @@ class ConnRegistry {
     // normal drain path.  Returns false when the id is gone already.
     bool kill(uint64_t id);
     // Shuts down connections whose last complete record is older than `idle`
-    // (followups/protocol-gaps.md C1), the way knfsd's svc_age_temp_xprts does.  A
+    // (followups/protocol-conformance-followups.md C1), the way knfsd's svc_age_temp_xprts does.  A
     // connection that never registered a clock, or `idle` of zero, is never reaped.
     // Returns how many were shut down.
     size_t kill_idle(std::chrono::seconds idle);

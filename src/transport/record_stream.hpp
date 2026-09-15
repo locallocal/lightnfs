@@ -21,7 +21,7 @@ class RecordStream {
     // A record may be split into fragments, and neither max_fragment nor max_record
     // bounds how *many*: a zero-length non-last fragment adds nothing to the record's
     // size, so a client could park a read coroutine indefinitely on 4-byte fragment
-    // headers (followups/protocol-gaps.md C1).  Real clients send one fragment per RPC —
+    // headers (followups/protocol-conformance-followups.md C1).  Real clients send one fragment per RPC —
     // this server always does — so the cap is generous by three orders of magnitude and
     // only ever fires on something that is not a client.
     static constexpr uint32_t kMaxFragments = 1024;

@@ -38,7 +38,7 @@ Result<Bitmap> Bitmap::decode(xdr::XdrDec& dec) {
     // server can answer live in the first three words; higher words are *recorded and
     // ignored* rather than rejected — asking about an attribute defined after this server
     // was written is not a malformed request, and BADXDR would blame the client's encoding
-    // for it (followups/protocol-gaps.md B8).  The cap is only a DoS bound.
+    // for it (followups/protocol-conformance-followups.md B8).  The cap is only a DoS bound.
     if (count > 64) return Err(Errno::kGarbage);
     Bitmap out;
     for (uint32_t i = 0; i < count; ++i) {

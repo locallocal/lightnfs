@@ -21,7 +21,7 @@ class AuthSys final : public Authenticator {
     Result<Cred> authenticate(const OpaqueAuth& cred, const OpaqueAuth& verf) override {
         // RFC 5531 §8.2: an AUTH_SYS credential travels with an AUTH_NONE verifier of
         // zero length.  Anything else is AUTH_BADVERF rather than something to ignore
-        // (followups/protocol-gaps.md C3) — no client sends anything else, and silently
+        // (followups/protocol-conformance-followups.md C3) — no client sends anything else, and silently
         // accepting a verifier we never look at is how a flavor confusion goes unnoticed.
         if (verf.flavor != static_cast<uint32_t>(AuthFlavor::kNone) || !verf.body.empty()) return Err(Errno::kBadVerf);
         // flat mode; body references the request record

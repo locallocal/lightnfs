@@ -19,8 +19,10 @@
 
 [design/followups/](design/followups/) 是**未闭环项**——已知的取舍、缺的验证、发布前该补的
 门槛。改动相关代码前先扫一眼：三册集群文档各自一份，另有一份跨协议面的
-[protocol-gaps.md](design/followups/protocol-gaps.md)（NFSv3/v4 协议一致性缺口与语义风险
-审计，按"会产生畸形回复 / 语义偏差 / 加固项"三级分类，带文件行号与修法）。
+[protocol-conformance-followups.md](design/followups/protocol-conformance-followups.md)（NFSv3/v4 协议面：
+2026-09-15 那次一致性审计的 18 个条目已全部收口，文件里留的是收口索引与剩下的未闭环项——
+volatile 句柄该回 FHEXPIRED、`INVALID_UID` 未映射 anon、外部测试套未跑，以及三项"复核后判定
+不做"的记录）。
 
 ## guide/ 使用文档
 

@@ -144,7 +144,7 @@ TEST(RecordStream, OversizeFragmentRejected) {
     EXPECT_EQ((int)res.error(), EMSGSIZE);
 }
 
-// followups/protocol-gaps.md C1: neither size cap bounds the *number* of fragments, and a
+// followups/protocol-conformance-followups.md C1: neither size cap bounds the *number* of fragments, and a
 // zero-length non-last fragment costs nothing against either -- so a client could park a
 // read coroutine indefinitely on 4-byte fragment headers.
 TEST(RecordStream, EndlessEmptyFragmentsAreCapped) {

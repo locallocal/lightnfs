@@ -27,7 +27,7 @@ class Engine {
     // Duplicate request cache for the non-idempotent procedures (design 03 §3.7).
     void set_drc(rpc::Drc* drc) { drc_ = drc; }
     // v4 state, for the read-delegation recall gate on the mutating procedures
-    // (followups/protocol-gaps.md B7).  Optional: null keeps the pre-B7 behaviour, and a
+    // (followups/protocol-conformance-followups.md B7).  Optional: null keeps the pre-B7 behaviour, and a
     // server without v4 has no delegations to recall anyway.
     void set_state_mgr(state::StateMgr* state) { state_ = state; }
 

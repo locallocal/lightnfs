@@ -122,7 +122,7 @@ struct Metrics {
     // Connections shut down by the idle reaper.
     ShardedCounter<uint64_t> conns_idle_reaped{};
     // Listings sent back to the start because the directory changed under them: the
-    // cost of the strict cookie verifier (followups/protocol-gaps.md C2).  A rising
+    // cost of the strict cookie verifier (followups/protocol-conformance-followups.md C2).  A rising
     // count on a busy directory is what "ls never finishes" looks like from here, and
     // it is not distinguishable from the other READDIR errors in the per-procedure
     // counters.

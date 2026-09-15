@@ -126,14 +126,14 @@ void encode_wcc_none(xdr::XdrEnc& enc) {
 }
 
 // A name longer than the export's max_name is NFS3ERR_NAMETOOLONG, so the client's
-// application sees ENAMETOOLONG (followups/protocol-gaps.md A3); every other
+// application sees ENAMETOOLONG (followups/protocol-conformance-followups.md A3); every other
 // name-discipline failure on a creation-family call keeps the one answer RFC 1813 gives
 // it, ACCES.  RMDIR distinguishes "." (INVAL) and ".." (EXIST) per §3.3.13.
 Status name_status(core::NameCheck check) {
     return check == core::NameCheck::kTooLong ? Status::kNametoolong : Status::kAcces;
 }
 
-// v4 read-delegation gate for the v3 mutating procedures (followups/protocol-gaps.md B7).
+// v4 read-delegation gate for the v3 mutating procedures (followups/protocol-conformance-followups.md B7).
 // A v3 write / truncate / remove / rename on a file some v4 client holds a read delegation
 // on has to recall it first: otherwise that client keeps serving its cached copy
 // indefinitely, with nothing to tell it otherwise.  This is worse than the documented
@@ -323,7 +323,7 @@ rt::Task<void> Engine::proc_lookup(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
     }
     // LOOKUP may name "." / ".."; the creation family may not (core/names.hpp).  A name
     // the filesystem could never hold is still answered as a lookup, not turned into an
-    // RPC-level error (followups/protocol-gaps.md A3/C5): over-long is NAMETOOLONG, and
+    // RPC-level error (followups/protocol-conformance-followups.md A3/C5): over-long is NAMETOOLONG, and
     // anything else unusable — empty, or carrying '/' or NUL — simply does not exist.
     if (core::NameCheck check = core::check_component(args->name, dir->exp->backend->limits().max_name);
         check != core::NameCheck::kOk && check != core::NameCheck::kDot) {
@@ -635,7 +635,7 @@ rt::Task<void> Engine::proc_fs_query(ConnCtx& ctx, RpcCall& call, const rpc::Cre
         // and macOS lineages — fall back to SET_TO_SERVER_TIME, so utimes(), `tar -p` and
         // `rsync -t` lose the timestamps they are trying to restore.  The Linux client
         // ignores it, which is why the local acceptance runs never noticed
-        // (followups/protocol-gaps.md B6).
+        // (followups/protocol-conformance-followups.md B6).
         if (fs.kCansettime) props |= kFsfCanSetTime;
         if (fs.link_support) props |= kFsfLink;
         if (fs.symlink_support) props |= kFsfSymlink;

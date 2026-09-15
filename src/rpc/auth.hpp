@@ -23,7 +23,7 @@ struct Cred {
     AuthFlavor flavor = AuthFlavor::kNone;
     // The caller claimed no identity at all (AUTH_NONE), so the export's anonymous
     // identity applies whatever its squash mode is — `none` is about passing a *claimed*
-    // identity through, and there is none here (followups/protocol-gaps.md C3).
+    // identity through, and there is none here (followups/protocol-conformance-followups.md C3).
     //
     // An explicit bit rather than `flavor == kNone`: flavor defaults to kNone, so every
     // default-constructed Cred — the test fixtures, any future internal caller — would

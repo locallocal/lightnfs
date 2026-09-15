@@ -106,7 +106,7 @@ bool v3_error_allowed(P proc, S status) {
         // SETATTR / CREATE / REMOVE / RENAME additionally admit JUKEBOX, which the RFC
         // rows list only for READ and WRITE: those four can now meet a v4 read delegation
         // that has to be recalled first, and JUKEBOX is how v3 says "retry shortly"
-        // (followups/protocol-gaps.md B7).  Folding it into IO instead would turn a
+        // (followups/protocol-conformance-followups.md B7).  Folding it into IO instead would turn a
         // recoverable wait into an application-visible IO error.
         case P::kCreate:
             return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kNametoolong, S::kNospc, S::kRofs,
@@ -247,7 +247,7 @@ bool v4_error_allowed(O4 op, S4 status) {
         case O4::kReaddir:
             // NOT_SAME is the answer to a stale cookieverf (§18.23.3).  The engine returns
             // it directly today, so this row is only a trap waiting for whoever routes it
-            // through to_v4() (followups/protocol-gaps.md B8).
+            // through to_v4() (followups/protocol-conformance-followups.md B8).
             return one_of4(status, std::array{S4::kNotdir, S4::kBadCookie, S4::kToosmall, S4::kInval, S4::kNotSame});
         case O4::kOpen:
             return one_of4(status, std::array{S4::kNoent, S4::kNotdir, S4::kIsdir, S4::kSymlink, S4::kWrongType,
