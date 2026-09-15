@@ -24,6 +24,11 @@ inline constexpr uint32_t kSupportedAttrs = 0, kType = 1, kFhExpireType = 2, kCh
                           kChangeAttrType = 79;
 // Referral attributes (RFC 8881 §11.10, plan 12 B2): supported under active-active only.
 inline constexpr uint32_t kFsLocations = 24, kFsLocationsInfo = 67;
+// fh_expire_type values (RFC 8881 §5.8.1.3).  Only these two are ever advertised:
+// persistent when the backend's handles survive a restart, "may expire at any time"
+// otherwise.  FH4_NOEXPIRE_WITH_OPEN is deliberately not added — the local backend's path
+// fallback breaks a handle when the file is renamed, open or not.
+inline constexpr uint32_t kFhPersistent = 0x0, kFhVolatileAny = 0x2;
 // change_attr_type values (RFC 7862 §12.2.3).
 inline constexpr uint32_t kChangeTypeMonotonicIncr = 0, kChangeTypeVersionCounter = 1,
                           kChangeTypeVersionCounterNoPnfs = 2, kChangeTypeTimeMetadata = 3, kChangeTypeUndefined = 4;

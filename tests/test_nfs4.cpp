@@ -1340,6 +1340,73 @@ TEST(Nfs4, WriteOnlyAttrsAreNotReadable) {
 
 // The encoder-level invariant behind A1: whatever a caller asks for, the attrmask the
 // encoder emits and the attrlist behind it must describe the same attributes.
+// followups/protocol-gaps.md B5: fh_expire_type was hardcoded FH4_PERSISTENT.  A backend
+// without kStableHandles -- the local backend's path fallback, taken when
+// name_to_handle_at is unavailable -- hands out handles that do not survive a restart, and
+// claiming persistence told the client it need not be prepared to recover.
+TEST(Nfs4, FhExpireTypeFollowsStableHandles) {
+    using nfsv4::attr::kFhExpireType;
+    rt::BufferPool pool;
+    backend::Attr a;
+    a.type = backend::FType::kReg;
+
+    // The one attribute, decoded back out of the encoder.
+    auto expire_type = [&](const core::FsProps* fs) {
+        xdr::XdrEnc enc(pool);
+        nfsv4::AttrSource src;
+        src.attr = &a;
+        src.fsid = 23;
+        src.fs = fs;
+        nfsv4::Bitmap want;
+        want.set(kFhExpireType);
+        nfsv4::encode_fattr(enc, want, src);
+        auto bytes = enc.take().to_bytes();
+        xdr::XdrDec dec(std::span<const std::byte>(bytes.data(), bytes.size()));
+        auto mask = nfsv4::Bitmap::decode(dec);
+        EXPECT_TRUE(mask.has_value() && mask->test(kFhExpireType));
+        // attrlist length, then the value
+        EXPECT_EQ(*dec.u32(), 4u);
+        auto v = dec.u32();
+        return v ? *v : 0xDEADBEEFu;
+    };
+
+    core::FsProps stable;
+    stable.stable_handles = true;
+    EXPECT_EQ(expire_type(&stable), nfsv4::attr::kFhPersistent);
+
+    core::FsProps volatile_fs;
+    volatile_fs.stable_handles = false;
+    EXPECT_EQ(expire_type(&volatile_fs), nfsv4::attr::kFhVolatileAny);
+
+    // The synthesized tree has no backend of its own; its node ids are path hashes, so it
+    // is persistent rather than inheriting the default-constructed false.
+    EXPECT_EQ(expire_type(nullptr), nfsv4::attr::kFhPersistent);
+}
+
+// The same thing through the real GETATTR path, and the derivation it depends on: the
+// memory backend advertises kStableHandles, so the export answers FH4_PERSISTENT.
+TEST(Nfs4, FhExpireTypeOverTheWire) {
+    V4Fixture f;
+    EXPECT_TRUE(core::fs_props(*f.exports.by_fsid(23)->backend).stable_handles);
+    f.establish_session();
+    auto fh = f.path_fh({"export", "data", "hello"});
+    ASSERT_TRUE(!fh.empty());
+    auto r = dir_op(f, fh, Op::kGetattr, [&](xdr::XdrEnc& e) {
+        nfsv4::Bitmap want;
+        want.set(nfsv4::attr::kFhExpireType);
+        want.encode(e);
+    });
+    ASSERT_TRUE(r.status == 0);
+    V4Fixture::expect_op(r.reply.dec, Op::kSequence, 0);
+    (void)r.reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(r.reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(r.reply.dec, Op::kGetattr, 0);
+    auto mask = nfsv4::Bitmap::decode(r.reply.dec);
+    ASSERT_TRUE(mask.has_value() && mask->test(nfsv4::attr::kFhExpireType));
+    EXPECT_EQ(*r.reply.dec.u32(), 4u);
+    EXPECT_EQ(*r.reply.dec.u32(), nfsv4::attr::kFhPersistent);
+}
+
 TEST(Nfs4, EncodeFattrNeverEmitsValuelessAttrs) {
     rt::BufferPool pool;
     xdr::XdrEnc enc(pool);

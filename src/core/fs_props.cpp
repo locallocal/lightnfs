@@ -15,6 +15,7 @@ FsProps fs_props(const backend::Backend& backend) {
     out.case_insensitive = caps.has(backend::Cap::kCaseInsensitive);
     out.native_change = caps.has(backend::Cap::kNativeChange);
     out.native_access = caps.has(backend::Cap::kNativeAccess);
+    out.stable_handles = caps.has(backend::Cap::kStableHandles);
     return out;
 }
 
