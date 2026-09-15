@@ -506,10 +506,19 @@ rt::Task<void> Engine::proc_readdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred
     // A directory modified between pages makes the verifier mismatch; BAD_COOKIE
     // sends the client back to cookie 0 for a consistent restart instead of a
     // silently duplicated/holey listing.
+    //
+    // `strict_readdir_cookies = false` trades that guarantee away (C2): a zero verifier
+    // that is never checked, which is what knfsd does and what POSIX readdir() already
+    // allows.  For a directory under continuous churn that is the difference between a
+    // listing that finishes and one that keeps restarting.
+    const bool strict_cookies = resolved->exp->strict_readdir_cookies.load(std::memory_order_relaxed);
     std::array<std::byte, 8> dir_verf{};
-    uint64_t dir_change = attr ? attr->change : 0;
-    std::memcpy(dir_verf.data(), &dir_change, sizeof(dir_change));
-    if (cookie != 0 && client_verf != dir_verf) {
+    if (strict_cookies) {
+        uint64_t dir_change = attr ? attr->change : 0;
+        std::memcpy(dir_verf.data(), &dir_change, sizeof(dir_change));
+    }
+    if (strict_cookies && cookie != 0 && client_verf != dir_verf) {
+        obs::Metrics::instance().v3_bad_cookie.fetch_add(1, std::memory_order_relaxed);
         begin_result(enc, ctx, call, Status::kBadCookie);
         encode_post_attr(enc, attr_value(attr), resolved->exp->fsid);
         co_await reply(ctx, enc, cap);

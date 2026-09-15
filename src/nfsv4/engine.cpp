@@ -1478,10 +1478,16 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
     // attribute.  A directory modified between pages flips the verifier; the client
     // gets NOT_SAME and restarts the listing instead of silently duplicating or
     // missing entries against stale cookies.
+    //
+    // `strict_readdir_cookies = false` on the export trades that away (C2): a zero
+    // verifier, never checked.  The synthesized tree is always strict — its verifier only
+    // moves when the export set is republished, which is rare and worth a restart.
+    const bool strict_cookies =
+        resolved->pseudo() || resolved->exp->strict_readdir_cookies.load(std::memory_order_relaxed);
     uint64_t dir_change = 0;
     if (resolved->pseudo()) {
         dir_change = ctx.set->pseudo->attr_of(*resolved->node).change;
-    } else {
+    } else if (strict_cookies) {
         auto dattr = co_await resolved->obj->getattr();
         if (!dattr) {
             uint32_t code = st(core::to_v4(dattr.error(), Op::kReaddir));
@@ -1491,8 +1497,9 @@ rt::Task<uint32_t> Engine::op_readdir(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& e
         dir_change = dattr->change;
     }
     std::array<std::byte, 8> dir_verf{};
-    std::memcpy(dir_verf.data(), &dir_change, sizeof(dir_change));
-    if (*cookie != 0 && !std::equal(verf->begin(), verf->end(), dir_verf.begin(), dir_verf.end())) {
+    if (strict_cookies) std::memcpy(dir_verf.data(), &dir_change, sizeof(dir_change));
+    if (strict_cookies && *cookie != 0 && !std::equal(verf->begin(), verf->end(), dir_verf.begin(), dir_verf.end())) {
+        obs::Metrics::instance().v4_readdir_not_same.fetch_add(1, std::memory_order_relaxed);
         enc.u32(st(Status::kNotSame));
         co_return st(Status::kNotSame);
     }

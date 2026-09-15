@@ -144,6 +144,15 @@ squash = "root"
 # the client host.  Set false for client populations that cannot get one -- containers,
 # `mount -o noresvport`, or an unprivileged userspace client such as lnfs_accept_client.
 # secure_ports = true
+# READDIR cookie verifier policy.  true (the default) derives the verifier from the
+# directory's change attribute, so a directory modified between pages sends the client
+# back to the start -- no duplicated and no missing entries.  The cost is that a directory
+# under continuous churn can keep invalidating the listing and `ls` may not converge.
+# false answers a zero verifier and never rejects a cookie, which is what knfsd does on
+# most filesystems and what POSIX readdir() already permits; entries may then be
+# duplicated or missed across pages.  Watch lightnfs_v3_bad_cookie_total and
+# lightnfs_v4_readdir_not_same_total to see whether this is costing you anything.
+# strict_readdir_cookies = true
 readonly = true     # phase 2: set false for read-write exports
 # Per-export token buckets (READ/WRITE data path); 0 / omitted = unlimited.
 # Hot-reloadable via SIGHUP / `lightnfs-ctl reload`.

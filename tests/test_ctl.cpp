@@ -1528,7 +1528,8 @@ TEST(Ctl, ClusterCatalogCommands) {
                                       " updated_by=? uid=42 comment=first one\n"));
         EXPECT_TRUE(shown.find("\nfsid=1 path=" + dir +
                                "/a backend=local nodes=- disabled=no clients=10.0.0.0/8 "
-                               "readonly=no secure_ports=yes squash=root anon_uid=65534 anon_gid=65534 read_bps=0 "
+                               "readonly=no secure_ports=yes strict_readdir_cookies=yes squash=root anon_uid=65534 "
+                               "anon_gid=65534 read_bps=0 "
                                "write_bps=0 "
                                "iops=0 keys=-\nfsid=2 path=" +
                                dir + "/b ") != std::string::npos);
@@ -1537,6 +1538,7 @@ TEST(Ctl, ClusterCatalogCommands) {
         EXPECT_TRUE(shown_json.find("\"comment\":\"first one\",\"exports_list\":[{\"fsid\":1,\"path\":\"" + dir +
                                     "/a\",\"backend\":\"local\",\"nodes\":[],\"disabled\":false,"
                                     "\"clients\":[\"10.0.0.0/8\"],\"readonly\":false,\"secure_ports\":true,"
+                                    "\"strict_readdir_cookies\":true,"
                                     "\"squash\":\"root\","
                                     "\"anon_uid\":65534,\"anon_gid\":65534,\"read_bps\":0,\"write_bps\":0,"
                                     "\"iops\":0,\"backend_keys\":{}},{\"fsid\":2,") != std::string::npos);
@@ -1732,12 +1734,14 @@ TEST(Ctl, ClusterExportCommands) {
         EXPECT_STREQ(v1->meta.comment, "add one");
         EXPECT_STREQ(ask("cluster export list"),
                      "fsid=1 path=/export/1 backend=local nodes=gw1,gw2 disabled=no clients=10.0.0.0/8,10.1.0.0/16 "
-                     "readonly=yes secure_ports=yes squash=none anon_uid=1 anon_gid=2 read_bps=300 "
+                     "readonly=yes secure_ports=yes strict_readdir_cookies=yes squash=none anon_uid=1 "
+                     "anon_gid=2 read_bps=300 "
                      "write_bps=400 iops=5 keys=handles=auto\n");
         EXPECT_STREQ(ask("cluster export list --json"),
                      "{\"version\":1,\"exports_list\":[{\"fsid\":1,\"path\":\"/export/1\",\"backend\":\"local\","
                      "\"nodes\":[\"gw1\",\"gw2\"],\"disabled\":false,\"clients\":[\"10.0.0.0/8\",\"10.1.0.0/16\"],"
-                     "\"readonly\":true,\"secure_ports\":true,\"squash\":\"none\",\"anon_uid\":1,"
+                     "\"readonly\":true,\"secure_ports\":true,\"strict_readdir_cookies\":true,"
+                     "\"squash\":\"none\",\"anon_uid\":1,"
                      "\"anon_gid\":2,\"read_bps\":300,\"write_bps\":400,\"iops\":5,"
                      "\"backend_keys\":{\"handles\":\"auto\"}}]}\n");
         EXPECT_TRUE(ask("cluster catalog show").find("\nfsid=1 path=/export/1 ") != std::string::npos);

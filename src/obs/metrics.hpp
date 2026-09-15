@@ -121,6 +121,13 @@ struct Metrics {
     ShardedCounter<uint64_t> insecure_port_rejected{};
     // Connections shut down by the idle reaper.
     ShardedCounter<uint64_t> conns_idle_reaped{};
+    // Listings sent back to the start because the directory changed under them: the
+    // cost of the strict cookie verifier (followups/protocol-gaps.md C2).  A rising
+    // count on a busy directory is what "ls never finishes" looks like from here, and
+    // it is not distinguishable from the other READDIR errors in the per-procedure
+    // counters.
+    ShardedCounter<uint64_t> v3_bad_cookie{};
+    ShardedCounter<uint64_t> v4_readdir_not_same{};
 
     // v4 engine (plan doc 10 §3.1): per-op calls/errors/latency indexed by opcode
     // (3..75 = nfsv4 kLastKnownOp; slot 0 collects out-of-table opcodes) plus a
