@@ -76,7 +76,7 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
     }
     // UMNT: consume path but keep no authoritative rmtab.
     if (call.proc == 3) {
-        auto path = call.args.string(1024);
+        auto path = call.args.string(kMountPathWireMax);
         if (!path || !call.args.at_end()) {
             co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
             co_return;
@@ -111,17 +111,22 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
         co_return;
     }
 
-    auto path_arg = call.args.string(1024);
+    auto path_arg = call.args.string(kMountPathWireMax);
     if (!path_arg || !call.args.at_end()) {
         co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
+        co_return;
+    }
+    xdr::XdrEnc enc(ctx.pool);
+    rpc::encode_reply_success(enc, call.xid);
+    if (path_arg->size() > kMaxMountPath) {
+        enc.u32(static_cast<uint32_t>(MountStatus::kNametoolong));
+        co_await send(ctx, enc);
         co_return;
     }
     std::string relative;
     // held for the rest of the MNT
     auto set = exports_.snapshot();
     core::ExportEntry* exp = set->for_mount_path(*path_arg, relative);
-    xdr::XdrEnc enc(ctx.pool);
-    rpc::encode_reply_success(enc, call.xid);
     if (!exp || !exports_.check_client(ctx.peer.addr, *exp)) {
         enc.u32(static_cast<uint32_t>(MountStatus::kAcces));
         co_await send(ctx, enc);
@@ -134,8 +139,9 @@ rt::Task<void> Mount3::dispatch(transport::ConnCtx& ctx, rpc::RpcCall& call, con
     while (obj && !relative.empty()) {
         size_t slash = relative.find('/');
         std::string part = relative.substr(0, slash);
-        if (!core::valid_component(part)) {
-            failure = errno_from(EINVAL);
+        core::NameCheck check = core::check_component(part, exp->backend->limits().max_name);
+        if (check != core::NameCheck::kOk) {
+            failure = errno_from(check == core::NameCheck::kTooLong ? ENAMETOOLONG : EINVAL);
             break;
         }
         auto next = co_await (*obj)->lookup(cred, part);

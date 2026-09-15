@@ -13,8 +13,17 @@ namespace lnfs::nfsv3 {
 inline constexpr uint32_t kProgram = 100003;
 inline constexpr uint32_t kVersion = 3;
 inline constexpr uint32_t kMaxFileHandle = 64;
-inline constexpr uint32_t kMaxName = 255;
-inline constexpr uint32_t kMaxPath = 1024;
+// filename3 and nfspath3 are `string<>` on the wire (RFC 1813 §2.5) — deliberately
+// unbounded, because the length limit is filesystem semantics, not XDR.  An over-long
+// name therefore has to decode and come back as NFS3ERR_NAMETOOLONG, never as an
+// RPC-level GARBAGE_ARGS the client can only turn into EIO (followups/protocol-gaps.md
+// A3).  These two are pure DoS ceilings: inside them a request is decoded and answered,
+// beyond them it does not name anything a filesystem could hold.
+inline constexpr uint32_t kNameWireMax = 4096;
+inline constexpr uint32_t kPathWireMax = 16384;
+// The semantic path limit (POSIX PATH_MAX).  The semantic *name* limit is per export —
+// the backend's limits().max_name, which is also the number PATHCONF advertises.
+inline constexpr uint32_t kMaxPath = 4096;
 
 enum class Proc : uint32_t {
     kNull = 0,

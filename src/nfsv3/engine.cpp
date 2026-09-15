@@ -124,14 +124,20 @@ void encode_wcc_none(xdr::XdrEnc& enc) {
     encode_wcc(enc, std::nullopt, std::nullopt, 0);
 }
 
-// v3 has one answer for every name-discipline failure on a creation-family call:
-// ACCES.  RMDIR distinguishes "." (INVAL) and ".." (EXIST) per RFC 1813 §3.3.13.
+// A name longer than the export's max_name is NFS3ERR_NAMETOOLONG, so the client's
+// application sees ENAMETOOLONG (followups/protocol-gaps.md A3); every other
+// name-discipline failure on a creation-family call keeps the one answer RFC 1813 gives
+// it, ACCES.  RMDIR distinguishes "." (INVAL) and ".." (EXIST) per §3.3.13.
+Status name_status(core::NameCheck check) {
+    return check == core::NameCheck::kTooLong ? Status::kNametoolong : Status::kAcces;
+}
+
 Status verdict_status(const MutateGuard::Verdict& verdict) {
     switch (verdict.kind) {
         case MutateGuard::Verdict::kReadonly:
             return Status::kRofs;
         case MutateGuard::Verdict::kBadName:
-            return Status::kAcces;
+            return name_status(verdict.name);
         default:
             return Status::kOk;
     }
@@ -283,8 +289,7 @@ rt::Task<void> Engine::proc_getattr(ConnCtx& ctx, RpcCall& call, const rpc::Cred
 
 rt::Task<void> Engine::proc_lookup(ConnCtx& ctx, RpcCall& call, const rpc::Cred& rpc_cred, Capture* cap) {
     auto args = Diropargs::decode(call.args);
-    // LOOKUP may name "." / ".."; the creation family may not (core/names.hpp).
-    if (!args || !call.args.at_end() || !core::valid_component(args->name, true)) {
+    if (!args || !call.args.at_end()) {
         co_await rpc::Dispatcher::reply_garbage_args(ctx, call.xid);
         co_return;
     }
@@ -293,6 +298,19 @@ rt::Task<void> Engine::proc_lookup(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
     if (!dir) {
         begin_result(enc, ctx, call, core::to_v3(dir.error(), Proc::kLookup));
         encode_post_attr(enc, std::nullopt, 0);
+        co_await reply(ctx, enc, cap);
+        co_return;
+    }
+    // LOOKUP may name "." / ".."; the creation family may not (core/names.hpp).  A name
+    // the filesystem could never hold is still answered as a lookup, not turned into an
+    // RPC-level error (followups/protocol-gaps.md A3/C5): over-long is NAMETOOLONG, and
+    // anything else unusable — empty, or carrying '/' or NUL — simply does not exist.
+    if (core::NameCheck check = core::check_component(args->name, dir->exp->backend->limits().max_name);
+        check != core::NameCheck::kOk && check != core::NameCheck::kDot) {
+        Status status = check == core::NameCheck::kTooLong ? Status::kNametoolong : Status::kNoent;
+        auto dir_attr = co_await core::sample_attr(dir->obj);
+        begin_result(enc, ctx, call, status);
+        encode_post_attr(enc, dir_attr, dir->exp->fsid);
         co_await reply(ctx, enc, cap);
         co_return;
     }
@@ -867,6 +885,8 @@ rt::Task<void> Engine::proc_symlink(ConnCtx& ctx, RpcCall& call, const rpc::Cred
     }
     MutateGuard guard(locks_, *dir->exp, rpc_cred);
     Status precheck = verdict_status(guard.precheck({args->where.name}));
+    // nfspath3 is unbounded on the wire; PATH_MAX is what the storage will take (A3).
+    if (precheck == Status::kOk && args->target.size() > kMaxPath) precheck = Status::kNametoolong;
     if (precheck == Status::kOk && !dir->exp->backend->caps().has(backend::Cap::kSymlink)) precheck = Status::kNotsupp;
     if (precheck != Status::kOk) {
         auto attr = co_await core::sample_attr(dir->obj);

@@ -11,9 +11,14 @@ rt::Task<std::optional<backend::Attr>> sample_attr(const backend::ObjPtr& obj) {
 
 MutateGuard::Verdict MutateGuard::precheck(std::initializer_list<std::string_view> names) const {
     if (exp_.readonly) return {Verdict::kReadonly};
+    // The length limit is the export's own — the backend's max_name, which is what
+    // PATHCONF and the v4 maxname attribute advertise — not a hardcoded 255: a backend
+    // is free to report something else, and the enforced limit has to be the advertised
+    // one (followups/protocol-gaps.md A3).
+    const size_t max_name = exp_.backend ? exp_.backend->limits().max_name : kMaxNameLen;
     size_t index = 0;
     for (std::string_view name : names) {
-        if (NameCheck c = check_component(name); c != NameCheck::kOk) return {Verdict::kBadName, c, index};
+        if (NameCheck c = check_component(name, max_name); c != NameCheck::kOk) return {Verdict::kBadName, c, index};
         ++index;
     }
     return {};
