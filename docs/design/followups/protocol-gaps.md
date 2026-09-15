@@ -24,7 +24,7 @@
 | A2 | A | `nfsv4/attrs.cpp:196` | `fs_locations_info`(67) 编码在 `mounted_on_fileid`(55) 之前，违反属性升序 | referral 探测时属性错位解析（仅 active-active）**——已修复** |
 | A3 | A | `nfsv3/nfs3_types.cpp:20,200`、`mountd/mount3.cpp:114` | v3 名字 >255B、symlink 目标 >1024B、MNT 路径 >1024B 一律 RPC GARBAGE_ARGS | 应为 NFS3ERR_NAMETOOLONG；`ln -s <1KB+ 目标>` 在 v3 上直接 EIO**——已修复（连带 C5）** |
 | A4 | A | `nfsv4/engine.cpp:789` 等 | v4 名字 256B → BADNAME，≥257B → BADXDR | 应为 NFS4ERR_NAMETOOLONG；`errmap` 白名单里的 NAMETOOLONG 无路径可达**——已修复** |
-| A5 | A | `state/state_mgr.cpp:1595`、`nfsv4/engine.cpp:2765` | FREE_STATEID 不校验 stateid 属主 | 叠加 B1 的可推 stateid → 可释放别人的 lock stateid |
+| A5 | A | `state/state_mgr.cpp:1595`、`nfsv4/engine.cpp:2765` | FREE_STATEID 不校验 stateid 属主 | 叠加 B1 的可推 stateid → 可释放别人的 lock stateid**——已修复** |
 | B1 | B | `state/state_mgr.cpp:141,549,734` | sessionid / clientid / stateid 全无随机分量；SEQUENCE 接受任意连接 | 网段内可枚举并冒用别人的会话与状态 |
 | B2 | B | `core/config.cpp:1089` | `squash = root` 只压 uid，不压 gid 0 与附加组 0 | 组 root 可写的文件仍可被写 |
 | B3 | B | 全路径缺失 | 无特权源端口（"secure"）检查 | 受信主机上的**普通用户**即可声称任意 uid |
@@ -207,7 +207,7 @@ RFC 8881 §18.10.3（LOOKUP）、§18.16.3（OPEN）、§18.4.3（CREATE）等�
   与 10036（BADXDR），即修复前的行为。注意 2000 字节目标那条在修复前也通过——v4 原本的
   上界就是 4096，那条是回归守卫而不是缺陷复现。
 
-### A5 FREE_STATEID 不校验 stateid 属主
+### A5 FREE_STATEID 不校验 stateid 属主（已修复）
 
 ```
 rt::Task<uint32_t> StateMgr::free_stateid(const Stateid& sid)   // state_mgr.cpp:1595
@@ -230,6 +230,23 @@ RFC 8881 §18.38.3：不属于本客户端的 stateid → NFS4ERR_BAD_STATEID。
 `tests/test_nfs4.cpp` 里补一条"客户端 B 的会话 FREE_STATEID 客户端 A 的 lock stateid"。
 
 ---
+
+**已修复**（本轮）：
+- `free_stateid(sid)` → `free_stateid(sid, clientid)`，`rec->client->clientid != clientid`
+  回 BAD_STATEID；`op_free_stateid` 传 `ctx.clientid`。**没有留无属主的重载**——内部若要
+  无条件丢状态，走 `unlink_state()`，不该从这个入口绕。
+- 属主检查**排在类型与持锁检查之前**：别人的 stateid 于是和「不存在的 stateid」给出完全一样
+  的回答，回复里不透露调用方无权知道的状态。修复前 B 拿 A 的 **open** stateid 去 FREE 会得到
+  LOCKS_HELD——等于确认「这个 stateid 是个活着的 open」，在 `other` 可枚举（B1）的前提下是一个
+  可用的探测原语。
+- 回归测例两条：`Nfs4.FreeStateidRejectsForeignStateids`（引擎层，两个会话共用一条连接：
+  A 开文件、加锁、LOCKU 掉区间；B 的会话 FREE_STATEID A 的 lock stateid / 一个不存在的
+  stateid / A 的 open stateid，三者都必须是 BAD_STATEID；换回 A 的会话同一调用成功，A 自己的
+  open stateid 仍是 LOCKS_HELD）与 `StateMgr.ByteRangeLocksLifecycle`（状态层直接断言）。
+- 反向验证（去掉属主检查）：两条各失败 3 处，失败值把这个洞讲清楚了——
+  **B 释放 A 的 lock stateid 返回 0（成功）**，紧接着 A 自己再 FREE 同一个 stateid 得到 10025
+  （BAD_STATEID），也就是审计里写的「受害方后续 LOCK/LOCKU 拿到 BAD_STATEID，锁流程断掉」；
+  B 拿 A 的 open stateid 返回 10037（LOCKS_HELD），即上面那条信息泄露。
 
 ## B. 语义偏差与安全边界偏差
 
@@ -505,7 +522,9 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 ## 建议的修复顺序
 
 1. ~~**A1**、**A2**~~ —— 均已修复（见上）。畸形回复这一类目前已清空。
-2. **A5、B1** —— 跨客户端的状态隔离。B1 的两个子项独立，可分别落。
+2. ~~**A5**~~（已修复，见上）、**B1** —— 跨客户端的状态隔离。A5 落地后，B1 的
+   「stateid 可推」不再能直接释放别人的锁状态，但会话冒用这条仍然开着；B1 的两个子项
+   （标识加随机量、SEQUENCE 连接绑定）独立，可分别落。
 3. ~~**A3**、**C5**、**A4**~~（均已修复，见上）、**B6**、**B5** —— 错误码与属性宣告的一致性。
    `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
    剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
@@ -526,8 +545,9 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 - **A3**：v3 侧补两条裸 RPC 用例——256 字节分量的 LOOKUP（期望 NAMETOOLONG）与 2000 字节
   symlink 目标的 SYMLINK（期望成功）。注意**不能**用 Linux 客户端挂载来测：客户端按
   PATHCONF 的 `name_max` 在本地就挡了，测不到线上行为，这也是这条一直没被发现的原因。
-- **A5 / B1**：`tests/test_nfs4.cpp` 里补"客户端 B 操作客户端 A 的 stateid / sessionid"的
-  跨客户端隔离用例组（FREE_STATEID、READ、DESTROY_SESSION 各一条）。
+- **B1**（A5 已由 `Nfs4.FreeStateidRejectsForeignStateids` 与
+  `StateMgr.ByteRangeLocksLifecycle` 覆盖）：把跨客户端隔离用例组补齐——A5 已经建好了
+  「两个会话共用一条连接」的夹具写法，READ 与 DESTROY_SESSION 两条照抄即可。
 - **B4**：DRC 用例里换一个源端口重发同一 xid，断言命中缓存（`tests/test_rpc.cpp` 已有 DRC
   测例可扩展）。
 - **B7**：在 `tests/` 里搭一个 v3 引擎 + v4 引擎共享同一 `MemoryBackend` 与 `StateMgr` 的

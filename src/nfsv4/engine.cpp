@@ -2803,7 +2803,7 @@ rt::Task<uint32_t> Engine::op_free_stateid(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrE
         enc.u32(cur);
         co_return cur;
     }
-    uint32_t code = co_await state_.free_stateid(*sid);
+    uint32_t code = co_await state_.free_stateid(*sid, ctx.clientid);
     enc.u32(code);
     co_return code;
 }

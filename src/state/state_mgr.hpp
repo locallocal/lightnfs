@@ -422,7 +422,11 @@ class StateMgr {
     rt::Task<uint32_t> close_state(const Stateid& sid);
     rt::Task<uint32_t> open_downgrade(const Stateid& sid, uint64_t clientid, uint32_t access, uint32_t deny,
                                       Stateid* out);
-    rt::Task<uint32_t> free_stateid(const Stateid& sid);
+    // FREE_STATEID (RFC 8881 §18.38): releases a lock stateid whose ranges are all gone.
+    // `clientid` is the caller's own — a stateid belonging to anyone else answers
+    // BAD_STATEID (followups/protocol-gaps.md A5).  There is no owner-less form: an
+    // internal caller that means to drop state regardless goes through unlink_state().
+    rt::Task<uint32_t> free_stateid(const Stateid& sid, uint64_t clientid);
 
     // ---- byte-range locks (7.6; LOCK/LOCKT/LOCKU, RFC 8881 §18.10–§18.12) ----
     struct LockDenied {
