@@ -28,8 +28,8 @@ uint64_t PseudoFs::stable_id(std::string_view path) {
     return id;
 }
 
-PseudoFs::PseudoFs(const std::vector<std::shared_ptr<ExportEntry>>& entries, uint64_t boot_epoch)
-    : boot_epoch_(boot_epoch) {
+PseudoFs::PseudoFs(const std::vector<std::shared_ptr<ExportEntry>>& entries, uint64_t change_base)
+    : change_base_(change_base) {
     root_.id = stable_id("/");
     root_.name = "/";
     by_id_[root_.id] = &root_;
@@ -100,9 +100,13 @@ backend::Attr PseudoFs::attr_of(const Node& node) const {
     a.size = 4096;
     a.used = 4096;
     a.fileid = node.id;
-    // The synthesized tree only changes on restart/reconfig — which is exactly when the
-    // boot epoch moves, so client caches revalidate then (plan doc 10 §1.6).
-    a.change = boot_epoch_;
+    // One change value for the whole tree: ExportSet::pseudo_change() of the set this
+    // tree was built for, which moves on every publish — a restart, and equally a hot
+    // export-set change (config.hpp: (epoch << 32) | generation).  That is what makes a
+    // v4 client re-list after an export is added or removed, instead of continuing
+    // against positional cookies into a re-indexed tree (plan doc 10 §1.6; C4 — the old
+    // comment here claimed restarts only, and the field was misnamed to match).
+    a.change = change_base_;
     return a;
 }
 
