@@ -15,6 +15,11 @@
 > **分级**：**A = 会产生错误码错误或畸形回复**（客户端可见故障，应修）；
 > **B = 语义偏差 / 安全边界偏差**（行为与 RFC 或与 knfsd 惯例不一致）；
 > **C = 加固项与已知取舍**（记录在案，按需）。
+>
+> **状态（2026-09-15 收尾）**：A1–A5、B1–B8、C1–C5 全部处理完毕，每条的「已修复（本轮）」
+> 段落记着实际改法、与原提案的差异，以及反向验证（把改动回退后失败的断言数）。其中三项
+> 复核后**判定不做**并在正文写明理由：B1 的「stateid 加随机量」与「SEQUENCE 严格连接绑定」
+> （SP4_NONE 下与 knfsd 一致），以及 B7 的一行降级方案。
 
 ## 0. 一页结论
 
@@ -33,7 +38,7 @@
 | B6 | B | `nfsv3/engine.cpp:584` | v3 FSINFO 不宣告 FSF3_CANSETTIME | 看 properties 的客户端不用 SET_TO_CLIENT_TIME**——已修复** |
 | B7 | B | `nfsv3/engine.hpp`（无 StateMgr） | v3 的写/删/改名不召回 v4 读委托 | v4 客户端**无限期**读到缓存旧内容**——已修复（方案 1，语义正确的那个）** |
 | B8 | B | 见正文清单 | 7 条较小的一致性偏差 | 各条见正文**——已全部处理** |
-| C1–C5 | C | 见正文 | 加固项与注释过期 | — |
+| C1–C5 | C | 见正文 | 加固项与注释过期 | 各条见正文**——已全部处理** |
 
 ---
 
@@ -757,19 +762,47 @@ anon，几十条 v4 测例当场改变语义。只有认证器会设这个位。
   匿名**，uid 0 保持 0）。
   回退两处行为后分别失败 2 / 3 处：坏 verifier 被放行，AUTH_NONE 回 65534 而不是 1000/1001。
 
-### C4 `pseudofs.cpp` 的注释已过期
+### C4 `pseudofs.cpp` 的注释已过期（已修复）
 
-`PseudoFs::attr_of` 的注释写「合成树只在重启/重配时变——而那正是 boot epoch 移动的时候」
-（`core/pseudofs.cpp:95-98`）。实现上传进来的是 `ExportSet::pseudo_change()` =
-`(epoch << 32) | generation`（`core/config.hpp:311-313`），**每次发布都会变**——这是对的
-（共享导出清单热更新后，v4 客户端的伪根 READDIR 会因 verifier 变化而重列，位置型 cookie 不会
-错位）。注释该改，免得后人按注释去"修"。
+原问题：`PseudoFs::attr_of` 的注释写「合成树只在重启/重配时变——而那正是 boot epoch 移动的
+时候」。实现上传进来的是 `ExportSet::pseudo_change()` = `(epoch << 32) | generation`
+（`core/config.hpp:311-313`），**每次发布都会变**——这是对的（共享导出清单热更新后，v4 客户端
+的伪根会因 change 变化而重列，位置型 cookie 不会错位）。
+
+已修复（本轮）—— 比条目里写的一行注释多改了一处，是命名：
+
+- `core/pseudofs.cpp:103-109` 的注释改成说明「一棵树一个 change 值，取自所属 ExportSet 的
+  `pseudo_change()`，重启会动、热改导出同样会动」，并写清这就是热更新后客户端重列的依据。
+- **构造参数与成员从 `boot_epoch` / `boot_epoch_` 改名为 `change_base` / `change_base_`**
+  （`core/pseudofs.hpp:40,61`、`core/pseudofs.cpp:31-32`）。名字本身就在说「这是启动纪元」，
+  和那句错注释是一对——只改注释而留着名字，下一个人照名字读代码还会得出同样的错结论。
+  改名安全：全仓只有 `core/config.cpp:894` 一处构造，且是位置传参。
+  头文件注释（`core/pseudofs.hpp:29-39`）同时记下了原先的错误读法与「热改导出必须翻动这个值」
+  的理由。
+
+**无行为变更**：`change_base_` 的取值、`attr_of` 的输出、伪根节点 id 的推导全部逐字节不变，
+所以这条没有可反向验证的失败断言——改名后 390 条用例照旧全绿即是它该有的证据。
 
 ### C5 v3 LOOKUP 的非法分量也回 GARBAGE_ARGS（已随 A3 修复）
 
-`nfsv3/engine.cpp:287` 把 `!core::valid_component(args->name, true)` 与 XDR 解码失败合并成
-一条 `reply_garbage_args`。"." / ".." 是放行的，但含 `/` 或 NUL 的分量会变成 RPC 层错误而不是
-NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
+原问题：`nfsv3/engine.cpp` 把 `!core::valid_component(args->name, true)` 与 XDR 解码失败合并
+成一条 `reply_garbage_args`。"." / ".." 是放行的，但含 `/` 或 NUL 的分量会变成 RPC 层错误。
+
+已修复（随 A3）：`nfsv3/engine.cpp:328-331` 现在走 `core::check_component`，且这段检查被移到
+句柄解析**之后**（STALE 优先于坏名字）：
+
+```cpp
+if (core::NameCheck check = core::check_component(args->name, dir->exp->backend->limits().max_name);
+    check != core::NameCheck::kOk && check != core::NameCheck::kDot) {
+    Status status = check == core::NameCheck::kTooLong ? Status::kNametoolong : Status::kNoent;
+```
+
+即：超长 → NAMETOOLONG，其余文件系统永远装不下的名字（空、含 `/` 或 NUL）→ NOENT。一律是
+NFS 层状态，不再是 RPC 层错误。
+
+覆盖：`Nfs3.OverlongNamesAnswerNametoolong`（`tests/test_nfs3.cpp:452-457`）对 `"a/b"` 与
+`""` 断言 `accept_stat == rpc::kSuccess` 且 status == NFS3ERR_NOENT——两个断言一起看才有意义：
+只断 NOENT 的话，GARBAGE_ARGS 那种无 body 的回复也可能被误判成通过。
 
 ---
 
@@ -785,7 +818,10 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 4. ~~**B2**、**B3**~~ —— 身份压缩与源端口，均已修复；两条都动了安全默认值，文档与配置样例已同步。
 5. ~~**B4**、**B7**~~ —— 均已修复。B7 走的是方案 1（完整召回），不是那个一行的降级方案：
    见下文「为什么没选方案 2」。
-6. ~~**B8**~~（已全部处理，见上）、**C 类** —— C 类按需；C4（过期注释）属于「改一行防将来踩」。
+6. ~~**B8**~~、~~**C 类**~~ —— 均已处理。C1（片数上限 + 连接空闲清扫）、C2（cookieverf 严格
+   化改为可配 `strict_readdir_cookies`）、C3（AUTH_SYS verifier 校验 + AUTH_NONE 走 anon）
+   有行为变更并带用例；C4 是注释与命名修正，无行为变更；C5 随 A3 一并收口。
+   **本文档的全部条目至此清空。**
 
 ## 验证建议
 

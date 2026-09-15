@@ -27,10 +27,17 @@ class PseudoFs {
     };
 
     // Built over an ExportSet's entries by ExportSetBuilder::finish (plan 12 B1) and
-    // owned by that set; nodes keep raw pointers into `entries`.  `boot_epoch` feeds the
-    // synthesized change attribute so clients revalidate the pseudo tree after a
-    // restart/reconfig (plan doc 10 §1.6).
-    explicit PseudoFs(const std::vector<std::shared_ptr<ExportEntry>>& entries, uint64_t boot_epoch = 1);
+    // owned by that set; nodes keep raw pointers into `entries`.
+    //
+    // `change_base` becomes every pseudo node's change attribute, so clients revalidate
+    // the synthesized tree whenever it moves.  The caller passes
+    // ExportSet::pseudo_change() — (boot_epoch << 32) | generation — which moves on
+    // *every* publish, not only on a restart.  It used to be called `boot_epoch`, which
+    // together with the comment here said the tree only changes across restarts; that
+    // reading is wrong, and it is the reading that matters, because a hot export-set
+    // change has to flip this or a v4 client would keep serving a stale listing of the
+    // pseudo tree against positional cookies (followups/protocol-gaps.md C4).
+    explicit PseudoFs(const std::vector<std::shared_ptr<ExportEntry>>& entries, uint64_t change_base = 1);
 
     // Nodes are handed out non-const like find()/for_export(): the tree is frozen with
     // its ExportSet, but engines walk it through mutable Node pointers.
@@ -57,7 +64,8 @@ class PseudoFs {
     Node root_;
     std::unordered_map<uint64_t, Node*> by_id_;
     std::unordered_map<uint32_t, Node*> by_export_;
-    uint64_t boot_epoch_ = 1;
+    // ExportSet::pseudo_change() of the set this tree belongs to; see the constructor.
+    uint64_t change_base_ = 1;
 };
 
 }  // namespace lnfs::core
