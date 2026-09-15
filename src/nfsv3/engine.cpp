@@ -600,6 +600,14 @@ rt::Task<void> Engine::proc_fs_query(ConnCtx& ctx, RpcCall& call, const rpc::Cre
         enc.u64(fs.limits.max_filesize);
         encode_time(enc, fs.limits.time_delta);
         uint32_t props = fs.kHomogeneous ? kFsfHomogeneous : 0;
+        // FSF3_CANSETTIME: SETATTR does accept SET_TO_CLIENT_TIME (decode_sattr), which is
+        // what FsProps::kCansettime records and what the v4 cansettime attribute already
+        // reports.  Without the bit, clients that consult `properties` — the BSD, Solaris
+        // and macOS lineages — fall back to SET_TO_SERVER_TIME, so utimes(), `tar -p` and
+        // `rsync -t` lose the timestamps they are trying to restore.  The Linux client
+        // ignores it, which is why the local acceptance runs never noticed
+        // (followups/protocol-gaps.md B6).
+        if (fs.kCansettime) props |= kFsfCanSetTime;
         if (fs.link_support) props |= kFsfLink;
         if (fs.symlink_support) props |= kFsfSymlink;
         enc.u32(props);

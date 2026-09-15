@@ -30,7 +30,7 @@
 | B3 | B | 全路径缺失 | 无特权源端口（"secure"）检查 | 受信主机上的**普通用户**即可声称任意 uid**——已修复（新增 `secure_ports`，默认 true）** |
 | B4 | B | `rpc/drc.hpp:39` | DRC 键含源端口 | 跨重连的重传 miss → 非幂等过程重放（REMOVE 回 NOENT 等）**——已修复** |
 | B5 | B | `nfsv4/attrs.cpp:133` | `fh_expire_type` 恒为 FH4_PERSISTENT，无视 `kStableHandles` | fallback 句柄模式下向客户端谎报句柄永久有效**——已修复** |
-| B6 | B | `nfsv3/engine.cpp:584` | v3 FSINFO 不宣告 FSF3_CANSETTIME | 看 properties 的客户端不用 SET_TO_CLIENT_TIME |
+| B6 | B | `nfsv3/engine.cpp:584` | v3 FSINFO 不宣告 FSF3_CANSETTIME | 看 properties 的客户端不用 SET_TO_CLIENT_TIME**——已修复** |
 | B7 | B | `nfsv3/engine.hpp`（无 StateMgr） | v3 的写/删/改名不召回 v4 读委托 | v4 客户端**无限期**读到缓存旧内容 |
 | B8 | B | 见正文清单 | 7 条较小的一致性偏差 | 各条见正文 |
 | C1–C5 | C | 见正文 | 加固项与注释过期 | — |
@@ -504,7 +504,7 @@ FH4_PERSISTENT（路径哈希 id，稳定）。
 一档；而且 Linux 客户端对 STALE 本来就有恢复路径，所以现状不比之前差——之前是**既谎报
 persistent 又回 STALE**，现在至少宣告是诚实的。**决定：本轮不做，记在此处。**
 
-### B6 v3 FSINFO 不宣告 FSF3_CANSETTIME
+### B6 v3 FSINFO 不宣告 FSF3_CANSETTIME（已修复）
 
 ```
 // nfsv3/engine.cpp:584-587
@@ -523,6 +523,17 @@ SET_TO_CLIENT_TIME，退化成 SET_TO_SERVER_TIME——`utimes()`、`tar -p`、`
 时间戳恢复失真。Linux 客户端不看这个位，所以本机验收发现不了。
 
 **修法**：一行，`if (core::FsProps::kCansettime) props |= kFsfCanSetTime;`。
+
+**已修复**（本轮）：一行——`if (fs.kCansettime) props |= kFsfCanSetTime;`。常量
+（`kFsfCanSetTime`）与判据（`FsProps::kCansettime`）本来都在，只是从没连起来。
+- 回归测例 `Nfs3.FsinfoAdvertisesCanSetTime`：断言 CANSETTIME 置位，同时断言 LINK /
+  SYMLINK / HOMOGENEOUS 三位仍在（新位是**加上**而不是替换），并断言 `properties` 里没有
+  RFC 1813 §3.3.19 四个位之外的东西。去掉那一行后该测例失败 1 处，正是 CANSETTIME。
+- 测例第二段本来想直接发一个 SET_TO_CLIENT_TIME 的 SETATTR 证明「宣告是诚实的」，结果回
+  PERM——夹具的匿名凭证不是文件属主，而 POSIX 的 `utimes()` 带显式时间要求属主权限。**服务器是
+  对的，测例是错的**：改成在解码层断言 `sattr3` 能解出 client-time 的 `SetAttr`，并在注释里
+  指向已经覆盖「真的下到后端」的两条既有测例（`WriteTypes.SattrAndCreateRoundTrip`、
+  `Nfs4.SetattrSizeModeOwner`）。
 
 ### B7 v3 侧的改动不召回 v4 读委托
 
@@ -647,7 +658,7 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 2. ~~**A5**、**B1**~~ —— 跨客户端的状态隔离，两条都收口了：A5 补上 stateid 属主检查，
    B1 让 sessionid 不可推。B1 里「stateid 加随机量」与「SEQUENCE 严格连接绑定」两项复核后
    **判定为不做**（理由见 B1 正文）。
-3. ~~**A3**、**C5**、**A4**、**B5**~~（均已修复，见上）、**B6** —— 错误码与属性宣告的一致性。
+3. ~~**A3**、**C5**、**A4**、**B5**、**B6**~~ —— 全部修复。错误码与属性宣告这一档清空了。
    `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
    剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
 4. ~~**B2**、**B3**~~ —— 身份压缩与源端口，均已修复；两条都动了安全默认值，文档与配置样例已同步。
