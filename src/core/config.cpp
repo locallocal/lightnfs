@@ -1086,10 +1086,23 @@ std::string ExportTable::reload_dynamic(const Config& fresh) {
 
 MappedCred ExportTable::squash_cred(const rpc::Cred& cred, const ExportEntry& entry) {
     MappedCred out{cred.uid, cred.gid, {cred.gids.begin(), cred.gids.end()}};
-    if (entry.squash == Squash::kAll || (entry.squash == Squash::kRoot && out.uid == 0)) {
+    if (entry.squash == Squash::kAll) {
         out.uid = entry.anon_uid;
         out.gid = entry.anon_gid;
         out.groups.clear();
+        return out;
+    }
+    // root_squash is three independent substitutions, not one (exports(5), and knfsd's
+    // nfsd_setuser): uid 0, gid 0, and every supplementary group 0 become anon.  Keying
+    // the whole mapping off `uid == 0` left a request with uid=1000 and gid=0 — or with
+    // group 0 in its list — holding group-root rights on a "squashed" export
+    // (followups/protocol-gaps.md B2).  Group 0 is replaced rather than dropped, so the
+    // caller keeps the same number of groups it claimed.
+    if (entry.squash == Squash::kRoot) {
+        if (out.uid == 0) out.uid = entry.anon_uid;
+        if (out.gid == 0) out.gid = entry.anon_gid;
+        for (uint32_t& group : out.groups)
+            if (group == 0) group = entry.anon_gid;
     }
     return out;
 }

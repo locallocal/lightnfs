@@ -21,7 +21,8 @@ lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面�
   PEM 证书链与私钥；可选 `ca` + `client_cert = true` 启用双向 TLS（校验客户端证书）。
   改动 `[tls]` 需重启（非热重载项）。
 - 用 `[[export]] clients = [...]` CIDR 白名单收敛来源，用 `squash` 把不受信客户端的
-  root 映射为匿名（默认 `root`；完全不信任时用 `all`）。
+  root 映射为匿名（默认 `root`；完全不信任时用 `all`）。注意 `root` 压的是**三样**：uid 0、
+  gid 0、附加组里的 0——一个 uid=1000 但声称 gid 0 的请求也会被压掉组 root 身份。
 - 句柄经 SipHash-2-4 HMAC 签名（`state_dir/hmac.key`，首启生成，0600），伪造句柄→
   BADHANDLE；每请求还校验导出 fsid 与来源 IP。**但这防的是伪造句柄，不是伪造身份**——
   身份边界仍是上面的网络假设。
@@ -74,7 +75,7 @@ sudo systemctl enable --now lightnfs
 | 端口 | `[server] port` / `mount_port` | 默认 2049 / 20048 |
 | 状态目录 | `[server] state_dir` | 存 boot_epoch、hmac.key、grace 名单——**须持久、独占、0700** |
 | 来源白名单 | `[[export]] clients` | CIDR 列表，收敛到受信网段 |
-| 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none` |
+| 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none`。`root` 按 exports(5) 的 root_squash 语义**分别**映射 uid 0、gid 0 与附加组里的 0 到 `anon_uid`/`anon_gid`——所以声称 gid 0 的非 root uid 同样被压；`all` 把任何身份压成 anon 并清空附加组；`none` 原样透传 |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
 | 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` / `[export.lustre]` / `[export.cephfs]` | `local`（本机目录树）、`gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名）或 `lustre`（Lustre 客户端挂载内的目录：`mount`（默认自动探测）/`hsm`/`native_locks`/`identity`/`fd_cache`；非 Lustre 挂载启动即拒，写明 statfs magic 不符）或 `cephfs`（libcephfs 挂载：`conf`/`id`/`keyring`/`mon_host`/`fs_name`/`subdir`/`options`/`uuid`（多网关接管时回收的会话 uuid，默认 `<cluster id>-<fsid>`）；运行时加载 `libcephfs.so.2`，缺库启动失败并写明；`path` 只是挂载名） |
 | 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |

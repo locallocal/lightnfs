@@ -359,6 +359,85 @@ TEST(ExportSet, PseudoChangeMonotonic) {
     EXPECT_EQ(seen.size(), 6u);
 }
 
+// followups/protocol-gaps.md B2: root_squash is three independent substitutions
+// (exports(5) / knfsd's nfsd_setuser) -- uid 0, gid 0 and every supplementary group 0.
+// Keying the whole mapping off uid == 0 let uid=1000,gid=0 keep group-root rights on a
+// squashed export.
+TEST(ExportSet, RootSquashMapsGroupRootToo) {
+    core::ExportTable table;
+    auto cfg = export_cfg(1, "/export/data");
+    cfg.squash = core::Squash::kRoot;
+    cfg.anon_uid = 1000;
+    cfg.anon_gid = 1001;
+    ASSERT_TRUE(table.add(cfg, mem(1)).has_value());
+    auto set = table.snapshot();
+    core::ExportEntry* entry = set->by_fsid(1);
+    ASSERT_TRUE(entry != nullptr);
+
+    auto squash = [&](uint32_t uid, uint32_t gid, std::initializer_list<uint32_t> groups) {
+        rpc::Cred cred;
+        cred.uid = uid;
+        cred.gid = gid;
+        for (uint32_t g : groups) cred.gids.push_back(g);
+        return core::ExportTable::squash_cred(cred, *entry);
+    };
+
+    // uid 0: the case that already worked.
+    auto root = squash(0, 0, {0, 42});
+    EXPECT_EQ(root.uid, 1000u);
+    EXPECT_EQ(root.gid, 1001u);
+
+    // The B2 case: a non-root uid claiming gid 0.  uid is its own, gid becomes anon.
+    auto group_root = squash(1000, 0, {});
+    EXPECT_EQ(group_root.uid, 1000u);
+    EXPECT_EQ(group_root.gid, 1001u);
+
+    // Group 0 in the supplementary list is replaced, not dropped: the caller keeps the
+    // same number of groups it claimed, with 0 mapped to anon and the rest untouched.
+    auto supp = squash(500, 500, {0, 42, 0});
+    EXPECT_EQ(supp.uid, 500u);
+    EXPECT_EQ(supp.gid, 500u);
+    ASSERT_TRUE(supp.groups.size() == 3u);
+    EXPECT_EQ(supp.groups[0], 1001u);
+    EXPECT_EQ(supp.groups[1], 42u);
+    EXPECT_EQ(supp.groups[2], 1001u);
+
+    // An ordinary caller with no root anywhere is left alone.
+    auto plain = squash(500, 600, {700, 800});
+    EXPECT_EQ(plain.uid, 500u);
+    EXPECT_EQ(plain.gid, 600u);
+    ASSERT_TRUE(plain.groups.size() == 2u);
+    EXPECT_EQ(plain.groups[0], 700u);
+    EXPECT_EQ(plain.groups[1], 800u);
+
+    // squash = all still flattens everything, groups included.
+    core::ExportSetPlan plan;
+    auto all = export_cfg(1, "/export/data");
+    all.squash = core::Squash::kAll;
+    all.anon_uid = 1000;
+    all.anon_gid = 1001;
+    plan.update.push_back(all);
+    std::vector<std::unique_ptr<backend::Backend>> none;
+    ASSERT_TRUE(table.apply(std::move(plan), none, set->epoch).has_value());
+    auto flattened = squash(500, 600, {700, 800});
+    EXPECT_EQ(flattened.uid, 1000u);
+    EXPECT_EQ(flattened.gid, 1001u);
+    EXPECT_TRUE(flattened.groups.empty());
+
+    // squash = none touches nothing, root included -- that is what it is for.
+    core::ExportSetPlan keep;
+    auto plain_cfg = export_cfg(1, "/export/data");
+    plain_cfg.squash = core::Squash::kNone;
+    keep.update.push_back(plain_cfg);
+    std::vector<std::unique_ptr<backend::Backend>> none2;
+    ASSERT_TRUE(table.apply(std::move(keep), none2, set->epoch).has_value());
+    auto untouched = squash(0, 0, {0});
+    EXPECT_EQ(untouched.uid, 0u);
+    EXPECT_EQ(untouched.gid, 0u);
+    ASSERT_TRUE(untouched.groups.size() == 1u);
+    EXPECT_EQ(untouched.groups[0], 0u);
+}
+
 TEST(ExportSet, DynamicFieldsUpdateInPlace) {
     core::ExportTable table;
     auto cfg = export_cfg(1, "/export/data");
