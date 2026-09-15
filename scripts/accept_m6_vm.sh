@@ -15,6 +15,11 @@
 # usage: accept_m6_vm.sh
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
 nfs_port=${LNFS_NFS_PORT:-12119}
 mount_port=${LNFS_MOUNT_PORT:-12118}
@@ -34,7 +39,7 @@ trap cleanup EXIT
 
 echo "== building lightnfsd (Release) + cthon04"
 cmake -S "$repo" -B "$repo/build-rel" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$repo/build-rel" --target lightnfsd lnfs_accept_client lightnfs-ctl >/dev/null
+cmake --build "$repo/build-rel" -j"$jobs" --target lightnfsd lnfs_accept_client lightnfs-ctl >/dev/null
 "$repo/scripts/fetch_cthon.sh" "$work/cthon04"
 make -C "$work/cthon04" 2>/dev/null >/dev/null || make -C "$work/cthon04" >/dev/null
 

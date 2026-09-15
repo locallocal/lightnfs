@@ -7,6 +7,11 @@
 # usage: accept_m2_vm.sh [FSX_OPS]     # default 50000 ops (~minutes); overnight: 10000000
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 fsx_ops=${1:-50000}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 nfs_port=${LNFS_NFS_PORT:-12099}
@@ -26,7 +31,7 @@ trap cleanup EXIT
 
 echo "== building lightnfsd (Release)"
 cmake -S "$repo" -B "$repo/build-rel" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$repo/build-rel" --target lightnfsd >/dev/null
+cmake --build "$repo/build-rel" -j"$jobs" --target lightnfsd >/dev/null
 
 echo "== fetching test suites"
 "$repo/scripts/fetch_cthon.sh" "$work/cthon04"

@@ -21,6 +21,8 @@
 #include "core/file_handle.hpp"
 #include "core/obj_lock.hpp"
 #include "core/pseudofs.hpp"
+#include "nfsv3/engine.hpp"
+#include "nfsv3/nfs3_types.hpp"
 #include "nfsv4/attrs.hpp"
 #include "nfsv4/engine.hpp"
 #include "runtime/reactor.hpp"
@@ -3174,6 +3176,197 @@ uint32_t do_delegreturn(V4Fixture& f, const std::vector<std::byte>& fh, const nf
 
 // CREATE_SESSION with CONN_BACK_CHAN binds the channel; a read-only OPEN then earns a
 // read delegation whose stateid serves READ; DELEGRETURN hands it back.
+// followups/protocol-gaps.md B7: the v3 engine held no StateMgr, so a v3 mutation on a
+// file a v4 client held a read delegation on recalled nothing -- that client kept serving
+// its cached copy indefinitely, with nothing to tell it otherwise.  This is worse than the
+// documented "v3 writes are not constrained by v4 share reservations" boundary: that one
+// costs concurrency control, this one returns stale data.
+//
+// Both engines on one export set, one handle codec, one lock registry and one StateMgr --
+// which is what the server actually does (ProtocolStack), and the only way to observe the
+// interaction.
+struct MixedFixture : V4Fixture {
+    nfsv3::Engine v3{exports, handles, locks};
+
+    MixedFixture() {
+        v3.set_state_mgr(&*state);
+        core::WriteVerf verf{};
+        verf[0] = std::byte{0xAB};
+        v3.set_write_verifier(verf);
+    }
+
+    // One v3 call on the shared connection, returning the reply payload past the record
+    // mark.  Backchannel CALLs (the CB_RECALL this test is about) can reach the wire
+    // before the reply, so they are stashed exactly as compound_raw does.
+    std::vector<std::byte> v3_request(nfsv3::Proc proc, rt::BufferChain args, uint32_t xid = 0x55) {
+        xdr::XdrEnc enc(pool);
+        enc.u32(xid);
+        enc.u32(rpc::kCall);
+        enc.u32(2);
+        enc.u32(nfsv3::kProgram);
+        enc.u32(nfsv3::kVersion);
+        enc.u32(static_cast<uint32_t>(proc));
+        // AUTH_NONE cred + verf
+        enc.u32(0);
+        enc.u32(0);
+        enc.u32(0);
+        enc.u32(0);
+        if (!args.empty()) enc.opaque_fixed(args.to_bytes());
+        auto record = enc.take();
+        auto parsed = rpc::parse_call(record);
+        if (!parsed.has_value()) return {};
+        rpc::Cred cred;
+        cred.uid = 0;
+        cred.gid = 0;
+        rt::spawn(v3.dispatch(ctx, *parsed, cred), reactor);
+        for (;;) {
+            while (!ring.has_pending(rt::testing::FakeRing::Kind::kSendv)) reactor.poll_once();
+            auto op = ring.take(rt::testing::FakeRing::Kind::kSendv, 5);
+            std::vector<std::byte> wire;
+            for (int i = 0; i < op.iovcnt; ++i) {
+                auto* p = static_cast<std::byte*>(op.iov[i].iov_base);
+                wire.insert(wire.end(), p, p + op.iov[i].iov_len);
+            }
+            ring.complete(op, static_cast<int32_t>(wire.size()));
+            while (reactor.poll_once()) {
+            }
+            std::vector<std::byte> payload(wire.begin() + 4, wire.end());
+            if (payload.size() >= 8 && payload[7] == std::byte{0}) {
+                cb_records.push_back(std::move(payload));
+                continue;
+            }
+            return payload;
+        }
+    }
+
+    // The nfsstat3 of a v3 reply, or ~0 when the reply carries no body (an accept error).
+    static uint32_t v3_status(std::vector<std::byte>& bytes) {
+        xdr::XdrDec dec(std::span<const std::byte>(bytes.data(), bytes.size()));
+        for (int i = 0; i < 6; ++i) (void)dec.u32();
+        auto v = dec.u32();
+        return v ? *v : ~0u;
+    }
+
+    // The v3 filehandle for a path under the export, taken from the v4 side.
+    nfsv3::FileHandle v3_fh(std::initializer_list<std::string_view> path) {
+        auto bytes = path_fh(path);
+        return nfsv3::FileHandle{bytes};
+    }
+};
+
+TEST(Nfs4, V3WriteRecallsV4ReadDelegation) {
+    MixedFixture f;
+    f.establish_session(true, "deleg-client", /*back_chan=*/true);
+    auto dir_fh = f.path_fh({"export", "data"});
+    auto o = do_open(f, dir_fh, "hello", 1, 0, "owner-b7");
+    ASSERT_TRUE(o.status == 0);
+    // Nothing below means anything unless a delegation was actually granted.
+    ASSERT_TRUE(o.deleg_type == 1u);
+    ASSERT_TRUE(f.state->stats().delegs == 1u);
+
+    auto file = f.v3_fh({"export", "data", "hello"});
+    ASSERT_TRUE(!file.data.empty());
+    auto write_args = [&] {
+        nfsv3::WriteArgs w;
+        xdr::XdrEnc enc(f.pool);
+        file.encode(enc);
+        enc.u64(0);
+        enc.u32(4);
+        enc.u32(nfsv3::kFileSync);
+        std::array<std::byte, 4> payload{std::byte{'v'}, std::byte{'3'}, std::byte{'!'}, std::byte{'!'}};
+        enc.opaque(payload);
+        return enc.take();
+    };
+
+    // The v3 WRITE must not go through while the delegation stands: JUKEBOX, the v3
+    // spelling of the DELAY the v4 write path answers.
+    auto reply = f.v3_request(nfsv3::Proc::kWrite, write_args(), 0x601);
+    EXPECT_EQ(MixedFixture::v3_status(reply), (uint32_t)nfsv3::Status::kJukebox);
+    // ASSERT, not EXPECT: take_cb_record() below spins until something reaches the wire,
+    // so if no recall was started this has to end the test rather than hang it.
+    ASSERT_TRUE(f.state->stats().deleg_recalls == 1u);
+
+    // And a CB_RECALL really went out on the backchannel -- the delegation holder was
+    // told, which is the whole point.
+    auto rec = f.take_cb_record();
+    ASSERT_TRUE(rec.size() > 100);
+    // CB_RECALL
+    EXPECT_EQ(rd_be32(rec, 96), 4u);
+    f.answer_cb(rec);
+
+    // A retry while the client still holds it keeps answering JUKEBOX (bounded: the
+    // revocation deadline is one lease away), and the file is untouched.
+    auto again = f.v3_request(nfsv3::Proc::kWrite, write_args(), 0x602);
+    EXPECT_EQ(MixedFixture::v3_status(again), (uint32_t)nfsv3::Status::kJukebox);
+    uint32_t read_status = 1;
+    EXPECT_STREQ(do_read(f, o.fh, o.deleg_stateid, 0, 64, &read_status), "hello v4 world");
+
+    // Once returned, the same WRITE goes through.
+    EXPECT_EQ(do_delegreturn(f, o.fh, o.deleg_stateid), 0u);
+    EXPECT_EQ(f.state->stats().delegs, 0u);
+    auto ok = f.v3_request(nfsv3::Proc::kWrite, write_args(), 0x603);
+    EXPECT_EQ(MixedFixture::v3_status(ok), (uint32_t)nfsv3::Status::kOk);
+}
+
+// The same gate on the metadata procedures: those need the victim looked up first, and
+// they answer JUKEBOX only because the error whitelist was widened for them.
+TEST(Nfs4, V3MetadataOpsRecallV4ReadDelegation) {
+    MixedFixture f;
+    f.establish_session(true, "deleg-client", /*back_chan=*/true);
+    auto dir_fh_v4 = f.path_fh({"export", "data"});
+    auto o = do_open(f, dir_fh_v4, "hello", 1, 0, "owner-b7m");
+    ASSERT_TRUE(o.status == 0);
+    ASSERT_TRUE(o.deleg_type == 1u);
+
+    nfsv3::FileHandle dir{dir_fh_v4};
+    auto file = f.v3_fh({"export", "data", "hello"});
+
+    // SETATTR (truncate) on the delegated file.
+    nfsv3::SetattrArgs sa;
+    sa.object = file;
+    sa.attrs.size = 0;
+    xdr::XdrEnc sargs(f.pool);
+    sa.encode(sargs);
+    auto sr = f.v3_request(nfsv3::Proc::kSetattr, sargs.take(), 0x611);
+    EXPECT_EQ(MixedFixture::v3_status(sr), (uint32_t)nfsv3::Status::kJukebox);
+
+    // REMOVE of the delegated file: the victim is found by name under the guard.
+    xdr::XdrEnc rargs(f.pool);
+    nfsv3::Diropargs{dir, "hello"}.encode(rargs);
+    auto rr = f.v3_request(nfsv3::Proc::kRemove, rargs.take(), 0x612);
+    EXPECT_EQ(MixedFixture::v3_status(rr), (uint32_t)nfsv3::Status::kJukebox);
+
+    // RENAME over the delegated file: the target is the one being destroyed.
+    xdr::XdrEnc nargs(f.pool);
+    nfsv3::Diropargs{dir, "other"}.encode(nargs);
+    auto mk = f.v3_request(
+        nfsv3::Proc::kCreate,
+        [&] {
+            nfsv3::CreateArgs c;
+            c.where = {dir, "other"};
+            c.mode = nfsv3::kCreateUnchecked;
+            xdr::XdrEnc e(f.pool);
+            c.encode(e);
+            return e.take();
+        }(),
+        0x613);
+    ASSERT_TRUE(MixedFixture::v3_status(mk) == (uint32_t)nfsv3::Status::kOk);
+    xdr::XdrEnc renargs(f.pool);
+    nfsv3::RenameArgs{{dir, "other"}, {dir, "hello"}}.encode(renargs);
+    auto ren = f.v3_request(nfsv3::Proc::kRename, renargs.take(), 0x614);
+    EXPECT_EQ(MixedFixture::v3_status(ren), (uint32_t)nfsv3::Status::kJukebox);
+
+    // An untouched file in the same directory is not gated: the check is per file, not
+    // per directory, and must not turn every v3 mutation into JUKEBOX.
+    xdr::XdrEnc other_sa(f.pool);
+    nfsv3::SetattrArgs osa;
+    osa.object = f.v3_fh({"export", "data", "other"});
+    osa.attrs.mode = 0600;
+    osa.encode(other_sa);
+    auto osr = f.v3_request(nfsv3::Proc::kSetattr, other_sa.take(), 0x615);
+    EXPECT_EQ(MixedFixture::v3_status(osr), (uint32_t)nfsv3::Status::kOk);
+}
+
 TEST(Nfs4, ReadDelegationGrantAndReturn) {
     V4Fixture f;
     f.establish_session(true, "lnfs-test-client", /*back_chan=*/true);

@@ -23,6 +23,11 @@
 #      flags, e.g. "-v" or "--skip times")
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 versions=("$@")
 [[ ${#versions[@]} -gt 0 ]] || versions=(3 4.1 4.2)
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -44,7 +49,7 @@ trap cleanup EXIT
 
 echo "== building lightnfsd (Release)"
 cmake -S "$repo" -B "$repo/build-rel" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$repo/build-rel" --target lightnfsd >/dev/null
+cmake --build "$repo/build-rel" -j"$jobs" --target lightnfsd >/dev/null
 
 mkdir -p "$data" "$work/state" "$mount_dir"
 chmod 777 "$data"

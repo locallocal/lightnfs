@@ -28,6 +28,11 @@
 # usage: accept_m6_local.sh
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
 nfs_port=${LNFS_NFS_PORT:-12119}
 mount_port=${LNFS_MOUNT_PORT:-12118}
@@ -44,10 +49,10 @@ trap cleanup EXIT
 
 echo "== building Release and ASAN configurations"
 cmake -S "$repo" -B "$repo/build-rel" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$repo/build-rel" >/dev/null  # every target: ctest also lists the fuzz_regress_* binaries
+cmake --build "$repo/build-rel" -j"$jobs" >/dev/null  # every target: ctest also lists the fuzz_regress_* binaries
 cmake -S "$repo" -B "$repo/build-asan" -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DLNFS_SANITIZE=address >/dev/null
-cmake --build "$repo/build-asan" >/dev/null
+cmake --build "$repo/build-asan" -j"$jobs" >/dev/null
 
 echo "== unit tests (Release + ASAN)"
 ctest --test-dir "$repo/build-rel" --output-on-failure >/dev/null

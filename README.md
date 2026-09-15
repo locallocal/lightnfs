@@ -405,7 +405,10 @@ pending a target cluster and v4 open/deny state stays per gateway.
 - AUTH_SYS only for **identity**; no Kerberos/RPCSEC_GSS. Channel encryption is available
   via built-in RPC-over-TLS (`[tls]`, RFC 9289) or an external tunnel.
 - No NLM/NSM: v3 clients have no byte-range locks, and v3 writes are not constrained
-  by v4 share reservations or locks on the same export (documented boundary).
+  by v4 share reservations or locks on the same export (documented boundary).  v3
+  mutations *do* recall v4 read delegations on the same file (answering NFS3ERR_JUKEBOX
+  while the recall runs), so a v3 write never leaves a v4 client serving stale cached
+  data.
 - Read delegations only (no write/directory delegations), no pNFS, no asynchronous or
   inter-server COPY, no xattr (the ops answer NOTSUPP).
 - Single gateway: v4 state lives in process memory plus the on-disk reclaim list; no
