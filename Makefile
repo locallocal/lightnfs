@@ -74,8 +74,8 @@ rpm:
 # ---- source gates ----
 format:
 	@command -v $(CLANG_FORMAT) >/dev/null || { echo "make format: $(CLANG_FORMAT) not found (pip install clang-format, or set CLANG_FORMAT=)"; exit 1; }
-	python3 scripts/trailing_comments.py --fix $(FORMAT_FILES)
-	$(CLANG_FORMAT) -i $(FORMAT_FILES)
+	@python3 scripts/trailing_comments.py --fix $(FORMAT_FILES)
+	@$(CLANG_FORMAT) -i $(FORMAT_FILES)
 	@echo "format: reformatted $(words $(FORMAT_FILES)) files"
 
 format-check:
