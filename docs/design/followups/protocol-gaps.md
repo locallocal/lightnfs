@@ -21,7 +21,7 @@
 | # | 级 | 位置 | 问题 | 客户端可见后果 |
 |---|----|------|------|----------------|
 | A1 | A | `nfsv4/attrs.cpp:57,102` | GETATTR 请求只写属性 `time_access_set`/`time_modify_set` 时，attrmask 置位但 attrlist 不带值 | fattr4 自相矛盾，客户端 XDR 解析失败（Linux → EIO）**——已修复** |
-| A2 | A | `nfsv4/attrs.cpp:196` | `fs_locations_info`(67) 编码在 `mounted_on_fileid`(55) 之前，违反属性升序 | referral 探测时属性错位解析（仅 active-active） |
+| A2 | A | `nfsv4/attrs.cpp:196` | `fs_locations_info`(67) 编码在 `mounted_on_fileid`(55) 之前，违反属性升序 | referral 探测时属性错位解析（仅 active-active）**——已修复** |
 | A3 | A | `nfsv3/nfs3_types.cpp:20,200`、`mountd/mount3.cpp:114` | v3 名字 >255B、symlink 目标 >1024B、MNT 路径 >1024B 一律 RPC GARBAGE_ARGS | 应为 NFS3ERR_NAMETOOLONG；`ln -s <1KB+ 目标>` 在 v3 上直接 EIO |
 | A4 | A | `nfsv4/engine.cpp:789` 等 | v4 名字 256B → BADNAME，≥257B → BADXDR | 应为 NFS4ERR_NAMETOOLONG；`errmap` 白名单里的 NAMETOOLONG 无路径可达 |
 | A5 | A | `state/state_mgr.cpp:1595`、`nfsv4/engine.cpp:2765` | FREE_STATEID 不校验 stateid 属主 | 叠加 B1 的可推 stateid → 可释放别人的 lock stateid |
@@ -77,7 +77,7 @@ RFC 8881 §18.7.3 的口径是：GETATTR 请求只写属性应答 **NFS4ERR_INVA
   撤掉修复后两条测例分别 7 / 2 处失败——修复前 VERIFY 回 NOT_SAME、NVERIFY 回 OK，
   即"拿截断的 attrlist 做了一次错误比较"，比单纯解析失败更隐蔽。
 
-### A2 `fs_locations_info` 破坏属性升序
+### A2 `fs_locations_info` 破坏属性升序（已修复）
 
 fattr4 的 attrlist 必须按属性号升序排列。`encode_fattr` 的编码顺序里
 `kFsLocationsInfo`(67) 写在 `src/nfsv4/attrs.cpp:196`，而 `kMountedOnFileid`(55) 在
@@ -97,6 +97,23 @@ fattr4 的 attrlist 必须按属性号升序排列。`encode_fattr` 的编码顺
 **修法**：把 `kFsLocationsInfo` 整块移到 `kMountedOnFileid` 之后、`kSuppattrExclCreat`
 之前。顺便建议给 `encode_fattr` 加一个 debug 断言：每写一个属性，校验其编号严格大于
 上一个。
+
+**已修复**（本轮）：
+- `encode_fattr` 里把 `kMountedOnFileid`(55) 移到 `kFsLocationsInfo`(67) 之前；整张表现在
+  严格升序（0,1,2,3,4,…,53,55,67,75,79），A2 是唯一一处错位；
+- 按本节建议加了常驻守卫：`ok()` 是每个属性的**唯一**访问点、且按源码顺序被调用（无论该位
+  是否置位），于是在 `ok()` 里断言 `id` 严格递增。挪错位置的代码块在第一次编码时就 abort，
+  而不是发出一个客户端会解析到错字段的 attrlist（debug 构建生效，release 零开销）；
+- 回归测例两条：`Nfs4.EncodeFattrOrdersReferralAttrsAscending` 按 fattr4 逐字段解
+  {fsid, fs_locations, mounted_on_fileid, fs_locations_info}，断言 55 的值出现在 67 之前且
+  attrlist 恰好读尽；`Nfs4.EncodeFattrFullSetRoundTrips` 是本节建议的那条不变式——请求
+  `supported_attrs()` 的**全集**（referrals 关/开各一轮），按每个属性的线格式走完整条
+  attrlist，断言掩码枚举顺序与值的顺序一致、长度恰等于各值之和、读完正好到尾。这张形状表
+  刻意重复了编码器的知识：新增属性必须同步这里，否则测例会失败。
+  两条测例都不解引用未校验的解码结果、也不信任解出来的数组长度——错位之后的读全是垃圾，
+  测例必须"干净地失败"，而不是崩在 `Result::value()` 的断言上或在垃圾计数上打转。
+- 反向验证：把顺序改回去（并去掉断言）后两条分别失败 12 / 3 处（`referrals = false` 那轮
+  不受影响，符合预期）。
 
 ### A3 v3 超长名字/路径被降级成 RPC GARBAGE_ARGS
 
@@ -437,7 +454,7 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 
 ## 建议的修复顺序
 
-1. ~~**A1**~~（已修复，见上）、**A2** —— 畸形回复，各几行。
+1. ~~**A1**、**A2**~~ —— 均已修复（见上）。畸形回复这一类目前已清空。
 2. **A5、B1** —— 跨客户端的状态隔离。B1 的两个子项独立，可分别落。
 3. **A3、A4、C5、B6、B5** —— 错误码与属性宣告的一致性，一次改动可以一起收
    （`check_component` 的 `kTooLong` 打通到两个引擎 + 两个属性位）。
@@ -448,8 +465,9 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 
 ## 验证建议
 
-- **A2 / A4**（A1 已由 `Nfs4.WriteOnlyAttrsAreNotReadable` 与
-  `Nfs4.EncodeFattrNeverEmitsValuelessAttrs` 覆盖）：pynfs 4.1 的 GETATTR / 属性组能覆盖 A4；A2 需要一个 referrals
+- **A4**（A1/A2 已由 `Nfs4.WriteOnlyAttrsAreNotReadable`、
+  `Nfs4.EncodeFattrNeverEmitsValuelessAttrs`、`Nfs4.EncodeFattrOrdersReferralAttrsAscending`、
+  `Nfs4.EncodeFattrFullSetRoundTrips` 四条覆盖）：pynfs 4.1 的 GETATTR / 属性组能覆盖 A4；原先提到 A2 需要一个 referrals
   开启的用例（`[cluster] mode = active-active`），或者像本次审计一样在
   `tests/test_nfs4.cpp` 里直接对 `encode_fattr` 断言"属性号严格升序 + attrlist 长度等于各
   属性值长度之和"——后者是能一次性守住整类问题的不变式，建议常态化。

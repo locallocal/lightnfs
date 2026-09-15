@@ -1373,6 +1373,278 @@ TEST(Nfs4, EncodeFattrNeverEmitsValuelessAttrs) {
     EXPECT_TRUE(dec.at_end());
 }
 
+// followups/protocol-gaps.md A2: fattr4 values must follow the attrmask in ascending
+// attribute order.  fs_locations_info(67) used to be encoded ahead of
+// mounted_on_fileid(55), which only misparsed when a client asked for both -- exactly
+// what a Linux referral probe does.
+TEST(Nfs4, EncodeFattrOrdersReferralAttrsAscending) {
+    using namespace nfsv4::attr;
+    rt::BufferPool pool;
+    xdr::XdrEnc enc(pool);
+    backend::Attr a;
+    a.type = backend::FType::kDir;
+    a.fileid = 0xAAAA;
+    core::FsProps fs;
+    core::FsOwner owner;
+    owner.address = "10.0.0.9:2049";
+    std::vector<std::string> root{"export", "data"};
+    nfsv4::AttrSource src;
+    src.referrals = true;
+    src.attr = &a;
+    src.fsid = 23;
+    src.fs = &fs;
+    src.owner = &owner;
+    src.fs_root = root;
+    src.mounted_on_fileid = 0xBBBB;
+    src.lease_seconds = 90;
+    nfsv4::Bitmap want;
+    want.set(kFsid);
+    want.set(kFsLocations);
+    want.set(kMountedOnFileid);
+    want.set(kFsLocationsInfo);
+    nfsv4::encode_fattr(enc, want, src);
+
+    auto bytes = enc.take().to_bytes();
+    xdr::XdrDec dec(std::span<const std::byte>(bytes.data(), bytes.size()));
+    auto mask = nfsv4::Bitmap::decode(dec);
+    ASSERT_TRUE(mask.has_value());
+    EXPECT_TRUE(mask->test(kFsid) && mask->test(kFsLocations) && mask->test(kMountedOnFileid) &&
+                mask->test(kFsLocationsInfo));
+    auto len = dec.u32();
+    ASSERT_TRUE(len.has_value());
+    const size_t after_len = dec.remaining();
+
+    // Misordered values make every following read garbage, so nothing here dereferences a
+    // decode result unchecked and no array count is trusted: the test must fail, not crash
+    // or spin.
+    auto u32v = [&]() -> uint32_t {
+        auto v = dec.u32();
+        return v ? *v : 0xDEADBEEFu;
+    };
+    auto u64v = [&]() -> uint64_t {
+        auto v = dec.u64();
+        return v ? *v : 0xDEADBEEFull;
+    };
+    auto str = [&]() -> std::string {
+        auto v = dec.string(1024);
+        return v ? std::string(*v) : std::string("<undecodable>");
+    };
+    auto pathname = [&]() {
+        std::vector<std::string> parts;
+        uint32_t n = u32v();
+        if (n > 64) return parts;
+        for (uint32_t i = 0; i < n; ++i) parts.push_back(str());
+        return parts;
+    };
+    // 8: fsid
+    EXPECT_EQ(u64v(), 23u);
+    EXPECT_EQ(u64v(), 0u);
+    // 24: fs_locations {fs_root, locations<>}
+    EXPECT_TRUE(pathname() == root);
+    EXPECT_EQ(u32v(), 1u);
+    EXPECT_EQ(u32v(), 1u);
+    EXPECT_STREQ(str(), "10.0.0.9");
+    EXPECT_TRUE(pathname() == root);
+    // 55: mounted_on_fileid -- before 67, which is the whole point
+    EXPECT_EQ(u64v(), 0xBBBBu);
+    // 67: fs_locations_info {fli_flags, fli_valid_for, fli_fs_root, fli_items<>}
+    EXPECT_EQ(u32v(), 0u);
+    EXPECT_EQ(u32v(), 90u);
+    EXPECT_TRUE(pathname() == root);
+    EXPECT_EQ(u32v(), 1u);
+    // fli_entries<>
+    EXPECT_EQ(u32v(), 1u);
+    // fls_currency = -1
+    EXPECT_EQ(u32v(), 0xffffffffu);
+    // fls_info<>: empty
+    EXPECT_EQ(u32v(), 0u);
+    EXPECT_STREQ(str(), "10.0.0.9");
+    EXPECT_TRUE(pathname() == root);
+    // The attrlist is exactly as long as the values it holds.
+    EXPECT_EQ(after_len - dec.remaining(), *len);
+    EXPECT_TRUE(dec.at_end());
+}
+
+// The standing invariant behind A1 and A2: ask for every supported attribute and walk the
+// attrlist by the wire shape of each, in ascending id order.  The table below deliberately
+// restates what encode_fattr knows -- that duplication IS the check, so a new attribute
+// must be added here too, and a block encoded out of order or with the wrong shape fails
+// here rather than on a client.
+TEST(Nfs4, EncodeFattrFullSetRoundTrips) {
+    using namespace nfsv4::attr;
+    rt::BufferPool pool;
+    backend::Attr a;
+    a.type = backend::FType::kReg;
+    a.mode = 0644;
+    a.nlink = 1;
+    a.uid = 1000;
+    a.gid = 1000;
+    a.size = 4096;
+    a.used = 4096;
+    a.fileid = 99;
+    a.change = 7;
+    a.rdev = {1, 3};
+    core::FsProps fs;
+    backend::FsStats stats;
+    core::FsOwner owner;
+    owner.address = "10.0.0.9:2049";
+    std::vector<std::string> root{"export", "data"};
+    std::array<std::byte, 20> fh{};
+
+    for (bool referrals : {false, true}) {
+        xdr::XdrEnc enc(pool);
+        nfsv4::AttrSource src;
+        src.referrals = referrals;
+        src.attr = &a;
+        src.fsid = 23;
+        src.mounted_on_fileid = 0xBBBB;
+        src.fh = fh;
+        src.fs = &fs;
+        src.stats = &stats;
+        src.lease_seconds = 90;
+        src.owner = &owner;
+        src.fs_root = root;
+        const nfsv4::Bitmap& want = nfsv4::supported_attrs(referrals);
+        nfsv4::encode_fattr(enc, want, src);
+
+        auto bytes = enc.take().to_bytes();
+        xdr::XdrDec dec(std::span<const std::byte>(bytes.data(), bytes.size()));
+        auto mask = nfsv4::Bitmap::decode(dec);
+        ASSERT_TRUE(mask.has_value());
+        auto len = dec.u32();
+        ASSERT_TRUE(len.has_value());
+        const size_t after_len = dec.remaining();
+
+        // One misplaced value desynchronises everything after it, so the walker never
+        // trusts what it decodes: a failed read or an implausible array count sets `bad`
+        // and stops the walk.  Without this a reordered block sends it spinning on a
+        // garbage count instead of failing.
+        bool bad = false;
+        auto u32 = [&] {
+            auto v = dec.u32();
+            if (!v) bad = true;
+            return v ? *v : 0u;
+        };
+        auto u64 = [&] {
+            if (!dec.u64()) bad = true;
+        };
+        auto opaque = [&] {
+            if (!dec.opaque(1u << 16)) bad = true;
+        };
+        auto bitmap = [&] {
+            if (!nfsv4::Bitmap::decode(dec)) bad = true;
+        };
+        auto nfstime = [&] {
+            u64();
+            u32();
+        };
+        // No array this encoder produces comes anywhere near this long.
+        auto count = [&](uint32_t max) {
+            uint32_t n = u32();
+            if (n > max) bad = true;
+            return bad ? 0u : n;
+        };
+        auto pathname = [&] {
+            uint32_t n = count(64);
+            for (uint32_t i = 0; i < n && !bad; ++i) opaque();
+        };
+        // fs_locations4 / fs_locations_info4 (RFC 8881 §11.10, §11.10.1)
+        auto locations = [&] {
+            pathname();
+            uint32_t n = count(16);
+            for (uint32_t i = 0; i < n && !bad; ++i) {
+                uint32_t servers = count(16);
+                for (uint32_t k = 0; k < servers && !bad; ++k) opaque();
+                pathname();
+            }
+        };
+        auto locations_info = [&] {
+            u32();
+            u32();
+            pathname();
+            uint32_t items = count(16);
+            for (uint32_t i = 0; i < items && !bad; ++i) {
+                uint32_t entries = count(16);
+                for (uint32_t k = 0; k < entries && !bad; ++k) {
+                    // fls_currency
+                    u32();
+                    // fls_info<>
+                    opaque();
+                    // fls_server
+                    opaque();
+                }
+                pathname();
+            }
+        };
+
+        int64_t previous = -1;
+        for (uint32_t bit = 0; bit < 96 && !bad; ++bit) {
+            if (!mask->test(bit)) continue;
+            // Ascending by construction of the loop; this catches the encoder writing the
+            // values in a different order than the mask enumerates them.
+            EXPECT_TRUE(static_cast<int64_t>(bit) > previous);
+            previous = bit;
+            switch (bit) {
+                case kSupportedAttrs:
+                case kSuppattrExclCreat:
+                    bitmap();
+                    break;
+                case kChange:
+                case kSize:
+                case kFileid:
+                case kFilesAvail:
+                case kFilesFree:
+                case kFilesTotal:
+                case kMaxfilesize:
+                case kMaxread:
+                case kMaxwrite:
+                case kSpaceAvail:
+                case kSpaceFree:
+                case kSpaceTotal:
+                case kSpaceUsed:
+                case kMountedOnFileid:
+                    u64();
+                    break;
+                case kFsid:
+                    u64();
+                    u64();
+                    break;
+                case kFilehandle:
+                case kOwner:
+                case kOwnerGroup:
+                    opaque();
+                    break;
+                case kTimeAccess:
+                case kTimeDelta:
+                case kTimeMetadata:
+                case kTimeModify:
+                    nfstime();
+                    break;
+                case kRawdev:
+                    u32();
+                    u32();
+                    break;
+                case kFsLocations:
+                    locations();
+                    break;
+                case kFsLocationsInfo:
+                    locations_info();
+                    break;
+                default:
+                    // type / fh_expire_type / the booleans / lease_time / rdattr_error /
+                    // maxlink / maxname / mode / numlinks / change_attr_type
+                    u32();
+                    break;
+            }
+        }
+        // Nothing left over and nothing short: the mask and the attrlist describe the
+        // same bytes.
+        EXPECT_FALSE(bad);
+        EXPECT_EQ(after_len - dec.remaining(), *len);
+        EXPECT_TRUE(dec.at_end());
+    }
+}
+
 TEST(Nfs4, NamespaceOpsCreateRemoveRenameLink) {
     V4Fixture f;
     f.establish_session();

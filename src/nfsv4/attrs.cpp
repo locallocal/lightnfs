@@ -1,5 +1,6 @@
 #include "nfsv4/attrs.hpp"
 
+#include <cassert>
 #include <cstring>
 #include <span>
 #include <string>
@@ -146,7 +147,18 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
     std::byte* len_gap = enc.raw_gap(4);
     const size_t vals_start = enc.size();
     xdr::XdrEnc& vals = enc;
-    auto ok = [&](uint32_t id) { return actual.test(id); };
+    // Every attribute below is visited through ok(), in source order, whether or not its
+    // bit is set — which makes this the one place that can hold the ascending order
+    // fattr4 requires.  A block moved to the wrong place trips the assert on the first
+    // encode instead of shipping an attrlist the client parses into the wrong fields
+    // (followups/protocol-gaps.md A2: fs_locations_info(67) sat ahead of
+    // mounted_on_fileid(55) and only showed up when a client asked for both).
+    int64_t last_id = -1;
+    auto ok = [&](uint32_t id) {
+        assert(static_cast<int64_t>(id) > last_id && "encode_fattr: attributes must be encoded in ascending order");
+        last_id = static_cast<int64_t>(id);
+        return actual.test(id);
+    };
 
     if (ok(kSupportedAttrs)) supported_attrs(src.referrals).encode(vals);
     if (ok(kType)) vals.u32(static_cast<uint32_t>(a.type));
@@ -212,6 +224,7 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
     if (ok(kTimeDelta)) encode_nfstime(vals, lim.time_delta);
     if (ok(kTimeMetadata)) encode_nfstime(vals, a.ctime);
     if (ok(kTimeModify)) encode_nfstime(vals, a.mtime);
+    if (ok(kMountedOnFileid)) vals.u64(src.mounted_on_fileid ? src.mounted_on_fileid : a.fileid);
     // fs_locations_info (RFC 8881 §11.10.1): the same single location — currency
     // unknown (-1), no fls_info, valid for one lease — under fli_flags 0.
     if (ok(kFsLocationsInfo)) {
@@ -234,7 +247,6 @@ void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src)
             encode_pathname(vals, src.fs_root);
         }
     }
-    if (ok(kMountedOnFileid)) vals.u64(src.mounted_on_fileid ? src.mounted_on_fileid : a.fileid);
     if (ok(kSuppattrExclCreat)) settable_attrs().encode(vals);
     // change_attr_type (RFC 7862 §12.2.3): the kNativeChange consumer (plan doc 10
     // §5.3).  A storage version counter is MONOTONIC_INCR; the ctime synthesis of
