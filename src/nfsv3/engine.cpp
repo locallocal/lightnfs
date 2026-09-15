@@ -14,6 +14,7 @@
 #include "obs/errlog.hpp"
 #include "obs/metrics.hpp"
 #include "rpc/drc.hpp"
+#include "state/state_mgr.hpp"
 #include "transport/connection.hpp"
 #include "util/log.hpp"
 
@@ -130,6 +131,25 @@ void encode_wcc_none(xdr::XdrEnc& enc) {
 // it, ACCES.  RMDIR distinguishes "." (INVAL) and ".." (EXIST) per §3.3.13.
 Status name_status(core::NameCheck check) {
     return check == core::NameCheck::kTooLong ? Status::kNametoolong : Status::kAcces;
+}
+
+// v4 read-delegation gate for the v3 mutating procedures (followups/protocol-gaps.md B7).
+// A v3 write / truncate / remove / rename on a file some v4 client holds a read delegation
+// on has to recall it first: otherwise that client keeps serving its cached copy
+// indefinitely, with nothing to tell it otherwise.  This is worse than the documented
+// "v3 writes are not constrained by v4 share reservations" boundary — that one costs
+// concurrency control, this one returns stale data.
+//
+// The recall is started and the caller is asked to retry.  JUKEBOX is the v3 spelling of
+// the DELAY the v4 path answers, it is bounded (DELEGRETURN, or the revocation deadline
+// one lease later), and the Linux client retries it for every procedure
+// (nfs3_rpc_wrapper) — which is the bar reference/nfsv3/08-errors.md §8.3 sets for using
+// it at all ("only for cases that will definitely clear up shortly").  Costs one relaxed
+// atomic load when no delegation exists anywhere, which is the common case and always the
+// case with delegations off.
+rt::Task<bool> deleg_recall_needed(state::StateMgr* state, uint32_t fsid, const backend::ObjId& oid) {
+    if (!state || !state->any_delegations()) co_return false;
+    co_return (co_await state->deleg_conflict(fsid, oid)) != 0;
 }
 
 Status verdict_status(const MutateGuard::Verdict& verdict) {
@@ -697,6 +717,13 @@ rt::Task<void> Engine::proc_setattr(ConnCtx& ctx, RpcCall& call, const rpc::Cred
         co_await reply(ctx, enc, cap);
         co_return;
     }
+    if (co_await deleg_recall_needed(state_, resolved->exp->fsid, resolved->oid)) {
+        co_await guard.finish();
+        begin_result(enc, ctx, call, Status::kJukebox);
+        encode_wcc_sample(enc, guard.first(), resolved->exp->fsid);
+        co_await reply(ctx, enc, cap);
+        co_return;
+    }
     auto result = co_await resolved->obj->setattr(guard.cred(), args->attrs);
     if (!result) {
         co_await guard.finish();
@@ -737,6 +764,14 @@ rt::Task<void> Engine::proc_write(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
     // Per-export QoS (plan doc 10 §4.3), before the exclusive object lock.
     co_await resolved->exp->qos.throttle(true, count);
     co_await guard.enter({resolved->obj, resolved->oid});
+    // A v4 client's read delegation on this file has to go first (B7).
+    if (co_await deleg_recall_needed(state_, resolved->exp->fsid, resolved->oid)) {
+        co_await guard.finish();
+        begin_result(enc, ctx, call, Status::kJukebox);
+        encode_wcc_sample(enc, guard.first(), resolved->exp->fsid);
+        co_await reply(ctx, enc, cap);
+        co_return;
+    }
     // Hand the payload down as the received segments, truncated to `count` (§2.4).
     SmallVec<iovec, 8> iov;
     for (uint32_t left = count; const auto& seg : args->data) {
@@ -805,6 +840,14 @@ rt::Task<void> Engine::proc_create(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
             // (truncate), matching common server practice.
             auto existing = co_await dir->obj->lookup(cred, args->where.name);
             if (existing) {
+                // UNCHECKED with a size truncates an existing file: a delegated one has to
+                // be recalled first (B7).
+                if (args->attrs.size && co_await deleg_recall_needed(state_, dir->exp->fsid, (*existing)->id())) {
+                    co_await guard.finish();
+                    fail(Status::kJukebox);
+                    co_await reply(ctx, enc, cap);
+                    co_return;
+                }
                 backend::Attr attr{};
                 if (args->attrs.size) {
                     backend::SetAttr size_only;
@@ -989,6 +1032,19 @@ rt::Task<void> Engine::proc_remove(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
         co_return;
     }
     co_await guard.enter({dir->obj, dir->oid});
+    // Deleting a delegated file recalls its read delegations first (B7).  The lookup only
+    // happens when a delegation exists at all.
+    if (state_ && state_->any_delegations()) {
+        if (auto victim = co_await dir->obj->lookup(guard.cred(), args->name); victim) {
+            if (co_await deleg_recall_needed(state_, dir->exp->fsid, (*victim)->id())) {
+                co_await guard.finish();
+                begin_result(enc, ctx, call, Status::kJukebox);
+                encode_wcc_sample(enc, guard.first(), dir->exp->fsid);
+                co_await reply(ctx, enc, cap);
+                co_return;
+            }
+        }
+    }
     auto removed = co_await dir->obj->unlink(guard.cred(), args->name);
     co_await guard.finish();
     begin_result(enc, ctx, call, removed ? Status::kOk : core::to_v3(removed.error(), Proc::kRemove));
@@ -1022,6 +1078,9 @@ rt::Task<void> Engine::proc_rmdir(ConnCtx& ctx, RpcCall& call, const rpc::Cred& 
         co_return;
     }
     co_await guard.enter({dir->obj, dir->oid});
+    // No delegation gate here: only regular files are ever delegated (the state manager
+    // grants on OPEN), so an empty directory cannot carry one.  LINK is likewise ungated —
+    // it adds a name, and the v4 path does not gate it either.
     auto removed = co_await dir->obj->rmdir(guard.cred(), args->name);
     co_await guard.finish();
     begin_result(enc, ctx, call, removed ? Status::kOk : core::to_v3(removed.error(), Proc::kRmdir));
@@ -1066,6 +1125,21 @@ rt::Task<void> Engine::proc_rename(ConnCtx& ctx, RpcCall& call, const rpc::Cred&
     }
     // Two-directory lock ordering by ObjId happens inside the guard (design 04 §4.2).
     co_await guard.enter({from->obj, from->oid}, {to.obj, to.oid});
+    // A rename that replaces an existing target deletes it: recall that file's read
+    // delegations first (B7).  The source only changes name, so its delegations stay
+    // coherent — same reasoning as the v4 path.
+    if (state_ && state_->any_delegations()) {
+        if (auto victim = co_await to.obj->lookup(guard.cred(), args->to.name); victim) {
+            if (co_await deleg_recall_needed(state_, to.exp->fsid, (*victim)->id())) {
+                co_await guard.finish();
+                begin_result(enc, ctx, call, Status::kJukebox);
+                encode_wcc_sample(enc, guard.first(), from->exp->fsid);
+                encode_wcc_sample(enc, guard.second(), to.exp->fsid);
+                co_await reply(ctx, enc, cap);
+                co_return;
+            }
+        }
+    }
     auto renamed = co_await from->obj->rename(guard.cred(), args->from.name, *to.obj, args->to.name);
     co_await guard.finish();
     begin_result(enc, ctx, call, renamed ? Status::kOk : core::to_v3(renamed.error(), Proc::kRename));

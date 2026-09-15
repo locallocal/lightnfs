@@ -16,6 +16,11 @@
 # usage: accept_m2_local.sh [ASAN_STRESS_SECONDS]
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 stress_secs=${1:-120}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 nfs_port=${LNFS_NFS_PORT:-12099}
@@ -32,10 +37,10 @@ trap cleanup EXIT
 
 echo "== building Release and ASAN configurations"
 cmake -S "$repo" -B "$repo/build-rel" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$repo/build-rel" --target lightnfsd lnfs_accept_client lightnfs-ctl lnfs_tests >/dev/null
+cmake --build "$repo/build-rel" -j"$jobs" --target lightnfsd lnfs_accept_client lightnfs-ctl lnfs_tests >/dev/null
 cmake -S "$repo" -B "$repo/build-asan" -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DLNFS_SANITIZE=address >/dev/null
-cmake --build "$repo/build-asan" --target lightnfsd lnfs_accept_client lnfs_tests >/dev/null
+cmake --build "$repo/build-asan" -j"$jobs" --target lightnfsd lnfs_accept_client lnfs_tests >/dev/null
 
 echo "== unit tests (Release + ASAN)"
 ctest --test-dir "$repo/build-rel" --output-on-failure >/dev/null

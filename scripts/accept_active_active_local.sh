@@ -37,6 +37,11 @@
 #        LNFS_EXPORTS=catalog accept_active_active_local.sh          # one exports mode
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
 p1=${LNFS_PORT1:-12319}; m1=${LNFS_MOUNT1:-12318}
 p2=${LNFS_PORT2:-12329}; m2=${LNFS_MOUNT2:-12328}
@@ -59,10 +64,10 @@ trap cleanup EXIT
 if [[ -z ${LNFS_BUILD_DIRS:-} ]]; then
   echo "== building Release and ASAN configurations"
   cmake -S "$repo" -B "$repo/build-rel" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-  cmake --build "$repo/build-rel" --target lightnfsd lightnfs-ctl lnfs_accept_client >/dev/null
+  cmake --build "$repo/build-rel" -j"$jobs" --target lightnfsd lightnfs-ctl lnfs_accept_client >/dev/null
   cmake -S "$repo" -B "$repo/build-asan" -G Ninja -DCMAKE_BUILD_TYPE=Debug \
     -DLNFS_SANITIZE=address >/dev/null
-  cmake --build "$repo/build-asan" --target lightnfsd lightnfs-ctl lnfs_accept_client >/dev/null
+  cmake --build "$repo/build-asan" -j"$jobs" --target lightnfsd lightnfs-ctl lnfs_accept_client >/dev/null
   LNFS_BUILD_DIRS="build-rel:rel build-asan:asan"
 fi
 

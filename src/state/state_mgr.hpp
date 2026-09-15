@@ -382,6 +382,11 @@ class StateMgr {
     // return NFS4ERR_DELAY (the client retries; DELEGRETURN or the revocation deadline
     // clears the way).  Returns 0 when the file is delegation-free.
     rt::Task<uint32_t> deleg_conflict(uint32_t fsid, const backend::ObjId& oid);
+    // Cheap "is any delegation outstanding at all" probe (one relaxed counter read).
+    // The v3 engine checks it before the extra lookup its recall gate needs, so the
+    // gate costs nothing in the common case — and nothing at all with delegations
+    // disabled (followups/protocol-gaps.md B7).
+    bool any_delegations() const { return deleg_count_.load(std::memory_order_relaxed) > 0; }
     // CLAIM_DELEG_CUR_FH: the stateid must be this client's delegation on this file.
     rt::Task<uint32_t> check_deleg_claim(const Stateid& sid, uint64_t clientid, uint32_t fsid,
                                          const backend::ObjId& oid);

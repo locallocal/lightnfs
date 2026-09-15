@@ -13,6 +13,11 @@
 # usage: fault_inject.sh [CRASH_ITERATIONS]   (default 5; nightly/weekly uses 20)
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
 iters=${1:-5}
 nfs_port=${LNFS_NFS_PORT:-12319}
@@ -35,7 +40,7 @@ trap cleanup EXIT
 
 echo "== building Release"
 cmake -S "$repo" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$build" --target lightnfsd lnfs_accept_client lightnfs-ctl >/dev/null
+cmake --build "$build" -j"$jobs" --target lightnfsd lnfs_accept_client lightnfs-ctl >/dev/null
 
 mkdir -p "$data" "$state"
 cat > "$work/lightnfs.toml" <<EOC

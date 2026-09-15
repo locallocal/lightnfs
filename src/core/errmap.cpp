@@ -94,7 +94,7 @@ bool v3_error_allowed(P proc, S status) {
         // Phase-2 write procedures (RFC 1813 per-procedure error sets).
         case P::kSetattr:
             return one_of(status, std::array{S::kPerm, S::kAcces, S::kInval, S::kNospc, S::kRofs, S::kDquot,
-                                             S::kNotSync, S::kIsdir, S::kFbig});
+                                             S::kNotSync, S::kIsdir, S::kFbig, S::kJukebox});
         case P::kWrite:
             return one_of(status, std::array{S::kAcces, S::kFbig, S::kDquot, S::kInval, S::kNospc, S::kRofs,
                                              S::kJukebox, S::kIsdir});
@@ -102,9 +102,15 @@ bool v3_error_allowed(P proc, S status) {
         // rows; MKDIR additionally admits MLINK (directory link-count limit) and
         // REMOVE/RMDIR admit PERM (sticky directories) — documented deviations that keep
         // the client's errno meaningful instead of a degraded IO.
+        //
+        // SETATTR / CREATE / REMOVE / RENAME additionally admit JUKEBOX, which the RFC
+        // rows list only for READ and WRITE: those four can now meet a v4 read delegation
+        // that has to be recalled first, and JUKEBOX is how v3 says "retry shortly"
+        // (followups/protocol-gaps.md B7).  Folding it into IO instead would turn a
+        // recoverable wait into an application-visible IO error.
         case P::kCreate:
             return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kNametoolong, S::kNospc, S::kRofs,
-                                             S::kNotdir, S::kNotsupp});
+                                             S::kNotdir, S::kNotsupp, S::kJukebox});
         case P::kMkdir:
             return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kNametoolong, S::kNospc, S::kRofs,
                                              S::kNotdir, S::kMlink});
@@ -115,15 +121,15 @@ bool v3_error_allowed(P proc, S status) {
             return one_of(status, std::array{S::kAcces, S::kExist, S::kDquot, S::kNametoolong, S::kNospc, S::kRofs,
                                              S::kNotdir, S::kNotsupp, S::kBadtype, S::kPerm});
         case P::kRemove:
-            return one_of(status,
-                          std::array{S::kNoent, S::kAcces, S::kNametoolong, S::kNotdir, S::kRofs, S::kIsdir, S::kPerm});
+            return one_of(status, std::array{S::kNoent, S::kAcces, S::kNametoolong, S::kNotdir, S::kRofs, S::kIsdir,
+                                             S::kPerm, S::kJukebox});
         case P::kRmdir:
             return one_of(status, std::array{S::kNoent, S::kAcces, S::kInval, S::kExist, S::kNametoolong, S::kNotdir,
                                              S::kNotempty, S::kRofs, S::kNotsupp, S::kPerm});
         case P::kRename:
             return one_of(status, std::array{S::kNoent, S::kAcces, S::kExist, S::kXdev, S::kNotdir, S::kIsdir,
                                              S::kInval, S::kNospc, S::kMlink, S::kNametoolong, S::kNotempty, S::kDquot,
-                                             S::kRofs, S::kNotsupp});
+                                             S::kRofs, S::kNotsupp, S::kJukebox});
         case P::kLink:
             return one_of(status, std::array{S::kAcces, S::kExist, S::kXdev, S::kMlink, S::kNametoolong, S::kNoent,
                                              S::kNotdir, S::kDquot, S::kRofs, S::kInval, S::kNotsupp, S::kPerm,

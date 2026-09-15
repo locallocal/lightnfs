@@ -17,6 +17,11 @@
 # gateway's identity (squash = "none": the client credentials are passed through).
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 stress_secs=${1:-60}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 build=${LNFS_BUILD_DIR:-$repo/build-rel}
@@ -47,7 +52,7 @@ fi
 if [[ ! -x $build/lightnfsd ]]; then
   echo "== building $build (Release)"
   cmake -S "$repo" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-  cmake --build "$build" --target lightnfsd lnfs_accept_client lightnfs-ctl >/dev/null
+  cmake --build "$build" -j"$jobs" --target lightnfsd lnfs_accept_client lightnfs-ctl >/dev/null
 fi
 "$repo/scripts/check_gfapi_abi.sh" || true
 

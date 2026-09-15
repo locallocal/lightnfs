@@ -22,6 +22,11 @@
 # usage: sudo LNFS_VIP=10.0.0.9 accept_failover_vm.sh [local|gluster|cephfs|lustre]
 set -euo pipefail
 
+# Build parallelism: the repo convention (ci.sh, coverage.sh, fuzz.sh) — half the cores
+# unless told otherwise.  Ninja defaults to all of them, which an ASAN build does not fit
+# into on a modest box.
+jobs=${LNFS_JOBS:-$(($(nproc) / 2))}
+
 backend=${1:-local}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 vip=${LNFS_VIP:-127.0.0.1}
@@ -45,7 +50,7 @@ trap cleanup EXIT
 
 echo "== building lightnfsd (Release)"
 cmake -S "$repo" -B "$repo/build-rel" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$repo/build-rel" --target lightnfsd lightnfs-ctl >/dev/null
+cmake --build "$repo/build-rel" -j"$jobs" --target lightnfsd lightnfs-ctl >/dev/null
 bin="$repo/build-rel"
 mkdir -p "$data" "$shared" "$mnt" "$work/a" "$work/b"
 

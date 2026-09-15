@@ -31,7 +31,7 @@
 | B4 | B | `rpc/drc.hpp:39` | DRC 键含源端口 | 跨重连的重传 miss → 非幂等过程重放（REMOVE 回 NOENT 等）**——已修复** |
 | B5 | B | `nfsv4/attrs.cpp:133` | `fh_expire_type` 恒为 FH4_PERSISTENT，无视 `kStableHandles` | fallback 句柄模式下向客户端谎报句柄永久有效**——已修复** |
 | B6 | B | `nfsv3/engine.cpp:584` | v3 FSINFO 不宣告 FSF3_CANSETTIME | 看 properties 的客户端不用 SET_TO_CLIENT_TIME**——已修复** |
-| B7 | B | `nfsv3/engine.hpp`（无 StateMgr） | v3 的写/删/改名不召回 v4 读委托 | v4 客户端**无限期**读到缓存旧内容 |
+| B7 | B | `nfsv3/engine.hpp`（无 StateMgr） | v3 的写/删/改名不召回 v4 读委托 | v4 客户端**无限期**读到缓存旧内容**——已修复（方案 1，语义正确的那个）** |
 | B8 | B | 见正文清单 | 7 条较小的一致性偏差 | 各条见正文 |
 | C1–C5 | C | 见正文 | 加固项与注释过期 | — |
 
@@ -535,7 +535,7 @@ SET_TO_CLIENT_TIME，退化成 SET_TO_SERVER_TIME——`utimes()`、`tar -p`、`
   指向已经覆盖「真的下到后端」的两条既有测例（`WriteTypes.SattrAndCreateRoundTrip`、
   `Nfs4.SetattrSizeModeOwner`）。
 
-### B7 v3 侧的改动不召回 v4 读委托
+### B7 v3 侧的改动不召回 v4 读委托（已修复）
 
 v4 侧的委托一致性是完整的：
 - OPEN 带写意图 → `StateMgr::open` 收集并召回该文件上的全部读委托（`state_mgr.cpp:1004-1018`）
@@ -562,6 +562,51 @@ README 的"已知限制"里写了「v3 写不受 v4 share reservation 与锁约�
    `maybe_grant_read_deleg` 加一个 per-export 开关即可，代价是丢掉这些导出上的委托收益。
 
 方案 1 语义正确；方案 2 一行且零风险。建议按部署形态给一个配置项，默认走 2。
+
+**已修复**（本轮，走**方案 1**）：
+- `nfsv3::Engine` 加可选的 `state::StateMgr*`（头里只前向声明，v3 的头不拖进 state 的头），
+  `ProtocolStack` 里 `nfs3.set_state_mgr(&state)`。为 null 时行为与修复前完全一致。
+- `StateMgr` 加 `any_delegations()`——一次 relaxed 原子读。v3 的闸门先看它：没有任何委托时
+  （常态，且 `delegations = false` 时恒真）不做任何额外工作，尤其是 REMOVE/RENAME 需要的那次
+  额外 lookup 不会发生。
+- 闸门落在五个过程上：WRITE、SETATTR（目标对象）、REMOVE 与 RENAME（先按名字找到**被销毁的
+  那个**对象）、CREATE 的 UNCHECKED-带-size 截断分支。命中即回 **NFS3ERR_JUKEBOX**。
+- **RMDIR 与 LINK 没有闸门**，理由写在代码里：只有普通文件会被授委托（状态层在 OPEN 时授予），
+  空目录不可能持有；LINK 只增加一个名字，v4 侧也没有闸门。
+- 为什么用 JUKEBOX：它是 v4 那条路回 DELAY 的 v3 对应物，有界（DELEGRETURN，或一个租约后的
+  吊销期限），而且 Linux 客户端对**每个**过程都会重试它（`nfs3_rpc_wrapper`）。这正好满足本仓库
+  [08-errors](../../reference/nfsv3/08-errors.md) §8.3 第 4 条给 JUKEBOX 划的线——「只用于确定稍后会好的
+  场景」。
+- **错误码白名单加宽**：SETATTR / CREATE / REMOVE / RENAME 现在也允许 JUKEBOX（RFC 的逐过程表
+  只给 READ/WRITE）。不加宽的话 `to_v3()` 会把它折成 NFS3ERR_IO——把一次可恢复的等待变成应用层
+  的 IO 错误。这是与既有的 MKDIR-admits-MLINK、REMOVE/RMDIR-admits-PERM 同类的有记录偏离，
+  errmap 里写了原因。
+
+**为什么没选方案 2（有 v3 导出就不授委托）**：lightnfs 的 v3 与 v4 共用同一个端口和同一份导出
+集，**没有**「这个导出只给 v4」的配置。所以方案 2 落地就等于「永久关掉读委托」——把一个已发布的
+特性（README 的 M8）变成死代码。真要走那条路，得先加 per-export 的协议限制，那比方案 1 还大。
+运维层面本来就有 `[protocol] delegations = false` 这个开关可用。
+
+- 回归测例两条，都建在新的 `MixedFixture` 上——**v3 引擎与 v4 引擎共用一份导出集、一个句柄
+  编解码器、一个锁表和一个 StateMgr**，也就是 `ProtocolStack` 真实的样子，这是唯一能观察到这个
+  交互的搭法（此前 v3 与 v4 的测试夹具完全隔离）。
+  `Nfs4.V3WriteRecallsV4ReadDelegation`：v4 客户端拿到读委托（先断言确实授予了，否则后面全是
+  空跑），v3 WRITE 回 JUKEBOX、`deleg_recalls == 1`、**backchannel 上真的出现 CB_RECALL**；重试
+  仍是 JUKEBOX 且文件未被改动；DELEGRETURN 之后同一个 WRITE 成功。
+  `Nfs4.V3MetadataOpsRecallV4ReadDelegation`：SETATTR(size)、REMOVE、RENAME-覆盖 三条都回
+  JUKEBOX，并且**同目录下另一个没被委托的文件照常成功**——闸门是按文件而不是按目录，不能把所有
+  v3 改动都变成 JUKEBOX。
+- 反向验证（只去掉 `set_state_mgr` 的接线，其余都留着）：两条分别失败 2 / 4 处，关键一条是
+  v3 WRITE 回 `0`（成功）而不是 10008——委托文件被就地改写，而持有方还在读它的缓存。
+  第一版反向验证**挂住了**而不是失败：没有召回就没有 CB 记录，`take_cb_record()` 会一直自旋。
+  已把那条断言改成 ASSERT（失败即返回），这是本轮第四次遇到「测例该干净地失败、而不是崩或挂」。
+
+**修复过程中撞到的第二个既有问题（非本条引入）**：`scripts/` 下 12 个脚本的
+`cmake --build` **没带 `-j`**，于是 Ninja 吃满所有核——本机 32 核跑 ASAN 构建把编译器搞崩了
+（验收脚本 `exit 139` = SIGSEGV，而且因为 `>/dev/null` 连错误都看不到）。仓库本来就有约定：
+`LNFS_JOBS`，默认 `nproc/2`（`ci.sh` / `coverage.sh` / `fuzz.sh` / `tidy.sh` /
+`accept_cephfs.sh` 都这么写），这 12 个是漏网的。已按同一约定补齐——也顺带让
+`LNFS_JOBS=16` 这类调用真的生效（此前对这些脚本是空操作）。
 
 ### B8 其余较小的一致性偏差
 
@@ -662,8 +707,8 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
    `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
    剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
 4. ~~**B2**、**B3**~~ —— 身份压缩与源端口，均已修复；两条都动了安全默认值，文档与配置样例已同步。
-5. ~~**B4**~~（已修复，见上）、**B7** —— B7 建议先上「有 v3 导出则不授委托」的一行版本，
-   再决定要不要做完整的 v3 召回。
+5. ~~**B4**、**B7**~~ —— 均已修复。B7 走的是方案 1（完整召回），不是那个一行的降级方案：
+   见下文「为什么没选方案 2」。
 6. **B8 / C 类** —— 按需。B8.5（errmap 白名单）与 C4（过期注释）属于"改一行防将来踩"。
 
 ## 验证建议

@@ -11,6 +11,10 @@ namespace lnfs::rpc {
 class Drc;
 }
 
+namespace lnfs::state {
+class StateMgr;
+}
+
 namespace lnfs::nfsv3 {
 
 class Engine {
@@ -22,6 +26,10 @@ class Engine {
     void set_write_verifier(core::WriteVerf verf) { verf_ = verf; }
     // Duplicate request cache for the non-idempotent procedures (design 03 §3.7).
     void set_drc(rpc::Drc* drc) { drc_ = drc; }
+    // v4 state, for the read-delegation recall gate on the mutating procedures
+    // (followups/protocol-gaps.md B7).  Optional: null keeps the pre-B7 behaviour, and a
+    // server without v4 has no delegations to recall anyway.
+    void set_state_mgr(state::StateMgr* state) { state_ = state; }
 
     void register_with(rpc::Dispatcher& dispatcher);
     rt::Task<void> dispatch(transport::ConnCtx&, rpc::RpcCall&, const rpc::Cred&);
@@ -70,6 +78,7 @@ class Engine {
     core::ObjLockRegistry& locks_;
     core::WriteVerf verf_{};
     rpc::Drc* drc_ = nullptr;
+    state::StateMgr* state_ = nullptr;
 };
 
 }  // namespace lnfs::nfsv3

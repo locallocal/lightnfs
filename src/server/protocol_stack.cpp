@@ -86,6 +86,10 @@ ProtocolStack::ProtocolStack(const core::ServerConfig& cfg, CoreState& core)
     nfs3.set_write_verifier(core.active_active ? core::verifier_for_node(core.epoch, core.node)
                                                : core::verifier_from_epoch(core.epoch));
     nfs3.set_drc(&drc);
+    // v3 mutations recall v4 read delegations (followups/protocol-gaps.md B7).  Always
+    // wired: without v4, or with delegations off, no delegation is ever granted and the
+    // gate is one relaxed atomic load.
+    nfs3.set_state_mgr(&state);
     nfs3.register_with(dispatcher);
     mount.register_with(dispatcher);
 }
