@@ -28,6 +28,9 @@
 - [scripts.md](guide/scripts.md)——`scripts/` 速查：源码门禁、验收脚本（本机 / root VM /
   真实集群后端）、外部测试套件的获取、性能与健壮性跑批、两个运维脚本，以及它们与
   `make` / ctest / `ci.sh` 的关系。
+- [posix-semantics.md](guide/posix-semantics.md)——POSIX 文件系统语义检查器
+  `scripts/posix_semantics.py` 的用法：12 组检查各看什么、SKIP 的判据、NFS 上合法的偏差
+  （silly-rename、时间戳粒度、v3 无字节锁）、与 cthon / fsx / pynfs 的分工。
 
 ## reference/ 协议调研
 

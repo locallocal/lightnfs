@@ -428,6 +428,9 @@ pending a target cluster and v4 open/deny state stays per gateway.
   [docs/guide/scripts.md](docs/guide/scripts.md) is the `scripts/` reference — source
   gates, acceptance runners (loopback / root VM / real cluster backend), external test
   suite fetchers, benchmark and fuzz drivers, and the two operations scripts.
+  [docs/guide/posix-semantics.md](docs/guide/posix-semantics.md) covers
+  `scripts/posix_semantics.py`, the POSIX filesystem semantics checker you can point at
+  any directory or at a lightnfs mount.
 - **Reference** — protocol research: [docs/reference/nfsv3/](docs/reference/nfsv3/README.md),
   [docs/reference/nfsv4/](docs/reference/nfsv4/README.md).
 - **Testing** — [test report](docs/testing/test-report.md) (conformance runs via

@@ -26,6 +26,8 @@
 | [`accept_m2_vm.sh`](#root-vm-验收真实内核挂载) | 真实 `vers=3` 挂载 + cthon + fsx | **是** | 手动 |
 | [`accept_m6_vm.sh`](#root-vm-验收真实内核挂载) | 真实 `vers=4.2` 挂载：稀疏 / copy / clone | **是** | 手动 |
 | [`accept_failover_vm.sh`](#root-vm-验收真实内核挂载) | 真实挂载下的网关故障切换 | **是** | 手动 |
+| [`posix_semantics.py`](#posix-语义) | 对任意目录跑 POSIX 文件系统语义检查 | 否 | 手动 |
+| [`posix_semantics_vm.sh`](#posix-语义) | 上面那个的 lightnfs 跑法：起网关、按版本挂载、逐轮跑 | **是** | 手动 |
 | [`accept_gluster.sh`](#集群后端验收需要真实存储) | GlusterFS 后端对真实卷 | 否 | 手动 |
 | [`accept_lustre.sh`](#集群后端验收需要真实存储) | Lustre 后端对真实挂载 | 否 | 手动 |
 | [`accept_cephfs.sh`](#集群后端验收需要真实存储) | CephFS 后端对真实集群 | 否 | 手动 |
@@ -145,6 +147,20 @@ root、不需要内核挂载、不需要集群。
   sudo LNFS_VIP=10.0.0.9 scripts/accept_failover_vm.sh local
   ```
 
+## POSIX 语义
+
+- **`posix_semantics.py DIR [--only G] [--skip G] [-v]`**——把一个目录过一遍 POSIX 要求的
+  文件系统行为（47 项 / 12 组：errno 表、硬链接与符号链接、rename 的原子替换与拒绝条件、
+  删掉仍打开的文件、目录与大目录列举、权限位、时间戳、稀疏、`fcntl` 字节锁、数据完整性）。
+  纯标准库，不依赖外部套件。**给它任何目录都行**：先对本地 ext4/tmpfs 跑一遍确认这些期望
+  本身是对的，再对 NFS 挂载点跑——那时的 FAIL 才是真差异。一轮约 4.5 秒。
+- **`posix_semantics_vm.sh [vers...]`**（需要 root）——起一个网关、按每个版本挂载
+  （默认 3、4.1、4.2）、对挂载点各跑一遍，并先跑一遍后端目录作为基线，好把"底下的文件系统
+  本来就不满足"和"NFS 这一层丢了语义"分开。v3 轮自动 `-o nolock` 并跳过 `lock` 组
+  （lightnfs 不实现 NLM/NSM）。
+
+完整说明见 [posix-semantics.md](posix-semantics.md)。
+
 ## 集群后端验收（需要真实存储）
 
 网关侧**不需要 root**：库在运行期加载，导出走回环 TCP，由 `lnfs_accept_client` 驱动
@@ -243,5 +259,5 @@ make test          → ctest：lnfs_tests、ctl_offline_catalog（test_ctl_offli
 scripts/ci.sh      → 以上全部 + 构建矩阵 + 三个后端 ABI 检查（+ nightly 的 bench/fuzz）
 ```
 
-验收脚本（`accept_*`）都不在 `make` 与 ctest 里，按需手动跑；跑出来的结论汇总在
-[../testing/test-report.md](../testing/test-report.md)。
+验收脚本（`accept_*`）与 POSIX 语义检查都不在 `make` 与 ctest 里，按需手动跑；跑出来的
+结论汇总在 [../testing/test-report.md](../testing/test-report.md)。
