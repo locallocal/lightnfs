@@ -17,8 +17,10 @@
 `09` 多网关无感故障切换 · `10` 多网关多活 · `11` 共享导出清单。逐册摘要与关键决策表见
 [design/README.md](design/README.md)。
 
-[design/followups/](design/followups/) 是三册集群文档各自的**未闭环项**——已知的取舍、缺的
-验证、发布前该补的门槛。改动相关代码前先扫一眼。
+[design/followups/](design/followups/) 是**未闭环项**——已知的取舍、缺的验证、发布前该补的
+门槛。改动相关代码前先扫一眼：三册集群文档各自一份，另有一份跨协议面的
+[protocol-gaps.md](design/followups/protocol-gaps.md)（NFSv3/v4 协议一致性缺口与语义风险
+审计，按"会产生畸形回复 / 语义偏差 / 加固项"三级分类，带文件行号与修法）。
 
 ## guide/ 使用文档
 

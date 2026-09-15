@@ -63,3 +63,11 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 | D6 | 错误模型 | `Result<T> = expected<T, Errno>`，errno 在协议引擎边界统一映射为 nfsstat3/nfsstat4 | 04 |
 | D7 | 锁 | 网关内统一锁表 + 后端 `native_locks()` 可选下推：状态层叠加而非替换（gluster/lustre/cephfs 已下推） | 05/07 |
 | D8 | 委托/pNFS | 读委托 + 回传通道已实现；不做写/目录委托，不支持 pNFS | 04/07 |
+
+## 协议一致性缺口
+
+本设计各分册描述的是"打算怎么做"。实现与协议之间还剩下的差距，收在
+[followups/protocol-gaps.md](followups/protocol-gaps.md)：对照 RFC 1813 / 8881 / 7862 / 5531
+与 [../reference/](../reference/) 的调研结论，逐条列出会产生畸形回复的缺陷（A 类）、语义与
+安全边界偏差（B 类）与加固项（C 类），每条带文件行号、影响与修法。改 `src/nfsv3/`、
+`src/nfsv4/`、`src/rpc/`、`src/state/` 之前先扫一眼。
