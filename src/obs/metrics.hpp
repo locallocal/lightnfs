@@ -119,6 +119,8 @@ struct Metrics {
     ShardedCounter<uint64_t> mount_calls{};
     // exports(5) `secure`: requests refused for coming from a non-reserved source port.
     ShardedCounter<uint64_t> insecure_port_rejected{};
+    // Connections shut down by the idle reaper.
+    ShardedCounter<uint64_t> conns_idle_reaped{};
 
     // v4 engine (plan doc 10 §3.1): per-op calls/errors/latency indexed by opcode
     // (3..75 = nfsv4 kLastKnownOp; slot 0 collects out-of-table opcodes) plus a

@@ -16,6 +16,14 @@ builtin_portmap = false
 state_dir = "/tmp/lightnfs-state"
 max_connections = 4096
 per_peer_limit = 128
+# Idle-connection reaper: shut down a connection that has not delivered a complete RPC
+# record for this many seconds (as knfsd's svc_age_temp_xprts does).  0 = off, the
+# default.  Closing the connection is harmless in itself -- v3 is stateless and a v4
+# session survives it -- but a v4 client's backchannel rides one of these connections, so
+# reaping an idle client that holds a read delegation delays CB_RECALL until it comes
+# back.  Turn it on where connection hoarding is a concern; the per-record fragment cap
+# that bounds the unbounded-hold case is always on and needs no configuration.
+# conn_idle_timeout = 360
 max_request_size = "2MiB"
 # ctl_socket = "/run/lightnfs/ctl.sock"   # default: <state_dir>/ctl.sock
 metrics_port = 0                          # Prometheus text endpoint; 0 = disabled

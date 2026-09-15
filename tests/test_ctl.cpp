@@ -194,6 +194,8 @@ TEST(Ctl, OpsConfigKeys) {
     ASSERT_TRUE(parsed.has_value());
     EXPECT_STREQ(parsed->server.bind, "127.0.0.1");
     EXPECT_STREQ(parsed->server.log_file, "/var/log/lightnfs.log");
+    // followups/protocol-gaps.md C1: the idle reaper is off unless configured.
+    EXPECT_EQ(parsed->server.conn_idle_timeout_s, 0u);
     EXPECT_EQ(parsed->server.log_rotate_size, 10u << 20);
     EXPECT_EQ(parsed->server.log_rotate_keep, 3u);
     EXPECT_EQ(parsed->server.lease_seconds, 90u);
@@ -706,6 +708,77 @@ TEST(Ctl, ConnRegistryListAndKill) {
     EXPECT_FALSE(transport::ConnRegistry::instance().kill(id));
     close(sv[0]);
     close(sv[1]);
+}
+
+// followups/protocol-gaps.md C1: connections had no idle bound at all, so a client could
+// hold one of the 4096 slots forever without ever completing a record.  kill_idle() is a
+// sweeper rather than a timeout around the recv: it only shuts the socket down, and the
+// connection's own read loop then runs the normal drain-and-close path -- a with_timeout
+// on the recv would leave a detached read writing into a buffer whose ConnCtx is gone.
+// C1: the reaper's knob parses, validates and defaults off.
+TEST(Ctl, ConnIdleTimeoutConfigKey) {
+    auto on = core::parse_config(
+        "[server]\n"
+        "conn_idle_timeout = 360\n"
+        "[[export]]\n"
+        "path = \"/tmp\"\n"
+        "fsid = 1\n");
+    ASSERT_TRUE(on.has_value());
+    EXPECT_EQ(on->server.conn_idle_timeout_s, 360u);
+    // Explicit zero is the documented way to say "off".
+    auto off = core::parse_config(
+        "[server]\n"
+        "conn_idle_timeout = 0\n"
+        "[[export]]\n"
+        "path = \"/tmp\"\n"
+        "fsid = 1\n");
+    ASSERT_TRUE(off.has_value());
+    EXPECT_EQ(off->server.conn_idle_timeout_s, 0u);
+    // Absurd values are refused rather than silently accepted.
+    EXPECT_FALSE(core::parse_config("[server]\n"
+                                    "conn_idle_timeout = 999999\n"
+                                    "[[export]]\n"
+                                    "path = \"/tmp\"\n"
+                                    "fsid = 1\n")
+                     .has_value());
+}
+
+TEST(Ctl, ConnRegistryReapsIdleConnections) {
+    auto now_s = [] {
+        return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    int sv[2];
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    int quiet[2];
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, quiet) == 0);
+    transport::Peer peer{};
+
+    // One connection that last read a record 600s ago, one that just did, and one that
+    // registered no clock at all (the pre-C1 add() overload, and the ctl socket).
+    std::atomic<int64_t> stale{now_s() - 600};
+    std::atomic<int64_t> fresh{now_s()};
+    uint64_t stale_id = transport::ConnRegistry::instance().add(sv[0], peer, &stale);
+    uint64_t fresh_id = transport::ConnRegistry::instance().add(quiet[0], peer, &fresh);
+    uint64_t clockless_id = transport::ConnRegistry::instance().add(quiet[0], peer);
+
+    // 0 means off: nothing is reaped however stale it is.
+    EXPECT_EQ(transport::ConnRegistry::instance().kill_idle(std::chrono::seconds(0)), 0u);
+    // A timeout longer than the staleness spares it too.
+    EXPECT_EQ(transport::ConnRegistry::instance().kill_idle(std::chrono::seconds(1200)), 0u);
+    // And now it goes -- exactly one, the stale one.
+    EXPECT_EQ(transport::ConnRegistry::instance().kill_idle(std::chrono::seconds(300)), 1u);
+    char b;
+    // shut down: the peer end sees EOF
+    EXPECT_EQ(read(sv[1], &b, 1), 0);
+
+    transport::ConnRegistry::instance().remove(stale_id);
+    transport::ConnRegistry::instance().remove(fresh_id);
+    transport::ConnRegistry::instance().remove(clockless_id);
+    close(sv[0]);
+    close(sv[1]);
+    close(quiet[0]);
+    close(quiet[1]);
 }
 
 // ---- plan doc 10 §7.1: the remaining ctl command surface + metrics HTTP contract ----

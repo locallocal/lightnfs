@@ -135,6 +135,7 @@ std::string prometheus_text() {
     out += std::format("lightnfs_mount_calls_total {}\n", m.mount_calls.load(std::memory_order_relaxed));
     out += std::format("lightnfs_insecure_port_rejected_total {}\n",
                        m.insecure_port_rejected.load(std::memory_order_relaxed));
+    out += std::format("lightnfs_conns_idle_reaped_total {}\n", m.conns_idle_reaped.load(std::memory_order_relaxed));
     out += std::format("lightnfs_connections_accepted_total {}\n", m.conns_accepted.load(std::memory_order_relaxed));
     out += std::format("lightnfs_connections_active {}\n", m.conns_active.load(std::memory_order_relaxed));
     out += std::format("lightnfs_connections_rejected_total {}\n", m.conns_rejected.load(std::memory_order_relaxed));

@@ -52,6 +52,7 @@ Task<Result<uint32_t>> RecordStream::read_be32() {
 
 Task<Result<rt::BufferChain>> RecordStream::read_record() {
     BufferChain rec;
+    uint32_t fragments = 0;
     for (;;) {
         auto hdr = co_await read_be32();
         if (!hdr) {
@@ -61,6 +62,9 @@ Task<Result<rt::BufferChain>> RecordStream::read_record() {
         }
         const bool last = *hdr & 0x80000000u;
         const uint32_t len = *hdr & 0x7fffffffu;
+        // The fragment count is its own limit: zero-length fragments cost nothing against
+        // the size caps below (C1).
+        if (++fragments > kMaxFragments) co_return Err(errno_from(EMSGSIZE));
         if (len > max_fragment_ || rec.size() + len > max_record_) {
             co_return Err(errno_from(EMSGSIZE));
         }

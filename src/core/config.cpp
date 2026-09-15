@@ -376,6 +376,11 @@ Result<Config> parse_config(std::string_view text) {
                 uint64_t n = LNFS_TRY(uint_value(value));
                 if (n == 0 || n > 1u << 20) return Err(errno_from(EINVAL));
                 config.server.per_peer_limit = static_cast<int>(n);
+            } else if (key == "conn_idle_timeout") {
+                uint64_t n = LNFS_TRY(uint_value(value));
+                // a day is already absurd for this; 0 = off
+                if (n > 86400) return Err(errno_from(EINVAL));
+                config.server.conn_idle_timeout_s = static_cast<uint32_t>(n);
             } else if (key == "ctl_socket") {
                 config.server.ctl_socket = LNFS_TRY(string_value(value));
             } else if (key == "metrics_port") {

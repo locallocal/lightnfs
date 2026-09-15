@@ -97,6 +97,11 @@ struct ConnCtx {
     RecordStream rs;
     rt::Semaphore inflight;
     rt::CancelSource cancel;
+    // Coarse seconds of the last complete record read from this connection, for the idle
+    // reaper (followups/protocol-gaps.md C1).  Written by the read loop, read by the
+    // sweeper under the registry mutex — relaxed is enough, a second either way does not
+    // matter for a minutes-scale timeout.
+    std::atomic<int64_t> last_rx{0};
     // in-flight handler coroutines (same-reactor)
     int64_t live = 0;
     rt::Event drained;
@@ -132,7 +137,10 @@ class ConnRegistry {
  public:
     static ConnRegistry& instance();
 
-    uint64_t add(int fd, const Peer& peer);
+    // `last_rx` (optional) is the connection's own last-record clock; kill_idle() reads it
+    // through this pointer, which stays valid because a connection removes its entry
+    // before closing its fd.
+    uint64_t add(int fd, const Peer& peer, const std::atomic<int64_t>* last_rx = nullptr);
     void remove(uint64_t id);
 
     struct Info {
@@ -145,6 +153,11 @@ class ConnRegistry {
     // shutdown(SHUT_RDWR) wakes the connection's read loop; teardown then runs the
     // normal drain path.  Returns false when the id is gone already.
     bool kill(uint64_t id);
+    // Shuts down connections whose last complete record is older than `idle`
+    // (followups/protocol-gaps.md C1), the way knfsd's svc_age_temp_xprts does.  A
+    // connection that never registered a clock, or `idle` of zero, is never reaped.
+    // Returns how many were shut down.
+    size_t kill_idle(std::chrono::seconds idle);
     // kill() for every live connection (a data plane going away, plan 10 C1); returns
     // how many were shut down.
     size_t close_all();
@@ -157,6 +170,7 @@ class ConnRegistry {
         int fd;
         Peer peer;
         std::chrono::steady_clock::time_point since;
+        const std::atomic<int64_t>* last_rx = nullptr;
     };
     std::mutex mu_;
     uint64_t next_id_ = 1;
