@@ -90,6 +90,30 @@ inflight_per_conn = 64
 # takeover_hook = ""       # optional executable run after the backend takeover hooks
 #                          # (LNFS_CLUSTER_ID / LNFS_NODE / LNFS_EPOCH / LNFS_PREV_NODE;
 #                          #  active-active also sets LNFS_FSID and LNFS_REASON)
+#
+# Where the export table comes from (design 11; failover and active-active alike):
+# exports_source = "local"  # local (default): the [[export]] blocks below, one identical
+#                          # copy per gateway.  catalog: shared_dir/catalog.toml, the
+#                          # cluster's single source of truth, edited with
+#                          # `lightnfs-ctl cluster catalog …` / `cluster export …`.
+#                          # Under "catalog" this file must have NO [[export]] block
+#                          # (EINVAL); a gateway starts with an empty export table until
+#                          # the first version exists.  Changing it needs a restart.
+# catalog_refresh = "auto" # catalog only: auto (default) applies a new version on the
+#                          # next fence tick; manual only records it as pending until
+#                          # `lightnfs-ctl cluster catalog apply` / reload / SIGHUP.
+#                          # This is the one [cluster] key that is hot-reloadable.
+
+# Per-node backend keys for catalog mode (design 11 §11.2): the catalog carries a
+# backend's CLUSTER keys (fs_name, subdir, volume, mount, …) and these per-machine keys
+# stay here, merged into every catalog export of that backend.  Only conf / keyring / id /
+# user / name / log_file / fd_cache / mon_host are accepted; a cluster key here is an
+# error, and these keys inside the catalog are refused at write time.  Ignored (with a
+# warning) under exports_source = "local".
+# [backend_defaults.cephfs]
+# conf = "/etc/ceph/ceph.conf"
+# keyring = "/etc/ceph/ceph.client.gw1.keyring"
+# name = "client.gw1"
 
 [[export]]
 path = "/tmp" # replace with the directory to export

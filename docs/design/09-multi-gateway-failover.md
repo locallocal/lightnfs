@@ -70,6 +70,13 @@ takeover   = "auto"            # auto | manual（manual 只接受 `lightnfs-ctl 
   本机 `state_dir/hmac.key` 在集群模式下不再使用。
 - 配置一致性：每个网关启动时把导出表的规范化摘要写入 `shared_dir/exports.<node>`，与
   其他网关的摘要不一致则拒绝进入集群（避免 fsid 相同而树不同）。
+  - **清单模式下改口径**（`[cluster] exports_source = "catalog"`，[11 册](11-shared-export-catalog.md)
+    §11.4 第 5 条）：导出来自共享的 `catalog.toml`，"各网关一致"由单一事实来源天然保证，
+    而各网关是**各自在自己的下一个 tick 跟进新版**的，滚动应用期间版本短暂不同属正常。
+    因此此时**不再据摘要拒绝启动**——版本差异只记录并告警，由 `catalog.<node>`（每台已应用的
+    版本 + 状态）与 `lightnfs-ctl cluster catalog status` 暴露给运维。`exports.<node>` 摘要
+    **照写**（值 = 合并本机 `[backend_defaults]` 之后导出表的规范摘要，与本地模式同一算法），
+    这样本地模式与清单模式混跑的迁移过渡期（11 §11.9）里，本地模式的网关仍受本条校验保护。
 
 ## 9.4 共享状态目录
 
@@ -82,6 +89,9 @@ shared_dir/
   clients/<hash(co_ownerid)>   # reclaim 名单：由活动网关维护（CREATE_SESSION 确认后写、状态全清后删）
   fence                    # 围栏租约：{node, epoch, expires_at}，活动网关周期刷新
   exports.<node>           # 导出表摘要（§9.3）
+  catalog.toml / catalog.history/ / catalog.lock / catalog.<node>
+                           # 仅 exports_source = "catalog"：共享导出清单、历史、写锁、每网关已应用版本
+                           #   （11 册 §11.3；主备与多活同一套，键空间全貌见 10 §10.3）
 ```
 
 访问方式：v1 用 **POSIX 路径**（各集群后端都有本机挂载：ceph 内核客户端 / ceph-fuse、

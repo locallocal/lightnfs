@@ -216,6 +216,9 @@ keepalived 只管地址漂移（两者可叠加：VIP 是第一反应，围栏�
 - **接管耗时**：铸新 epoch + 重建协议栈 + 进 grace 通常 < 1s（`lightnfs_cluster_activation_seconds`
   指标覆盖）；客户端感知到的中断还包含 VIP 漂移与 TCP 重连时间，由 keepalived 与客户端
   `timeo`/`retrans` 决定。
+- **导出表仍是"改 N 份文件 + 重启 N 台"**：上面"陈旧 `exports.<node>`"那条的前提是每台各带一份
+  必须逐字相同的 `[[export]]`。要把导出表集中到共享目录、用 `lightnfs-ctl` 在线增删改，
+  开 `[cluster] exports_source = "catalog"`——**主备与多活都可用**，口径见 §6.1。
 
 ## 6. 多网关多活（每导出一个属主网关）
 
@@ -337,6 +340,98 @@ takeovers fence_lost activation_failures`；`--json` 时 `exports` 为数组；`
 告警建议：某 fsid 的 `fs_role{role="active"}` 在集群内之和 ≠ 1、`fs_owner` 长时间无样本、
 `fs_fence_lost_total` 增长（脑裂 / 围栏被改写）、`v4_moved_total` 持续增长（客户端没有跟随
 `fs_locations`：老客户端或 `node_address` 不可达）。
+
+### 6.1 共享导出清单（集中式导出配置）
+
+默认每台网关各带一份本地 TOML，其中 `[[export]]` 段**全集群必须逐字相同**（`exports.<node>`
+摘要互校），于是"加一个导出 = 改 N 份文件 + 重启 N 台网关"。`[cluster] exports_source =
+"catalog"`（设计见 [design/11-shared-export-catalog.md](design/11-shared-export-catalog.md)）把
+导出表上移到 `shared_dir/catalog.toml`——集群一份、带版本号与历史、只由管理命令写；本地文件只
+留身份与本机键。**主备（§5）与多活（§6）都可用**，与 `mode` 正交。
+
+**本地文件变成这样**（每台各自一份，`node` / `node_address` / 凭据各不同）：
+
+```toml
+[cluster]
+enabled         = true
+id              = "3f9c…-uuid"
+shared_dir      = "/mnt/cephfs/.lightnfs-cluster"
+mode            = "active-active"
+node            = "gw1"
+node_address    = "10.0.0.11:2049"
+exports_source  = "catalog"        # local（默认）| catalog
+catalog_refresh = "auto"           # auto = 围栏 tick 上发现新版即应用 | manual = 等 `catalog apply`
+
+[backend_defaults.cephfs]          # 本机键，合并进清单里每个 cephfs 导出
+conf    = "/etc/ceph/ceph.conf"
+keyring = "/etc/ceph/ceph.client.gw1.keyring"
+name    = "client.gw1"
+# exports_source = "catalog" 时本文件里不得再有 [[export]]（启动即 EINVAL，避免两处事实来源）
+```
+
+分工：**清单**装导出身份与集群决策（`path` / `fsid` / `backend` / `nodes` / `readonly` / `squash` /
+`anon_*` / `clients` / QoS / `disabled` / 后端集群键如 `fs_name`、`subdir`、`volume`、`mount`）；
+**本地**装本机键——`conf`、`keyring`、`id`、`user`、`name`、`log_file`、`fd_cache`、`mon_host`
+（`[backend_defaults.<backend>]`）。清单里出现本机键会被写入侧拒绝；本地 `[backend_defaults]`
+里出现集群键报错。共享目录里随之多出 `catalog.toml`、`catalog.history/<version>.toml`（最近 32 份）、
+`catalog.lock`、每网关一份 `catalog.<node>`（已应用版本 + 状态）；`exports.<node>` 摘要照写。
+
+**日常操作**（`lightnfs-ctl` 对**任一**网关发出，不要求它是属主，全部支持 `--json`）：
+
+```bash
+lightnfs-ctl cluster catalog show          # 当前清单：版本、更新者、每导出一行
+lightnfs-ctl cluster catalog status        # 每台网关已应用哪一版 / 是否落后 / 是否失败
+lightnfs-ctl cluster catalog history       # 历史版本（版本、时间、更新者、comment）
+lightnfs-ctl cluster catalog diff 3 5      # 两版之间的导出级差异
+lightnfs-ctl cluster export add --path /export/c --fsid 3 --backend cephfs \
+    --nodes gw3,gw1 --clients 10.0.0.0/8 --opt fs_name=cephfs --opt subdir=/nfs/c
+lightnfs-ctl cluster export set 3 --nodes gw2,gw1     # 改属主顺位：不在名单里的属主平滑迁出
+lightnfs-ctl cluster export set 3 --disabled=true     # 下线（保留 fsid）
+lightnfs-ctl cluster export remove 3                  # 删除；有属主时被护栏拒，--force 越过
+lightnfs-ctl cluster catalog rollback 4               # 把第 4 版作为新版提交
+```
+
+每次提交回 `catalog vN committed (was vM): …`；加 `--dry-run` 只报差异不写。**不重启即生效**的范围：
+新增 / 删除 / 禁用导出、改 `nodes`、改 `clients` 与 QoS、改 `readonly` / `squash` / `anon_*`。
+**不可在线改**：一个 fsid 的 `path` / `backend` / 后端集群键（句柄绑 fsid + 后端对象）——写入侧
+直接拒绝，改法是删掉重加或换一个新 fsid。删除 / 禁用对客户端等同删除（旧句柄回 `NFS4ERR_STALE` /
+v3 `ESTALE`），推荐顺序 `export set <fsid> --disabled=true` → `catalog status` 确认无属主 →
+`export remove <fsid>`。
+
+**跟进与排障**：`catalog_refresh = "auto"`（默认）时各网关在自己的下一个围栏 tick（`fence_lease`，
+默认 3s）应用新版；`manual` 时只记 `pending`，由 `lightnfs-ctl cluster catalog apply` / `reload` /
+SIGHUP 触发。**应用不是原子的集群操作**——各网关各自跟进，期间版本短暂不一致是正常的（围栏 CAS
+仍保证一个导出只有一个属主）。某台本机校验失败（缺 `[backend_defaults.cephfs]`、导出路径本机不
+存在……）只影响它自己：它停在旧版、`cluster status` 的 `catalog_error=` 与 `catalog status` 的
+`status=error:<text>` 给出原因，其他网关照常前进；修本机配置后 `catalog apply`，或 `catalog
+rollback` 退回上一版。告警：`lightnfs_cluster_catalog_version` 落后 `_latest_version` 超过 N 个
+lease、`_apply_failures_total` 增长、各网关 `_version` 不一致。清单文件被手工改坏时所有网关停在
+各自的旧版并报错、服务不受影响——用 `catalog rollback` 从历史恢复（`catalog.history/` 只由网关写，
+不要手改）。
+
+**从本地模式迁移过来**（design 11 §11.9；全程不停服）：
+
+1. 集群仍在本地模式，在任一网关上把现有本地文件导成 v1：
+   `lightnfs-ctl cluster catalog import /etc/lightnfs/lightnfs.toml`（网关剥掉本机键后写出，
+   `--dry-run` 先看一眼）。所有网关都还没起来（首次引导）或都起不来（救援）时用**离线形态**，
+   它不连任何网关、直接读写共享目录：
+   `lightnfs-ctl catalog import --shared-dir=/mnt/cephfs/.lightnfs-cluster --from-local=/etc/lightnfs/lightnfs.toml`
+   （`--from-local` 明确该文件是网关配置而非清单文档；按文件里的 `[cluster] mode` 决定是否用多活
+   校验，`--active-active` 可显式覆盖；离线子命令有 `show/status/history/diff/import/rollback`，
+   没有 `apply`——应用一版是运行中的网关的事）。
+2. 逐台改本地 TOML：删掉 `[[export]]`、加 `exports_source = "catalog"` 与 `[backend_defaults.*]`，
+   用 `scripts/cluster_roll.sh evacuate <node>` 撤空该网关 → 重启 → `restore <node>` 迁回
+   （主备下就是 §5 的正常轮换）。过渡期两种模式混跑：清单模式网关写出的 `exports.<node>` 摘要
+   与本地模式网关的完全相同（同一份内容、同一算法），§5 的摘要一致性校验仍然通过。**过渡期不要
+   改清单**——改了之后本地模式的网关下次启动会因摘要不一致而拒绝入集群（这正是想要的保护）。
+3. 全部切换完，`lightnfs-ctl cluster catalog status` 显示每台在同一版，本地文件里不再有导出。
+4. 回退：把 `[[export]]` 放回各本地文件、`exports_source = "local"`，逐台重启即可；
+   `catalog.toml` 留在共享目录里无害。
+
+**空集群引导**：清单还不存在时，清单模式的网关以**空导出表**正常启动（伪根可挂、
+`cluster status` 报 `catalog=none`），等第一次 `catalog import` / `export add` 建出 v1 后自动
+加载——不需要"先起一台特殊网关"，也不需要先写一份本地导出。`--check-config` 在清单模式下会读
+共享目录并按本机键合并校验一遍，打印 `catalog: vN` 或 `catalog: none yet (empty export table)`。
 
 ## 7. 已知限制
 

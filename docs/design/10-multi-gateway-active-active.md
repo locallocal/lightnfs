@@ -81,8 +81,20 @@ shared_dir/
   fs/<fsid>/owner              # "<fs_epoch> <address> <node>\n"：当前属主（供非属主网关应答 fs_locations）
   fs/<fsid>/clients/<fnv64>    # 该导出的 reclaim 名单（该 fsid 的属主维护，co_ownerid 原文）
   fence.lock / epoch.lock / epoch.<node>.lock / fs/<fsid>/epoch.lock   # O_EXCL 串行化，陈旧锁按 pid+时间回收
+
+  # 以下仅 [cluster] exports_source = "catalog" 时出现（11 册 §11.3，主备与多活同）
+  catalog.toml                 # 共享导出清单当前版：整文件原子替换，版本号在 [catalog] version 里
+  catalog.history/<version>.toml   # 每次提交前的快照，保留最近 32 份（回滚 / 审计）
+  catalog.lock                 # 清单写者串行化（O_EXCL，与上面同一套陈旧锁回收）
+  catalog.<node>               # "<applied_version> <digest> <applied_at_ms> <status>\n"
+                               #   该网关已应用的版本与结果（ok | error:<text>），供 catalog status
 ```
 
+- **清单键与多活键正交**：`catalog.*` 只决定"导出集是什么"，围栏 / epoch / 属主 / reclaim 名单
+  照常按 fsid 走上面的规则；新导出进清单后由控制器 `sync_exports` 加进 `fs_`，按 `nodes` 顺位
+  接管。文件名 `catalog.*` 不与 `exports.` 前缀过滤（`cluster_store.cpp` 的
+  `list_exports_digests`）、也不与 `fence.` / `epoch.` 命名冲突；清单模式下 `exports.<node>`
+  摘要照写（供与本地模式网关混跑的过渡期校验，11 §11.9）。
 - **没有 `fs/<fsid>/fence` 文件**：per-fsid 围栏是对全部 `fence.<node>` 记录的**派生视图**——
   `read_fs_fence(fsid)` 取存活且列出该 fsid 的记录，否则取最新的过期记录；`acquire_fs_fence`
   取围栏时把该 fsid 从其他节点的记录里剔除，保证一个导出永远只被一条记录列出；所有
@@ -327,6 +339,14 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
 - `nodes` 进导出摘要 `exports.<node>`（`canonical_exports_text` 输出 `nodes=a,b,c`），各网关必须
   逐字相同，否则拒绝入集群；改 `nodes` 需重启。入口地址（DNS-RR / 轻 VIP）在部署侧配置，
   lightnfs 不管。
+- **导出也可以不写在本地文件里**：`[cluster] exports_source = "catalog"`（[11 册](11-shared-export-catalog.md)，
+  主备与多活都可用）把上面整个 `[[export]]` 段——含 `nodes` 与后端集群键——移到
+  `shared_dir/catalog.toml`，本地只留 `[cluster]` 身份与 `[backend_defaults.<backend>]` 本机键
+  （凭据 / 日志路径 / 缓存大小），本文件里再出现 `[[export]]` 即 EINVAL。此时"各网关逐字相同"
+  由"同一份共享文件"天然保证而不再靠互校，`nodes` 与 `clients` / QoS / `readonly` / `squash` /
+  `anon_*` 改为在线生效、增删导出不再需要重启，改法是 `lightnfs-ctl cluster export add|set|remove`
+  / `cluster catalog import|rollback`（11 §11.10，命令细节见 08 §8.6，部署见
+  [../deployment.md](../deployment.md) §6.1）。默认 `local` 时本节一切不变。
 
 ## 10.11 客户端兼容性与 v3 边界
 
