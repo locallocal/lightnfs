@@ -580,6 +580,79 @@ TEST(Nfs3, ReaddirVerifierRoundTripAndChangeDetection) {
 // wire as NFS3ERR_JUKEBOX on READ (one of the two procedures the 08 §8.2 whitelist
 // admits it on; both are idempotent and never DRC-cached, so a retransmission always
 // re-executes) and the retry succeeds once the backend is ready.
+// followups/protocol-gaps.md C2: the strict cookie verifier buys "no duplicated and no
+// missing entries" at the price of restarting a listing whenever the directory changes.
+// On a directory under continuous churn that restart can keep happening, so an operator
+// needs (a) a way to see it and (b) a way to trade it away per export.
+TEST(Nfs3, ReaddirCookieToleranceAndMetric) {
+    NfsFixture f;
+    auto list = [&](uint64_t cookie, std::array<std::byte, 8> verf, uint32_t* status, uint64_t* last_cookie,
+                    std::array<std::byte, 8>* out_verf) {
+        xdr::XdrEnc args(f.pool);
+        nfsv3::ReaddirArgs{f.root_fh, cookie, verf, 8192}.encode(args);
+        auto reply = f.request((uint32_t)nfsv3::Proc::kReaddir, args.take());
+        auto result = f.result(reply);
+        *status = *result.u32();
+        if (*status != 0) return;
+        if (*result.boolean()) (void)result.skip(84);
+        auto got = *result.opaque_fixed(8);
+        std::copy(got.begin(), got.end(), out_verf->begin());
+        while (*result.boolean()) {
+            (void)result.u64();
+            (void)result.string(255);
+            *last_cookie = *result.u64();
+        }
+    };
+
+    // Strict is the default, and a rejected listing is now countable: the per-procedure
+    // error counter cannot tell BAD_COOKIE from NOTDIR or TOOSMALL.
+    uint64_t before = obs::Metrics::instance().v3_bad_cookie.load(std::memory_order_relaxed);
+    uint32_t status = 1;
+    uint64_t last_cookie = 0, ignore = 0;
+    std::array<std::byte, 8> verf{}, verf2{};
+    list(0, {}, &status, &last_cookie, &verf);
+    ASSERT_TRUE(status == 0);
+    ASSERT_TRUE(last_cookie != 0);
+    ASSERT_TRUE(f.memory->add_file("/churn-1", "x").has_value());
+    list(last_cookie, verf, &status, &ignore, &verf2);
+    ASSERT_TRUE(status == (uint32_t)nfsv3::Status::kBadCookie);
+    EXPECT_EQ(obs::Metrics::instance().v3_bad_cookie.load(std::memory_order_relaxed), before + 1);
+
+    // Tolerant: a zero verifier, never checked, so the same stale pair keeps listing.
+    // That is knfsd's behaviour and what POSIX readdir() already allows.
+    core::ExportSetPlan plan;
+    auto cfg = f.exports.snapshot()->by_fsid(23);
+    ASSERT_TRUE(cfg != nullptr);
+    core::ExportConfig relaxed;
+    relaxed.path = "/export";
+    relaxed.fsid = 23;
+    relaxed.clients = {"127.0.0.0/8"};
+    relaxed.squash = core::Squash::kNone;
+    relaxed.strict_readdir_cookies = false;
+    plan.update.push_back(relaxed);
+    std::vector<std::unique_ptr<backend::Backend>> none;
+    ASSERT_TRUE(f.exports.apply(std::move(plan), none, f.exports.snapshot()->epoch).has_value());
+    EXPECT_FALSE(f.exports.snapshot()->by_fsid(23)->strict_readdir_cookies.load());
+
+    uint64_t after_switch = obs::Metrics::instance().v3_bad_cookie.load(std::memory_order_relaxed);
+    std::array<std::byte, 8> zero{};
+    list(0, {}, &status, &last_cookie, &verf);
+    ASSERT_TRUE(status == 0);
+    // the verifier handed out is all zeroes now
+    EXPECT_TRUE(verf == zero);
+    ASSERT_TRUE(f.memory->add_file("/churn-2", "y").has_value());
+    // The churn no longer invalidates the listing: the old cookie is still accepted.
+    list(last_cookie, verf, &status, &ignore, &verf2);
+    EXPECT_EQ(status, 0u);
+    // ...and a stale non-zero verifier is not rejected either, because nothing is checked.
+    std::array<std::byte, 8> bogus{};
+    bogus[0] = std::byte{0x5A};
+    list(last_cookie, bogus, &status, &ignore, &verf2);
+    EXPECT_EQ(status, 0u);
+    // Nothing was counted while tolerant.
+    EXPECT_EQ(obs::Metrics::instance().v3_bad_cookie.load(std::memory_order_relaxed), after_switch);
+}
+
 TEST(Nfs3, JukeboxReachesTheWireAndRetrySucceeds) {
     NfsFixture f;
     rpc::Drc drc({.ttl = std::chrono::milliseconds(60000), .max_memory = 1 << 20});

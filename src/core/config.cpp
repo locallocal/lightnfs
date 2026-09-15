@@ -199,6 +199,8 @@ Result<bool> ExportBlockParser::line(std::string_view line) {
         exp_.readonly = LNFS_TRY(bool_value(value));
     else if (key == "secure_ports")
         exp_.secure_ports = LNFS_TRY(bool_value(value));
+    else if (key == "strict_readdir_cookies")
+        exp_.strict_readdir_cookies = LNFS_TRY(bool_value(value));
     else if (key == "anon_uid")
         LNFS_TRY(u32(exp_.anon_uid));
     else if (key == "anon_gid")
@@ -880,6 +882,7 @@ Result<void> ExportSetBuilder::add(ExportConfig cfg, std::unique_ptr<backend::Ba
     entry->anon_gid = cfg.anon_gid;
     entry->readonly = cfg.readonly;
     entry->secure_ports = cfg.secure_ports;
+    entry->strict_readdir_cookies = cfg.strict_readdir_cookies;
     entry->set_nodes(std::move(cfg.nodes));
     entry->backend = std::move(backend);
     std::vector<Cidr> clients;
@@ -957,6 +960,7 @@ void update_entry(ExportEntry& entry, const ExportConfig& cfg, std::vector<Cidr>
     entry.qos.ops.configure(cfg.iops);
     entry.readonly.store(cfg.readonly, std::memory_order_relaxed);
     entry.secure_ports.store(cfg.secure_ports, std::memory_order_relaxed);
+    entry.strict_readdir_cookies.store(cfg.strict_readdir_cookies, std::memory_order_relaxed);
     entry.squash.store(cfg.squash, std::memory_order_relaxed);
     entry.anon_uid.store(cfg.anon_uid, std::memory_order_relaxed);
     entry.anon_gid.store(cfg.anon_gid, std::memory_order_relaxed);

@@ -144,10 +144,10 @@ std::string export_text(const CatalogExport& exp) {
     for (const auto& [k, v] : backend_keys(c)) keys += std::format("{}{}={}", keys.empty() ? "" : ",", k, v);
     return std::format(
         "fsid={} path={} backend={} nodes={} disabled={} clients={} readonly={} secure_ports={} "
-        "squash={} anon_uid={} anon_gid={} read_bps={} write_bps={} iops={} keys={}\n",
+        "strict_readdir_cookies={} squash={} anon_uid={} anon_gid={} read_bps={} write_bps={} iops={} keys={}\n",
         c.fsid, c.path, c.backend, text_list(c.nodes), exp.disabled ? "yes" : "no", text_list(c.clients),
-        c.readonly ? "yes" : "no", c.secure_ports ? "yes" : "no", squash_name(c.squash), c.anon_uid, c.anon_gid,
-        c.read_bps, c.write_bps, c.iops, dash_if_empty(keys));
+        c.readonly ? "yes" : "no", c.secure_ports ? "yes" : "no", c.strict_readdir_cookies ? "yes" : "no",
+        squash_name(c.squash), c.anon_uid, c.anon_gid, c.read_bps, c.write_bps, c.iops, dash_if_empty(keys));
 }
 
 std::string export_json(const CatalogExport& exp) {
@@ -157,11 +157,12 @@ std::string export_json(const CatalogExport& exp) {
         keys += std::format("{}{}:{}", keys.empty() ? "" : ",", json_string(k), json_string(v));
     return std::format(
         "{{\"fsid\":{},\"path\":{},\"backend\":{},\"nodes\":{},\"disabled\":{},\"clients\":{},"
-        "\"readonly\":{},\"secure_ports\":{},\"squash\":\"{}\",\"anon_uid\":{},\"anon_gid\":{},"
+        "\"readonly\":{},\"secure_ports\":{},\"strict_readdir_cookies\":{},\"squash\":\"{}\","
+        "\"anon_uid\":{},\"anon_gid\":{},"
         "\"read_bps\":{},\"write_bps\":{},\"iops\":{},\"backend_keys\":{{{}}}}}",
         c.fsid, json_string(c.path), json_string(c.backend), json_strings(c.nodes), exp.disabled,
-        json_strings(c.clients), c.readonly, c.secure_ports, squash_name(c.squash), c.anon_uid, c.anon_gid, c.read_bps,
-        c.write_bps, c.iops, keys);
+        json_strings(c.clients), c.readonly, c.secure_ports, c.strict_readdir_cookies, squash_name(c.squash),
+        c.anon_uid, c.anon_gid, c.read_bps, c.write_bps, c.iops, keys);
 }
 
 std::string meta_text(const Catalog& cat) {
@@ -607,10 +608,11 @@ struct ExportFlags {
     const std::string& get(std::string_view name) const { return values.at(std::string(name)); }
 };
 
-inline constexpr std::string_view kValueFlags[] = {"path",   "fsid",     "backend",  "nodes",    "clients",
-                                                   "squash", "anon-uid", "anon-gid", "read-bps", "write-bps",
-                                                   "iops",   "comment",  "readonly", "disabled", "secure-ports"};
-inline constexpr std::string_view kBoolFlags[] = {"readonly", "disabled", "force", "dry-run", "secure-ports"};
+inline constexpr std::string_view kValueFlags[] = {
+    "path",     "fsid",      "backend", "nodes",   "clients",  "squash",   "anon-uid",     "anon-gid",
+    "read-bps", "write-bps", "iops",    "comment", "readonly", "disabled", "secure-ports", "strict-readdir-cookies"};
+inline constexpr std::string_view kBoolFlags[] = {"readonly", "disabled",     "force",
+                                                  "dry-run",  "secure-ports", "strict-readdir-cookies"};
 
 Result<ExportFlags> parse_export_flags(const CtlCommand& cmd, size_t first, std::string& why) {
     ExportFlags out;
@@ -703,6 +705,7 @@ Result<void> apply_dynamic_flags(const ExportFlags& f, CatalogExport& exp, std::
     if (f.has("clients")) c.clients = split_list(f.get("clients"));
     if (f.has("readonly")) c.readonly = f.get("readonly") == "true";
     if (f.has("secure-ports")) c.secure_ports = f.get("secure-ports") == "true";
+    if (f.has("strict-readdir-cookies")) c.strict_readdir_cookies = f.get("strict-readdir-cookies") == "true";
     if (f.has("disabled")) exp.disabled = f.get("disabled") == "true";
     if (f.has("squash")) {
         const auto& s = f.get("squash");

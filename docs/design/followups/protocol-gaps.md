@@ -696,17 +696,34 @@ feature 表现在写明 DUMP/UMNTALL 会应答但服务器不维护权威 rmtab�
 - 反向验证：去掉分片上限后第一条测例**永远不 done**——正是"无限占用"本身；让回收器忽略截止
   时间后第三条回收了 2 条而不是 0/1 条，把"截止时间真的在起作用"也钉住了。
 
-### C2 v3 cookieverf 严格化的运营边界（已记为取舍）
+### C2 v3 cookieverf 严格化的运营边界（已修复）
 
-[nfsv3/07-caching-consistency.md](../../reference/nfsv3/07-caching-consistency.md) §"已删除项
-对应的 cookie" 已经把"分页期间目录被改即回 BAD_COOKIE（v4 NOT_SAME），换不重复不漏项的强
-保证"写成了明确选择，代码即如此（`nfsv3/engine.cpp:474`、`nfsv4/engine.cpp:1458`）。
+初版把这条记为"已决的取舍 + 建议加指标"，并**建议考虑**给导出一个开关。两半都做了。
 
-补一条运营上的风险备案：在**持续高频变动的大目录**上，客户端每次重列都会再次撞上 verifier
-变化，`ls` 可能长时间不收敛（knfsd 在多数文件系统上 verifier 恒 0，从不回 BAD_COOKIE，所以
-这是 lightnfs 特有的行为差异）。**建议**：加 `lightnfs_v3_bad_cookie_total` /
-`lightnfs_v4_readdir_not_same_total` 指标以便发现，并考虑给导出一个"容忍跳项"的开关，让运维
-在这类目录上可以换成宽松策略。
+**(a) 可观测性 —— 新增两个指标（建议项）。**
+`lightnfs_v3_bad_cookie_total` 与 `lightnfs_v4_readdir_not_same_total`。此前这两种情形只体现在
+逐过程/逐 op 的错误计数里，和 NOTDIR / TOOSMALL / ACCES 混在一起——运维看到 `ls` 卡住，无法从
+指标判断是不是 cookieverf 在反复失效。
+
+**(b) 容忍开关 —— 新增 `[[export]] strict_readdir_cookies`，默认 `true`（考虑项，做了）。**
+
+初版只说"考虑"，实际做了，理由是：**这条危害目前没有任何缓解手段**。一个持续变动的大目录
+（构建树、邮件 spool）上，客户端每次重列都会再撞上 verifier 变化；目录越大、页数越多，越难收敛，
+而运维没有任何旋钮可用。只加指标等于只告诉他"你完蛋了"，不给出路。
+置 `false` 时回全 0 verifier 且从不校验——这既是 knfsd 在多数文件系统上的行为，也在 POSIX
+`readdir()` 的既有许可范围内（"opendir() 之后增删的项是否出现在后续 readdir() 中未规定"）。
+**默认不变**，所以设计 04 §4.2 选的强保证仍然是开箱行为。
+
+- **伪根始终严格**，与任何导出的设置无关：它的 verifier 只在导出集重新发布时才动，那种时候让
+  客户端重列是对的、也很少发生。
+- 走完整配置链路（和 B3 的 `secure_ports` 一样，包含容易漏的那半）：TOML 解析、
+  `ExportSetBuilder::add`、`apply` 热更新，以及**共享清单**——`catalog.cpp` 的发射器与变更检测、
+  `ctl_catalog.cpp` 的 `--strict-readdir-cookies` 旗标与 text/JSON 两种 dump。
+- 回归测例两条：`Nfs3.ReaddirCookieToleranceAndMetric`（严格模式下 churn 导致 BAD_COOKIE **且
+  指标 +1**；热切成容忍后 verifier 变全 0、同一个过期 cookie 继续列、连一个伪造的非零 verifier
+  也不再被拒、且指标不再增长）与 `Nfs4.ReaddirNotSameMetricAndTolerance`（同样的四段，外加
+  断言**伪根仍然回 NOT_SAME**）。
+  把行为回退成"恒严格、不计数"后两条分别失败 4 / 3 处。
 
 ### C3 AUTH 层的两个记录项
 

@@ -140,6 +140,18 @@ struct ExportConfig {
     // directly and claim any uid (followups/protocol-gaps.md B3).  Turn it off per export
     // for client populations that cannot get one (containers, `mount -o noresvport`).
     bool secure_ports = true;
+    // READDIR cookie verifier policy (followups/protocol-gaps.md C2).  Strict (the
+    // default) derives the verifier from the directory's change attribute, so a directory
+    // modified between pages sends the client back to the start — no duplicated and no
+    // missing entries, which is the guarantee design 04 §4.2 chose.  The cost is that a
+    // directory under continuous churn can keep invalidating the listing and `ls` may not
+    // converge, with nothing an operator can trade away today.
+    //
+    // Tolerant answers a zero verifier and never rejects a cookie, which is what knfsd
+    // does on most filesystems and what POSIX readdir() already permits ("whether a
+    // subsequent readdir() returns an entry added or removed since opendir() is
+    // unspecified").  Entries may then be duplicated or missed across pages.
+    bool strict_readdir_cookies = true;
     // Per-export token buckets (plan doc 10 §4.3): bytes/s for READ and WRITE plus an
     // IO ops/s cap.  0 = unlimited.  Hot-reloadable.
     uint64_t read_bps = 0;
@@ -261,6 +273,7 @@ struct ExportEntry {
     std::atomic<uint32_t> anon_gid{65534};
     std::atomic<bool> readonly{false};
     std::atomic<bool> secure_ports{true};
+    std::atomic<bool> strict_readdir_cookies{true};
     std::unique_ptr<backend::Backend> backend;
     // Per-export data-path counters (plan doc 10 §3.3), exported with export/fsid labels.
     obs::ExportMetrics metrics;

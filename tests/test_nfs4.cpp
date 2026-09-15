@@ -3562,6 +3562,85 @@ TEST(Nfs4, V3MetadataOpsRecallV4ReadDelegation) {
     EXPECT_EQ(MixedFixture::v3_status(osr), (uint32_t)nfsv3::Status::kOk);
 }
 
+// C2 on the v4 side: NOT_SAME is countable, and the same per-export switch relaxes it.
+// The synthesized tree stays strict either way -- its verifier only moves when the export
+// set is republished.
+TEST(Nfs4, ReaddirNotSameMetricAndTolerance) {
+    V4Fixture f;
+    f.establish_session();
+    auto dir_fh = f.path_fh({"export", "data"});
+    auto list = [&](uint64_t cookie, const std::array<std::byte, 8>& verf, std::array<std::byte, 8>* out,
+                    uint64_t* last) {
+        auto r = dir_op(f, dir_fh, Op::kReaddir, [&](xdr::XdrEnc& e) {
+            e.u64(cookie);
+            e.opaque_fixed(verf);
+            e.u32(4096);
+            e.u32(8192);
+            nfsv4::Bitmap want;
+            want.set(nfsv4::attr::kFileid);
+            want.encode(e);
+        });
+        if (r.status != 0) return r.status;
+        V4Fixture::expect_op(r.reply.dec, Op::kSequence, 0);
+        (void)r.reply.dec.skip(16 + 5 * 4);
+        V4Fixture::expect_op(r.reply.dec, Op::kPutfh, 0);
+        V4Fixture::expect_op(r.reply.dec, Op::kReaddir, 0);
+        auto got = *r.reply.dec.opaque_fixed(8);
+        std::copy(got.begin(), got.end(), out->begin());
+        while (*r.reply.dec.boolean()) {
+            *last = *r.reply.dec.u64();
+            (void)r.reply.dec.string(256);
+            auto mask = nfsv4::Bitmap::decode(r.reply.dec);
+            auto len = r.reply.dec.u32();
+            if (mask && len) (void)r.reply.dec.skip(*len);
+        }
+        return 0u;
+    };
+
+    uint64_t before = obs::Metrics::instance().v4_readdir_not_same.load(std::memory_order_relaxed);
+    std::array<std::byte, 8> verf{}, verf2{}, zero{};
+    uint64_t last = 0;
+    ASSERT_TRUE(list(0, zero, &verf, &last) == 0u);
+    ASSERT_TRUE(last != 0);
+    ASSERT_TRUE(f.memory->add_file("/churn", "x").has_value());
+    EXPECT_EQ(list(last, verf, &verf2, &last), stv(Status::kNotSame));
+    EXPECT_EQ(obs::Metrics::instance().v4_readdir_not_same.load(std::memory_order_relaxed), before + 1);
+
+    // Relax the export and the same stale pair keeps listing.
+    core::ExportSetPlan plan;
+    core::ExportConfig relaxed;
+    relaxed.path = "/export/data";
+    relaxed.fsid = 23;
+    relaxed.clients = {"127.0.0.0/8"};
+    relaxed.squash = core::Squash::kNone;
+    relaxed.strict_readdir_cookies = false;
+    plan.update.push_back(relaxed);
+    std::vector<std::unique_ptr<backend::Backend>> none;
+    ASSERT_TRUE(f.exports.apply(std::move(plan), none, f.exports.snapshot()->epoch).has_value());
+
+    uint64_t after_switch = obs::Metrics::instance().v4_readdir_not_same.load(std::memory_order_relaxed);
+    ASSERT_TRUE(list(0, zero, &verf, &last) == 0u);
+    EXPECT_TRUE(verf == zero);
+    ASSERT_TRUE(f.memory->add_file("/churn2", "y").has_value());
+    EXPECT_EQ(list(last, verf, &verf2, &last), 0u);
+    EXPECT_EQ(obs::Metrics::instance().v4_readdir_not_same.load(std::memory_order_relaxed), after_switch);
+
+    // The pseudo root is strict regardless of any export's setting.
+    auto root_fh = f.path_fh({});
+    auto pseudo = dir_op(f, root_fh, Op::kReaddir, [&](xdr::XdrEnc& e) {
+        e.u64(3);
+        std::array<std::byte, 8> bogus{};
+        bogus[0] = std::byte{0x5A};
+        e.opaque_fixed(bogus);
+        e.u32(4096);
+        e.u32(8192);
+        nfsv4::Bitmap want;
+        want.set(nfsv4::attr::kFileid);
+        want.encode(e);
+    });
+    EXPECT_EQ(pseudo.status, stv(Status::kNotSame));
+}
+
 TEST(Nfs4, ReadDelegationGrantAndReturn) {
     V4Fixture f;
     f.establish_session(true, "lnfs-test-client", /*back_chan=*/true);
