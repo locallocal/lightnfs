@@ -1592,7 +1592,7 @@ rt::Task<uint32_t> StateMgr::open_downgrade(const Stateid& sid, uint64_t clienti
     co_return 0;
 }
 
-rt::Task<uint32_t> StateMgr::free_stateid(const Stateid& sid) {
+rt::Task<uint32_t> StateMgr::free_stateid(const Stateid& sid, uint64_t clientid) {
     // FREE_STATEID (RFC 8881 §18.38): only a lock stateid whose ranges are all released
     // may be freed; open and delegation stateids answer LOCKS_HELD (they are released by
     // CLOSE / DELEGRETURN instead).
@@ -1606,6 +1606,13 @@ rt::Task<uint32_t> StateMgr::free_stateid(const Stateid& sid) {
         if (it == shard.table.end()) co_return as_u32(Status::kBadStateid);
         rec = it->second;
     }
+    // Somebody else's stateid is none of this client's business (§18.38.3).  The check
+    // comes before the type and locks verdicts on purpose: a foreign stateid then answers
+    // exactly like a nonexistent one, so the reply says nothing about state the caller
+    // has no right to know about.  It matters here because `other` is derived from a
+    // counter and is guessable (B1) — without this a client could walk the table and free
+    // other clients' lock stateids, breaking their locking with BAD_STATEID.
+    if (rec->client->clientid != clientid) co_return as_u32(Status::kBadStateid);
     // Open stateids are released by CLOSE; a lock stateid can be freed once its ranges
     // are gone (RFC 8881 §18.38.3), otherwise LOCKS_HELD.
     if (rec->type != StateType::kLock) co_return as_u32(Status::kLocksHeld);

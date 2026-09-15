@@ -2386,6 +2386,94 @@ CopyRes do_copy(V4Fixture& f, const std::vector<std::byte>& src, const nfsv4::St
 
 }  // namespace
 
+// followups/protocol-gaps.md A5: FREE_STATEID took no clientid, so any session could
+// free any other client's lock stateid -- and `other` is a bare counter (B1), so they are
+// walkable.  The victim's next LOCK/LOCKU then fails with BAD_STATEID.
+TEST(Nfs4, FreeStateidRejectsForeignStateids) {
+    V4Fixture f;
+    f.establish_session(true, "client-a");
+    auto dir_fh = f.path_fh({"export", "data"});
+    auto o = do_open(f, dir_fh, "hello", 3, 0, "owner-a");
+    ASSERT_TRUE(o.status == 0);
+
+    // A takes a lock and releases the range, leaving a lock stateid with no ranges --
+    // the only thing FREE_STATEID will accept.
+    xdr::XdrEnc lk(f.pool);
+    lk.u32(static_cast<uint32_t>(Op::kPutfh));
+    lk.opaque(o.fh);
+    lk.u32(static_cast<uint32_t>(Op::kLock));
+    // WRITE_LT
+    lk.u32(2);
+    lk.boolean(false);
+    lk.u64(0);
+    lk.u64(100);
+    // new lock owner
+    lk.boolean(true);
+    lk.u32(0);
+    o.stateid.encode(lk);
+    lk.u32(0);
+    lk.u64(f.clientid);
+    lk.string("lo-a");
+    auto lr = f.parse(f.compound_raw(f.session_body(2, lk.take())));
+    ASSERT_TRUE(lr.status == 0);
+    V4Fixture::expect_op(lr.dec, Op::kSequence, 0);
+    (void)lr.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(lr.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(lr.dec, Op::kLock, 0);
+    auto lock_sid = *nfsv4::Stateid::decode(lr.dec);
+
+    xdr::XdrEnc lu(f.pool);
+    lu.u32(static_cast<uint32_t>(Op::kPutfh));
+    lu.opaque(o.fh);
+    lu.u32(static_cast<uint32_t>(Op::kLocku));
+    lu.u32(2);
+    lu.u32(0);
+    lock_sid.encode(lu);
+    lu.u64(0);
+    lu.u64(100);
+    auto ur = f.parse(f.compound_raw(f.session_body(2, lu.take())));
+    ASSERT_TRUE(ur.status == 0);
+    V4Fixture::expect_op(ur.dec, Op::kSequence, 0);
+    (void)ur.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(ur.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(ur.dec, Op::kLocku, 0);
+    auto released_sid = *nfsv4::Stateid::decode(ur.dec);
+
+    auto free_stateid = [&](const nfsv4::Stateid& sid) {
+        xdr::XdrEnc ops(f.pool);
+        ops.u32(static_cast<uint32_t>(Op::kFreeStateid));
+        sid.encode(ops);
+        return f.parse(f.compound_raw(f.session_body(1, ops.take()))).status;
+    };
+
+    // Park A's session and bring up a second client on the same connection.
+    const auto a_sessionid = f.sessionid;
+    const auto a_slot_seq = f.slot_seq;
+    const uint64_t a_clientid = f.clientid;
+    f.establish_session(true, "client-b");
+    ASSERT_TRUE(f.clientid != a_clientid);
+
+    // B may not free A's lock stateid, and gets the same answer it would get for a
+    // stateid that does not exist -- nothing leaks about A's state.
+    EXPECT_EQ(free_stateid(released_sid), stv(Status::kBadStateid));
+    nfsv4::Stateid nonexistent = released_sid;
+    nonexistent.other[11] = static_cast<std::byte>(0xA5);
+    EXPECT_EQ(free_stateid(nonexistent), stv(Status::kBadStateid));
+    // A's *open* stateid likewise: BAD_STATEID, not the LOCKS_HELD that would confirm it
+    // is a live open somewhere.
+    EXPECT_EQ(free_stateid(o.stateid), stv(Status::kBadStateid));
+
+    // Back on A's session the same call succeeds, so the check is about ownership and
+    // not about having broken FREE_STATEID.
+    f.sessionid = a_sessionid;
+    f.slot_seq = a_slot_seq;
+    f.clientid = a_clientid;
+    EXPECT_EQ(free_stateid(released_sid), 0u);
+    // Its own open stateid is still an open: LOCKS_HELD, the pre-existing verdict.
+    EXPECT_EQ(free_stateid(o.stateid), stv(Status::kLocksHeld));
+    EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+}
+
 TEST(Nfs4, MinorversionTwoOpcodeTable) {
     V4Fixture f;
     // minorversion 3 is not served.

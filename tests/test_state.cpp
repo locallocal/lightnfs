@@ -637,12 +637,16 @@ TEST(StateMgr, ByteRangeLocksLifecycle) {
         auto io2 = co_await mgr.check_io(l2.stateid, b.clientid, 1, oid_of(1), state::kShareWrite);
         EXPECT_EQ(io2.status, st4(nfsv4::Status::kOpenmode));
         // FREE_STATEID: LOCKS_HELD while ranges remain; LOCKU everything, then frees.
-        EXPECT_EQ(co_await mgr.free_stateid(l3.stateid), st4(nfsv4::Status::kLocksHeld));
+        EXPECT_EQ(co_await mgr.free_stateid(l3.stateid, a.clientid), st4(nfsv4::Status::kLocksHeld));
         nfsv4::Stateid after;
         EXPECT_EQ(co_await mgr.locku(l3.stateid, a.clientid, 0, UINT64_MAX, &after), kOk);
         EXPECT_EQ(after.seqid, 3u);
         EXPECT_EQ(co_await mgr.locku(l3.stateid, b.clientid, 0, 1, nullptr), st4(nfsv4::Status::kBadStateid));
-        EXPECT_EQ(co_await mgr.free_stateid(after), kOk);
+        // A5: b may not free a's stateid, and the refusal is indistinguishable from a
+        // stateid that does not exist -- b learns nothing about a's state.
+        EXPECT_EQ(co_await mgr.free_stateid(after, b.clientid), st4(nfsv4::Status::kBadStateid));
+        EXPECT_EQ(co_await mgr.free_stateid(ob.stateid, a.clientid), st4(nfsv4::Status::kBadStateid));
+        EXPECT_EQ(co_await mgr.free_stateid(after, a.clientid), kOk);
         EXPECT_EQ(mgr.stats().lock_states, 1u);
         // CLOSE releases b's lock state and its ranges.
         nfsv4::Stateid closed;
