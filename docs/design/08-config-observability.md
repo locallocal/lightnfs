@@ -9,6 +9,20 @@
 与 QoS 速率、per-client QoS。导出增删（拓扑）仍需重启，前置条件是 PseudoFs 可重建与
 导出表并发保护，尚未做。`grace` 已与 `lease` 解绑（`auto` = lease）。
 
+**清单模式的热重载口径（`exports_source = "catalog"`，11 册；`server/daemon.cpp` 的 `reload_config`
+与 `reload_inline`）**：导出不再来自本地文件，`ExportTable::reload_dynamic` 整个不参与。SIGHUP /
+`lightnfs-ctl reload` 先应用本地文件里仍属本机的热键（日志级别、`slow_request_ms`、`error_ring`、
+per-client QoS）与唯一可热改的 `[cluster]` 键 `catalog_refresh`（答 `catalog_refresh -> auto|manual`），
+再在主循环上跑一次"应用最新清单版本"（答 `catalog: vN applied (was vM)` / `catalog: vN is current` /
+`catalog: apply failed, still vN: <why>`）；其余 `[cluster]` 键仍是 `cluster settings changed: restart
+required`。导出侧"哪些键在线"因此由清单决定，比本地模式宽——**新增 / 删除 / 禁用（`disabled`）导出、
+改 `nodes`、改 `clients` 与 QoS，以及 `readonly` / `squash` / `anon_uid` / `anon_gid` 全部在线生效**
+（11 §11.5：新增导出构造后端并进伪根，`nodes` 变化把不在新名单里的属主迁出，删除 / 禁用在属主上
+drain 后退休条目；`readonly` 变化对已打开写句柄的下一次 WRITE 生效，回 `ROFS`）；只有一个 fsid 的
+`path` / `backend` / 后端集群键仍不可在线改，且在写入侧就被拒（"remove and re-add, or use a new
+fsid"）。本地模式（默认）的 `reload_dynamic` 口径一字不变，`readonly` / `squash` / `anon_*` 仍报
+restart required——零默认行为变化。
+
 全部键与默认值以 `config/lightnfs.toml.example`（逐键注释）和 `core/config.hpp` 为准；摘要：
 
 ```toml

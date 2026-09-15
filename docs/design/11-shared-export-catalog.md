@@ -1,6 +1,9 @@
 # 11. 共享导出清单（集群级集中式导出配置）——设计方案
 
-> 状态：**设计稿（2026-09-08），未开始实施**。实施步骤见 [12 册](12-shared-export-catalog-steps.md)。
+> 状态：**已实现（2026-09-15）**——阶段 A–E 全部合并。实施步骤、代码锚点与每步的实现注原属
+> 12 册（A1–E2 ✅，全部完成后与 09 / 10 的步骤文档同样撤下，见 git 历史）；未闭环项见
+> [../toto/shared-export-catalog-followups.md](../toto/shared-export-catalog-followups.md)。
+> 运维视角见 [../deployment.md](../deployment.md) §6.1，配置 / 热重载口径 / 指标 / ctl 见 08 册。
 > 本册建立在 [10 册](10-multi-gateway-active-active.md) 多活与 [09 册](09-multi-gateway-failover.md)
 > 主备之上：`ClusterStore`（09 §9.4）、导出表摘要一致性校验（09 §9.3）、`FsClusterController`
 > 与 per-fsid 围栏 / 属主视图（10 §10.3）、`cluster migrate`（10 §10.7）、既有的热重载子集
@@ -231,7 +234,7 @@ failover 的 `ClusterController` 只需轮询 + 投递应用，没有 per-fsid �
 - **删除 / 禁用对客户端是硬中断**（STALE）：这是删除的本意；需要"不中断地换属主"用 `nodes` /
   `migrate`，需要"暂停服务但保留挂载"没有协议手段。
 - **ctl 线协议无引号**（`ctl.cpp` `parse_command` 按空白切分）：`export add` 的 `--path` / `--clients`
-  含空格无法表达。12 册 D1 给 `parse_command` 加双引号 + 反斜杠转义，ctl 客户端按需加引号；
+  含空格无法表达。实施步骤 D1 给 `parse_command` 加了双引号 + 反斜杠转义，ctl 客户端按需加引号；
   `catalog import <file>` 的 `<file>` 是**网关侧**路径（同今天 `--config`），不经线协议传内容。
 - **`readonly` / `squash` / `anon_*` 改为在线生效**是行为变化，只在清单模式下启用；本地模式
   的 `reload_dynamic` 保持"restart required"（零默认行为变化）。
@@ -243,8 +246,8 @@ failover 的 `ClusterController` 只需轮询 + 投递应用，没有 per-fsid �
 
 1. 集群仍在本地模式；在任一网关上 `lightnfs-ctl cluster catalog import /etc/lightnfs/lightnfs.toml`
    （本地模式下允许 `import` / `show` / `status`，只是本机不取用）：网关剥掉本机键写出 v1。
-   或用离线形态 `lightnfs-ctl catalog import --shared-dir <dir> <file>`（12 册 D3，不需要运行中的
-   网关，适合首次引导）。
+   或用离线形态 `lightnfs-ctl catalog import --shared-dir <dir> --from-local <file>`（实施步骤 D3，
+   不需要运行中的网关，适合首次引导 / 全部网关都起不来时的救援）。
 2. 逐台改本地 TOML：删 `[[export]]`、加 `exports_source = "catalog"` 与 `[backend_defaults.*]`，用
    `scripts/cluster_roll.sh evacuate/restore` 滚动重启。过渡期两种模式混跑：清单模式网关的
    `exports.<node>` 摘要与本地模式网关相同（同一份内容、同一算法），09 §9.3 校验仍通过；若
@@ -281,16 +284,22 @@ catalog_error=-|<text>`；指标 `lightnfs_cluster_catalog_version`（已应用�
 `lightnfs_cluster_catalog_latest_version`（共享目录里的）、`lightnfs_cluster_catalog_applies_total`、
 `lightnfs_cluster_catalog_apply_failures_total`。
 
-## 11.11 实现阶段（详见 12 册）
+## 11.11 实现阶段与落地代码
 
-| 阶段 | 交付 | 依赖 |
-|------|------|------|
-| A 清单文档与存储（无行为变化） | `exports_source` / `catalog_refresh` / `[backend_defaults]` 解析；`core/catalog.*` 解析 / 序列化 / 合并 / 集群级校验；`ClusterStore` 的 `read_catalog / write_catalog / history / catalog.<node>` | 10 册 |
-| B 运行期可变导出集 | `ExportSet` 快照 + RCU 发布；读者改取快照；新增 / 就地更新 / 退休；控制器 `sync_exports` | — |
-| C 启动与跟进 | 清单模式启动（含空表引导）；tick 轮询 + auto 投递 / manual 挂起；`apply` / `reload` / SIGHUP；`cluster status` 字段与指标 | A B |
-| D 管理命令 | ctl 线协议引号；`cluster catalog …` / `cluster export …`；离线 `catalog import --shared-dir` | A C |
-| E 验收与文档 | 三实例脚本加"清单"段（引导 → 在线加导出 → referral 可见 → 改 `nodes` 迁移 → 删除 STALE）；08 / 10 / deployment / README | 全部 |
+实施步骤原属 12 册（阶段 A–E，每步带代码锚点、测试与验收标准），A–E 全部完成后撤下，每步的
+改动点与实现注见 git 历史。阶段与落地位置：
 
-**可用性里程碑**：A + C（以"新增 / 删除仍 restart required"的桩应用器）+ D 已经交付"集中配置
-+ 管理命令 + `nodes` / clients / QoS 在线"；B 落地后才有"不重启增删导出"。若 B 延期，C 的
-应用器先按 `reload_dynamic` 的口径报 `restart required`，不阻塞前三者。
+| 阶段 | 交付 | 落地 | 状态 |
+|------|------|------|------|
+| A 清单文档与存储 | `exports_source` / `catalog_refresh` / `[backend_defaults]` 解析；`Catalog` 解析 / 序列化 / 合并 / 集群级校验 / diff；`ClusterStore` 的 `read_catalog` / `write_catalog(expected)` / 历史 / `catalog.<node>` | `core/config.*`、`core/catalog.*`、`server/cluster_store.*` | ✅ 2026-09-08 / 09-09 |
+| B 运行期可变导出集 | `ExportSet` 快照 + RCU 发布；读者改取快照；`ExportTable::apply` 的新增 / 就地更新 / 退休队列；控制器 `sync_exports` | `core/config.*`（`ExportSet`）、`core/pseudofs.*`、`server/cluster_controller.*` | ✅ 2026-09-09 |
+| C 启动与跟进 | 清单模式启动（含空表引导）；tick 轮询 + auto 投递 / manual 挂起；`apply_catalog` 流水线；`apply` / `reload` / SIGHUP；`cluster status` 字段与 `lightnfs_cluster_catalog_*` | `server/catalog_applier.*`、`server/daemon.cpp`、`server/ctl.cpp` | ✅ 2026-09-09 / 09-10 |
+| D 管理命令 | ctl 线协议引号；`cluster catalog show/status/history/diff/import/rollback/apply`；`cluster export list/add/set/remove`；离线 `lightnfs-ctl catalog … --shared-dir` | `server/ctl.cpp`、`server/ctl_catalog.cpp`、`tools/lightnfs_ctl.cpp` | ✅ 2026-09-10 … 09-14 |
+| E 验收与文档 | `scripts/accept_active_active_local.sh` 的导出模式外层循环（`LNFS_EXPORTS="local catalog"`）与"清单"段、`lnfs_accept_client v4catalog` 模式；08 / 09 / 10 / deployment / README | `scripts/`、`tests/accept_client.cpp`、`docs/` | ✅ 2026-09-14 / 09-15 |
+
+验收段覆盖：离线引导 v1 → 三台 `catalog status` 在同一版 → 在线 `export add` 后伪根 READDIR 多
+一项且伪根 change 严格变大 → 非属主上 READ 回 MOVED 且 `fs_locations` 非空 → `export set --nodes`
+把属主踢出名单后原属主的 SEQUENCE 置 `SEQ4_STATUS_LEASE_MOVED` → `--disabled=true` 后旧句柄回
+STALE、名字从 READDIR 消失 → `remove` 的属主护栏与 `--force` → 一台改 `catalog_refresh = manual`
+后停在旧版、`catalog apply` 追平 → `catalog rollback 1` 全部回到 v1。Release 与 ASAN 各一轮，
+既有的 status / v4moved / roll / crash 四段在 `local` 与 `catalog` 两种导出模式下各跑一遍。
