@@ -7,15 +7,23 @@ namespace {
 class AuthNone final : public Authenticator {
  public:
     Result<Cred> authenticate(const OpaqueAuth&, const OpaqueAuth&) override {
-        // anonymous/nobody
-        return Cred{};
+        Cred out;
+        // No identity claimed: squash_cred() maps this onto the export's anon_uid/anon_gid.
+        // The 65534 defaults stay as the fallback for a path that never squashes.
+        out.anonymous = true;
+        return out;
     }
 };
 
 // AUTH_SYS body (RFC 5531 appendix A): stamp, machinename<255>, uid, gid, gids<16>.
 class AuthSys final : public Authenticator {
  public:
-    Result<Cred> authenticate(const OpaqueAuth& cred, const OpaqueAuth&) override {
+    Result<Cred> authenticate(const OpaqueAuth& cred, const OpaqueAuth& verf) override {
+        // RFC 5531 §8.2: an AUTH_SYS credential travels with an AUTH_NONE verifier of
+        // zero length.  Anything else is AUTH_BADVERF rather than something to ignore
+        // (followups/protocol-gaps.md C3) — no client sends anything else, and silently
+        // accepting a verifier we never look at is how a flavor confusion goes unnoticed.
+        if (verf.flavor != static_cast<uint32_t>(AuthFlavor::kNone) || !verf.body.empty()) return Err(Errno::kBadVerf);
         // flat mode; body references the request record
         xdr::XdrDec dec(cred.body);
 

@@ -1128,6 +1128,16 @@ std::string ExportTable::reload_dynamic(const Config& fresh) {
 
 MappedCred ExportTable::squash_cred(const rpc::Cred& cred, const ExportEntry& entry) {
     MappedCred out{cred.uid, cred.gid, {cred.gids.begin(), cred.gids.end()}};
+    // AUTH_NONE claimed no identity, so the export's anonymous one applies regardless of
+    // the squash mode — `none` passes a *claimed* identity through and there is none here.
+    // Without this the hardcoded nobody/nogroup from the authenticator won and an export's
+    // anon_uid/anon_gid were quietly ignored for these callers (C3).
+    if (cred.anonymous) {
+        out.uid = entry.anon_uid;
+        out.gid = entry.anon_gid;
+        out.groups.clear();
+        return out;
+    }
     if (entry.squash == Squash::kAll) {
         out.uid = entry.anon_uid;
         out.gid = entry.anon_gid;
