@@ -28,6 +28,8 @@
 | [`accept_failover_vm.sh`](#root-vm-验收真实内核挂载) | 真实挂载下的网关故障切换 | **是** | 手动 |
 | [`posix_semantics.py`](#posix-语义) | 对任意目录跑 POSIX 文件系统语义检查 | 否 | 手动 |
 | [`posix_semantics_vm.sh`](#posix-语义) | 上面那个的 lightnfs 跑法：起网关、按版本挂载、逐轮跑 | **是** | 手动 |
+| [`fsperf.py`](#文件系统性能) | 对任意目录量元数据与数据性能 | 否 | 手动 |
+| [`fsperf_vm.sh`](#文件系统性能) | 上面那个的 lightnfs 跑法：后端目录作基线、按版本挂载量 | **是** | 手动 |
 | [`accept_gluster.sh`](#集群后端验收需要真实存储) | GlusterFS 后端对真实卷 | 否 | 手动 |
 | [`accept_lustre.sh`](#集群后端验收需要真实存储) | Lustre 后端对真实挂载 | 否 | 手动 |
 | [`accept_cephfs.sh`](#集群后端验收需要真实存储) | CephFS 后端对真实集群 | 否 | 手动 |
@@ -160,6 +162,21 @@ root、不需要内核挂载、不需要集群。
   （lightnfs 不实现 NLM/NSM）。
 
 完整说明见 [posix-semantics.md](posix-semantics.md)。
+
+## 文件系统性能
+
+- **`fsperf.py DIR [--threads N] [--files N] [--seconds S] [--bs LIST] [--direct]
+  [--json OUT] [--compare BASE.json]`**——用真实 syscall 量一个目录的元数据（create /
+  stat / open+close / chmod / rename / lookup-miss / readdir / symlink / link /
+  mkdir+rmdir / unlink 的 ops/s 与 p50/p95/p99）与数据（顺序读写、重读、随机读写、
+  每次 fsync 的写，在多个块大小下的 MiB/s 与 IOPS）。纯标准库，不需要 fio / mdtest。
+  默认一轮约 30 秒。基线存 `--json`，之后 `--compare` 逐项比百分比。
+- **`fsperf_vm.sh [vers...]`**（需要 root）——起网关、先量后端目录作基线、再按每个版本
+  挂载量一遍，逐项对着基线报百分比，并记下每轮生效的挂载选项（`rsize`/`wsize`/`actimeo`
+  对结果的影响比多数服务端参数都大）。
+
+完整说明见 [fsperf.md](fsperf.md)。与 `lightnfs-ctl bench`（协议栈上限，不经挂载）的分工
+见 [../testing/benchmarks.md](../testing/benchmarks.md)。
 
 ## 集群后端验收（需要真实存储）
 
