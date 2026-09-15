@@ -430,7 +430,9 @@ pending a target cluster and v4 open/deny state stays per gateway.
   suite fetchers, benchmark and fuzz drivers, and the two operations scripts.
   [docs/guide/posix-semantics.md](docs/guide/posix-semantics.md) covers
   `scripts/posix_semantics.py`, the POSIX filesystem semantics checker you can point at
-  any directory or at a lightnfs mount.
+  any directory or at a lightnfs mount, and
+  [docs/guide/fsperf.md](docs/guide/fsperf.md) covers `scripts/fsperf.py`, the metadata
+  and data benchmark for the same targets.
 - **Reference** — protocol research: [docs/reference/nfsv3/](docs/reference/nfsv3/README.md),
   [docs/reference/nfsv4/](docs/reference/nfsv4/README.md).
 - **Testing** — [test report](docs/testing/test-report.md) (conformance runs via

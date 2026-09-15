@@ -31,6 +31,9 @@
 - [posix-semantics.md](guide/posix-semantics.md)——POSIX 文件系统语义检查器
   `scripts/posix_semantics.py` 的用法：12 组检查各看什么、SKIP 的判据、NFS 上合法的偏差
   （silly-rename、时间戳粒度、v3 无字节锁）、与 cthon / fsx / pynfs 的分工。
+- [fsperf.md](guide/fsperf.md)——文件系统性能测试 `scripts/fsperf.py` 的用法：元数据与
+  数据各量了什么、怎么读这些数字（缓存、线程、`O_DIRECT`、长尾）、怎么用 `--json` /
+  `--compare` 做对比，以及与 `lightnfs-ctl bench` 和 fio 的分工。
 
 ## reference/ 协议调研
 
