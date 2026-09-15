@@ -3,9 +3,9 @@
 > 清单的实施步骤文档（原 `docs/design/12-shared-export-catalog-steps.md`）的 A1–E2 已全部实现并
 > 合并，随之与 09 / 10 的步骤文档同样撤下，每步的改动点与实现注见 git 历史。本文件按其 §E2 的
 > 约定收口未闭环项，供后续处理。设计与实现见
-> [../design/11-shared-export-catalog.md](../design/11-shared-export-catalog.md)，运维视角见
-> [../deployment.md](../deployment.md) §6.1，配置 / 热重载口径 / 指标 / ctl 见
-> [../design/08-config-observability.md](../design/08-config-observability.md)。
+> [../design/11-shared-export-catalog.md](../11-shared-export-catalog.md)，运维视角见
+> [../deployment.md](../../guide/deployment.md) §6.1，配置 / 热重载口径 / 指标 / ctl 见
+> [../design/08-config-observability.md](../08-config-observability.md)。
 
 ## 1. 导出退出清单后，`fs/<fsid>/*` 共享状态无人回收
 

@@ -66,7 +66,7 @@ Put compose variables in `docker/.env` (git-ignored).
   host.
 - **Capabilities.** Docker's default set lacks `CAP_DAC_READ_SEARCH`; without it the
   entrypoint warns and the local backend uses path-based filehandles (see
-  `docs/deployment.md`). The compose file adds it. `CAP_NET_BIND_SERVICE` is only needed
+  `docs/guide/deployment.md`). The compose file adds it. `CAP_NET_BIND_SERVICE` is only needed
   for ports < 1024 inside the container. The other capabilities in the compose list are
   used by the entrypoint before it drops to `LNFS_UID`, plus `CAP_DAC_OVERRIDE` for
   container root (healthcheck, `docker compose exec … lightnfs-ctl`) to reach the 0600

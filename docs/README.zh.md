@@ -8,8 +8,8 @@ io_uring reactor 之上（epoll 兜底），不依赖内核 NFS 服务。
 [English README](../README.md)
 
 - 设计文档：[design/](design/README.md)
-- 协议调研：[nfsv3/](nfsv3/README.md)、[nfsv4/](nfsv4/README.md)
-- 部署指南：[deployment.md](deployment.md)
+- 协议调研：[reference/nfsv3/](reference/nfsv3/README.md)、[reference/nfsv4/](reference/nfsv4/README.md)
+- 部署指南：[guide/deployment.md](guide/deployment.md)
 
 ---
 
@@ -196,7 +196,7 @@ scripts/ci.sh                     # 完整矩阵：GCC/Clang × Debug/Release ×
 ./build/lightnfs-ctl bench nullrpc  1 4 20000 32      # L2：null RPC（门禁：单 reactor ≥100k rps）
 ./build/lightnfs-ctl bench fullpath 1 4 20000 32 read # L4：全链路（memory 后端）
 scripts/bench_gate.sh                       # 三项对照 tools/bench/baseline.txt
-                                            #（用法见 docs/performance/benchmarks.md）
+                                            #（用法见 docs/testing/benchmarks.md）
 ```
 
 ## 配置
@@ -294,7 +294,7 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 
 ## 部署与安全
 
-对外暴露前请先读 [deployment.md](deployment.md)。要点：
+对外暴露前请先读 [guide/deployment.md](guide/deployment.md)。要点：
 
 - **信任边界：仅 AUTH_SYS。** 客户端声明的 uid/gid 被直接信任；只在受信网络运行。
   启用内置 **RPC-over-TLS**（`[tls]`，RFC 9289）或前置 WireGuard 做通道加密，每个导出都用
@@ -306,7 +306,7 @@ ctl socket 默认 `<state_dir>/ctl.sock`（`LIGHTNFS_CTL` 覆盖路径）。指�
 - **重启行为。** 崩溃或重启 → 新的写验证器（客户端重发未提交数据）+ 以 `lease` 为长度
   的宽限期，名单内的 v4 客户端在其中 reclaim open/锁。
 
-逐项验证记录见 [security-checklist.md](security-checklist.md)。
+逐项验证记录见 [testing/security-checklist.md](testing/security-checklist.md)。
 
 ## 测试
 
@@ -366,11 +366,17 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
 
 ## 文档索引
 
-- 设计：[design/](design/README.md)——架构、运行时/并发、传输/RPC/XDR、NFS 核心、
-  后端接口、后端实现、状态管理、配置/可观测性、多网关无感故障切换（方案）
-- 协议调研：[nfsv3/](nfsv3/README.md)、[nfsv4/](nfsv4/README.md)
-- 运维：[部署指南](deployment.md)、[安全清单](security-checklist.md)
-- 性能：[基准工具使用指南](performance/benchmarks.md)（`lightnfs-ctl bench`、
-  `scripts/bench_gate.sh`、基线更新规则、真实挂载 fio 建议）与
-  [测试报告](performance/test-report.md)——协议一致性（cthon / pynfs / fsx）、三层基准对照
-  `tools/bench/baseline.txt` 的数据、单测/fuzz/后端测试覆盖
+`docs/` 按四类分目录（总览见 [README.md](README.md)）：
+
+- **设计** [design/](design/README.md)——架构、运行时/并发、传输/RPC/XDR、NFS 核心、
+  后端接口、后端实现、状态管理、配置/可观测性，以及三册集群文档（多网关主备、每导出一个
+  属主网关的多活、共享导出清单）。每册未闭环的取舍与门槛在
+  [design/followups/](design/followups/)。
+- **使用** [guide/deployment.md](guide/deployment.md)——安全信任边界、最小特权 systemd
+  单元、关键配置、运维与可观测性、多网关主备与多活部署、共享导出清单、已知限制。
+- **参考** 协议调研：[reference/nfsv3/](reference/nfsv3/README.md)、
+  [reference/nfsv4/](reference/nfsv4/README.md)。
+- **测试** [测试报告](testing/test-report.md)（协议一致性 cthon / pynfs / fsx、三层基准
+  对照 `tools/bench/baseline.txt` 的数据、单测/fuzz/后端测试覆盖）、
+  [基准工具使用指南](testing/benchmarks.md)（`lightnfs-ctl bench`、`scripts/bench_gate.sh`、
+  基线更新规则、真实挂载 fio 建议）、[安全加固清单](testing/security-checklist.md)。

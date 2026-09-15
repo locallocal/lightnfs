@@ -6,9 +6,9 @@
 > 同一时刻一个网关对外服务，故障后另一个接管。"每个导出一个属主网关、N 台同时服务"的多活
 > 形态是它的演进，见 [10 册](10-multi-gateway-active-active.md)（§9.9）；两者是同一
 > `[cluster]` 段的互斥取值。配置 / 指标 / ctl 见 [08 册](08-config-observability.md)，部署见
-> [../deployment.md](../deployment.md) §5，把导出表从本地文件上移到共享清单见
+> [../guide/deployment.md](../guide/deployment.md) §5，把导出表从本地文件上移到共享清单见
 > [11 册](11-shared-export-catalog.md)。未闭环的取舍与发布前门槛见
-> [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)。
+> [followups/multi-gateway-failover-followups.md](followups/multi-gateway-failover-followups.md)。
 
 ## 9.1 问题：切换后客户端看到的是"另一台服务器"
 
@@ -283,4 +283,4 @@ per-fsid 键空间与代码锚点见 [10 册](10-multi-gateway-active-active.md)
 - **root VM**（人工，需 root）：`scripts/accept_failover_vm.sh`——keepalived VIP + 两台网关
   + 内核客户端跑 fsx / cthon lock 组，切换中 `kill -9` 活动网关，负载不中断、无 EIO /
   ESTALE。本机环境无 root，执行情况见
-  [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)。
+  [followups/multi-gateway-failover-followups.md](followups/multi-gateway-failover-followups.md)。

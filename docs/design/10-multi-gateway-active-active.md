@@ -1,9 +1,9 @@
 # 10. 多网关多活（每导出一个活动网关）——设计与实现
 
 > `[cluster] mode = "active-active"`：N 个网关同时对外服务，**每个导出（fsid）有且只有一个属主
-> 网关**，不同导出可落在不同网关。运维视角见 [../deployment.md](../deployment.md) §6，配置 /
+> 网关**，不同导出可落在不同网关。运维视角见 [../guide/deployment.md](../guide/deployment.md) §6，配置 /
 > 指标 / ctl 见 [08 册](08-config-observability.md)，状态层见 07 §7.5，未闭环项见
-> [../toto/multi-gateway-active-active-followups.md](../toto/multi-gateway-active-active-followups.md)。
+> [followups/multi-gateway-active-active-followups.md](followups/multi-gateway-active-active-followups.md)。
 >
 > 本册把 [09 册](09-multi-gateway-failover.md) §9.9 的一句展开成完整方案：在 09 主备接管的原语
 > （`ClusterStore`、围栏租约、集群身份、后端接管钩子、per-fsid 会话 uuid）之上，把"一个集群一个
@@ -246,7 +246,7 @@ ctl 命令 `lightnfs-ctl cluster migrate <fsid> <node>`，**在当前属主上�
    （导出退出清单时无人清理共享状态），少了它，一个已被移出 `nodes` 的旧属主会在导出重新加入时
    凭陈旧的 owner 记录把它抢回去——而顺位规则 `our_turn()` 是唯一拦住未列名网关的地方
    （11 册 §11.5；共享状态本身仍无人回收，见
-   [../toto/shared-export-catalog-followups.md](../toto/shared-export-catalog-followups.md) §1）。
+   [followups/shared-export-catalog-followups.md](followups/shared-export-catalog-followups.md) §1）。
 6. **窗口内**：T 处于 Activating，对引擎发布为 unowned → 对 F 回 `DELAY`；其他网关的视图 Remote
    指向 T → 回 MOVED 指 T；除 T 以外的顺位网关看到 owner 指向存活的 T 时**主动让位**。因此
    **任何编排都必须轮询目标到 `role=active`**，而不是源端变 remote（收尾项 §3）。
@@ -346,7 +346,7 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
   由"同一份共享文件"天然保证而不再靠互校，`nodes` 与 `clients` / QoS / `readonly` / `squash` /
   `anon_*` 改为在线生效、增删导出不再需要重启，改法是 `lightnfs-ctl cluster export add|set|remove`
   / `cluster catalog import|rollback`（11 §11.10，命令细节见 08 §8.6，部署见
-  [../deployment.md](../deployment.md) §6.1）。默认 `local` 时本节一切不变。
+  [../guide/deployment.md](../guide/deployment.md) §6.1）。默认 `local` 时本节一切不变。
 
 ## 10.11 客户端兼容性与 v3 边界
 

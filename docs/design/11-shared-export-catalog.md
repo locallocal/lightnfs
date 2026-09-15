@@ -5,9 +5,9 @@
 > `[backend_defaults]` 本机键。于是增删导出、改属主顺位 `nodes`、改 `clients` / QoS /
 > `readonly` / `squash` / `anon_*` 都不再需要改 N 份文件、重启 N 台网关。默认值
 > `exports_source = "local"` 下导出仍来自本地 `[[export]]`，行为一如不启用清单时。运维视角见
-> [../deployment.md](../deployment.md) §6.1，配置 / 热重载口径 / 指标 / ctl 见
+> [../guide/deployment.md](../guide/deployment.md) §6.1，配置 / 热重载口径 / 指标 / ctl 见
 > [08 册](08-config-observability.md)，未闭环项见
-> [../toto/shared-export-catalog-followups.md](../toto/shared-export-catalog-followups.md)。
+> [followups/shared-export-catalog-followups.md](followups/shared-export-catalog-followups.md)。
 >
 > 本册长在 [09 册](09-multi-gateway-failover.md) 主备与 [10 册](10-multi-gateway-active-active.md)
 > 多活之上：`ClusterStore`（09 §9.4）、导出表摘要一致性校验（09 §9.3）、`FsClusterController`

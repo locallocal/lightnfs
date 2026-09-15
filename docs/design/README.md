@@ -4,7 +4,7 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 
 实现语言/范式：**C++20 + 协程**（全异步、无阻塞事件循环）。
 
-协议语义依据本仓库调研文档：[../nfsv3/](../nfsv3/README.md) 与 [../nfsv4/](../nfsv4/README.md)，本设计不重复协议细节，只引用。
+协议语义依据本仓库调研文档：[../reference/nfsv3/](../reference/nfsv3/README.md) 与 [../reference/nfsv4/](../reference/nfsv4/README.md)，本设计不重复协议细节，只引用。
 
 ## 文档目录
 
@@ -16,9 +16,9 @@ lightnfs 是一个用户态 NFS 网关：北向同时提供 **NFSv3 与 NFSv4.1/
 6. [后端实现](06-backends.md) —— 本地文件系统后端详设；Lustre（§6.5）、GlusterFS（§6.6）、CephFS（§6.8）三个集群后端的映射表与实现要点
 7. [状态管理](07-state-management.md) —— v3 DRC、v4 clientid/会话/槽表/租约/宽限期、持久化
 8. [配置、可观测性与安全](08-config-observability.md) —— 导出表、日志/指标/追踪、资源限制
-9. [多网关无感故障切换](09-multi-gateway-failover.md) —— 共享后端上的主备接管：集群身份（统一 server_owner + 共享句柄密钥）、共享 reclaim 名单、全局单调 epoch 与围栏租约、后端接管钩子，把"切到另一台网关"变成客户端已会处理的"同一台服务器重启"；§9.10 代码地图，§9.11 验证资产；多活/计划内迁移的演进路径见 §9.9 与 10 册。`[cluster] mode = failover`（默认），配置/指标/ctl 见 08 册，部署见 [../deployment.md](../deployment.md) §5；尚未闭环的取舍与发布前门槛见 [../toto/multi-gateway-failover-followups.md](../toto/multi-gateway-failover-followups.md)
-10. [多网关多活（每导出一个活动网关）](10-multi-gateway-active-active.md) —— 09 的演进：per-fsid 围栏/epoch/grace、按节点批量的围栏心跳、伪根 + fs_locations + NFS4ERR_MOVED 把客户端引到每个导出的属主网关、按 `nodes` 顺位的导出级故障接管与 `cluster migrate` 计划内迁移；CephFS 天生契合（per-fsid 会话 uuid），Gluster/Lustre 同卷同进退，v3 与老客户端的边界写明。`[cluster] mode = active-active`，与 09 的 failover 二选一；§10.13 验收与指标、§10.14 代码锚点；配置/指标/ctl 见 08 册，部署见 [../deployment.md](../deployment.md) §6，待决项见 [../toto/multi-gateway-active-active-followups.md](../toto/multi-gateway-active-active-followups.md)
-11. [共享导出清单（集群级集中式导出配置）](11-shared-export-catalog.md) —— 把 `[[export]]` 从每台网关的本地 TOML 上移到 `shared_dir/catalog.toml`（带版本、历史、CAS 写入），本地只留身份与 `[backend_defaults]` 本机键；`lightnfs-ctl cluster catalog …` / `cluster export add|set|remove` 改清单（另有不连网关的离线形态 `lightnfs-ctl catalog … --shared-dir`）；网关按 `catalog_refresh = auto|manual` 在围栏 tick 上跟进；不重启地增删导出、改 `nodes`、改 `clients`/QoS/`readonly`/`squash`/`anon_*`（不可变导出集快照 + RCU 发布，§11.6）；§11.11 代码地图与验证。`exports_source = "catalog"` 启用，主备与多活都可用，默认 `local` 零变化；配置/热重载口径/指标/ctl 见 08 册，部署与迁移步骤见 [../deployment.md](../deployment.md) §6.1，未闭环项见 [../toto/shared-export-catalog-followups.md](../toto/shared-export-catalog-followups.md)
+9. [多网关无感故障切换](09-multi-gateway-failover.md) —— 共享后端上的主备接管：集群身份（统一 server_owner + 共享句柄密钥）、共享 reclaim 名单、全局单调 epoch 与围栏租约、后端接管钩子，把"切到另一台网关"变成客户端已会处理的"同一台服务器重启"；§9.10 代码地图，§9.11 验证资产；多活/计划内迁移的演进路径见 §9.9 与 10 册。`[cluster] mode = failover`（默认），配置/指标/ctl 见 08 册，部署见 [../guide/deployment.md](../guide/deployment.md) §5；尚未闭环的取舍与发布前门槛见 [followups/multi-gateway-failover-followups.md](followups/multi-gateway-failover-followups.md)
+10. [多网关多活（每导出一个活动网关）](10-multi-gateway-active-active.md) —— 09 的演进：per-fsid 围栏/epoch/grace、按节点批量的围栏心跳、伪根 + fs_locations + NFS4ERR_MOVED 把客户端引到每个导出的属主网关、按 `nodes` 顺位的导出级故障接管与 `cluster migrate` 计划内迁移；CephFS 天生契合（per-fsid 会话 uuid），Gluster/Lustre 同卷同进退，v3 与老客户端的边界写明。`[cluster] mode = active-active`，与 09 的 failover 二选一；§10.13 验收与指标、§10.14 代码锚点；配置/指标/ctl 见 08 册，部署见 [../guide/deployment.md](../guide/deployment.md) §6，待决项见 [followups/multi-gateway-active-active-followups.md](followups/multi-gateway-active-active-followups.md)
+11. [共享导出清单（集群级集中式导出配置）](11-shared-export-catalog.md) —— 把 `[[export]]` 从每台网关的本地 TOML 上移到 `shared_dir/catalog.toml`（带版本、历史、CAS 写入），本地只留身份与 `[backend_defaults]` 本机键；`lightnfs-ctl cluster catalog …` / `cluster export add|set|remove` 改清单（另有不连网关的离线形态 `lightnfs-ctl catalog … --shared-dir`）；网关按 `catalog_refresh = auto|manual` 在围栏 tick 上跟进；不重启地增删导出、改 `nodes`、改 `clients`/QoS/`readonly`/`squash`/`anon_*`（不可变导出集快照 + RCU 发布，§11.6）；§11.11 代码地图与验证。`exports_source = "catalog"` 启用，主备与多活都可用，默认 `local` 零变化；配置/热重载口径/指标/ctl 见 08 册，部署与迁移步骤见 [../guide/deployment.md](../guide/deployment.md) §6.1，未闭环项见 [followups/shared-export-catalog-followups.md](followups/shared-export-catalog-followups.md)
 
 ## 一页纸架构
 
