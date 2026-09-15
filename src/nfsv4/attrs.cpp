@@ -86,6 +86,21 @@ const Bitmap& supported_attrs(bool referrals) {
     return referrals ? with_referrals : plain;
 }
 
+const Bitmap& write_only_attrs() {
+    static const Bitmap value = [] {
+        Bitmap b;
+        for (uint32_t id : {kTimeAccessSet, kTimeModifySet}) b.set(id);
+        return b;
+    }();
+    return value;
+}
+
+bool wants_write_only(const Bitmap& wanted) {
+    for (uint32_t id : {kTimeAccessSet, kTimeModifySet})
+        if (wanted.test(id)) return true;
+    return false;
+}
+
 bool wants_stats(const Bitmap& wanted) {
     for (uint32_t id : {kFilesAvail, kFilesFree, kFilesTotal, kSpaceAvail, kSpaceFree, kSpaceTotal})
         if (wanted.test(id)) return true;
@@ -102,8 +117,14 @@ void patch_be32(std::byte* gap, uint32_t v) {
 void encode_fattr(xdr::XdrEnc& enc, const Bitmap& wanted, const AttrSource& src) {
     Bitmap actual;
     const Bitmap& sup = supported_attrs(src.referrals);
+    // Write-only attributes are dropped here as well as rejected by the read paths: an
+    // attrmask bit with no value behind it makes attrmask and attrlist disagree, which no
+    // client can parse (followups/protocol-gaps.md A1).  One filter, two places, so a new
+    // read path cannot reintroduce it.
+    const Bitmap& wo = write_only_attrs();
+    auto word = [](const Bitmap& b, uint32_t w) { return w < b.words.size() ? b.words[w] : 0u; };
     for (uint32_t w = 0; w < 3; ++w) {
-        uint32_t bits = (w < wanted.words.size() ? wanted.words[w] : 0) & (w < sup.words.size() ? sup.words[w] : 0);
+        uint32_t bits = word(wanted, w) & word(sup, w) & ~word(wo, w);
         if (bits) {
             while (actual.words.size() <= w) actual.words.push_back(0);
             actual.words[w] = bits;
