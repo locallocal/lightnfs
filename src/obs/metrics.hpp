@@ -117,6 +117,8 @@ struct Metrics {
     LatencyHistogram v3_duration[kV3Procs]{};
     ShardedCounter<uint64_t> rpc_garbage{};
     ShardedCounter<uint64_t> mount_calls{};
+    // exports(5) `secure`: requests refused for coming from a non-reserved source port.
+    ShardedCounter<uint64_t> insecure_port_rejected{};
 
     // v4 engine (plan doc 10 §3.1): per-op calls/errors/latency indexed by opcode
     // (3..75 = nfsv4 kLastKnownOp; slot 0 collects out-of-table opcodes) plus a

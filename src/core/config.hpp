@@ -122,6 +122,13 @@ struct ExportConfig {
     uint32_t anon_uid = 65534;
     uint32_t anon_gid = 65534;
     bool readonly = false;
+    // exports(5) `secure`: refuse requests whose source port is not a reserved one
+    // (< 1024).  On by default, as in knfsd: AUTH_SYS trusts the client's kernel to put
+    // the caller's real uid in the credential, and only a privileged process can bind a
+    // reserved port — without this an unprivileged user on an allowed host can speak NFS
+    // directly and claim any uid (followups/protocol-gaps.md B3).  Turn it off per export
+    // for client populations that cannot get one (containers, `mount -o noresvport`).
+    bool secure_ports = true;
     // Per-export token buckets (plan doc 10 §4.3): bytes/s for READ and WRITE plus an
     // IO ops/s cap.  0 = unlimited.  Hot-reloadable.
     uint64_t read_bps = 0;
@@ -242,6 +249,7 @@ struct ExportEntry {
     std::atomic<uint32_t> anon_uid{65534};
     std::atomic<uint32_t> anon_gid{65534};
     std::atomic<bool> readonly{false};
+    std::atomic<bool> secure_ports{true};
     std::unique_ptr<backend::Backend> backend;
     // Per-export data-path counters (plan doc 10 §3.3), exported with export/fsid labels.
     obs::ExportMetrics metrics;
@@ -411,6 +419,8 @@ class ExportTable {
 
     // Per-entry rules that need no table state.
     static bool check_client(const sockaddr_storage& peer, const ExportEntry& entry);
+    // The `secure_ports` half of check_client, exposed for tests.
+    static bool port_allowed(const sockaddr_storage& peer, const ExportEntry& entry);
     static MappedCred squash_cred(const rpc::Cred& cred, const ExportEntry& entry);
 
     // Hot reload, step 1 (plan doc 10 §4.1): re-applies the non-topology per-export

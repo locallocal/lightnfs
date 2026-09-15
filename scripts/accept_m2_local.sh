@@ -65,6 +65,9 @@ fsid = 1
 clients = ["127.0.0.0/8"]
 squash = "none"
 readonly = false
+# lnfs_accept_client is an unprivileged userspace client: it connects from an
+# ephemeral port, so the exports(5) "secure" check has to be off here.
+secure_ports = false
 
 [export.local]
 handles = "auto"
@@ -128,11 +131,18 @@ run_phase() {  # $1 build label, $2 stress secs
 
     echo "== [$label] admin tools"
     export LIGHTNFS_CTL="$state/ctl.sock"
+    # `producer | grep -q PATTERN` is unsafe here: grep exits as soon as it matches and
+    # closes the pipe, so the producer dies of SIGPIPE (lightnfs-ctl -> 141) or reports a
+    # write error (curl -> 23), and `set -o pipefail` turns that into a step failure even
+    # though the pattern was found.  Capture first, then grep the file.
     "$repo/build-rel/lightnfs-ctl" ping >/dev/null
-    "$repo/build-rel/lightnfs-ctl" metrics | grep -q lightnfs_v3_calls_total
+    "$repo/build-rel/lightnfs-ctl" metrics > "$work/ctl-metrics.txt"
+    grep -q lightnfs_v3_calls_total "$work/ctl-metrics.txt"
     "$repo/build-rel/lightnfs-ctl" fdcache >/dev/null
-    "$repo/build-rel/lightnfs-ctl" drc | grep -q inserts=
-    curl -sf "http://127.0.0.1:$((nfs_port + 1))/metrics" | grep -q lightnfs_drc_inserts_total
+    "$repo/build-rel/lightnfs-ctl" drc > "$work/ctl-drc.txt"
+    grep -q inserts= "$work/ctl-drc.txt"
+    curl -sf "http://127.0.0.1:$((nfs_port + 1))/metrics" > "$work/http-metrics.txt"
+    grep -q lightnfs_drc_inserts_total "$work/http-metrics.txt"
   else
     echo "== [$label] concurrent rw stress ${secs}s (leak soak)"
     head -c 8388608 /dev/urandom > "$data/soak.bin"

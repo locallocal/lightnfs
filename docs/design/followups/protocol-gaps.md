@@ -27,7 +27,7 @@
 | A5 | A | `state/state_mgr.cpp:1595`、`nfsv4/engine.cpp:2765` | FREE_STATEID 不校验 stateid 属主 | 叠加 B1 的可推 stateid → 可释放别人的 lock stateid**——已修复** |
 | B1 | B | `state/state_mgr.cpp:549` | sessionid 全无随机分量，网段内可枚举并冒用别人的会话**——已修复**；同条目下的 stateid 可推（A5 覆盖）与 SEQUENCE 隐式绑定连接（与 knfsd 在 SP4_NONE 下一致）**原判定过重，已更正** | 见 B1 正文 |
 | B2 | B | `core/config.cpp:1089` | `squash = root` 只压 uid，不压 gid 0 与附加组 0 | 组 root 可写的文件仍可被写**——已修复** |
-| B3 | B | 全路径缺失 | 无特权源端口（"secure"）检查 | 受信主机上的**普通用户**即可声称任意 uid |
+| B3 | B | 全路径缺失 | 无特权源端口（"secure"）检查 | 受信主机上的**普通用户**即可声称任意 uid**——已修复（新增 `secure_ports`，默认 true）** |
 | B4 | B | `rpc/drc.hpp:39` | DRC 键含源端口 | 跨重连的重传 miss → 非幂等过程重放（REMOVE 回 NOENT 等） |
 | B5 | B | `nfsv4/attrs.cpp:133` | `fh_expire_type` 恒为 FH4_PERSISTENT，无视 `kStableHandles` | fallback 句柄模式下向客户端谎报句柄永久有效 |
 | B6 | B | `nfsv3/engine.cpp:584` | v3 FSINFO 不宣告 FSF3_CANSETTIME | 看 properties 的客户端不用 SET_TO_CLIENT_TIME |
@@ -360,7 +360,7 @@ deployment.md §3 的 squash 说明同步。
 交给后端（`local` 的 setfsuid 会失败，`kNativeAccess` 后端由存储侧判定）。这会改变
 `squash = none` 的行为，不在 B2 条目内，**留作独立项**。
 
-### B3 不检查特权源端口
+### B3 不检查特权源端口（已修复）
 
 全路径没有任何"源端口 < 1024"的判断（`transport/listener.cpp`、`rpc/dispatch.cpp`、
 `core/config.cpp` 均无）。knfsd 默认开 `secure`（exports(5)），正是因为 AUTH_SYS 的信任模型
@@ -376,6 +376,50 @@ deployment.md §1 写的"网络内任意**主机**可声称任意用户身份"�
 - 加 `[[export]] secure_ports`（默认 `true`，与 knfsd 对齐），在 `check_client` 旁边判端口；
 - 至少把 deployment.md §1 的口径改准，明确"受信主机上的非特权用户同样能伪造身份，因此导出
   网段里的主机必须是被完整管控的"。
+
+**已修复**（本轮）：
+- 新增 `[[export]] secure_ports`，**默认 `true`**（与 knfsd 的 `secure` 一致），判定落在
+  `ExportTable::port_allowed()` 里、由 `check_client()` 调用——于是 v3 句柄解码、v4 句柄解码、
+  v4 伪根跨越、MOUNT 四条路径**一次到位**，各自沿用已有的 EACCES / NFS4ERR_ACCESS /
+  MNT3ERR_ACCES。NULL 过程不查导出，所以健康检查与 rpcinfo 不受影响；`AF_UNIX` 对端（ctl
+  socket）没有端口，不参与判定。
+- 与其它 per-export 标量一样热更新（`apply()` 原地翻），并走完整链路：TOML 解析、
+  `ExportSetBuilder::add`、`apply`。
+- 被拒请求计入 `lightnfs_insecure_port_rejected_total`，并在**进程内第一次**发生时打一条带
+  端口与键名的 warn——不刷日志，但第一次就能自诊断。
+
+**默认值的取舍（自行判断，需要复核）**：本条建议的是默认 `true`，我照此实现，理由是
+knfsd 的 `secure` 默认开、且这道检查正是 deployment.md §1 那句「网络内任意主机可声称任意用户
+身份」成立的前提——没有它，边界实际是「受信主机上任意**用户**」。代价是**行为变更**：拿不到
+保留端口的客户端升级后会收到 EACCES。缓解是上面那条 warn + 指标，以及部署文档里写明。
+
+**发现的连带影响**（看代码才发现，不是猜的）：`tests/accept_client.cpp` 的 `connect_tcp()`
+从不绑保留端口，而本机验收又是无 root 跑的——所以默认开之后**所有验收脚本都会挂**。处理：
+给 10 个驱动 `lnfs_accept_client` 的脚本（`accept_m2/m6_local`、`accept_m6_vm`、
+`accept_failover_local`、`accept_active_active_local`、`accept_gluster/cephfs/lustre`、
+`fault_inject`、`gen_seccomp_allowlist`）生成的导出块加上 `secure_ports = false` 并注明原因；
+纯内核挂载的脚本（`accept_m2_vm`、`accept_failover_vm`、`posix_semantics_vm`、`fsperf_vm`）
+不动，内核客户端默认用保留端口，那几条顺带成了「默认开」的端到端覆盖。
+
+- 走完整配置链路，不只是本机 TOML：解析、`ExportSetBuilder::add`、`apply` 热更新，**以及
+  共享清单**——`core/catalog.cpp` 的 TOML 发射器与变更检测、`ctl_catalog.cpp` 的
+  `--secure-ports` 旗标与 text/JSON 两种 dump。漏掉清单那一半会留个陷阱：给容器导出关掉之后，
+  下一次 `cluster export set` 重写清单就把它静默恢复成安全默认值。
+- 回归测例两条。`ExportSet.SecurePortsRefusesUnprivilegedSourcePorts`：默认即开（配置不写
+  也开）；665 通过 / 34567 拒绝；1023 通过 / 1024 拒绝（边界）；IPv6 走同一道闸；保留端口但在
+  CIDR 之外仍拒（两半都在）；`AF_UNIX` 对端放行；`secure_ports = false` 热更新后放行、而 CIDR
+  仍然生效。`Ctl.ClusterExportCommands` 末尾加了清单往返断言（旗标 → 发射的 TOML → 解析回来），
+  放在最后是因为中间插一次提交会把上面所有按版本号写死的期望串位。
+- 端到端：`scripts/accept_m2_local.sh` 全程通过（Release + ASAN + ASAN soak，`exit 0`）——
+  验收客户端用非保留端口，经 `secure_ports = false` 正常工作。
+
+**修复过程中撞到的一个既有问题（非本条引入）**：`accept_m2_local.sh` 的 admin-tools 步骤在
+`set -o pipefail` 下用 `producer | grep -q PATTERN`。`grep -q` 一命中就退出并关掉管道，于是生产者
+拿到 SIGPIPE（`lightnfs-ctl` → 141）或写错误（`curl` → 23），pipefail 把它变成整步失败——**即使
+模式是匹配到的**。在**干净 HEAD 上同样失败**（141），所以不是 B3 造成的，但它挡住了 B3 的端到端
+验证。已改成「先落盘再 grep」。同一写法在 `scripts/` 下还有约 30 处，**本轮只修了挡路的这一处**，
+其余留作独立项（多数在 `[[ ]]` 条件里、不受 pipefail 影响，需要逐个看）。
+
 
 ### B4 DRC 键含源端口，跨重连重传失效
 
@@ -570,7 +614,7 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 3. ~~**A3**、**C5**、**A4**~~（均已修复，见上）、**B6**、**B5** —— 错误码与属性宣告的一致性。
    `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
    剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
-4. ~~**B2**~~（已修复，见上）、**B3** —— 身份压缩与源端口，动的是安全默认值，需要同步文档与配置样例。
+4. ~~**B2**、**B3**~~ —— 身份压缩与源端口，均已修复；两条都动了安全默认值，文档与配置样例已同步。
 5. **B4、B7** —— DRC 键与委托一致性。B4 是删一个字段；B7 建议先上"有 v3 导出则不授委托"的
    一行版本，再决定要不要做完整的 v3 召回。
 6. **B8 / C 类** —— 按需。B8.5（errmap 白名单）与 C4（过期注释）属于"改一行防将来踩"。

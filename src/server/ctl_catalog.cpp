@@ -143,11 +143,11 @@ std::string export_text(const CatalogExport& exp) {
     std::string keys;
     for (const auto& [k, v] : backend_keys(c)) keys += std::format("{}{}={}", keys.empty() ? "" : ",", k, v);
     return std::format(
-        "fsid={} path={} backend={} nodes={} disabled={} clients={} readonly={} squash={} "
-        "anon_uid={} anon_gid={} read_bps={} write_bps={} iops={} keys={}\n",
+        "fsid={} path={} backend={} nodes={} disabled={} clients={} readonly={} secure_ports={} "
+        "squash={} anon_uid={} anon_gid={} read_bps={} write_bps={} iops={} keys={}\n",
         c.fsid, c.path, c.backend, text_list(c.nodes), exp.disabled ? "yes" : "no", text_list(c.clients),
-        c.readonly ? "yes" : "no", squash_name(c.squash), c.anon_uid, c.anon_gid, c.read_bps, c.write_bps, c.iops,
-        dash_if_empty(keys));
+        c.readonly ? "yes" : "no", c.secure_ports ? "yes" : "no", squash_name(c.squash), c.anon_uid, c.anon_gid,
+        c.read_bps, c.write_bps, c.iops, dash_if_empty(keys));
 }
 
 std::string export_json(const CatalogExport& exp) {
@@ -157,11 +157,11 @@ std::string export_json(const CatalogExport& exp) {
         keys += std::format("{}{}:{}", keys.empty() ? "" : ",", json_string(k), json_string(v));
     return std::format(
         "{{\"fsid\":{},\"path\":{},\"backend\":{},\"nodes\":{},\"disabled\":{},\"clients\":{},"
-        "\"readonly\":{},\"squash\":\"{}\",\"anon_uid\":{},\"anon_gid\":{},\"read_bps\":{},"
-        "\"write_bps\":{},\"iops\":{},\"backend_keys\":{{{}}}}}",
+        "\"readonly\":{},\"secure_ports\":{},\"squash\":\"{}\",\"anon_uid\":{},\"anon_gid\":{},"
+        "\"read_bps\":{},\"write_bps\":{},\"iops\":{},\"backend_keys\":{{{}}}}}",
         c.fsid, json_string(c.path), json_string(c.backend), json_strings(c.nodes), exp.disabled,
-        json_strings(c.clients), c.readonly, squash_name(c.squash), c.anon_uid, c.anon_gid, c.read_bps, c.write_bps,
-        c.iops, keys);
+        json_strings(c.clients), c.readonly, c.secure_ports, squash_name(c.squash), c.anon_uid, c.anon_gid, c.read_bps,
+        c.write_bps, c.iops, keys);
 }
 
 std::string meta_text(const Catalog& cat) {
@@ -609,8 +609,8 @@ struct ExportFlags {
 
 inline constexpr std::string_view kValueFlags[] = {"path",   "fsid",     "backend",  "nodes",    "clients",
                                                    "squash", "anon-uid", "anon-gid", "read-bps", "write-bps",
-                                                   "iops",   "comment",  "readonly", "disabled"};
-inline constexpr std::string_view kBoolFlags[] = {"readonly", "disabled", "force", "dry-run"};
+                                                   "iops",   "comment",  "readonly", "disabled", "secure-ports"};
+inline constexpr std::string_view kBoolFlags[] = {"readonly", "disabled", "force", "dry-run", "secure-ports"};
 
 Result<ExportFlags> parse_export_flags(const CtlCommand& cmd, size_t first, std::string& why) {
     ExportFlags out;
@@ -702,6 +702,7 @@ Result<void> apply_dynamic_flags(const ExportFlags& f, CatalogExport& exp, std::
     if (f.has("nodes")) c.nodes = split_list(f.get("nodes"));
     if (f.has("clients")) c.clients = split_list(f.get("clients"));
     if (f.has("readonly")) c.readonly = f.get("readonly") == "true";
+    if (f.has("secure-ports")) c.secure_ports = f.get("secure-ports") == "true";
     if (f.has("disabled")) exp.disabled = f.get("disabled") == "true";
     if (f.has("squash")) {
         const auto& s = f.get("squash");
@@ -914,9 +915,11 @@ std::string export_remove(const CtlDeps& deps, const CtlCommand& cmd, std::optio
 const char* export_usage(bool json) {
     return json ? "{\"error\":\"bad subcommand\"}\n"
                 : "cluster export: expected list|add --path P --fsid N [--backend B] [--nodes a,b] "
-                  "[--clients c1,c2] [--readonly] [--squash root|all|none] [--anon-uid N] [--anon-gid N] "
+                  "[--clients c1,c2] [--readonly] [--secure-ports[=bool]] [--squash root|all|none] [--anon-uid N] "
+                  "[--anon-gid N] "
                   "[--read-bps N] [--write-bps N] [--iops N] [--opt k=v …] [--disabled] [--force] "
                   "[--dry-run] [--comment T]|set <fsid> [--nodes …] [--clients …] [--readonly[=bool]] "
+                  "[--secure-ports[=bool]] "
                   "[--squash …] [--anon-uid N] [--anon-gid N] [--read-bps N] [--write-bps N] [--iops N] "
                   "[--disabled[=bool]] [--dry-run] [--comment T]|remove <fsid> [--force] [--dry-run] "
                   "[--comment T]\n";

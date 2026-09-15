@@ -23,6 +23,13 @@ lightnfs 是一个用户态 NFS 网关（NFSv3 + NFSv4.1/4.2，读写），面�
 - 用 `[[export]] clients = [...]` CIDR 白名单收敛来源，用 `squash` 把不受信客户端的
   root 映射为匿名（默认 `root`；完全不信任时用 `all`）。注意 `root` 压的是**三样**：uid 0、
   gid 0、附加组里的 0——一个 uid=1000 但声称 gid 0 的请求也会被压掉组 root 身份。
+- `[[export]] secure_ports`（**默认 true**，与 knfsd 的 `secure` 一致）要求请求来自保留端口
+  （< 1024）。这条是上面那句「网络内任意主机可声称任意用户身份」的**边界前提**：只有特权进程
+  能绑保留端口，所以 AUTH_SYS 的 uid 才可以当成「客户端内核填的」而不是「客户端上任意用户填
+  的」。关掉它，受信主机上的**普通用户**也能直接发 NFS RPC 声称任意 uid。
+  拿不到保留端口的客户端（容器、`mount -o noresvport`、以及本仓库的 `lnfs_accept_client`）
+  需要对那个导出设 `secure_ports = false`；被拒的请求计入
+  `lightnfs_insecure_port_rejected_total`，并在进程内第一次发生时打一条带端口与键名的 warn。
 - 句柄经 SipHash-2-4 HMAC 签名（`state_dir/hmac.key`，首启生成，0600），伪造句柄→
   BADHANDLE；每请求还校验导出 fsid 与来源 IP。**但这防的是伪造句柄，不是伪造身份**——
   身份边界仍是上面的网络假设。
@@ -76,6 +83,7 @@ sudo systemctl enable --now lightnfs
 | 状态目录 | `[server] state_dir` | 存 boot_epoch、hmac.key、grace 名单——**须持久、独占、0700** |
 | 来源白名单 | `[[export]] clients` | CIDR 列表，收敛到受信网段 |
 | 身份压缩 | `[[export]] squash` | `root`（默认）/`all`/`none`。`root` 按 exports(5) 的 root_squash 语义**分别**映射 uid 0、gid 0 与附加组里的 0 到 `anon_uid`/`anon_gid`——所以声称 gid 0 的非 root uid 同样被压；`all` 把任何身份压成 anon 并清空附加组；`none` 原样透传 |
+| 保留端口 | `[[export]] secure_ports` | 默认 `true`（对齐 knfsd `secure`）：要求源端口 < 1024。容器 / `noresvport` / `lnfs_accept_client` 这类拿不到保留端口的客户端需置 `false`，见 §1 |
 | 只读 | `[[export]] readonly` | 只读导出置 `true` |
 | 后端 | `[[export]] backend` + `[export.local]` / `[export.gluster]` / `[export.lustre]` / `[export.cephfs]` | `local`（本机目录树）、`gluster`（libgfapi 卷：`volume`/`servers`/`subdir`；运行时加载 `libgfapi.so.0`，缺库启动失败并写明；`path` 只是挂载名）或 `lustre`（Lustre 客户端挂载内的目录：`mount`（默认自动探测）/`hsm`/`native_locks`/`identity`/`fd_cache`；非 Lustre 挂载启动即拒，写明 statfs magic 不符）或 `cephfs`（libcephfs 挂载：`conf`/`id`/`keyring`/`mon_host`/`fs_name`/`subdir`/`options`/`uuid`（多网关接管时回收的会话 uuid，默认 `<cluster id>-<fsid>`）；运行时加载 `libcephfs.so.2`，缺库启动失败并写明；`path` 只是挂载名） |
 | 监听地址 | `[server] bind` | 监听地址字面量；空 = 全接口双栈。收敛到存储网卡 |

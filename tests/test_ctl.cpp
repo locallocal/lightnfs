@@ -1455,14 +1455,16 @@ TEST(Ctl, ClusterCatalogCommands) {
                                       " updated_by=? uid=42 comment=first one\n"));
         EXPECT_TRUE(shown.find("\nfsid=1 path=" + dir +
                                "/a backend=local nodes=- disabled=no clients=10.0.0.0/8 "
-                               "readonly=no squash=root anon_uid=65534 anon_gid=65534 read_bps=0 write_bps=0 "
+                               "readonly=no secure_ports=yes squash=root anon_uid=65534 anon_gid=65534 read_bps=0 "
+                               "write_bps=0 "
                                "iops=0 keys=-\nfsid=2 path=" +
                                dir + "/b ") != std::string::npos);
         auto shown_json = ask("cluster catalog show --json");
         EXPECT_TRUE(shown_json.starts_with("{\"version\":1,\"exports\":2,\"updated_at\":\""));
         EXPECT_TRUE(shown_json.find("\"comment\":\"first one\",\"exports_list\":[{\"fsid\":1,\"path\":\"" + dir +
                                     "/a\",\"backend\":\"local\",\"nodes\":[],\"disabled\":false,"
-                                    "\"clients\":[\"10.0.0.0/8\"],\"readonly\":false,\"squash\":\"root\","
+                                    "\"clients\":[\"10.0.0.0/8\"],\"readonly\":false,\"secure_ports\":true,"
+                                    "\"squash\":\"root\","
                                     "\"anon_uid\":65534,\"anon_gid\":65534,\"read_bps\":0,\"write_bps\":0,"
                                     "\"iops\":0,\"backend_keys\":{}},{\"fsid\":2,") != std::string::npos);
 
@@ -1657,13 +1659,14 @@ TEST(Ctl, ClusterExportCommands) {
         EXPECT_STREQ(v1->meta.comment, "add one");
         EXPECT_STREQ(ask("cluster export list"),
                      "fsid=1 path=/export/1 backend=local nodes=gw1,gw2 disabled=no clients=10.0.0.0/8,10.1.0.0/16 "
-                     "readonly=yes squash=none anon_uid=1 anon_gid=2 read_bps=300 write_bps=400 iops=5 "
-                     "keys=handles=auto\n");
+                     "readonly=yes secure_ports=yes squash=none anon_uid=1 anon_gid=2 read_bps=300 "
+                     "write_bps=400 iops=5 keys=handles=auto\n");
         EXPECT_STREQ(ask("cluster export list --json"),
                      "{\"version\":1,\"exports_list\":[{\"fsid\":1,\"path\":\"/export/1\",\"backend\":\"local\","
                      "\"nodes\":[\"gw1\",\"gw2\"],\"disabled\":false,\"clients\":[\"10.0.0.0/8\",\"10.1.0.0/16\"],"
-                     "\"readonly\":true,\"squash\":\"none\",\"anon_uid\":1,\"anon_gid\":2,\"read_bps\":300,"
-                     "\"write_bps\":400,\"iops\":5,\"backend_keys\":{\"handles\":\"auto\"}}]}\n");
+                     "\"readonly\":true,\"secure_ports\":true,\"squash\":\"none\",\"anon_uid\":1,"
+                     "\"anon_gid\":2,\"read_bps\":300,\"write_bps\":400,\"iops\":5,"
+                     "\"backend_keys\":{\"handles\":\"auto\"}}]}\n");
         EXPECT_TRUE(ask("cluster catalog show").find("\nfsid=1 path=/export/1 ") != std::string::npos);
         // Refused: a duplicate fsid, a nested path, a per-node key, an unknown backend,
         // an unparseable client; v1 stands.
@@ -1704,6 +1707,10 @@ TEST(Ctl, ClusterExportCommands) {
         EXPECT_STREQ(joined_calls(v3->by_fsid(1)->cfg.nodes), "gw2 gw1");
         EXPECT_FALSE(v3->by_fsid(1)->cfg.readonly);
         EXPECT_STREQ(v3->meta.comment, "reorder");
+        // B3: secure_ports defaults on and is a dynamic field like the other scalars; the
+        // round trip through the emitted catalog is asserted at the end of this test,
+        // where adding a commit does not renumber the golden messages above.
+        EXPECT_TRUE(v3->by_fsid(1)->cfg.secure_ports);
         EXPECT_STREQ(ask("cluster export set 2 --disabled --json"),
                      "{\"version\":4,\"was\":3,\"fsid\":2,\"action\":\"updated\",\"added\":[],\"removed\":[],"
                      "\"disabled\":[2],\"enabled\":[],\"nodes_changed\":[],\"dynamic_changed\":[],"
@@ -1799,6 +1806,23 @@ TEST(Ctl, ClusterExportCommands) {
         EXPECT_STREQ(ask("cluster export remove 4 --force"),
                      "catalog v13 committed (was v12): export fsid=4 removed: added=- removed=4 disabled=- enabled=- "
                      "nodes_changed=- dynamic_changed=- rejected=-\n");
+
+        // followups/protocol-gaps.md B3: secure_ports has to survive the catalog round
+        // trip -- ctl flag, emitted TOML, parsed back -- or turning it off for a container
+        // export would silently come back on (to the secure default) at the next publish.
+        // Last in this test on purpose: a commit here renumbers nothing above.
+        auto remaining = store.catalog_docs.rbegin()->first;
+        auto before = core::parse_catalog(store.catalog_docs[remaining]);
+        ASSERT_TRUE(before.has_value());
+        ASSERT_TRUE(!before->exports.empty());
+        uint32_t fsid = before->exports.front().cfg.fsid;
+        EXPECT_TRUE(before->by_fsid(fsid)->cfg.secure_ports);
+        EXPECT_TRUE(ask("cluster export list").find("secure_ports=yes") != std::string::npos);
+        (void)ask(std::format("cluster export set {} --secure-ports=false", fsid));
+        auto after = core::parse_catalog(store.catalog_docs[store.catalog_docs.rbegin()->first]);
+        ASSERT_TRUE(after.has_value());
+        EXPECT_FALSE(after->by_fsid(fsid)->cfg.secure_ports);
+        EXPECT_TRUE(ask("cluster export list").find("secure_ports=no") != std::string::npos);
     }
     runtime.stop_and_join();
 }
