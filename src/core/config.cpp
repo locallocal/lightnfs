@@ -18,6 +18,7 @@
 
 #include "backend/api.hpp"
 #include "core/pseudofs.hpp"
+#include "obs/metrics.hpp"
 #include "util/log.hpp"
 #include "util/sha256.hpp"
 
@@ -196,6 +197,8 @@ Result<bool> ExportBlockParser::line(std::string_view line) {
         exp_.nodes = LNFS_TRY(string_array(value));
     else if (key == "readonly")
         exp_.readonly = LNFS_TRY(bool_value(value));
+    else if (key == "secure_ports")
+        exp_.secure_ports = LNFS_TRY(bool_value(value));
     else if (key == "anon_uid")
         LNFS_TRY(u32(exp_.anon_uid));
     else if (key == "anon_gid")
@@ -871,6 +874,7 @@ Result<void> ExportSetBuilder::add(ExportConfig cfg, std::unique_ptr<backend::Ba
     entry->anon_uid = cfg.anon_uid;
     entry->anon_gid = cfg.anon_gid;
     entry->readonly = cfg.readonly;
+    entry->secure_ports = cfg.secure_ports;
     entry->set_nodes(std::move(cfg.nodes));
     entry->backend = std::move(backend);
     std::vector<Cidr> clients;
@@ -947,6 +951,7 @@ void update_entry(ExportEntry& entry, const ExportConfig& cfg, std::vector<Cidr>
     entry.qos.write_bytes.configure(cfg.write_bps);
     entry.qos.ops.configure(cfg.iops);
     entry.readonly.store(cfg.readonly, std::memory_order_relaxed);
+    entry.secure_ports.store(cfg.secure_ports, std::memory_order_relaxed);
     entry.squash.store(cfg.squash, std::memory_order_relaxed);
     entry.anon_uid.store(cfg.anon_uid, std::memory_order_relaxed);
     entry.anon_gid.store(cfg.anon_gid, std::memory_order_relaxed);
@@ -1040,7 +1045,35 @@ std::optional<std::chrono::steady_clock::time_point> ExportTable::oldest_retired
     return oldest;
 }
 
+// exports(5) `secure`, on by default: the source port must be a reserved one.  This is
+// what makes the AUTH_SYS trust model hold up — only a privileged process can bind below
+// 1024, so the credential comes from the client's kernel rather than from any user on the
+// host (followups/protocol-gaps.md B3).  A rejection is counted, and warned about once per
+// process so the first one names the port and the key to turn off instead of flooding.
+bool ExportTable::port_allowed(const sockaddr_storage& peer, const ExportEntry& entry) {
+    if (!entry.secure_ports.load(std::memory_order_relaxed)) return true;
+    uint16_t port = 0;
+    if (peer.ss_family == AF_INET)
+        port = ntohs(reinterpret_cast<const sockaddr_in*>(&peer)->sin_port);
+    else if (peer.ss_family == AF_INET6)
+        port = ntohs(reinterpret_cast<const sockaddr_in6*>(&peer)->sin6_port);
+    else
+        // a unix socket has no port: the ctl path, not an NFS peer
+        return true;
+    if (port < 1024) return true;
+    obs::Metrics::instance().insecure_port_rejected.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed))
+        LNFS_WARN(
+            "export {} (fsid {}): refused a request from source port {} — not a reserved "
+            "port (< 1024).  Clients that cannot get one (containers, mount -o noresvport) "
+            "need `secure_ports = false` on this export",
+            entry.path, entry.fsid, port);
+    return false;
+}
+
 bool ExportTable::check_client(const sockaddr_storage& peer, const ExportEntry& entry) {
+    if (!port_allowed(peer, entry)) return false;
     const auto& clients = entry.client_list();
     return std::any_of(clients.begin(), clients.end(), [&](const Cidr& cidr) { return cidr.contains(peer); });
 }

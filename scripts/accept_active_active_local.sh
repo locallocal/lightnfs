@@ -79,6 +79,9 @@ fsid = 1
 clients = ["127.0.0.0/8"]
 squash = "none"
 readonly = false
+# lnfs_accept_client is an unprivileged userspace client: it connects from an
+# ephemeral port, so the exports(5) "secure" check has to be off here.
+secure_ports = false
 nodes = ["gw1", "gw2", "gw3"]
 [export.local]
 handles = "auto"
@@ -89,6 +92,9 @@ fsid = 2
 clients = ["127.0.0.0/8"]
 squash = "none"
 readonly = false
+# lnfs_accept_client is an unprivileged userspace client: it connects from an
+# ephemeral port, so the exports(5) "secure" check has to be off here.
+secure_ports = false
 nodes = ["gw2", "gw3", "gw1"]
 [export.local]
 handles = "auto"
@@ -138,6 +144,9 @@ fsid = $fsid
 clients = ["127.0.0.0/8"]
 squash = "none"
 readonly = false
+# lnfs_accept_client is an unprivileged userspace client: it connects from an
+# ephemeral port, so the exports(5) "secure" check has to be off here.
+secure_ports = false
 nodes = ["gw1"]
 [export.local]
 handles = "auto"

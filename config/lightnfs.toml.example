@@ -130,6 +130,12 @@ clients = ["192.168.0.0/24", "127.0.0.0/8"]
 squash = "root"
 # anon_uid = 65534   # identity root_squash / all_squash map to; default nobody/nogroup
 # anon_gid = 65534
+# exports(5) "secure": require a reserved source port (< 1024).  On by default, as in
+# knfsd.  Only a privileged process can bind one, which is what lets AUTH_SYS trust that
+# the uid in the credential came from the client's kernel rather than from any user on
+# the client host.  Set false for client populations that cannot get one -- containers,
+# `mount -o noresvport`, or an unprivileged userspace client such as lnfs_accept_client.
+# secure_ports = true
 readonly = true     # phase 2: set false for read-write exports
 # Per-export token buckets (READ/WRITE data path); 0 / omitted = unlimited.
 # Hot-reloadable via SIGHUP / `lightnfs-ctl reload`.

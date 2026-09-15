@@ -14,6 +14,9 @@
 #include "core/pseudofs.hpp"
 #include "mini_test.hpp"
 
+#include <arpa/inet.h>
+#include <sys/un.h>
+
 using namespace lnfs;
 
 namespace {
@@ -363,6 +366,70 @@ TEST(ExportSet, PseudoChangeMonotonic) {
 // (exports(5) / knfsd's nfsd_setuser) -- uid 0, gid 0 and every supplementary group 0.
 // Keying the whole mapping off uid == 0 let uid=1000,gid=0 keep group-root rights on a
 // squashed export.
+// followups/protocol-gaps.md B3: exports(5) `secure`, on by default as in knfsd.  Only a
+// privileged process can bind a reserved port, which is what lets AUTH_SYS trust that the
+// uid in the credential came from the client's kernel and not from any user on the host.
+TEST(ExportSet, SecurePortsRefusesUnprivilegedSourcePorts) {
+    auto peer_v4 = [](const char* addr, uint16_t port) {
+        sockaddr_storage ss{};
+        auto* a = reinterpret_cast<sockaddr_in*>(&ss);
+        a->sin_family = AF_INET;
+        a->sin_port = htons(port);
+        inet_pton(AF_INET, addr, &a->sin_addr);
+        return ss;
+    };
+    auto peer_v6 = [](const char* addr, uint16_t port) {
+        sockaddr_storage ss{};
+        auto* a = reinterpret_cast<sockaddr_in6*>(&ss);
+        a->sin6_family = AF_INET6;
+        a->sin6_port = htons(port);
+        inet_pton(AF_INET6, addr, &a->sin6_addr);
+        return ss;
+    };
+
+    core::ExportTable table;
+    auto cfg = export_cfg(1, "/export/data");
+    cfg.clients = {"127.0.0.0/8", "::1/128"};
+    ASSERT_TRUE(table.add(cfg, mem(1)).has_value());
+    auto set = table.snapshot();
+    core::ExportEntry* entry = set->by_fsid(1);
+    ASSERT_TRUE(entry != nullptr);
+    // On by default, without saying so in the config.
+    EXPECT_TRUE(entry->secure_ports.load());
+
+    // A reserved port passes, an ephemeral one does not -- and the refusal comes out of
+    // check_client, so every caller (v3 handles, v4 handles, MOUNT) gets it for free.
+    EXPECT_TRUE(core::ExportTable::check_client(peer_v4("127.0.0.1", 665), *entry));
+    EXPECT_FALSE(core::ExportTable::check_client(peer_v4("127.0.0.1", 34567), *entry));
+    // 1023 is the last reserved port; 1024 is the first that is not.
+    EXPECT_TRUE(core::ExportTable::port_allowed(peer_v4("127.0.0.1", 1023), *entry));
+    EXPECT_FALSE(core::ExportTable::port_allowed(peer_v4("127.0.0.1", 1024), *entry));
+    // IPv6 goes through the same gate.
+    EXPECT_TRUE(core::ExportTable::check_client(peer_v6("::1", 800), *entry));
+    EXPECT_FALSE(core::ExportTable::check_client(peer_v6("::1", 40000), *entry));
+    // The CIDR list still applies on top: a reserved port from outside it is refused.
+    EXPECT_FALSE(core::ExportTable::check_client(peer_v4("10.0.0.1", 665), *entry));
+    // A peer with no port at all (the unix ctl socket) is not an NFS client and is not
+    // judged on a port it does not have.
+    sockaddr_storage unix_peer{};
+    unix_peer.ss_family = AF_UNIX;
+    EXPECT_TRUE(core::ExportTable::port_allowed(unix_peer, *entry));
+
+    // Turning it off per export is what a container / noresvport client population needs,
+    // and it is hot-reloadable like the other per-export scalars.
+    core::ExportSetPlan plan;
+    auto insecure = export_cfg(1, "/export/data");
+    insecure.clients = {"127.0.0.0/8", "::1/128"};
+    insecure.secure_ports = false;
+    plan.update.push_back(insecure);
+    std::vector<std::unique_ptr<backend::Backend>> none;
+    ASSERT_TRUE(table.apply(std::move(plan), none, set->epoch).has_value());
+    EXPECT_FALSE(entry->secure_ports.load());
+    EXPECT_TRUE(core::ExportTable::check_client(peer_v4("127.0.0.1", 34567), *entry));
+    // ...and the CIDR list is still the other half of the gate.
+    EXPECT_FALSE(core::ExportTable::check_client(peer_v4("10.0.0.1", 34567), *entry));
+}
+
 TEST(ExportSet, RootSquashMapsGroupRootToo) {
     core::ExportTable table;
     auto cfg = export_cfg(1, "/export/data");

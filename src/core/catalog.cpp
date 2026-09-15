@@ -139,10 +139,11 @@ std::string serialize_catalog(const Catalog& catalog) {
         const char* squash = cfg.squash == Squash::kNone ? "none" : cfg.squash == Squash::kAll ? "all" : "root";
         out += std::format(
             "\n[[export]]\npath = {}\nfsid = {}\nbackend = {}\nnodes = {}\nclients = {}\n"
-            "readonly = {}\nsquash = \"{}\"\nanon_uid = {}\nanon_gid = {}\nread_bps = {}\n"
-            "write_bps = {}\niops = {}\ndisabled = {}\n",
+            "readonly = {}\nsecure_ports = {}\nsquash = \"{}\"\nanon_uid = {}\nanon_gid = {}\n"
+            "read_bps = {}\nwrite_bps = {}\niops = {}\ndisabled = {}\n",
             quote(cfg.path), cfg.fsid, quote(cfg.backend), quote_array(cfg.nodes), quote_array(cfg.clients),
-            cfg.readonly, squash, cfg.anon_uid, cfg.anon_gid, cfg.read_bps, cfg.write_bps, cfg.iops, exp.disabled);
+            cfg.readonly, cfg.secure_ports, squash, cfg.anon_uid, cfg.anon_gid, cfg.read_bps, cfg.write_bps, cfg.iops,
+            exp.disabled);
         // sorted; per-node keys never leave a host
         auto keys = cluster_backend_keys(cfg);
         if (keys.empty()) continue;
@@ -256,7 +257,8 @@ CatalogDiff diff_catalog(const Catalog& from, const Catalog& to) {
         if (it->second->disabled && !now->disabled) diff.enabled.push_back(fsid);
         if (a.nodes != b.nodes) diff.nodes_changed.push_back(fsid);
         if (a.clients != b.clients || a.read_bps != b.read_bps || a.write_bps != b.write_bps || a.iops != b.iops ||
-            a.readonly != b.readonly || a.squash != b.squash || a.anon_uid != b.anon_uid || a.anon_gid != b.anon_gid)
+            a.readonly != b.readonly || a.secure_ports != b.secure_ports || a.squash != b.squash ||
+            a.anon_uid != b.anon_uid || a.anon_gid != b.anon_gid)
             diff.dynamic_changed.push_back(fsid);
     }
     // map iteration made every list fsid ascending
