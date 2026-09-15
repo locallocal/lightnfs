@@ -34,16 +34,19 @@ void Bitmap::encode(xdr::XdrEnc& enc) const {
 
 Result<Bitmap> Bitmap::decode(xdr::XdrDec& dec) {
     uint32_t count = LNFS_TRY(dec.u32());
-    // attrs stop well below 8 words
-    if (count > 8) return Err(Errno::kGarbage);
+    // bitmap4 is a variable-length array with no bound on the wire.  The attributes this
+    // server can answer live in the first three words; higher words are *recorded and
+    // ignored* rather than rejected — asking about an attribute defined after this server
+    // was written is not a malformed request, and BADXDR would blame the client's encoding
+    // for it (followups/protocol-gaps.md B8).  The cap is only a DoS bound.
+    if (count > 64) return Err(Errno::kGarbage);
     Bitmap out;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t word = LNFS_TRY(dec.u32());
         if (i < 3)
             out.words.push_back(word);
         else if (word != 0)
-            // bits we can never serve
-            return Err(Errno::kGarbage);
+            out.beyond_known = true;
     }
     return out;
 }

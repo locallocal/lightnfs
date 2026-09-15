@@ -1557,7 +1557,7 @@ rt::Task<StateMgr::StateLookup> StateMgr::lookup_stateid(const Stateid& sid) {
     co_return out;
 }
 
-rt::Task<uint32_t> StateMgr::close_state(const Stateid& sid, uint64_t clientid, Stateid* out) {
+rt::Task<uint32_t> StateMgr::close_state(const Stateid& sid, uint64_t clientid, Stateid* out, const FileRef* expect) {
     if (sid.is_special()) co_return as_u32(Status::kBadStateid);
     if (epoch_of(sid.other) != static_cast<uint32_t>(cfg_.boot_epoch)) co_return as_u32(Status::kStaleStateid);
     StateRef rec;
@@ -1569,6 +1569,8 @@ rt::Task<uint32_t> StateMgr::close_state(const Stateid& sid, uint64_t clientid, 
         rec = it->second;
     }
     if (clientid != 0 && rec->client->clientid != clientid) co_return as_u32(Status::kBadStateid);
+    // The stateid must name the file the current filehandle names (B8).
+    if (expect && (rec->fsid != expect->fsid || !(rec->oid == expect->oid))) co_return as_u32(Status::kBadStateid);
     // seqid discipline (RFC 8881 §8.2.2): zero means "current", older is OLD_STATEID,
     // ahead of the server is BAD_STATEID.
     if (clientid != 0 && sid.seqid != 0) {
@@ -1590,7 +1592,7 @@ rt::Task<uint32_t> StateMgr::close_state(const Stateid& sid) {
 }
 
 rt::Task<uint32_t> StateMgr::open_downgrade(const Stateid& sid, uint64_t clientid, uint32_t access, uint32_t deny,
-                                            Stateid* out) {
+                                            Stateid* out, const FileRef* expect) {
     if (sid.is_special()) co_return as_u32(Status::kBadStateid);
     if (epoch_of(sid.other) != static_cast<uint32_t>(cfg_.boot_epoch)) co_return as_u32(Status::kStaleStateid);
     StateRef rec;
@@ -1602,6 +1604,8 @@ rt::Task<uint32_t> StateMgr::open_downgrade(const Stateid& sid, uint64_t clienti
         rec = it->second;
     }
     if (rec->client->clientid != clientid || rec->type != StateType::kOpen) co_return as_u32(Status::kBadStateid);
+    // The stateid must name the file the current filehandle names (B8).
+    if (expect && (rec->fsid != expect->fsid || !(rec->oid == expect->oid))) co_return as_u32(Status::kBadStateid);
     if (sid.seqid != 0 && sid.seqid < rec->seqid) co_return as_u32(Status::kOldStateid);
     if (sid.seqid != 0 && sid.seqid > rec->seqid) co_return as_u32(Status::kBadStateid);
     // RFC 8881 §18.18: the new modes must be a subset of the current ones and access
@@ -2021,7 +2025,7 @@ rt::Task<StateMgr::LockResult> StateMgr::push_native_lock(backend::LockMgr& nati
 }
 
 rt::Task<uint32_t> StateMgr::locku(const Stateid& sid, uint64_t clientid, uint64_t offset, uint64_t length,
-                                   Stateid* out) {
+                                   Stateid* out, const FileRef* expect) {
     if (sid.is_special()) co_return as_u32(Status::kBadStateid);
     if (epoch_of(sid.other) != static_cast<uint32_t>(cfg_.boot_epoch)) co_return as_u32(Status::kStaleStateid);
     StateRef rec;
@@ -2033,6 +2037,8 @@ rt::Task<uint32_t> StateMgr::locku(const Stateid& sid, uint64_t clientid, uint64
         rec = it->second;
     }
     if (rec->type != StateType::kLock || rec->client->clientid != clientid) co_return as_u32(Status::kBadStateid);
+    // The stateid must name the file the current filehandle names (B8).
+    if (expect && (rec->fsid != expect->fsid || !(rec->oid == expect->oid))) co_return as_u32(Status::kBadStateid);
     if (sid.seqid != 0 && sid.seqid < rec->seqid) co_return as_u32(Status::kOldStateid);
     if (sid.seqid != 0 && sid.seqid > rec->seqid) co_return as_u32(Status::kBadStateid);
     locks_.unlock(FileKey{rec->fsid, rec->oid}, rec->lowner, {offset, length});

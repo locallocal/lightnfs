@@ -1936,6 +1936,201 @@ TEST(Nfs4, LongSymlinkTargetIsAccepted) {
     EXPECT_EQ(huge.status, stv(Status::kBadxdr));
 }
 
+// followups/protocol-gaps.md B8, the state half: CLOSE / OPEN_DOWNGRADE / LOCKU act on
+// the current filehandle, so a stateid belonging to a different file is BAD_STATEID
+// (knfsd checks the same thing in nfs4_preprocess_seqid_op).  They used to act on
+// whatever the stateid named and ignore the filehandle entirely.
+TEST(Nfs4, StateOpsRequireTheCurrentFilehandleToMatch) {
+    V4Fixture f;
+    f.establish_session();
+    auto dir_fh = f.path_fh({"export", "data"});
+    auto hello = do_open(f, dir_fh, "hello", 3, 0, "owner-b8");
+    ASSERT_TRUE(hello.status == 0);
+    // A second file to point the filehandle at.
+    auto other = do_open(f, dir_fh, "other", 3, 0, "owner-b8b", /*create_mode=*/0,
+                         [&](xdr::XdrEnc& e) { encode_empty_fattr(e); });
+    ASSERT_TRUE(other.status == 0);
+    ASSERT_TRUE(other.fh != hello.fh);
+
+    auto close_with = [&](const std::vector<std::byte>& fh, const nfsv4::Stateid& sid) {
+        return dir_op(f, fh, Op::kClose,
+                      [&](xdr::XdrEnc& e) {
+                          e.u32(0);
+                          sid.encode(e);
+                      })
+            .status;
+    };
+    // hello's stateid under other's filehandle: refused, and hello stays open.
+    EXPECT_EQ(close_with(other.fh, hello.stateid), stv(Status::kBadStateid));
+    // The directory is not a regular file, so it cannot be any open's file either.
+    EXPECT_EQ(close_with(dir_fh, hello.stateid), stv(Status::kBadStateid));
+    // The pseudo root likewise -- no state lives in the synthesized tree.
+    EXPECT_EQ(close_with(f.path_fh({}), hello.stateid), stv(Status::kBadStateid));
+
+    // OPEN_DOWNGRADE with a mismatched filehandle.
+    auto downgrade_with = [&](const std::vector<std::byte>& fh, const nfsv4::Stateid& sid) {
+        return dir_op(f, fh, Op::kOpenDowngrade,
+                      [&](xdr::XdrEnc& e) {
+                          sid.encode(e);
+                          e.u32(0);
+                          // OPEN4_SHARE_ACCESS_READ, deny none
+                          e.u32(1);
+                          e.u32(0);
+                      })
+            .status;
+    };
+    EXPECT_EQ(downgrade_with(other.fh, hello.stateid), stv(Status::kBadStateid));
+    // ...and with the right one it works, so the check is about the pairing.
+    EXPECT_EQ(downgrade_with(hello.fh, hello.stateid), 0u);
+
+    // The matching CLOSE still succeeds for both files.
+    EXPECT_EQ(close_with(other.fh, other.stateid), 0u);
+}
+
+// LOCKU with a lock stateid from another file.
+TEST(Nfs4, LockuRequiresTheCurrentFilehandleToMatch) {
+    V4Fixture f;
+    f.establish_session();
+    auto dir_fh = f.path_fh({"export", "data"});
+    auto hello = do_open(f, dir_fh, "hello", 3, 0, "owner-b8l");
+    ASSERT_TRUE(hello.status == 0);
+    auto other = do_open(f, dir_fh, "other", 3, 0, "owner-b8l2", /*create_mode=*/0,
+                         [&](xdr::XdrEnc& e) { encode_empty_fattr(e); });
+    ASSERT_TRUE(other.status == 0);
+
+    xdr::XdrEnc lk(f.pool);
+    lk.u32(static_cast<uint32_t>(Op::kPutfh));
+    lk.opaque(hello.fh);
+    lk.u32(static_cast<uint32_t>(Op::kLock));
+    // WRITE_LT
+    lk.u32(2);
+    lk.boolean(false);
+    lk.u64(0);
+    lk.u64(100);
+    lk.boolean(true);
+    lk.u32(0);
+    hello.stateid.encode(lk);
+    lk.u32(0);
+    lk.u64(f.clientid);
+    lk.string("lo-b8");
+    auto lr = f.parse(f.compound_raw(f.session_body(2, lk.take())));
+    ASSERT_TRUE(lr.status == 0);
+    V4Fixture::expect_op(lr.dec, Op::kSequence, 0);
+    (void)lr.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(lr.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(lr.dec, Op::kLock, 0);
+    auto lock_sid = *nfsv4::Stateid::decode(lr.dec);
+
+    auto locku_with = [&](const std::vector<std::byte>& fh) {
+        return dir_op(f, fh, Op::kLocku,
+                      [&](xdr::XdrEnc& e) {
+                          e.u32(2);
+                          e.u32(0);
+                          lock_sid.encode(e);
+                          e.u64(0);
+                          e.u64(100);
+                      })
+            .status;
+    };
+    // The lock is on hello; unlocking it through other's filehandle must not work.
+    EXPECT_EQ(locku_with(other.fh), stv(Status::kBadStateid));
+    EXPECT_EQ(locku_with(hello.fh), 0u);
+}
+
+// B8, the decoder half: an attribute bitmap reaching past the words this server knows is
+// ignored on a read (an unsupported attribute is simply not returned) but refused on a
+// write, where silently not setting what the client asked for would be worse.
+TEST(Nfs4, AttrBitmapBeyondKnownWords) {
+    V4Fixture f;
+    f.establish_session();
+    auto dir_fh = f.path_fh({"export", "data"});
+    auto o = do_open(f, dir_fh, "hello", 3, 0, "owner-b8m");
+    ASSERT_TRUE(o.status == 0);
+
+    // GETATTR asking for size plus a bit in word 3: answered, with only size in it.
+    auto r = dir_op(f, o.fh, Op::kGetattr, [&](xdr::XdrEnc& e) {
+        // four words
+        e.u32(4);
+        e.u32(1u << nfsv4::attr::kSize);
+        e.u32(0);
+        e.u32(0);
+        // an attribute number this server has never heard of
+        e.u32(1u << 5);
+    });
+    ASSERT_TRUE(r.status == 0);
+    V4Fixture::expect_op(r.reply.dec, Op::kSequence, 0);
+    (void)r.reply.dec.skip(16 + 5 * 4);
+    V4Fixture::expect_op(r.reply.dec, Op::kPutfh, 0);
+    V4Fixture::expect_op(r.reply.dec, Op::kGetattr, 0);
+    auto mask = nfsv4::Bitmap::decode(r.reply.dec);
+    ASSERT_TRUE(mask.has_value());
+    EXPECT_TRUE(mask->test(nfsv4::attr::kSize));
+    EXPECT_EQ(*r.reply.dec.u32(), 8u);
+
+    // SETATTR with the same shape: ATTRNOTSUPP, not a silent no-op.
+    auto sr = dir_op(f, o.fh, Op::kSetattr, [&](xdr::XdrEnc& e) {
+        o.stateid.encode(e);
+        e.u32(4);
+        e.u32(0);
+        e.u32(0);
+        e.u32(0);
+        e.u32(1u << 5);
+        // empty attrlist
+        e.u32(0);
+    });
+    EXPECT_EQ(sr.status, stv(Status::kAttrnotsupp));
+    EXPECT_EQ(do_close(f, o.fh, o.stateid), 0u);
+}
+
+// B8: undefined share_access bits are INVAL rather than silently masked off, and
+// RECLAIM_COMPLETE with rca_one_fs needs a current filehandle to name a filesystem.
+TEST(Nfs4, ShareAccessBitsAndOneFsReclaimComplete) {
+    V4Fixture f;
+    f.establish_session();
+    auto dir_fh = f.path_fh({"export", "data"});
+    auto open_with = [&](uint32_t share_access) {
+        return dir_op(f, dir_fh, Op::kOpen,
+                      [&](xdr::XdrEnc& e) {
+                          e.u32(0);
+                          e.u32(share_access);
+                          e.u32(0);
+                          e.u64(0);
+                          e.string("owner-sa");
+                          // OPEN4_NOCREATE, CLAIM_NULL
+                          e.u32(0);
+                          e.u32(0);
+                          e.string("hello");
+                      })
+            .status;
+    };
+    // 0x4 is not a defined bit: it used to be masked away, leaving access 0 -> INVAL for
+    // the wrong reason.  0x8 used to be masked away entirely and the OPEN succeeded.
+    EXPECT_EQ(open_with(0x4), stv(Status::kInval));
+    EXPECT_EQ(open_with(0x1 | 0x8), stv(Status::kInval));
+    EXPECT_EQ(open_with(0x40000000), stv(Status::kInval));
+    // The defined ones still work: READ, plus a delegation-want hint and the two
+    // "signal when available" hints (RFC 8881 §18.16.3).
+    EXPECT_EQ(open_with(0x1), 0u);
+    EXPECT_EQ(open_with(0x1 | 0x0400), 0u);
+    EXPECT_EQ(open_with(0x1 | 0x10000 | 0x20000), 0u);
+
+    // RECLAIM_COMPLETE(rca_one_fs = TRUE) names the fs of the current filehandle.
+    auto reclaim = [&](bool one_fs, bool with_fh) {
+        xdr::XdrEnc ops(f.pool);
+        uint32_t extra = 1;
+        if (with_fh) {
+            ops.u32(static_cast<uint32_t>(Op::kPutfh));
+            ops.opaque(dir_fh);
+            ++extra;
+        }
+        ops.u32(static_cast<uint32_t>(Op::kReclaimComplete));
+        ops.boolean(one_fs);
+        return f.parse(f.compound_raw(f.session_body(extra, ops.take()))).status;
+    };
+    EXPECT_EQ(reclaim(true, false), stv(Status::kNofilehandle));
+    EXPECT_EQ(reclaim(true, true), 0u);
+}
+
 TEST(Nfs4, RestartReclaimWithinGrace) {
     V4Fixture f;
     f.establish_session();

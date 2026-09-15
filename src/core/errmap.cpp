@@ -245,7 +245,10 @@ bool v4_error_allowed(O4 op, S4 status) {
             return one_of4(status, std::array{S4::kInval, S4::kIsdir, S4::kWrongType, S4::kOpenmode, S4::kBadStateid,
                                               S4::kStaleStateid, S4::kOldStateid, S4::kGrace, S4::kExpired});
         case O4::kReaddir:
-            return one_of4(status, std::array{S4::kNotdir, S4::kBadCookie, S4::kToosmall, S4::kInval});
+            // NOT_SAME is the answer to a stale cookieverf (§18.23.3).  The engine returns
+            // it directly today, so this row is only a trap waiting for whoever routes it
+            // through to_v4() (followups/protocol-gaps.md B8).
+            return one_of4(status, std::array{S4::kNotdir, S4::kBadCookie, S4::kToosmall, S4::kInval, S4::kNotSame});
         case O4::kOpen:
             return one_of4(status, std::array{S4::kNoent, S4::kNotdir, S4::kIsdir, S4::kSymlink, S4::kWrongType,
                                               S4::kRofs, S4::kExist, S4::kNospc, S4::kDquot, S4::kNametoolong,

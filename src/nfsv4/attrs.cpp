@@ -295,6 +295,9 @@ Status decode_settable_fattr(xdr::XdrDec& dec, backend::SetAttr& out, Bitmap& se
     auto mask = Bitmap::decode(dec);
     auto vals = mask ? dec.opaque(1u << 20) : Result<std::span<const std::byte>>(Err(Errno::kGarbage));
     if (!mask || !vals) return Status::kBadxdr;
+    // Bits above the words we know are ignored on a read but must not be ignored here:
+    // silently not setting an attribute the client asked for is worse than refusing it.
+    if (mask->beyond_known) return Status::kAttrnotsupp;
     xdr::XdrDec v(*vals);
     const Bitmap& sup = supported_attrs();
     const Bitmap& settable = settable_attrs();

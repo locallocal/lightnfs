@@ -408,6 +408,34 @@ TEST(Nfs3, LongSymlinkTargetIsAccepted) {
 }
 
 // A3, MOUNT side: MNT3ERR_NAMETOOLONG exists for exactly this.
+// followups/protocol-gaps.md B8: a mount point is a directory.  MNT used to hand back the
+// filehandle of whatever the path named, so mounting a path ending at a regular file
+// succeeded and then failed every lookup underneath with nothing saying why.
+TEST(Mount3, MntRefusesANonDirectory) {
+    NfsFixture f;
+    // /export/hello is a regular file in the fixture's backing tree.
+    xdr::XdrEnc file_arg(f.pool);
+    file_arg.string("/export/hello");
+    auto reply = f.mount_request(1, file_arg.take());
+    EXPECT_EQ(accept_stat(reply), rpc::kSuccess);
+    // MNT3ERR_NOTDIR
+    EXPECT_EQ(reply_status(f, reply), 20u);
+
+    // A symlink is not a directory either.
+    xdr::XdrEnc link_arg(f.pool);
+    link_arg.string("/export/link");
+    auto link_reply = f.mount_request(1, link_arg.take());
+    EXPECT_EQ(reply_status(f, link_reply), 20u);
+
+    // The export root and a directory inside it still mount.
+    for (const char* path : {"/export", "/export/d"}) {
+        xdr::XdrEnc dir_arg(f.pool);
+        dir_arg.string(path);
+        auto ok = f.mount_request(1, dir_arg.take());
+        EXPECT_EQ(reply_status(f, ok), 0u);
+    }
+}
+
 TEST(Mount3, OverlongPathAnswersNametoolong) {
     NfsFixture f;
     xdr::XdrEnc args(f.pool);
