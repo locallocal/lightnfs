@@ -480,6 +480,52 @@ TEST(WritePath, DrcReplaysIdenticalReply) {
     EXPECT_EQ(*dec4.u32(), 17u);
 }
 
+// followups/protocol-gaps.md B4: the DRC key used to include the source port, so the one
+// case the cache exists for -- a client that lost its connection and resends the same xid
+// -- missed it and re-executed the non-idempotent procedure.  The successful mkdir then
+// came back as EEXIST, the successful remove as NOENT.
+TEST(WritePath, DrcReplaysAcrossAReconnect) {
+    WriteFixture f;
+    rpc::Drc drc({.ttl = std::chrono::milliseconds(60000), .max_memory = 1 << 20});
+    f.engine.set_drc(&drc);
+    auto* peer = reinterpret_cast<sockaddr_in*>(&f.ctx.peer.addr);
+    // Reserved ports throughout: a real client uses one, and secure_ports would refuse
+    // anything else before the DRC ever saw the call.
+    auto from_port = [&](uint16_t port) { peer->sin_port = htons(port); };
+
+    nfsv3::MkdirArgs mk;
+    mk.where = {f.root_fh, "reconnect_dir"};
+    mk.attrs.mode = 0700;
+    auto encode = [&] {
+        xdr::XdrEnc enc(f.pool);
+        mk.encode(enc);
+        return enc.take();
+    };
+
+    from_port(665);
+    auto first = f.request(nfsv3::Proc::kMkdir, encode(), 0x901);
+    auto dec = WriteFixture::result(first);
+    ASSERT_TRUE(*dec.u32() == 0u);
+
+    // The connection drops and the client reconnects -- a new source port -- then resends
+    // the same xid, which is what the Linux client does.  That must replay the cached
+    // reply, byte for byte, rather than run MKDIR again.
+    from_port(700);
+    auto again = f.request(nfsv3::Proc::kMkdir, encode(), 0x901);
+    EXPECT_TRUE(first == again);
+    EXPECT_EQ(drc.stats().replays, 1u);
+    EXPECT_EQ(drc.stats().inserts, 1u);
+
+    // A different address is still a different client: no replay, and MKDIR genuinely
+    // answers EEXIST.  (The address is the identity; only the port was dropped.)
+    inet_pton(AF_INET, "127.0.0.9", &peer->sin_addr);
+    auto other = f.request(nfsv3::Proc::kMkdir, encode(), 0x901);
+    auto dec_other = WriteFixture::result(other);
+    EXPECT_EQ(*dec_other.u32(), 17u);
+    EXPECT_EQ(drc.stats().replays, 1u);
+    EXPECT_EQ(drc.stats().inserts, 2u);
+}
+
 TEST(WritePath, ErrmapWhitelistForWriteProcs) {
     using S = nfsv3::Status;
     using P = nfsv3::Proc;

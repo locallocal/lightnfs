@@ -12,11 +12,9 @@ Drc::Key Drc::Key::make(const sockaddr_storage& peer, uint32_t xid, uint32_t pro
         // ::ffff:a.b.c.d
         k.peer_addr[10] = k.peer_addr[11] = 0xff;
         std::memcpy(k.peer_addr.data() + 12, &a->sin_addr, 4);
-        k.peer_port = ntohs(a->sin_port);
     } else if (peer.ss_family == AF_INET6) {
         auto* a = reinterpret_cast<const sockaddr_in6*>(&peer);
         std::memcpy(k.peer_addr.data(), &a->sin6_addr, 16);
-        k.peer_port = ntohs(a->sin6_port);
     }
     k.xid = xid;
     k.prog = prog;
@@ -33,7 +31,6 @@ size_t Drc::KeyHash::operator()(const Key& k) const noexcept {
         h *= 1099511628211ull;
     };
     for (uint8_t c : k.peer_addr) mix(c);
-    mix(k.peer_port);
     mix(k.xid);
     mix(k.prog);
     mix(k.vers);

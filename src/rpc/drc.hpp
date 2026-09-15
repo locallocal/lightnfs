@@ -33,10 +33,20 @@ class Drc {
     };
 
     struct Key {
-        // Binary peer identity: 16-byte address (v4 addresses v6-mapped) + port. Replaces
-        // the per-request inet_ntop + string hash/compare (plan doc 10 §2.4).
+        // Binary peer identity: the 16-byte address alone (v4 addresses v6-mapped), no
+        // port.  Replaces the per-request inet_ntop + string hash/compare (plan doc 10
+        // §2.4).
+        //
+        // The port is deliberately not part of the identity (followups/protocol-gaps.md
+        // B4).  The case the DRC exists for is a client that lost its connection and
+        // resends the same xid — and a reconnect means a new source port, so keying on it
+        // missed exactly that case and re-executed the non-idempotent procedure: the
+        // second REMOVE answers NOENT, the second MKDIR EEXIST.  knfsd compares addresses
+        // only (rpc_cmp_addr) for the same reason.  Two clients behind one NAT address
+        // can now collide, but only on the same xid, program, version, procedure *and*
+        // argument checksum — and then the cached reply answers a request identical to
+        // the one that produced it.
         std::array<uint8_t, 16> peer_addr{};
-        uint16_t peer_port = 0;
         uint32_t xid = 0;
         uint32_t prog = 0, vers = 0, proc = 0;
         uint64_t args_hash = 0;

@@ -28,7 +28,7 @@
 | B1 | B | `state/state_mgr.cpp:549` | sessionid 全无随机分量，网段内可枚举并冒用别人的会话**——已修复**；同条目下的 stateid 可推（A5 覆盖）与 SEQUENCE 隐式绑定连接（与 knfsd 在 SP4_NONE 下一致）**原判定过重，已更正** | 见 B1 正文 |
 | B2 | B | `core/config.cpp:1089` | `squash = root` 只压 uid，不压 gid 0 与附加组 0 | 组 root 可写的文件仍可被写**——已修复** |
 | B3 | B | 全路径缺失 | 无特权源端口（"secure"）检查 | 受信主机上的**普通用户**即可声称任意 uid**——已修复（新增 `secure_ports`，默认 true）** |
-| B4 | B | `rpc/drc.hpp:39` | DRC 键含源端口 | 跨重连的重传 miss → 非幂等过程重放（REMOVE 回 NOENT 等） |
+| B4 | B | `rpc/drc.hpp:39` | DRC 键含源端口 | 跨重连的重传 miss → 非幂等过程重放（REMOVE 回 NOENT 等）**——已修复** |
 | B5 | B | `nfsv4/attrs.cpp:133` | `fh_expire_type` 恒为 FH4_PERSISTENT，无视 `kStableHandles` | fallback 句柄模式下向客户端谎报句柄永久有效 |
 | B6 | B | `nfsv3/engine.cpp:584` | v3 FSINFO 不宣告 FSF3_CANSETTIME | 看 properties 的客户端不用 SET_TO_CLIENT_TIME |
 | B7 | B | `nfsv3/engine.hpp`（无 StateMgr） | v3 的写/删/改名不召回 v4 读委托 | v4 客户端**无限期**读到缓存旧内容 |
@@ -421,7 +421,7 @@ knfsd 的 `secure` 默认开、且这道检查正是 deployment.md §1 那句「
 其余留作独立项（多数在 `[[ ]]` 条件里、不受 pipefail 影响，需要逐个看）。
 
 
-### B4 DRC 键含源端口，跨重连重传失效
+### B4 DRC 键含源端口，跨重连重传失效（已修复）
 
 ```
 // rpc/drc.hpp:34-44
@@ -443,6 +443,19 @@ knfsd 的 DRC 用 `rpc_cmp_addr()`，**只比地址不比端口**，就是为了
 **修法**：从 `Key` 去掉 `peer_port`（`Key::make` 里也不再取 `sin_port`）。`args_hash`
 （`rpc/rpc_msg.cpp` 对参数前 256 字节的 FNV-1a）已经承担了"同 xid 不同请求"的区分职责，
 去掉端口不会引入误命中。
+
+**已修复**（本轮）：
+- `Key` 去掉 `peer_port`，`Key::make` 不再取 `sin_port`/`sin6_port`，`KeyHash` 不再混它。
+  身份只剩地址（v4 映射成 v6 形式），与 knfsd 的 `rpc_cmp_addr` 一致。
+- 代价写在类型注释里：同一 NAT 地址后面的两个客户端现在可能撞上，但必须 xid、program、
+  version、procedure **和参数校验和**全都相同——那时缓存回的应答对应的正是一个和它逐字节相同
+  的请求。
+- 回归测例 `WritePath.DrcReplaysAcrossAReconnect`：同一地址、**换源端口**、同 xid 重发
+  MKDIR，必须逐字节重放且 `replays == 1`、`inserts == 1`；换成另一个**地址**则不重放、MKDIR
+  真的回 EEXIST（证明去掉的只是端口、地址仍然是身份）。全程用保留端口——真实客户端就是这样，
+  而且 B3 之后非保留端口根本到不了 DRC。
+  把端口加回键里后该测例失败 5 处，关键两条是 `replays: 0 vs 1` 与 `inserts: 2 vs 1`——
+  重连的重传 miss 了缓存并重新执行了一次。
 
 ### B5 `fh_expire_type` 恒为 FH4_PERSISTENT
 
@@ -615,8 +628,8 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
    `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
    剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
 4. ~~**B2**、**B3**~~ —— 身份压缩与源端口，均已修复；两条都动了安全默认值，文档与配置样例已同步。
-5. **B4、B7** —— DRC 键与委托一致性。B4 是删一个字段；B7 建议先上"有 v3 导出则不授委托"的
-   一行版本，再决定要不要做完整的 v3 召回。
+5. ~~**B4**~~（已修复，见上）、**B7** —— B7 建议先上「有 v3 导出则不授委托」的一行版本，
+   再决定要不要做完整的 v3 召回。
 6. **B8 / C 类** —— 按需。B8.5（errmap 白名单）与 C4（过期注释）属于"改一行防将来踩"。
 
 ## 验证建议
