@@ -1817,7 +1817,15 @@ rt::Task<uint32_t> Engine::op_open(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc)
         enc.u32(st(Status::kNofilehandle));
         co_return st(Status::kNofilehandle);
     }
-    // high bits carry deleg-want flags: ignored
+    // share_access is the access mode in the low two bits, the delegation-want hint in
+    // 0xFF00, and two "signal/push when available" hints at 0x10000 / 0x20000 (RFC 8881
+    // §18.16.3).  Anything outside those is undefined: INVAL, rather than silently masked
+    // away as if the client had not asked (followups/protocol-gaps.md B8).
+    constexpr uint32_t kShareAccessDefined = 0x3 | 0xFF00 | 0x10000 | 0x20000;
+    if (*share_access & ~kShareAccessDefined) {
+        enc.u32(st(Status::kInval));
+        co_return st(Status::kInval);
+    }
     uint32_t access = *share_access & 0x3;
     uint32_t deny = *share_deny;
     if (access == 0 || deny > state::kShareBoth) {
@@ -2137,12 +2145,27 @@ rt::Task<uint32_t> Engine::op_close(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
         enc.u32(st(Status::kNofilehandle));
         co_return st(Status::kNofilehandle);
     }
+    // CLOSE acts on the current filehandle, so resolve it and let the state layer check
+    // the stateid against the file it names (B8).  A plain resolve, not resolve_regular:
+    // RFC 8881 §18.2.3 has no ISDIR/WRONG_TYPE row for CLOSE, and a non-regular current
+    // filehandle simply cannot match an open stateid's file — BAD_STATEID says that.
+    auto target = co_await resolve(ctx, ctx.cfh);
+    if (!target) {
+        uint32_t code = st(core::to_v4(target.error(), Op::kClose));
+        enc.u32(code);
+        co_return code;
+    }
+    if (target->pseudo()) {
+        enc.u32(st(Status::kBadStateid));
+        co_return st(Status::kBadStateid);
+    }
     if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
         enc.u32(cur);
         co_return cur;
     }
     Stateid out;
-    uint32_t code = co_await state_.close_state(*sid, ctx.clientid, &out);
+    state::StateMgr::FileRef expect{target->exp->fsid, target->oid};
+    uint32_t code = co_await state_.close_state(*sid, ctx.clientid, &out, &expect);
     if (code != 0) {
         enc.u32(code);
         co_return code;
@@ -2171,12 +2194,25 @@ rt::Task<uint32_t> Engine::op_open_downgrade(Ctx& ctx, xdr::XdrDec& dec, xdr::Xd
         enc.u32(st(Status::kInval));
         co_return st(Status::kInval);
     }
+    // Same as CLOSE: the current filehandle names the file the stateid must belong to,
+    // and §18.18.3 has no type-error row either.
+    auto target = co_await resolve(ctx, ctx.cfh);
+    if (!target) {
+        uint32_t code = st(core::to_v4(target.error(), Op::kOpenDowngrade));
+        enc.u32(code);
+        co_return code;
+    }
+    if (target->pseudo()) {
+        enc.u32(st(Status::kBadStateid));
+        co_return st(Status::kBadStateid);
+    }
     if (uint32_t cur = resolve_current(ctx, *sid); cur != st(Status::kOk)) {
         enc.u32(cur);
         co_return cur;
     }
     Stateid out;
-    uint32_t code = co_await state_.open_downgrade(*sid, ctx.clientid, *access, *deny, &out);
+    state::StateMgr::FileRef expect{target->exp->fsid, target->oid};
+    uint32_t code = co_await state_.open_downgrade(*sid, ctx.clientid, *access, *deny, &out, &expect);
     if (code != 0) {
         enc.u32(code);
         co_return code;
@@ -2840,8 +2876,16 @@ rt::Task<uint32_t> Engine::op_reclaim_complete(Ctx& ctx, xdr::XdrDec& dec, xdr::
         enc.u32(st(Status::kOpNotInSession));
         co_return st(Status::kOpNotInSession);
     }
-    // fs-scoped completion: accepted, only the global flag is tracked
+    // fs-scoped completion (RFC 8881 §18.51.3): it names the filesystem of the current
+    // filehandle, so there has to be one.  Accepted and otherwise ignored — only the
+    // per-client flag is tracked, which is what the Linux client's rca_one_fs = FALSE
+    // needs; per-fs reclaim tracking is recorded as an open item for the active-active
+    // per-fsid grace work (followups/protocol-gaps.md B8).
     if (*one_fs) {
+        if (ctx.cfh.empty()) {
+            enc.u32(st(Status::kNofilehandle));
+            co_return st(Status::kNofilehandle);
+        }
         enc.u32(st(Status::kOk));
         co_return st(Status::kOk);
     }
@@ -3029,7 +3073,8 @@ rt::Task<uint32_t> Engine::op_locku(Ctx& ctx, xdr::XdrDec& dec, xdr::XdrEnc& enc
         co_return cur;
     }
     Stateid out;
-    code = co_await state_.locku(*sid, ctx.clientid, *offset, *length, &out);
+    state::StateMgr::FileRef expect{target->exp->fsid, target->oid};
+    code = co_await state_.locku(*sid, ctx.clientid, *offset, *length, &out, &expect);
     enc.u32(code);
     if (code == 0) {
         ctx.current_sid = out;

@@ -32,7 +32,7 @@
 | B5 | B | `nfsv4/attrs.cpp:133` | `fh_expire_type` 恒为 FH4_PERSISTENT，无视 `kStableHandles` | fallback 句柄模式下向客户端谎报句柄永久有效**——已修复** |
 | B6 | B | `nfsv3/engine.cpp:584` | v3 FSINFO 不宣告 FSF3_CANSETTIME | 看 properties 的客户端不用 SET_TO_CLIENT_TIME**——已修复** |
 | B7 | B | `nfsv3/engine.hpp`（无 StateMgr） | v3 的写/删/改名不召回 v4 读委托 | v4 客户端**无限期**读到缓存旧内容**——已修复（方案 1，语义正确的那个）** |
-| B8 | B | 见正文清单 | 7 条较小的一致性偏差 | 各条见正文 |
+| B8 | B | 见正文清单 | 7 条较小的一致性偏差 | 各条见正文**——已全部处理** |
 | C1–C5 | C | 见正文 | 加固项与注释过期 | — |
 
 ---
@@ -608,46 +608,55 @@ README 的"已知限制"里写了「v3 写不受 v4 share reservation 与锁约�
 `accept_cephfs.sh` 都这么写），这 12 个是漏网的。已按同一约定补齐——也顺带让
 `LNFS_JOBS=16` 这类调用真的生效（此前对这些脚本是空操作）。
 
-### B8 其余较小的一致性偏差
+### B8 其余较小的一致性偏差（已修复）
 
-按影响从大到小：
+七条全部处理；每条后面标了实际做法，与初版的"修法"不完全一致的地方写了原因。
 
-1. **CLOSE / OPEN_DOWNGRADE / LOCKU 不校验 CFH 与 stateid 指向同一文件**
-   （`nfsv4/engine.cpp:2095, 2123, 2966`）。三者都只查 `ctx.cfh.empty()`，随后完全按
-   stateid 里记的 `fsid/oid` 动作。RFC 要求当前句柄就是该 stateid 的文件，否则
-   BAD_STATEID（knfsd 在 `nfs4_preprocess_seqid_op` 里比对）。行为错乱只会伤到发起方自己，
-   故列在 B8。
-2. **RECLAIM_COMPLETE `rca_one_fs = TRUE` 直接回 OK**（`:2792-2806`），既不检查当前句柄
-   （RFC 8881 §18.51.3 要求有 CFH），也不记录任何 per-fs 完成状态。Linux 客户端发的是
-   FALSE，所以实际不可见；但多活模式（per-fsid grace）迟早要用到这一支。
-3. **`Bitmap::decode` 对第 4 个非零 word 回 BADXDR**（`nfsv4/nfs4_types.cpp:36-48`）。
-   RFC 的口径是"不支持的属性位忽略、不回错"。当前 RFC 8881/7862 的属性号都 < 96，所以不可达；
-   未来客户端请求 bit ≥ 96 时会拿到 BADXDR。
-4. **OPEN 的 `share_access` 未定义位被静默丢弃**（`nfsv4/engine.cpp:1783`，
-   `access = *share_access & 0x3`）。`share_access = 0x4`（无定义）会被当成 access=0 → INVAL
-   （正确），但 `0x7` 会被当成 BOTH，忽略未定义的 bit 2。`share_deny` 只查上界
-   （`deny > kShareBoth`）。
-5. **`errmap` 的 READDIR 白名单缺 NOT_SAME**（`core/errmap.cpp:241`，
-   `{kNotdir, kBadCookie, kToosmall, kInval}`）。当前无影响——cookieverf 不匹配时引擎直接
-   `enc.u32(st(Status::kNotSame))`（`nfsv4/engine.cpp:1458`），不走 `to_v4()`。但哪天把这条
-   改成经 errno 映射，会被白名单折成 NFS4ERR_IO。
-6. **MOUNTv3 DUMP 恒回空表**（`mountd/mount3.cpp:70-75`：proc 2 只 `enc.boolean(false)`）。
-   README 的 feature 表把 "MNT/UMNT/EXPORT/DUMP" 列为已覆盖；DUMP 实为桩（设计上也确实
-   不维护权威 rmtab，UMNT 同样是空操作）。建议改 README 口径而不是实现 rmtab。
-7. **MNT 不检查目标是否为目录**（`mountd/mount3.cpp:114-152`）。指向一个普通文件的路径会
-   拿到该文件的句柄并回 MNT3ERR_OK，而不是 MNT3ERR_NOTDIR。
-8. **4.1 里 REQUIRED 但未实现（回 NOTSUPP）**：`BACKCHANNEL_CTL`(40)、`SET_SSV`(54)。
-   后者在 EXCHANGE_ID 只宣告 SP4_NONE 的前提下客户端不会发，实际不可达；前者 Linux 客户端
-   也不用（它靠 CREATE_SESSION 的 CONN_BACK_CHAN 与 BIND_CONN_TO_SESSION）。其余未实现的
-   opcode 都是 OPTIONAL 或仅 pNFS 服务器必需（GETDEVICEINFO / LAYOUT*，且已宣告
-   `EXCHGID4_FLAG_USE_NON_PNFS`），回 NOTSUPP 正确；4.0 专属的 MNI 操作
-   （OPEN_CONFIRM / RENEW / SETCLIENTID* / RELEASE_LOCKOWNER）落在 3..58 区间同样回 NOTSUPP，
-   也正确。**结论：opcode 覆盖面上没有实质遗漏**，这一条只是备案。
-9. **minorversion = 1 的 `supported_attrs` 里含 4.2 才有的 `change_attr_type`(79)**
-   （`nfsv4/attrs.cpp:60`，`supported_attrs()` 不分小版本）。4.1 客户端不会请求，无害，但
-   宣告面比 RFC 8881 宽。
+**1. CLOSE / OPEN_DOWNGRADE / LOCKU 不校验 CFH 与 stateid 同文件 —— 已修。**
+三个操作都作用在当前句柄上，所以 stateid 指向别的文件就该是 BAD_STATEID（knfsd 在
+`nfs4_preprocess_seqid_op` 里查同一件事）。加了一个可选的 `StateMgr::FileRef{fsid, oid}`
+参数（默认 `nullptr`），判定放在状态层、紧跟属主检查之后；过期/回收路径没有句柄、本就要不分文件
+地丢状态，默认值让它们一行不改。选可选参数而不是必填，是为了不动 `tests/test_state.cpp` 里
+十来处既有调用。
+CLOSE 与 OPEN_DOWNGRADE 用的是**普通 `resolve()` 而不是 `resolve_regular()`**——后者会回
+ISDIR/WRONG_TYPE，而 RFC 8881 §18.2.3 / §18.18.3 的错误表里没有这两行；非普通文件的当前句柄
+本来就配不上任何 open stateid，BAD_STATEID 正好表达这件事。伪根同理（合成树里没有状态）。
+LOCKU 复用 `resolve_lock_target()` 的结果，它的错误表本来就收 ISDIR/WRONG_TYPE。
 
----
+**2. RECLAIM_COMPLETE `rca_one_fs = TRUE` —— 部分修。**
+按 RFC 8881 §18.51.3 补上"没有当前句柄就回 NOFILEHANDLE"。**per-fs 完成状态仍然不记录**：
+Linux 客户端发的是 FALSE，这一支实际不可见；真要用上它得跟多活的 per-fsid grace 一起设计。
+**决定：本轮只修句柄检查，per-fs 跟踪留给 per-fsid grace 那条线。**
+
+**3. `Bitmap::decode` 对第 4 个非零 word 回 BADXDR —— 已修，但不是简单忽略。**
+读路径（GETATTR/READDIR/VERIFY）现在忽略高位 word：问一个本服务器还不认识的属性不是"报文
+畸形"，BADXDR 是在怪客户端的编码。但**写路径不能忽略**——静默不设置客户端要求的属性比报错更
+糟。所以 `Bitmap` 加了一个 `beyond_known` 标记，`decode_settable_fattr` 见到它回
+ATTRNOTSUPP。上界从 8 个 word 放宽到 64（纯 DoS 界）。
+这一条初版只说"忽略即可"，漏了 SETATTR 那半边。
+
+**4. OPEN 的 `share_access` 未定义位 —— 已修。**
+掩码是 `0x3 | 0xFF00 | 0x10000 | 0x20000`（RFC 8881 §18.16.3：访问模式、委托 want 提示、
+两个"可用时通知/推送"提示）。初版只提了 `0x3` 与 `0xFF00`，**漏了后两个**——只按前两个判会把
+合法的 `WANT_SIGNAL_DELEG_WHEN_RESOURCE_AVAIL` 打成 INVAL。
+
+**5. `errmap` 的 READDIR 白名单缺 NOT_SAME —— 已修**（一行）。当前引擎直接返回该码、不走
+`to_v4()`，所以没有行为变化；这条纯粹是给以后改成经 errno 映射的人留的安全网。
+
+**6. MOUNT DUMP 是桩但 README 列为已覆盖 —— 按初版建议改的是 README**，不是实现 rmtab：
+feature 表现在写明 DUMP/UMNTALL 会应答但服务器不维护权威 rmtab，所以 DUMP 恒回空挂载表。
+
+**7. MNT 不检查目标是不是目录 —— 已修**，非目录回 MNT3ERR_NOTDIR（RFC 1813 §5.2.1）。此前
+指向普通文件的路径能挂上，然后下面每次 lookup 都失败且没有任何说明。
+
+**回归测例五条**：`Nfs4.StateOpsRequireTheCurrentFilehandleToMatch`、
+`Nfs4.LockuRequiresTheCurrentFilehandleToMatch`、`Nfs4.AttrBitmapBeyondKnownWords`、
+`Nfs4.ShareAccessBitsAndOneFsReclaimComplete`、`Mount3.MntRefusesANonDirectory`。
+每条都带"该成功的仍然成功"的对照断言（匹配的 CLOSE/LOCKU 成功、合法 share_access 位成功、
+目录仍能挂载），免得闸门收得太宽。
+逐条回退行为（保留签名与字段，让测例仍能编译）后分别失败 2 / 2 / 1 / 2 / 2 处，其中两条最能
+说明问题：`close_with(other.fh, hello.stateid)` 回 **0（成功）**——用另一个文件的句柄关掉了这个
+文件的状态；MNT 对普通文件和符号链接都回 **0（挂上了）**。
 
 ## C. 加固项与已知取舍
 
@@ -709,7 +718,7 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 4. ~~**B2**、**B3**~~ —— 身份压缩与源端口，均已修复；两条都动了安全默认值，文档与配置样例已同步。
 5. ~~**B4**、**B7**~~ —— 均已修复。B7 走的是方案 1（完整召回），不是那个一行的降级方案：
    见下文「为什么没选方案 2」。
-6. **B8 / C 类** —— 按需。B8.5（errmap 白名单）与 C4（过期注释）属于"改一行防将来踩"。
+6. ~~**B8**~~（已全部处理，见上）、**C 类** —— C 类按需；C4（过期注释）属于「改一行防将来踩」。
 
 ## 验证建议
 

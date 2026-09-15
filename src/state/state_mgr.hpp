@@ -422,11 +422,21 @@ class StateMgr {
 
     // CLOSE: seqid discipline (0 = current, older → OLD_STATEID, ahead → BAD_STATEID).
     // Returns the post-close stateid in `out`.
-    rt::Task<uint32_t> close_state(const Stateid& sid, uint64_t clientid, Stateid* out);
+    // The file a current filehandle names.  CLOSE, OPEN_DOWNGRADE and LOCKU operate on
+    // the current filehandle, so a stateid naming a different file is BAD_STATEID rather
+    // than something to act on (followups/protocol-gaps.md B8; knfsd checks the same thing
+    // in nfs4_preprocess_seqid_op).  Optional so the expiry/reclaim paths, which have no
+    // filehandle and mean to drop state wherever it lives, stay as they were.
+    struct FileRef {
+        uint32_t fsid = 0;
+        backend::ObjId oid{};
+    };
+    rt::Task<uint32_t> close_state(const Stateid& sid, uint64_t clientid, Stateid* out,
+                                   const FileRef* expect = nullptr);
     // legacy: any owner, any seqid
     rt::Task<uint32_t> close_state(const Stateid& sid);
     rt::Task<uint32_t> open_downgrade(const Stateid& sid, uint64_t clientid, uint32_t access, uint32_t deny,
-                                      Stateid* out);
+                                      Stateid* out, const FileRef* expect = nullptr);
     // FREE_STATEID (RFC 8881 §18.38): releases a lock stateid whose ranges are all gone.
     // `clientid` is the caller's own — a stateid belonging to anyone else answers
     // BAD_STATEID (followups/protocol-gaps.md A5).  There is no owner-less form: an
@@ -468,7 +478,8 @@ class StateMgr {
     rt::Task<LockResult> lock(LockArgs args);
     rt::Task<LockResult> lockt(uint64_t clientid, uint32_t fsid, const backend::ObjId& oid, std::string owner,
                                bool exclusive, uint64_t offset, uint64_t length);
-    rt::Task<uint32_t> locku(const Stateid& sid, uint64_t clientid, uint64_t offset, uint64_t length, Stateid* out);
+    rt::Task<uint32_t> locku(const Stateid& sid, uint64_t clientid, uint64_t offset, uint64_t length, Stateid* out,
+                             const FileRef* expect = nullptr);
     GatewayLockMgr& lock_table() { return locks_; }
     // One scanner pass: expired leases → courtesy; courtesy beyond the window → reclaim.
     rt::Task<void> scan_leases();

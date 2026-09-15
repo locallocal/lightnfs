@@ -220,6 +220,12 @@ using Verifier = std::array<std::byte, 8>;
 // bitmap4: variable-length word array; we never need more than 3 words (attrs < 96).
 struct Bitmap {
     SmallVec<uint32_t, 3> words;
+    // Set when the client's bitmap carried bits above word 2 — attributes newer than
+    // anything this server knows about.  A read (GETATTR / READDIR) simply does not return
+    // them, which is what RFC 8881 says to do with unsupported attributes; a write
+    // (SETATTR / CREATE / OPEN) must answer ATTRNOTSUPP instead of silently not setting
+    // them (followups/protocol-gaps.md B8).
+    bool beyond_known = false;
 
     bool test(uint32_t bit) const {
         uint32_t w = bit / 32;
