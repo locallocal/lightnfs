@@ -23,7 +23,7 @@
 | A1 | A | `nfsv4/attrs.cpp:57,102` | GETATTR 请求只写属性 `time_access_set`/`time_modify_set` 时，attrmask 置位但 attrlist 不带值 | fattr4 自相矛盾，客户端 XDR 解析失败（Linux → EIO）**——已修复** |
 | A2 | A | `nfsv4/attrs.cpp:196` | `fs_locations_info`(67) 编码在 `mounted_on_fileid`(55) 之前，违反属性升序 | referral 探测时属性错位解析（仅 active-active）**——已修复** |
 | A3 | A | `nfsv3/nfs3_types.cpp:20,200`、`mountd/mount3.cpp:114` | v3 名字 >255B、symlink 目标 >1024B、MNT 路径 >1024B 一律 RPC GARBAGE_ARGS | 应为 NFS3ERR_NAMETOOLONG；`ln -s <1KB+ 目标>` 在 v3 上直接 EIO**——已修复（连带 C5）** |
-| A4 | A | `nfsv4/engine.cpp:789` 等 | v4 名字 256B → BADNAME，≥257B → BADXDR | 应为 NFS4ERR_NAMETOOLONG；`errmap` 白名单里的 NAMETOOLONG 无路径可达 |
+| A4 | A | `nfsv4/engine.cpp:789` 等 | v4 名字 256B → BADNAME，≥257B → BADXDR | 应为 NFS4ERR_NAMETOOLONG；`errmap` 白名单里的 NAMETOOLONG 无路径可达**——已修复** |
 | A5 | A | `state/state_mgr.cpp:1595`、`nfsv4/engine.cpp:2765` | FREE_STATEID 不校验 stateid 属主 | 叠加 B1 的可推 stateid → 可释放别人的 lock stateid |
 | B1 | B | `state/state_mgr.cpp:141,549,734` | sessionid / clientid / stateid 全无随机分量；SEQUENCE 接受任意连接 | 网段内可枚举并冒用别人的会话与状态 |
 | B2 | B | `core/config.cpp:1089` | `squash = root` 只压 uid，不压 gid 0 与附加组 0 | 组 root 可写的文件仍可被写 |
@@ -170,7 +170,7 @@ NFS3ERR_NAMETOOLONG、mountd 映射成 MNT3ERR_NAMETOOLONG（`map_error` 已有�
 - 反向验证（保留新常量、只回退行为）：三条分别失败 15 / 1 / 3 处，失败值恰是修复前的行为
   （accept_stat = 4 即 GARBAGE_ARGS、status 读不出来、MOUNT 分量超长回 22 即 MNT3ERR_INVAL）。
 
-### A4 v4 超长名字回 BADNAME / BADXDR
+### A4 v4 超长名字回 BADNAME / BADXDR（已修复）
 
 v4 的分量解码是 `dec.string(kMaxName + 1)` = 256 字节上界（`src/nfsv4/engine.cpp:786,
 1722, 2520, 2581-2582, 2654, 3001` 等）。于是：
@@ -183,6 +183,29 @@ RFC 8881 §18.10.3（LOOKUP）、§18.16.3（OPEN）、§18.4.3（CREATE）等�
 
 **修法**：与 A3 同源，同一次改动。`verdict_status4()`（`src/nfsv4/engine.cpp:65-71`）要为
 `NameCheck::kTooLong` 单独返回 NAMETOOLONG（现在只区分 `kEmpty` → INVAL，其余 → BADNAME）。
+
+**已修复**（本轮）：
+- 与 A3 同一套做法：`nfs4_types.hpp` 删掉 `kMaxName`，新增 `kNameWireMax = 4096` /
+  `kSymlinkWireMax = 16384` 作为**纯 DoS 天花板**（`component4` / `linktext4` 都是
+  `utf8str_cs`，RFC 8881 §3.2 里是 `string<>`），语义上界回到"该导出后端的
+  `limits().max_name`"——也就是 `maxname` 属性宣告的那个数；
+- 新增 `name_status4(NameCheck)`：`kTooLong` → NAMETOOLONG、`kEmpty` → INVAL、其余
+  （"." / ".." / 含 `/` 或 NUL）→ BADNAME。`verdict_status4()` 的 `kBadName` 分支改调它，
+  于是 CREATE / REMOVE / RENAME / LINK 四个走 `MutateGuard::precheck` 的 op 一次到位；
+- 自己查名字的三个 op（LOOKUP / OPEN CLAIM_NULL / SECINFO）也改调同一个判定。LOOKUP 与
+  SECINFO 的检查因此挪到解出句柄之后（长度上界要先知道是哪个文件系统），顺带把 STALE 的
+  优先级摆正——与 A3 在 v3 侧做的一样；
+- 顺带对齐 v4 与 v3 在**同一个输入**上的分歧：`CREATE(NF4LNK)` 的目标超过 PATH_MAX 现在回
+  NAMETOOLONG 而不是 BADXDR（v3 SYMLINK 在 A3 里已经这么改了）。严格说这不在 A4 的条目
+  里，但两个引擎对同一个 symlink 目标给不同答案，正是这份审计要消掉的东西。
+- 回归测例两条：`Nfs4.OverlongComponentsAnswerNametoolong`（LOOKUP / SECINFO /
+  OPEN×2（NOCREATE 与 CREATE）/ CREATE / REMOVE / RENAME / LINK 共 8 处超长名字，外加
+  255 字节名字仍是 NOENT、`""` → INVAL、`"."` / `".."` / `"a/b"` → BADNAME、超过解码天花板
+  仍是 BADXDR）、`Nfs4.LongSymlinkTargetIsAccepted`（2000 字节目标创建并 READLINK 读回、
+  >PATH_MAX → NAMETOOLONG、>天花板 → BADXDR）。
+- 反向验证（保留新常量、只回退行为）：两条分别失败 8 / 1 处，失败值全是 10041（BADNAME）
+  与 10036（BADXDR），即修复前的行为。注意 2000 字节目标那条在修复前也通过——v4 原本的
+  上界就是 4096，那条是回归守卫而不是缺陷复现。
 
 ### A5 FREE_STATEID 不校验 stateid 属主
 
@@ -483,9 +506,9 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 
 1. ~~**A1**、**A2**~~ —— 均已修复（见上）。畸形回复这一类目前已清空。
 2. **A5、B1** —— 跨客户端的状态隔离。B1 的两个子项独立，可分别落。
-3. ~~**A3**、**C5**~~（已修复，见上）、**A4**、**B6**、**B5** —— 错误码与属性宣告的一致性。
-   A3 已经把 `check_component` 的 `kTooLong` 打通到 v3 与 mountd；A4 只剩
-   `verdict_status4()` 与 v4 的解码上界两处。
+3. ~~**A3**、**C5**、**A4**~~（均已修复，见上）、**B6**、**B5** —— 错误码与属性宣告的一致性。
+   `check_component` 的 `kTooLong` 现在在 v3、mountd、v4 三处都通到了对应的 NAMETOOLONG；
+   剩下 B6（FSF3_CANSETTIME）与 B5（fh_expire_type）两条属性宣告。
 4. **B2、B3** —— 身份压缩与源端口，动的是安全默认值，需要同步文档与配置样例。
 5. **B4、B7** —— DRC 键与委托一致性。B4 是删一个字段；B7 建议先上"有 v3 导出则不授委托"的
    一行版本，再决定要不要做完整的 v3 召回。
@@ -493,7 +516,8 @@ NFS3ERR_ACCES / NOENT。与 A3 同源，同一次改动里一起收。
 
 ## 验证建议
 
-- **A4**（A1/A2 已由 `Nfs4.WriteOnlyAttrsAreNotReadable`、
+- **（A4 已由 `Nfs4.OverlongComponentsAnswerNametoolong` 与 `Nfs4.LongSymlinkTargetIsAccepted`
+  覆盖）** A1/A2 已由 `Nfs4.WriteOnlyAttrsAreNotReadable`、
   `Nfs4.EncodeFattrNeverEmitsValuelessAttrs`、`Nfs4.EncodeFattrOrdersReferralAttrsAscending`、
   `Nfs4.EncodeFattrFullSetRoundTrips` 四条覆盖）：pynfs 4.1 的 GETATTR / 属性组能覆盖 A4；原先提到 A2 需要一个 referrals
   开启的用例（`[cluster] mode = active-active`），或者像本次审计一样在
