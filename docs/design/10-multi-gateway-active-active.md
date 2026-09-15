@@ -1,11 +1,9 @@
 # 10. 多网关多活（每导出一个活动网关）——设计与实现
 
-> 状态：**已实现（2026-09-06）**，本册于 2026-09-08 按最终实现回写。本册原为 11 册：09 的实施
-> 步骤（原 10 册）与本册的实施步骤（原 12 册，阶段 A1–E3）完成后均已撤下（每步实现记录见 git
-> 历史；代码注释里的 `plan 12 A3`、`plan 10 D1` 等标签即指这两份已撤下的步骤文档），本册顺位
-> 改为 10 册。未闭环项见
+> `[cluster] mode = "active-active"`：N 个网关同时对外服务，**每个导出（fsid）有且只有一个属主
+> 网关**，不同导出可落在不同网关。运维视角见 [../deployment.md](../deployment.md) §6，配置 /
+> 指标 / ctl 见 [08 册](08-config-observability.md)，状态层见 07 §7.5，未闭环项见
 > [../toto/multi-gateway-active-active-followups.md](../toto/multi-gateway-active-active-followups.md)。
-> 运维视角见 [../deployment.md](../deployment.md) §6，配置 / 指标 / ctl 见 08 册，状态层见 07 §7.5。
 >
 > 本册把 [09 册](09-multi-gateway-failover.md) §9.9 的一句展开成完整方案：在 09 主备接管的原语
 > （`ClusterStore`、围栏租约、集群身份、后端接管钩子、per-fsid 会话 uuid）之上，把"一个集群一个
@@ -80,7 +78,8 @@ shared_dir/
   fs/<fsid>/epoch              # 该导出的接管代数：属主每变更 +1（诊断 / 围栏代数，不进 stateid）
   fs/<fsid>/owner              # "<fs_epoch> <address> <node>\n"：当前属主（供非属主网关应答 fs_locations）
   fs/<fsid>/clients/<fnv64>    # 该导出的 reclaim 名单（该 fsid 的属主维护，co_ownerid 原文）
-  fence.lock / epoch.lock / epoch.<node>.lock / fs/<fsid>/epoch.lock   # O_EXCL 串行化，陈旧锁按 pid+时间回收
+  fence.lock / epoch.lock / epoch.<node>.lock / fs/<fsid>/epoch.lock   # O_EXCL 串行化
+                               #   锁内容 "<pid> <unix_ms>"；超过 2 × fence_lease 视为写者已死并回收
 
   # 以下仅 [cluster] exports_source = "catalog" 时出现（11 册 §11.3，主备与多活同）
   catalog.toml                 # 共享导出清单当前版：整文件原子替换，版本号在 [catalog] version 里
@@ -139,9 +138,9 @@ lightnfs 已有只读**伪文件系统**（`src/core/pseudofs.*`，fsid 0，从�
   句柄解析到某个 fsid 的 op（READ / WRITE / ACCESS / LOOKUP / LOOKUPP / READDIR / SECINFO / OPEN /
   LOCK / SETATTR …）在**任何后端调用之前**按视图判定：Active → 放行；Draining / Remote →
   `NFS4ERR_MOVED`（10019，计 `lightnfs_v4_moved_total{fsid}`）；Unowned → `NFS4ERR_DELAY`
-  （不计数）。别的网关铸的导出句柄拿到本网关，同样在 resolve 里直接 MOVED，不碰存储。所以
-  MOVED 覆盖的是**全部** op，不只是设计初稿写的"状态类操作"——这是 RFC 8881 §11.10 要求的
-  行为。不经 resolve 的 op 照常：`PUTFH / GETFH / SAVEFH / RESTOREFH`、`SEQUENCE`、`EXCHANGE_ID /
+  （不计数）。别的网关铸的导出句柄拿到本网关，同样在 resolve 里直接 MOVED，不碰存储。因此
+  MOVED 覆盖**全部**经 resolve 的 op，而不只是状态类操作——这是 RFC 8881 §11.10 要求的行为。
+  不经 resolve 的 op 照常：`PUTFH / GETFH / SAVEFH / RESTOREFH`、`SEQUENCE`、`EXCHANGE_ID /
   CREATE_SESSION / DESTROY_* / BIND_CONN_TO_SESSION`、`RECLAIM_COMPLETE`、`TEST/FREE_STATEID`。
 - **跨进一个导出（fsid F 的边界）时**：
   - `LOOKUP` 跨进非属主导出、以及 `/` 本身是他人导出时的 `PUTROOTFH`，都**成功**，cfh 置为该
@@ -188,7 +187,7 @@ lightnfs 已有只读**伪文件系统**（`src/core/pseudofs.*`，fsid 0，从�
   `fs/<fsid>/clients/`）。多活下全局名单**不再在 CREATE_SESSION 写**；客户端在导出 F 内**首次铸出
   状态**（OPEN / LOCK / 委托）时 `put(F, owner)`，在 F 内最后一个状态销毁或客户端过期时
   `erase(F, owner)`。名单语义因此收紧为"在 F 持有状态、可能 reclaim 的客户端"。
-- **`RECLAIM_COMPLETE` 仍是整 clientid 的**（与设计初稿不同）：引擎接受 `rca_one_fs = TRUE` 但
+- **`RECLAIM_COMPLETE` 是整 clientid 的，不按 fs**：引擎接受 `rca_one_fs = TRUE` 但
   不按 fs 处理，`note_reclaimed(owner)` 没有 fsid 维度，一次完成对该客户端所在的**所有窗口**
   生效。后果：客户端只发 per-fs 完成时该窗口不提前收窄、跑到期限；发全局完成则一次计入全部
   窗口。Linux 客户端在 referral 子挂载上发的是全局完成，实际影响是导出窗口最多多等到期限。
@@ -213,7 +212,7 @@ lightnfs 已有只读**伪文件系统**（`src/core/pseudofs.*`，fsid 0，从�
   供属主故障接管时把 reclaim 锁下推到存储、并让新属主看见接管前的残留（§10.8）。
 - **迁移/接管时的后端残留**：复用 09 §9.7 的 `Backend::takeover()` 钩子 + `[cluster]
   takeover_hook`，scope 到单 fsid（`prev_node` = 上一个持有者，`LNFS_REASON` 区分猝死接管与迁移）：
-  - **CephFS 最干净**：09 §9.7 已实现的**每 fsid 一个会话 uuid**（`[export.cephfs] uuid` 默认
+  - **CephFS 最干净**：09 §9.7 的**每 fsid 一个会话 uuid**（`[export.cephfs] uuid` 默认
     `<cluster id>-<fsid>`）——新属主 `ceph_start_reclaim(<该 fsid 的 uuid>, RESET)` 只回收**该
     fsid** 的旧会话，不影响该网关正在服务的其他 fsid。多活与 CephFS 天生契合。只有 CephFS 覆盖
     了 `takeover()`，Gluster / Lustre 用默认空操作 + 外部 `takeover_hook`。
@@ -246,7 +245,8 @@ ctl 命令 `lightnfs-ctl cluster migrate <fsid> <node>`，**在当前属主上�
    owner 记录、开始对 F 服务。其中 `nodes` 那一条是必需的：`fs/<F>/owner` 比导出本身活得久
    （导出退出清单时无人清理共享状态），少了它，一个已被移出 `nodes` 的旧属主会在导出重新加入时
    凭陈旧的 owner 记录把它抢回去——而顺位规则 `our_turn()` 是唯一拦住未列名网关的地方
-   （11 册 §11.5，12 册 E1）。
+   （11 册 §11.5；共享状态本身仍无人回收，见
+   [../toto/shared-export-catalog-followups.md](../toto/shared-export-catalog-followups.md) §1）。
 6. **窗口内**：T 处于 Activating，对引擎发布为 unowned → 对 F 回 `DELAY`；其他网关的视图 Remote
    指向 T → 回 MOVED 指 T；除 T 以外的顺位网关看到 owner 指向存活的 T 时**主动让位**。因此
    **任何编排都必须轮询目标到 `role=active`**，而不是源端变 remote（收尾项 §3）。
@@ -285,7 +285,7 @@ ctl 命令 `lightnfs-ctl cluster migrate <fsid> <node>`，**在当前属主上�
   reclaim，可由 `lightnfs_cluster_fs_epoch{fsid}` 与 `fs_fence_lost_total` 诊断，数据不静默错
   （09 §9.5）。
 
-## 10.9 协议面新增（相对 09 / 现状）
+## 10.9 协议面新增（相对 09）
 
 - **GETATTR 支持 `fs_locations`（属性 24）与 `fs_locations_info`（属性 67）**：`src/nfsv4/attrs.cpp`
   按 §10.4 编码，`AttrSource{fs_root, owner, referrals}` 由引擎从伪 fs 路径与 `FsOwnerView` 填；
@@ -388,26 +388,29 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
   `PARENT` 形态则 MOVED）；`end_grace(fsid≠0)` 不清 `grace_any_` 快路径，下一次 `in_grace()` 扫描
   时自清。
 
-## 10.13 实现阶段、验收与指标
+## 10.13 验收、指标与 ctl
 
-| 阶段 | 交付 | 状态 |
-|------|------|------|
-| P1 | `ClusterStore` 多活键空间（`epoch.<node>` / `nodes/<node>` / 批量 `fence.<node>` / `fs/<fsid>/*`）；`StateMgr` grace 与名单改 per-fsid；`mode=active-active` 配置解析与校验 | ✅ 2026-09-06（原 12 册 A1–A3） |
-| P2 | 多活 server 身份与 `eir_flags`；`fs_locations` / `fs_locations_info` 编码 + `FsOwnerView`；非属主 fsid 回 `NFS4ERR_MOVED` 与缺席属性应答 | ✅ 2026-09-06（B1–B3） |
-| P3 | `FsClusterController` per-fsid 角色状态机 + 批量续租；按 `nodes` 顺位的自动接管（含 settling / stuck 规则）；`SEQ4_STATUS_LEASE_MOVED`；多活 ctl 与指标 | ✅ 2026-09-06（C1–C4） |
-| P4 | `cluster migrate <fsid> <node>` 计划内迁移；`scripts/cluster_roll.sh evacuate/restore` | ✅ 2026-09-06（D1–D2） |
-| P5 | 验收：`tests/accept_client.cpp` 的 `v4moved` 模式 + 三实例脚本 `scripts/accept_active_active_local.sh`；fake 演练；文档 | ✅ 2026-09-06（E1–E3），范围见下 |
-
-- **本机验收实际覆盖**（`scripts/accept_active_active_local.sh`，Release 与 ASAN 各一轮，local 后端
-  + `unsafe_skip_backend_checks`，三实例 loopback）：三网关**两导出**（fsid 1 `nodes=[gw1,gw2,gw3]`、
-  fsid 2 `[gw2,gw3,gw1]`）——① status 断言属主分布；② `v4moved`：A 上 `eir_flags` 带 REFER|MIGR、
-  他人导出有 `fs_locations` 且 READ 回 MOVED，B 上建 open/lock/未提交写后 `migrate 2 gw3`，B 上
-  `SEQUENCE` 见 `LEASE_MOVED`、READ 回 MOVED，C 上同 co_ownerid `CLAIM_PREVIOUS` + `LOCK(reclaim)`
-  成功、COMMIT 验证器与 B 不同、重发写字节级校验、`RECLAIM_COMPLETE` 后普通 OPEN 通过（提前出
-  grace）；③ `cluster_roll.sh evacuate gw1` / `restore gw1`；④ `kill -9` gw1 后 gw2 在 10 ×
-  `fence_lease` 内接管 fsid 1 并可写；⑤ **单网关退化**：一个网关三个导出全 `nodes=["gw1"]`，三行
-  `role=active`、恰一个 `fence.gw1`（多活的单网关退化 = 单机行为，回归门）；⑥ 干净退出、无
-  `level=error`、无 ASAN 报告。
+- **本机验收覆盖**（`scripts/accept_active_active_local.sh`，local 后端 +
+  `unsafe_skip_backend_checks`，三实例 loopback）：三网关**两导出**（fsid 1
+  `nodes=[gw1,gw2,gw3]`、fsid 2 `[gw2,gw3,gw1]`）——① `status` 断言属主分布、每台一条
+  `fence.<node>`、属主视图一致；② `v4moved`：A 上 `eir_flags` 带 REFER|MIGR、他人导出有
+  `fs_locations` 且 READ 回 MOVED，B 上建 open / lock / 未提交写后 `migrate 2 gw3`，B 上
+  `SEQUENCE` 见 `LEASE_MOVED`、READ 回 MOVED，C 上同 co_ownerid `CLAIM_PREVIOUS` +
+  `LOCK(reclaim)` 成功、COMMIT 验证器与 B 不同、重发写字节级校验、`RECLAIM_COMPLETE` 后普通
+  OPEN 通过（提前出 grace）；③ `roll`：`cluster_roll.sh evacuate gw1` / `restore gw1`，客户端
+  不中断；④ `crash`：`kill -9` 持两个导出的网关，两个导出各自被各自 `nodes` 里的后继接走
+  （负载分散），各自 reclaim 后字节校验；⑤ `catalog`（仅清单模式）：集群在服务中经
+  `cluster export add|set|remove` 增删改一个导出，客户端侧由 `v4catalog` 断言伪目录 READDIR、
+  change 属性单调、MOVED + `fs_locations`、`LEASE_MOVED`、STALE，另覆盖属主护栏与 `--force`、
+  `catalog_refresh = manual` 的一台经 `catalog apply` 追平、`catalog rollback`；⑥ **单网关
+  退化**：一个网关三个导出全 `nodes=["gw1"]`，三行 `role=active`、恰一个 `fence.gw1`（多活的
+  单网关退化 = 单机行为，回归门）；⑦ 干净退出、无 `level=error`、无 ASAN 报告、每个守护进程
+  留下空的 `fence.<node>` 记录。
+  每种构建（Release、ASAN）× 每种导出来源（`LNFS_EXPORTS="local catalog"`，见 11 册）各跑一轮：
+  清单模式下本地文件里一个 `[[export]]` 都没有，同样两个导出由启动前的离线
+  `lightnfs-ctl catalog import --from-local` 发布，`status` / `v4moved` / `roll` / `crash`
+  四段必须逐字同样通过（`catalog` 段只在清单模式下存在；`single` 段只跑 local——`nodes=["gw1"]`
+  的退化门与导出来源无关）。
 - **未覆盖**（收尾项 §1）：真内核客户端（`mount -o vers=4.1` 走入口、子挂载、迁移中 fsx）与
   CephFS per-fsid uuid 回收的端到端验证——本机无 root / 无 Ceph 集群，留待 VM/CI。
 - **单元测试**：`tests/test_cluster_controller.cpp`（单网关持全部 fsid、续租一次写、丢一个 fsid 只
@@ -431,11 +434,16 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
   [<node>]`（一个网关——默认本网关——此刻服务的导出：`node= alive= address= exports= fsids=` 一行 +
   每导出 `fsid= path= role= fs_epoch=`；节点未登记且不在任何 `nodes` 里报 `unknown node`）、
   `cluster takeover <fsid> [--force]`、`cluster standby <fsid>`、`cluster migrate <fsid> <node>`；
-  09 的无参形态在多活下答 `fsid required`。
+  09 的无参形态在多活下答 `fsid required`。`exports_source = "catalog"` 时 `cluster status` 的
+  网关行尾再接 `catalog= catalog_latest= catalog_refresh= catalog_error=`，另有整组
+  `cluster catalog …` / `cluster export …` 命令（11 §11.10）。
 
 ## 10.14 代码锚点
 
-| 位置 | 改动 |
+代码注释里的 `plan 10 <步骤>` / `plan 12 <步骤>` 标签指 09 与本册当年的实施步骤文档，两份都已
+在特性落地后撤下（每步记录见 git 历史）；标签保留是为了让注释与那段历史对得上。
+
+| 位置 | 职责 |
 |------|------|
 | `core/config.{hpp,cpp}` | `[cluster] mode / node_address`、`[[export]] nodes`（进导出摘要）、`validate_active_active`（含同卷同 `nodes`）、`cluster_active_active()` |
 | `core/fs_owner_view.hpp` | `FsRole` / `FsOwner` / `FsOwnerView`（RCU 快照）、`address_host()` |
@@ -451,5 +459,5 @@ nodes  = ["gw2", "gw3", "gw1"]        # b 的属主优先 gw2 → 负载分摊
 | `nfsv4/attrs.{hpp,cpp}` | 属性 24 / 67 编码、`AttrSource`、`supported_attrs(referrals)` |
 | `nfsv4/engine.{hpp,cpp}` | `ownership_gate` / `resolve` 的 MOVED、伪 fs 穿越点、`absent_attr_reply`、READDIR referral 项、`eir_flags`、`note_moved` / `moved_counts` |
 | `util/errno.hpp`、`core/errmap.cpp` | `Errno::kMoved` → `NFS4ERR_MOVED` |
-| `backend/cephfs/*` | per-fsid uuid（09 D2）沿用 |
+| `backend/cephfs/*` | per-fsid 会话 uuid（09 §9.7）沿用 |
 | `tools/lightnfs_ctl.cpp`、`scripts/cluster_roll.sh`、`scripts/accept_active_active_local.sh`、`tests/accept_client.cpp` | ctl 客户端、滚动维护、三实例验收、`v4moved` 模式 |
