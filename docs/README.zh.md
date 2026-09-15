@@ -373,7 +373,9 @@ format 门禁构成逐次改动的检查，`ci.sh nightly` 追加基准地板门
   属主网关的多活、共享导出清单）。每册未闭环的取舍与门槛在
   [design/followups/](design/followups/)。
 - **使用** [guide/deployment.md](guide/deployment.md)——安全信任边界、最小特权 systemd
-  单元、关键配置、运维与可观测性、多网关主备与多活部署、共享导出清单、已知限制。
+  单元、关键配置、运维与可观测性、多网关主备与多活部署、共享导出清单、已知限制；
+  [guide/scripts.md](guide/scripts.md)——`scripts/` 速查：源码门禁、各类验收脚本、外部测试
+  套件获取、性能与 fuzz 跑批、运维脚本。
 - **参考** 协议调研：[reference/nfsv3/](reference/nfsv3/README.md)、
   [reference/nfsv4/](reference/nfsv4/README.md)。
 - **测试** [测试报告](testing/test-report.md)（协议一致性 cthon / pynfs / fsx、三层基准
